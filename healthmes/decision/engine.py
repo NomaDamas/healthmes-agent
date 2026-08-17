@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Awaitable
 from threading import Lock
 from typing import Any, Protocol
@@ -34,6 +35,22 @@ class DecisionAgent(Protocol):
     ) -> Awaitable[DecisionAgentRun]: ...
 
     def close(self) -> None: ...
+
+
+class PersistedDecisionFinalizer(Protocol):
+    """Finalizer surface needed for safe idempotent pointer replay."""
+
+    def revalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult: ...
+
+    async def arevalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult: ...
 
 
 class _RequestPhase:
@@ -152,6 +169,36 @@ class HealthMesDecisionEngine:
             run,
         )
 
+    async def _run_persisted_replay(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult:
+        async_revalidate = getattr(
+            self._finalizer,
+            "arevalidate_persisted",
+            None,
+        )
+        if callable(async_revalidate):
+            return await async_revalidate(
+                request,
+                decision_record_id,
+            )
+        revalidate = getattr(
+            self._finalizer,
+            "revalidate_persisted",
+            None,
+        )
+        if not callable(revalidate):
+            raise RuntimeError(
+                "decision finalizer cannot revalidate persisted results"
+            )
+        return await asyncio.to_thread(
+            revalidate,
+            request,
+            decision_record_id,
+        )
+
     def _track_request(
         self,
         loop: asyncio.AbstractEventLoop,
@@ -223,6 +270,59 @@ class HealthMesDecisionEngine:
         """Compatibility wrapper for the canonical ``ask_wellness`` API."""
 
         return await self.ask_wellness(request)
+
+    async def replay_persisted_decision(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult:
+        """Revalidate one stored pointer without invoking the LLM again."""
+
+        if not isinstance(request, DecisionRequest):
+            raise TypeError("request must be a DecisionRequest")
+        if not isinstance(decision_record_id, uuid.UUID):
+            raise TypeError("decision_record_id must be a UUID")
+        loop = asyncio.get_running_loop()
+        with self._state_lock:
+            if self._closing or self._closed:
+                raise DecisionEngineClosedError(
+                    "HealthMes decision engine is closing"
+                )
+            if (
+                self._loop is not None
+                and self._loop is not loop
+                and self._active
+            ):
+                raise RuntimeError(
+                    "HealthMes decision engine has active requests on "
+                    "another event loop"
+                )
+            if len(self._active) >= self._max_pending_requests:
+                raise DecisionEngineBusyError(
+                    "HealthMes decision engine is at capacity"
+                )
+            self._loop = loop
+            replay_coroutine = self._run_persisted_replay(
+                request,
+                decision_record_id,
+            )
+            try:
+                task = loop.create_task(
+                    replay_coroutine,
+                    name=f"healthmes-replay-{decision_record_id}",
+                )
+            except BaseException:
+                replay_coroutine.close()
+                raise
+            self._active.add(task)
+            task.add_done_callback(self._request_finished)
+        try:
+            done, _pending = await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        assert task in done
+        return task.result()
 
     async def aclose(self) -> None:
         """Reject new work and await the engine's single shutdown task."""

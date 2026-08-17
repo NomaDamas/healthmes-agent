@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from threading import Lock
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import (
     AwareDatetime,
@@ -54,7 +54,8 @@ _REST_REQUEST_NAMESPACE = uuid.UUID(
     "d8fcb625-cade-45a4-b27f-63a6c06c9719"
 )
 _DECISION_RECEIPT_RETENTION = timedelta(days=30)
-_DECISION_RECEIPT_SCHEMA = "healthmes.decision-receipt.v1"
+_DECISION_RECEIPT_SCHEMA = "healthmes.decision-receipt.v2"
+_LEGACY_DECISION_RECEIPT_SCHEMA = "healthmes.decision-receipt.v1"
 _DECISION_SERVICE_FINGERPRINT_CONTEXT = (
     b"healthmes-decision-service-request-fingerprint-v1\x00"
 )
@@ -163,6 +164,12 @@ class DecisionEngine(Protocol):
         request: DecisionRequest,
     ) -> DecisionResult: ...
 
+    async def replay_persisted_decision(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult: ...
+
 
 class DecisionService(Protocol):
     """Canonical service surface allowed behind product ingress adapters."""
@@ -184,6 +191,26 @@ class _ActiveDecision:
 class _IdempotentExecution:
     result: DecisionResult
     cache_expires_at: datetime | None
+
+
+class _TransientReceiptV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_name: Literal["healthmes.decision-receipt.v2"] = Field(
+        alias="schema"
+    )
+    kind: Literal["transient_result"]
+    result: DecisionResult
+
+
+class _PersistedReceiptV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_name: Literal["healthmes.decision-receipt.v2"] = Field(
+        alias="schema"
+    )
+    kind: Literal["decision_record"]
+    decision_record_id: uuid.UUID
 
 
 class HealthMesDecisionService:
@@ -399,7 +426,11 @@ class HealthMesDecisionService:
                     assert claim.result_payload is not None
                     assert claim.expires_at is not None
                     return _IdempotentExecution(
-                        result=_result_from_receipt(claim.result_payload),
+                        result=await self._replay_completed_receipt(
+                            submission,
+                            requested_at=claim.requested_at,
+                            payload=claim.result_payload,
+                        ),
                         cache_expires_at=_as_utc(claim.expires_at),
                     )
                 if claim.state is DecisionReceiptClaimState.ACQUIRED:
@@ -445,6 +476,7 @@ class HealthMesDecisionService:
                 except DecisionReceiptOwnershipError:
                     canonical = await self._converge_after_lease_loss(
                         store,
+                        submission=submission,
                         request_id=request_id,
                         fingerprint=fingerprint,
                         legacy_fingerprint=legacy_fingerprint,
@@ -458,10 +490,16 @@ class HealthMesDecisionService:
                     continue
                 except DecisionReceiptExpiredError as exc:
                     raise DecisionIdempotencyExpiredError(str(exc)) from exc
+                if completion.result_payload == payload:
+                    canonical_result = result
+                else:
+                    canonical_result = await self._replay_completed_receipt(
+                        submission,
+                        requested_at=requested_at,
+                        payload=completion.result_payload,
+                    )
                 return _IdempotentExecution(
-                    result=_result_from_receipt(
-                        completion.result_payload
-                    ),
+                    result=canonical_result,
                     cache_expires_at=(
                         _as_utc(completion.expires_at)
                         if completion.expires_at is not None
@@ -484,6 +522,7 @@ class HealthMesDecisionService:
         self,
         store: DecisionReceiptStore,
         *,
+        submission: DecisionServiceRequest,
         request_id: uuid.UUID,
         fingerprint: str,
         legacy_fingerprint: str,
@@ -513,8 +552,10 @@ class HealthMesDecisionService:
                 assert observation.result_payload is not None
                 assert observation.expires_at is not None
                 return _IdempotentExecution(
-                    result=_result_from_receipt(
-                        observation.result_payload
+                    result=await self._replay_completed_receipt(
+                        submission,
+                        requested_at=observation.requested_at,
+                        payload=observation.result_payload,
                     ),
                     cache_expires_at=_as_utc(
                         observation.expires_at
@@ -523,6 +564,56 @@ class HealthMesDecisionService:
             if observation.lease_expired:
                 return None
             await asyncio.sleep(observation.retry_after_seconds)
+
+    async def _replay_completed_receipt(
+        self,
+        submission: DecisionServiceRequest,
+        *,
+        requested_at: datetime | None,
+        payload: dict,
+    ) -> DecisionResult:
+        transient = _transient_result_from_receipt(payload)
+        if transient is not None:
+            return transient
+
+        pointer = _decision_record_id_from_receipt(payload)
+        if pointer is None:
+            raise RuntimeError("decision receipt payload is invalid")
+        engine = self._engine_provider()
+        if engine is None:
+            raise DecisionRuntimeNotConfiguredError(
+                "HealthMes decision runtime is not configured"
+            )
+        replay = getattr(engine, "replay_persisted_decision", None)
+        if not callable(replay):
+            raise DecisionRuntimeNotConfiguredError(
+                "HealthMes decision runtime cannot revalidate stored results"
+            )
+        frozen_submission = submission.model_copy(
+            update={
+                "requested_at": _as_utc(
+                    requested_at or submission.requested_at or self._clock()
+                )
+            }
+        )
+        request = self.build_request(frozen_submission)
+        result = await replay(request, pointer)
+        if not isinstance(result, DecisionResult):
+            raise TypeError(
+                "decision replay must return DecisionResult"
+            )
+        if result.request_id != request.request_id:
+            raise RuntimeError(
+                "decision replay returned a different request identity"
+            )
+        if result.status is DecisionStatus.COMPLETED and (
+            result.persistence_status is not PersistenceStatus.PERSISTED
+            or result.decision_record_id != pointer
+        ):
+            raise RuntimeError(
+                "completed decision replay did not return its stored record"
+            )
+        return result
 
     def _get_receipt_store(self) -> DecisionReceiptStore:
         with self._idempotency_lock:
@@ -737,8 +828,18 @@ def _is_terminal_non_retryable(result: DecisionResult) -> bool:
 
 
 def _result_receipt_payload(result: DecisionResult) -> dict:
+    if (
+        result.persistence_status is PersistenceStatus.PERSISTED
+        and result.decision_record_id is not None
+    ):
+        return {
+            "schema": _DECISION_RECEIPT_SCHEMA,
+            "kind": "decision_record",
+            "decision_record_id": str(result.decision_record_id),
+        }
     return {
         "schema": _DECISION_RECEIPT_SCHEMA,
+        "kind": "transient_result",
         "result": result.model_dump(
             mode="json",
             round_trip=True,
@@ -747,15 +848,70 @@ def _result_receipt_payload(result: DecisionResult) -> dict:
     }
 
 
-def _result_from_receipt(payload: dict) -> DecisionResult:
-    if payload.get("schema") != _DECISION_RECEIPT_SCHEMA:
+def _transient_result_from_receipt(
+    payload: dict,
+) -> DecisionResult | None:
+    schema_name = payload.get("schema")
+    if schema_name == _LEGACY_DECISION_RECEIPT_SCHEMA:
+        raw_result = payload.get("result")
+        if not isinstance(raw_result, dict):
+            raise RuntimeError("decision receipt result is invalid")
+        if (
+            raw_result.get("persistence_status")
+            == PersistenceStatus.PERSISTED.value
+            and raw_result.get("decision_record_id") is not None
+        ):
+            return None
+        return DecisionResult.model_validate(
+            {**raw_result, "tool_trace": []}
+        )
+    if schema_name != _DECISION_RECEIPT_SCHEMA:
         raise RuntimeError("unsupported decision receipt schema")
-    raw_result = payload.get("result")
-    if not isinstance(raw_result, dict):
-        raise RuntimeError("decision receipt result is invalid")
-    return DecisionResult.model_validate(
-        {**raw_result, "tool_trace": []}
+    if payload.get("kind") == "decision_record":
+        return None
+    try:
+        parsed = _TransientReceiptV2.model_validate(payload)
+    except Exception as exc:
+        raise RuntimeError(
+            "decision receipt result is invalid"
+        ) from exc
+    return parsed.result.model_copy(
+        update={"tool_trace": []},
+        deep=True,
     )
+
+
+def _decision_record_id_from_receipt(
+    payload: dict,
+) -> uuid.UUID | None:
+    if payload.get("schema") == _LEGACY_DECISION_RECEIPT_SCHEMA:
+        raw_result = payload.get("result")
+        if not isinstance(raw_result, dict):
+            raise RuntimeError("decision receipt result is invalid")
+        if (
+            raw_result.get("persistence_status")
+            != PersistenceStatus.PERSISTED.value
+        ):
+            return None
+        raw_id = raw_result.get("decision_record_id")
+        try:
+            return uuid.UUID(str(raw_id))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "persisted decision receipt has no record identity"
+            ) from exc
+    if payload.get("schema") != _DECISION_RECEIPT_SCHEMA:
+        return None
+    if payload.get("kind") != "decision_record":
+        return None
+    try:
+        return _PersistedReceiptV2.model_validate(
+            payload
+        ).decision_record_id
+    except Exception as exc:
+        raise RuntimeError(
+            "persisted decision receipt is invalid"
+        ) from exc
 
 
 async def _claim_with_cancellation_cleanup(

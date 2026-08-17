@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import threading
+import uuid
 import warnings
 from datetime import UTC, datetime
 
@@ -146,6 +147,31 @@ class _UnknownCommitFinalizer:
         await self.release.wait()
 
 
+class _BlockingReplayFinalizer:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = []
+
+    async def arevalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult:
+        self.calls.append((request, decision_record_id))
+        self.started.set()
+        await self.release.wait()
+        return DecisionResult(
+            request_id=request.request_id,
+            turn_id=uuid.uuid4(),
+            status=DecisionStatus.COMPLETED,
+            answer="Stored wellness action.",
+            persistence_status=PersistenceStatus.PERSISTED,
+            decision_record_id=decision_record_id,
+            runtime=RuntimeMetadata(runtime="test-finalizer"),
+        )
+
+
 async def test_aclose_rejects_new_requests_and_drains_accepted_work() -> None:
     agent = _StubAgent()
     finalizer = _BlockingFinalizer()
@@ -171,6 +197,56 @@ async def test_aclose_rejects_new_requests_and_drains_accepted_work() -> None:
     assert result.status is DecisionStatus.COMPLETED
     assert agent.closed is True
     await engine.aclose()
+
+
+async def test_persisted_replay_uses_finalizer_without_calling_agent() -> None:
+    agent = _StubAgent()
+    finalizer = _BlockingReplayFinalizer()
+    engine = HealthMesDecisionEngine(
+        agent=agent,  # type: ignore[arg-type]
+        finalizer=finalizer,  # type: ignore[arg-type]
+    )
+    request = _request()
+    record_id = uuid.uuid4()
+
+    replay_task = asyncio.create_task(
+        engine.replay_persisted_decision(request, record_id)
+    )
+    await asyncio.wait_for(finalizer.started.wait(), timeout=1)
+    finalizer.release.set()
+    result = await replay_task
+
+    assert result.decision_record_id == record_id
+    assert finalizer.calls == [(request, record_id)]
+    assert agent.close_calls == 0
+    await engine.aclose()
+    assert agent.close_calls == 1
+
+
+async def test_aclose_drains_an_accepted_persisted_replay() -> None:
+    agent = _StubAgent()
+    finalizer = _BlockingReplayFinalizer()
+    engine = HealthMesDecisionEngine(
+        agent=agent,  # type: ignore[arg-type]
+        finalizer=finalizer,  # type: ignore[arg-type]
+    )
+    replay = asyncio.create_task(
+        engine.replay_persisted_decision(
+            _request(),
+            uuid.uuid4(),
+        )
+    )
+    await asyncio.wait_for(finalizer.started.wait(), timeout=1)
+
+    closing = asyncio.create_task(engine.aclose())
+    await asyncio.sleep(0)
+    assert closing.done() is False
+    assert agent.closed is False
+
+    finalizer.release.set()
+    assert (await replay).status is DecisionStatus.COMPLETED
+    await closing
+    assert agent.closed is True
 
 
 async def test_aclose_drains_commit_worker_after_unknown_response() -> None:

@@ -24,6 +24,10 @@ from healthmes.store.models import (
 )
 from healthmes.store.session import session_scope
 
+_DECISION_RECEIPT_SCHEMA_V1 = "healthmes.decision-receipt.v1"
+_DECISION_RECEIPT_SCHEMA_V2 = "healthmes.decision-receipt.v2"
+_TRANSIENT_RESULT_MAX_AGE = timedelta(minutes=15)
+
 
 class DecisionReceiptConflictError(RuntimeError):
     """The same request identity was reused with different input."""
@@ -115,7 +119,11 @@ class DecisionReceiptStore:
                 fingerprint,
                 legacy_fingerprint=legacy_fingerprint,
             )
-            _tombstone_result_if_expired(receipt, now=current)
+            _normalize_completed_receipt(
+                session,
+                receipt,
+                now=current,
+            )
 
             if receipt.state == DecisionReceiptClaimState.COMPLETED:
                 return _completed_claim(receipt)
@@ -197,7 +205,11 @@ class DecisionReceiptStore:
                     fingerprint,
                     legacy_fingerprint=legacy_fingerprint,
                 )
-                _tombstone_result_if_expired(receipt, now=current)
+                _normalize_completed_receipt(
+                    session,
+                    receipt,
+                    now=current,
+                )
                 if receipt.state == DecisionReceiptClaimState.COMPLETED:
                     claim = _completed_claim(receipt)
                     assert claim.result_payload is not None
@@ -221,6 +233,7 @@ class DecisionReceiptStore:
                     result_expires_at = _result_expiry(
                         session,
                         receipt=receipt,
+                        result_payload=result_payload,
                     )
                     receipt.owner_token = None
                     receipt.lease_expires_at = None
@@ -304,7 +317,11 @@ class DecisionReceiptStore:
                 fingerprint,
                 legacy_fingerprint=legacy_fingerprint,
             )
-            _tombstone_result_if_expired(receipt, now=current)
+            _normalize_completed_receipt(
+                session,
+                receipt,
+                now=current,
+            )
             if receipt.state == DecisionReceiptClaimState.COMPLETED:
                 return _completed_claim(receipt)
             if receipt.state == "tombstone":
@@ -413,7 +430,12 @@ def scrub_decision_receipt_results(
         statement = statement.with_for_update()
     candidates = 0
     for receipt in session.scalars(statement):
-        policy_deadline = _result_expiry(session, receipt=receipt)
+        payload = _compact_receipt_payload(receipt.result_payload)
+        policy_deadline = _result_expiry(
+            session,
+            receipt=receipt,
+            result_payload=payload,
+        )
         stored_deadline = (
             _as_utc(receipt.result_expires_at)
             if receipt.result_expires_at is not None
@@ -435,11 +457,14 @@ def scrub_decision_receipt_results(
                 receipt.lease_expires_at = None
                 receipt.result_payload = null()
                 receipt.result_expires_at = None
-        elif not dry_run and (
-            receipt.result_expires_at is None
-            or _as_utc(receipt.result_expires_at) != deadline
-        ):
-            receipt.result_expires_at = deadline
+        elif not dry_run:
+            if payload != receipt.result_payload:
+                receipt.result_payload = payload
+            if (
+                receipt.result_expires_at is None
+                or _as_utc(receipt.result_expires_at) != deadline
+            ):
+                receipt.result_expires_at = deadline
     if not dry_run:
         session.flush()
     return candidates
@@ -495,29 +520,54 @@ def _completed_claim(
     )
 
 
-def _tombstone_result_if_expired(
+def _normalize_completed_receipt(
+    session: Session,
     receipt: DecisionRequestReceipt,
     *,
     now: datetime,
 ) -> None:
-    if (
-        receipt.state == "completed"
-        and receipt.result_expires_at is not None
-        and _as_utc(receipt.result_expires_at) <= _as_utc(now)
-    ):
+    if receipt.state != "completed":
+        return
+    if not isinstance(receipt.result_payload, dict):
+        raise RuntimeError("completed decision receipt has no result payload")
+    if receipt.result_expires_at is None:
+        raise RuntimeError(
+            "completed decision receipt has no result expiry"
+        )
+    payload = _compact_receipt_payload(receipt.result_payload)
+    deadline = min(
+        _as_utc(receipt.result_expires_at),
+        _result_expiry(
+            session,
+            receipt=receipt,
+            result_payload=payload,
+        ),
+    )
+    if deadline <= _as_utc(now):
         receipt.state = "tombstone"
         receipt.owner_token = None
         receipt.lease_expires_at = None
         receipt.result_payload = null()
         receipt.result_expires_at = None
+        return
+    if payload != receipt.result_payload:
+        receipt.result_payload = payload
+    receipt.result_expires_at = deadline
 
 
 def _result_expiry(
     session: Session,
     *,
     receipt: DecisionRequestReceipt,
+    result_payload: dict[str, Any] | None = None,
 ) -> datetime:
     identity_deadline = _as_utc(receipt.expires_at)
+    if _receipt_payload_is_transient(result_payload or receipt.result_payload):
+        identity_deadline = min(
+            identity_deadline,
+            _as_utc(receipt.retention_basis_at)
+            + _TRANSIENT_RESULT_MAX_AGE,
+        )
     policy = session.scalar(
         select(RetentionPolicy)
         .where(RetentionPolicy.data_class == "decision")
@@ -533,6 +583,46 @@ def _result_expiry(
         receipt.retention_basis_at
     ) + timedelta(days=policy.retention_days)
     return min(identity_deadline, decision_deadline)
+
+
+def _compact_receipt_payload(
+    payload: Any,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("completed decision receipt has no result payload")
+    normalized = dict(payload)
+    if normalized.get("schema") != _DECISION_RECEIPT_SCHEMA_V1:
+        return normalized
+    raw_result = normalized.get("result")
+    if not isinstance(raw_result, dict):
+        return normalized
+    if (
+        raw_result.get("persistence_status") == "persisted"
+        and raw_result.get("decision_record_id") is not None
+    ):
+        try:
+            record_id = uuid.UUID(str(raw_result["decision_record_id"]))
+        except (TypeError, ValueError):
+            return normalized
+        return {
+            "schema": _DECISION_RECEIPT_SCHEMA_V2,
+            "kind": "decision_record",
+            "decision_record_id": str(record_id),
+        }
+    return {
+        "schema": _DECISION_RECEIPT_SCHEMA_V2,
+        "kind": "transient_result",
+        "result": raw_result,
+    }
+
+
+def _receipt_payload_is_transient(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return True
+    return not (
+        payload.get("schema") == _DECISION_RECEIPT_SCHEMA_V2
+        and payload.get("kind") == "decision_record"
+    )
 
 
 def _require_fingerprint(

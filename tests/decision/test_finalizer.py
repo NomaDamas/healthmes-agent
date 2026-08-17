@@ -471,6 +471,112 @@ def test_source_backed_action_is_atomically_persisted(persistence):
         assert "tool_trace" not in visible
 
 
+def test_persisted_pointer_replay_revalidates_current_source_state(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        event = _event(session)
+        event_id = event.id
+        ref = _source_ref(event)
+    request = _request()
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(request, _run(request, [ref]))
+    assert first.decision_record_id is not None
+
+    replay_request = request.model_copy(
+        update={"turn_id": uuid.uuid4()}
+    )
+    replay = finalizer.revalidate_persisted(
+        replay_request,
+        first.decision_record_id,
+    )
+
+    assert replay.status is DecisionStatus.COMPLETED
+    assert replay.decision_record_id == first.decision_record_id
+    assert replay.source_refs == [ref]
+    assert replay.tool_trace == []
+
+    with factory() as session:
+        event = session.get(WellnessEvent, event_id)
+        assert event is not None
+        session.delete(event)
+        session.commit()
+
+    rejected = finalizer.revalidate_persisted(
+        replay_request,
+        first.decision_record_id,
+    )
+
+    assert rejected.status is DecisionStatus.FAILED
+    assert rejected.proposed_action is False
+    assert rejected.source_refs == []
+    assert "decision_source_ref_revalidation_failed" in rejected.limitations
+    assert "source_ref_record_missing" in rejected.limitations
+
+
+def test_persisted_pointer_replay_rechecks_current_domain_consent(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    first = _finalizer(factory).finalize(
+        request,
+        _run(request, [ref]),
+    )
+    assert first.decision_record_id is not None
+
+    replay = _finalizer(
+        factory,
+        policy=_policy(enabled=False),
+    ).revalidate_persisted(
+        request.model_copy(update={"turn_id": uuid.uuid4()}),
+        first.decision_record_id,
+    )
+
+    assert replay.status is DecisionStatus.FAILED
+    assert replay.proposed_action is False
+    assert replay.source_refs == []
+    assert "domain_consent_denied" in replay.limitations
+
+
+def test_persisted_pointer_replay_rejects_expired_decision_record(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(request, _run(request, [ref]))
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "1d",
+            now=NOW + timedelta(days=2),
+        )
+        session.commit()
+        assert session.get(
+            DecisionRecord,
+            first.decision_record_id,
+        ) is None
+
+    replay = finalizer.revalidate_persisted(
+        request.model_copy(update={"turn_id": uuid.uuid4()}),
+        first.decision_record_id,
+    )
+
+    assert replay.status is DecisionStatus.FAILED
+    assert replay.proposed_action is False
+    assert replay.source_refs == []
+    assert "decision_record_not_available" in replay.limitations
+
+
 def test_finalizer_purge_scrubs_older_expired_trigger_answer(
     persistence,
 ) -> None:

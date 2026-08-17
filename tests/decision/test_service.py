@@ -85,6 +85,36 @@ class RecordingEngine:
         return _completed_result(request)
 
 
+class PersistedRecordingEngine(RecordingEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.record_id = uuid.uuid4()
+        self.persisted_result = None
+        self.replay_requests = []
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        self.persisted_result = DecisionResult(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            status=DecisionStatus.COMPLETED,
+            answer="Take the recorded wellness action.",
+            persistence_status=PersistenceStatus.PERSISTED,
+            decision_record_id=self.record_id,
+            runtime=RuntimeMetadata(runtime="test"),
+        )
+        return self.persisted_result
+
+    async def replay_persisted_decision(
+        self,
+        request,
+        decision_record_id,
+    ):
+        self.replay_requests.append((request, decision_record_id))
+        assert self.persisted_result is not None
+        return self.persisted_result.model_copy(deep=True)
+
+
 class RecordingService:
     def __init__(self, result) -> None:
         self.result = result
@@ -821,7 +851,7 @@ def test_sqlite_takeover_preserves_first_server_retention_basis(
         now=NOW + timedelta(seconds=2),
     )
 
-    assert completion.expires_at == NOW + timedelta(days=1)
+    assert completion.expires_at == NOW + timedelta(minutes=15)
     with service_session_factory() as session:
         receipt = session.scalar(
             select(DecisionRequestReceipt).where(
@@ -1099,8 +1129,17 @@ async def test_retention_shrink_serializes_with_receipt_completion(
     finish_completion = threading.Event()
     original_result_expiry = decision_receipts_module._result_expiry
 
-    def blocking_result_expiry(session, *, receipt):
-        deadline = original_result_expiry(session, receipt=receipt)
+    def blocking_result_expiry(
+        session,
+        *,
+        receipt,
+        result_payload=None,
+    ):
+        deadline = original_result_expiry(
+            session,
+            receipt=receipt,
+            result_payload=result_payload,
+        )
         policy_read.set()
         if not finish_completion.wait(timeout=5):
             raise TimeoutError("test did not release retention calculation")
@@ -1364,6 +1403,134 @@ async def test_keyed_fingerprint_preserves_legacy_sha_receipt_replay(
 
 
 @pytest.mark.asyncio
+async def test_legacy_persisted_receipt_is_compacted_before_replay(
+    settings,
+    service_session_factory,
+) -> None:
+    clock = MutableClock(NOW)
+    engine = PersistedRecordingEngine()
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take the stored action?",
+        ingress=DecisionIngress.SCHEDULED,
+        source="morning-briefing",
+    )
+    original = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    first = await original.ask_wellness(submission)
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        receipt.result_payload = {
+            "schema": "healthmes.decision-receipt.v1",
+            "result": first.model_dump(
+                mode="json",
+                round_trip=True,
+                exclude={"tool_trace"},
+            ),
+        }
+        session.commit()
+
+    restarted = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    replay = await restarted.ask_wellness(submission)
+
+    assert replay == first
+    assert len(engine.replay_requests) == 1
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.result_payload == {
+            "schema": "healthmes.decision-receipt.v2",
+            "kind": "decision_record",
+            "decision_record_id": str(engine.record_id),
+        }
+        assert first.answer not in str(receipt.result_payload)
+
+
+@pytest.mark.asyncio
+async def test_legacy_transient_receipt_cannot_outlive_fifteen_minutes(
+    settings,
+    service_session_factory,
+) -> None:
+    clock = MutableClock(NOW)
+    engine = RecordingEngine()
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="What did my context show?",
+        ingress=DecisionIngress.REST,
+    )
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    first = await service.ask_wellness(submission)
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        receipt.result_payload = {
+            "schema": "healthmes.decision-receipt.v1",
+            "result": first.model_dump(
+                mode="json",
+                round_trip=True,
+                exclude={"tool_trace"},
+            ),
+        }
+        receipt.result_expires_at = (
+            NOW + timedelta(days=30)
+        ).replace(tzinfo=None)
+        session.commit()
+
+    clock.advance(timedelta(minutes=16))
+    restarted_engine = RecordingEngine()
+    restarted = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: restarted_engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    with pytest.raises(DecisionIdempotencyExpiredError):
+        await restarted.ask_wellness(submission)
+
+    assert restarted_engine.requests == []
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "tombstone"
+        assert receipt.result_payload is None
+
+
+@pytest.mark.asyncio
 async def test_decision_retention_tombstone_blocks_sensitive_replay(
     settings,
     service_session_factory,
@@ -1403,13 +1570,13 @@ async def test_decision_retention_tombstone_blocks_sensitive_replay(
         assert receipt is not None
         assert receipt.state == "completed"
         assert receipt.result_expires_at == (
-            NOW + timedelta(days=1)
+            NOW + timedelta(minutes=15)
         ).replace(tzinfo=None)
         assert receipt.expires_at == (
             NOW + timedelta(days=30)
         ).replace(tzinfo=None)
 
-    clock.advance(timedelta(days=1))
+    clock.advance(timedelta(minutes=15))
     with pytest.raises(DecisionIdempotencyExpiredError):
         await service.ask_wellness(submission)
 
@@ -1486,10 +1653,10 @@ async def test_receipt_retention_uses_server_receive_time_not_requested_at(
             stored_expiry = stored_expiry.replace(tzinfo=UTC)
         assert stored_basis.astimezone(UTC) == NOW
         assert stored_expiry.astimezone(UTC) == (
-            NOW + timedelta(days=1)
+            NOW + timedelta(minutes=15)
         )
 
-    clock.advance(timedelta(days=1))
+    clock.advance(timedelta(minutes=15))
     with pytest.raises(DecisionIdempotencyExpiredError):
         await service.ask_wellness(submission)
     assert len(engine.requests) == 1
@@ -1531,7 +1698,7 @@ async def test_durable_receipt_survives_memory_lru_eviction(
 
 
 @pytest.mark.asyncio
-async def test_completed_receipt_and_memory_cache_expire_at_original_cutoff(
+async def test_transient_receipt_expires_at_fifteen_minute_cutoff(
     settings,
     service_session_factory,
 ) -> None:
@@ -1553,7 +1720,7 @@ async def test_completed_receipt_and_memory_cache_expire_at_original_cutoff(
     first_result = await original.ask_wellness(submission)
     assert len(original_engine.requests) == 1
 
-    clock.advance(timedelta(days=29))
+    clock.advance(timedelta(minutes=14))
     restarted_engine = RecordingEngine()
     restarted = DecisionChannelAdapter(
         service=HealthMesDecisionService(
@@ -1567,10 +1734,111 @@ async def test_completed_receipt_and_memory_cache_expire_at_original_cutoff(
     assert replay == first_result
     assert restarted_engine.requests == []
 
-    clock.advance(timedelta(days=2))
-    refreshed = await restarted.ask_wellness(submission)
-    assert refreshed.status is DecisionStatus.COMPLETED
-    assert len(restarted_engine.requests) == 1
+    clock.advance(timedelta(minutes=2))
+    with pytest.raises(DecisionIdempotencyExpiredError):
+        await restarted.ask_wellness(submission)
+    assert restarted_engine.requests == []
+
+
+@pytest.mark.asyncio
+async def test_persisted_receipt_stores_only_pointer_and_revalidates_replay(
+    settings,
+    service_session_factory,
+) -> None:
+    clock = MutableClock(NOW)
+    engine = PersistedRecordingEngine()
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take the recommended action?",
+        ingress=DecisionIngress.PROACTIVE,
+        source="scheduler",
+    )
+    original = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+
+    first = await original.ask_wellness(submission)
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id
+                == submission.request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.result_payload == {
+            "schema": "healthmes.decision-receipt.v2",
+            "kind": "decision_record",
+            "decision_record_id": str(engine.record_id),
+        }
+        assert first.answer not in str(receipt.result_payload)
+        assert receipt.result_expires_at == (
+            NOW + timedelta(days=30)
+        ).replace(tzinfo=None)
+
+    clock.advance(timedelta(days=29))
+    restarted = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    replay = await restarted.ask_wellness(submission)
+
+    assert replay == first
+    assert len(engine.requests) == 1
+    assert len(engine.replay_requests) == 1
+    replay_request, replay_record_id = engine.replay_requests[0]
+    assert replay_request.request_id == submission.request_id
+    assert replay_record_id == engine.record_id
+
+
+@pytest.mark.parametrize(
+    ("ingress", "source"),
+    (
+        (DecisionIngress.REST, None),
+        (DecisionIngress.CHANNEL, "future-ios-app"),
+        (DecisionIngress.PROACTIVE, "activity-trigger"),
+        (DecisionIngress.SCHEDULED, "morning-briefing"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_every_ingress_revalidates_a_persisted_receipt_pointer(
+    settings,
+    service_session_factory,
+    ingress,
+    source,
+) -> None:
+    engine = PersistedRecordingEngine()
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I follow this recommendation?",
+        ingress=ingress,
+        source=source,
+    )
+    first_service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    first = await first_service.ask_wellness(submission)
+    restarted = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+
+    replay = await restarted.ask_wellness(submission)
+
+    assert replay == first
+    assert len(engine.requests) == 1
+    assert len(engine.replay_requests) == 1
 
 
 @pytest.mark.asyncio

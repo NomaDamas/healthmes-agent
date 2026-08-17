@@ -515,7 +515,7 @@ def test_postgres_takeover_preserves_first_server_retention_basis() -> None:
             now=NOW + timedelta(seconds=2),
         )
 
-        assert completion.expires_at == NOW + timedelta(days=1)
+        assert completion.expires_at == NOW + timedelta(minutes=15)
         with factory() as session:
             receipt = session.scalar(
                 sa.select(DecisionRequestReceipt).where(
@@ -526,7 +526,7 @@ def test_postgres_takeover_preserves_first_server_retention_basis() -> None:
             assert receipt.retention_basis_at == NOW
             assert receipt.requested_at == semantic_requested_at
             assert receipt.result_expires_at == (
-                NOW + timedelta(days=1)
+                NOW + timedelta(minutes=15)
             )
 
 
@@ -634,8 +634,17 @@ async def test_postgres_retention_shrink_serializes_with_receipt_completion(
         finish_completion = threading.Event()
         original_result_expiry = decision_receipts_module._result_expiry
 
-        def blocking_result_expiry(session, *, receipt):
-            deadline = original_result_expiry(session, receipt=receipt)
+        def blocking_result_expiry(
+            session,
+            *,
+            receipt,
+            result_payload=None,
+        ):
+            deadline = original_result_expiry(
+                session,
+                receipt=receipt,
+                result_payload=result_payload,
+            )
             policy_read.set()
             if not finish_completion.wait(timeout=5):
                 raise TimeoutError(

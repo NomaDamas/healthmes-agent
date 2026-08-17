@@ -832,6 +832,40 @@ class DecisionFinalizer:
             await asyncio.sleep(min(0.01, remaining))
         return self._supervised_result(request, run, control)
 
+    def revalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult:
+        """Recover a stored result only after rechecking current source access."""
+
+        control = self._start_supervised_revalidation(
+            request,
+            decision_record_id,
+        )
+        control.done.wait(
+            timeout=max(0.0, control.deadline - steady_time())
+        )
+        return self._supervised_revalidation_result(request, control)
+
+    async def arevalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult:
+        """Async replay path that shares finalizer capacity and shutdown fences."""
+
+        control = self._start_supervised_revalidation(
+            request,
+            decision_record_id,
+        )
+        while not control.done.is_set():
+            remaining = control.deadline - steady_time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.01, remaining))
+        return self._supervised_revalidation_result(request, control)
+
     def _start_supervised_finalization(
         self,
         request: DecisionRequest,
@@ -905,6 +939,71 @@ class DecisionFinalizer:
                     request,
                     run,
                 ),
+            )
+            control.prepare_result(result)
+            with self._workers_lock:
+                self._worker_slots.release()
+                self._active_controls.discard(control)
+                control.signal_done()
+        return control
+
+    def _start_supervised_revalidation(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> _FinalizationControl:
+        control = _FinalizationControl(
+            steady_time() + self._timeout_seconds
+        )
+        if not self._worker_slots.acquire(blocking=False):
+            control.publish(
+                _revalidation_failure_result(
+                    request,
+                    code=_FINALIZATION_CAPACITY_EXHAUSTED,
+                )
+            )
+            return control
+        with self._workers_lock:
+            if self._shutdown_started:
+                self._worker_slots.release()
+                control.publish(
+                    _revalidation_failure_result(
+                        request,
+                        code=_FINALIZATION_TIMEOUT,
+                    )
+                )
+                return control
+            self._active_controls.add(control)
+
+        def worker() -> None:
+            try:
+                result = self._revalidate_persisted_inline(
+                    request,
+                    decision_record_id,
+                    deadline=control.deadline,
+                )
+            except BaseException:
+                result = _revalidation_failure_result(
+                    request,
+                    code=_PERSISTENCE_FAILURE,
+                )
+            control.prepare_result(result)
+            with self._workers_lock:
+                self._worker_slots.release()
+                self._active_controls.discard(control)
+                control.signal_done()
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"healthmes-revalidate-{decision_record_id}",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException:
+            result = _revalidation_failure_result(
+                request,
+                code=_PERSISTENCE_FAILURE,
             )
             control.prepare_result(result)
             with self._workers_lock:
@@ -1038,6 +1137,144 @@ class DecisionFinalizer:
             code=_FINALIZATION_TIMEOUT,
             persistence_required=_run_requires_persistence(request, run),
         )
+
+    def _supervised_revalidation_result(
+        self,
+        request: DecisionRequest,
+        control: _FinalizationControl,
+    ) -> DecisionResult:
+        _phase, result, published_in_time = control.response_snapshot()
+        if published_in_time and result is not None:
+            return result
+        control.expire(response_deadline=True)
+        _phase, result, published_in_time = control.response_snapshot()
+        if published_in_time and result is not None:
+            return result
+        return _revalidation_failure_result(
+            request,
+            code=_FINALIZATION_TIMEOUT,
+        )
+
+    def _revalidate_persisted_inline(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+        *,
+        deadline: float,
+    ) -> DecisionResult:
+        try:
+            canonical_request = strict_model_validate(
+                DecisionRequest,
+                request,
+            )
+            canonical_record_id = uuid.UUID(str(decision_record_id))
+        except (TypeError, ValueError, ValidationError):
+            return _revalidation_failure_result(
+                request,
+                code="invalid_decision_revalidation_input",
+            )
+
+        try:
+            with activity_write_lock(
+                timeout_seconds=_remaining_seconds(deadline)
+            ):
+                with self._session_factory() as session:
+                    original_bind = session.bind
+                    with _finalization_connection_guard(
+                        session.get_bind(),
+                        timeout_seconds=_remaining_seconds(deadline),
+                    ) as guarded_connection:
+                        if guarded_connection is not None:
+                            session.bind = guarded_connection
+                        try:
+                            _begin_finalization_transaction(
+                                session,
+                                timeout_seconds=_remaining_seconds(
+                                    deadline
+                                ),
+                            )
+                            statement = select(DecisionRecord).where(
+                                DecisionRecord.id
+                                == canonical_record_id,
+                                DecisionRecord.decision_request_id
+                                == canonical_request.request_id,
+                            )
+                            if (
+                                session.get_bind().dialect.name
+                                == "postgresql"
+                            ):
+                                statement = statement.with_for_update()
+                            row = session.scalar(statement)
+                            _ensure_finalization_deadline(deadline)
+                            if (
+                                row is None
+                                or (
+                                    row.expires_at is not None
+                                    and _as_utc(row.expires_at)
+                                    <= _as_utc(self._clock())
+                                )
+                            ):
+                                raise _FinalizationRejected(
+                                    "decision_record_not_available"
+                                )
+                            fingerprint = (
+                                row.decision_request_fingerprint
+                            )
+                            if fingerprint is None:
+                                raise _FinalizationRejected(
+                                    "decision_record_contract_invalid"
+                                )
+                            stored = _stored_decision(
+                                row,
+                                fingerprint=fingerprint,
+                            )
+                            if isinstance(stored, str):
+                                raise _FinalizationRejected(stored)
+                            policy = self._resolve_policy(
+                                canonical_request,
+                                session=session,
+                                lock=True,
+                            )
+                            _ensure_finalization_deadline(deadline)
+                            result = self._revalidate_stored_decision(
+                                session,
+                                canonical_request,
+                                policy=policy,
+                                stored=stored,
+                            )
+                            _ensure_finalization_deadline(deadline)
+                            session.rollback()
+                            return result
+                        finally:
+                            if session.in_transaction():
+                                session.rollback()
+                            _restore_sqlite_busy_timeout(session)
+                            session.bind = original_bind
+        except _FinalizationRejected as exc:
+            return _revalidation_failure_result(
+                canonical_request,
+                code=exc.code,
+                extra_limitations=exc.limitations,
+            )
+        except TimeoutError:
+            return _revalidation_failure_result(
+                canonical_request,
+                code=_FINALIZATION_TIMEOUT,
+            )
+        except DBAPIError as exc:
+            return _revalidation_failure_result(
+                canonical_request,
+                code=(
+                    _FINALIZATION_TIMEOUT
+                    if _database_timeout_error(exc)
+                    else _PERSISTENCE_FAILURE
+                ),
+            )
+        except Exception:
+            return _revalidation_failure_result(
+                canonical_request,
+                code=_PERSISTENCE_FAILURE,
+            )
 
     def _finalize_inline(
         self,
@@ -2209,6 +2446,29 @@ def _failure_result(
             if persistence_required
             else PersistenceStatus.NOT_REQUIRED
         ),
+        runtime=RuntimeMetadata(runtime="healthmes-finalizer"),
+        tool_trace=[],
+    )
+
+
+def _revalidation_failure_result(
+    request: DecisionRequest | Any,
+    *,
+    code: str,
+    extra_limitations: Sequence[str] = (),
+) -> DecisionResult:
+    request_id = getattr(request, "request_id", uuid.uuid4())
+    turn_id = getattr(request, "turn_id", uuid.uuid4())
+    return DecisionResult(
+        request_id=request_id,
+        turn_id=turn_id,
+        status=DecisionStatus.FAILED,
+        proposed_action=False,
+        limitations=_merge_limitations(
+            extra_limitations,
+            (code,),
+        ),
+        persistence_status=PersistenceStatus.FAILED,
         runtime=RuntimeMetadata(runtime="healthmes-finalizer"),
         tool_trace=[],
     )
