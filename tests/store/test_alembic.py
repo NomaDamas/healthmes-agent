@@ -196,6 +196,18 @@ def _render_offline_decision_retention_downgrade(
     return buffer.getvalue()
 
 
+def _render_offline_decision_receipt_hardening_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "f0a1b2c3d4e5:a1b2c3d4e5f6",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
@@ -230,6 +242,25 @@ class TestOfflineRender:
         assert "UUID" in rendered  # sa.Uuid became native UUID
         # enums stay portable VARCHAR: no postgres CREATE TYPE
         assert "CREATE TYPE" not in rendered
+
+    def test_postgres_receipt_hardening_drops_exact_published_constraint(
+        self,
+    ) -> None:
+        rendered = _render_offline_decision_receipt_hardening_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert (
+            "DROP CONSTRAINT "
+            "ck_decision_request_receipt_state_payload_consistent"
+            in rendered
+        )
+        assert (
+            "ck_decision_request_receipt_"
+            "ck_decision_request_receipt_state_payload_consistent"
+            not in rendered
+        )
+        assert "ALTER COLUMN requested_at SET NOT NULL" in rendered
 
     @pytest.mark.parametrize(
         "database_url",
@@ -791,8 +822,10 @@ class TestSqliteUpgrade:
         command.upgrade(config, "f0a1b2c3d4e5")
         engine = sa.create_engine(database_url)
         receipt_id = uuid.uuid4().hex
+        null_receipt_id = uuid.uuid4().hex
         requested_at = datetime(2099, 8, 16, 8, tzinfo=UTC)
         created_at = requested_at + timedelta(hours=1)
+        null_created_at = created_at + timedelta(hours=1)
         original_result_expires_at = requested_at + timedelta(hours=12)
         try:
             with engine.begin() as connection:
@@ -833,31 +866,65 @@ class TestSqliteUpgrade:
                         updated_at=created_at,
                     )
                 )
+                connection.execute(
+                    receipt.insert().values(
+                        id=null_receipt_id,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="d" * 64,
+                        requested_at=None,
+                        state="pending",
+                        owner_token=uuid.uuid4().hex,
+                        lease_expires_at=(
+                            null_created_at + timedelta(minutes=5)
+                        ),
+                        expires_at=null_created_at + timedelta(days=30),
+                        created_at=null_created_at,
+                        updated_at=null_created_at,
+                    )
+                )
         finally:
             engine.dispose()
 
         command.upgrade(config, "head")
         engine = sa.create_engine(database_url)
         try:
+            requested_at_column = next(
+                column
+                for column in sa.inspect(engine).get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "requested_at"
+            )
+            assert requested_at_column["nullable"] is False
             receipt = sa.Table(
                 "decision_request_receipt",
                 sa.MetaData(),
                 autoload_with=engine,
             )
             with engine.connect() as connection:
-                row = connection.execute(
-                    sa.select(receipt).where(
-                        receipt.c.id == receipt_id
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(receipt).where(
+                            receipt.c.id.in_(
+                                (receipt_id, null_receipt_id)
+                            )
+                        )
                     )
-                ).one()
-                assert row.requested_at == requested_at.replace(
+                }
+                assert rows[receipt_id].requested_at == requested_at.replace(
                     tzinfo=None
                 )
-                assert row.lease_generation == 1
+                assert rows[receipt_id].lease_generation == 1
                 assert (
-                    row.result_expires_at
+                    rows[receipt_id].result_expires_at
                     == original_result_expires_at.replace(tzinfo=None)
                 )
+                assert rows[null_receipt_id].requested_at == (
+                    null_created_at.replace(tzinfo=None)
+                )
+                assert rows[null_receipt_id].lease_generation == 1
+                assert rows[null_receipt_id].result_expires_at is None
                 assert connection.scalar(
                     sa.text(
                         "SELECT version_num FROM alembic_version"
@@ -3214,6 +3281,21 @@ class TestSqliteUpgrade:
         engine = sa.create_engine(database_url)
         event_id = uuid.uuid4().hex
         fired_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+        original_payload = {
+            "summary": "Retain this pending outbox row.",
+            "trigger": {
+                "summary": "Nested observation.",
+                "proposal": "Keep the nested structure intact.",
+                "evidence": {
+                    "domains": ["activity", "wearable"],
+                    "metrics": {"focus_minutes": 42, "recovery": 0.73},
+                },
+            },
+            "push": {
+                "state": "dispatching",
+                "channel": "decision",
+            },
+        }
         try:
             trigger = sa.Table(
                 "trigger_event",
@@ -3226,13 +3308,7 @@ class TestSqliteUpgrade:
                         id=event_id,
                         fired_at=fired_at,
                         rule_id="migration-existing-dispatch",
-                        payload={
-                            "summary": "Retain this pending outbox row.",
-                            "push": {
-                                "state": "dispatching",
-                                "channel": "decision",
-                            },
-                        },
+                        payload=original_payload,
                         alert_sent=False,
                         dedup_key="migration-existing-dispatch:1",
                     )
@@ -3280,6 +3356,7 @@ class TestSqliteUpgrade:
                     )
                 ).one()
                 assert row.rule_id == "migration-existing-dispatch"
+                assert row.payload == original_payload
                 assert row.dispatch_owner_token is None
                 assert row.dispatch_generation == 0
                 assert row.dispatch_lease_expires_at is None
@@ -3326,6 +3403,21 @@ def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
     config = _config(schema_url)
     event_id = uuid.uuid4()
     fired_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+    original_payload = {
+        "summary": "Retain this pending outbox row.",
+        "trigger": {
+            "summary": "Nested observation.",
+            "proposal": "Keep the nested structure intact.",
+            "evidence": {
+                "domains": ["activity", "wearable"],
+                "metrics": {"focus_minutes": 42, "recovery": 0.73},
+            },
+        },
+        "push": {
+            "state": "dispatching",
+            "channel": "decision",
+        },
+    }
     try:
         with admin_engine.begin() as connection:
             connection.execute(
@@ -3346,13 +3438,7 @@ def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
                         id=event_id,
                         fired_at=fired_at,
                         rule_id="postgres-migration-existing-dispatch",
-                        payload={
-                            "summary": "Retain this pending outbox row.",
-                            "push": {
-                                "state": "dispatching",
-                                "channel": "decision",
-                            },
-                        },
+                        payload=original_payload,
                         alert_sent=False,
                         dedup_key=(
                             "postgres-migration-existing-dispatch:1"
@@ -3404,6 +3490,7 @@ def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
                 assert row.rule_id == (
                     "postgres-migration-existing-dispatch"
                 )
+                assert row.payload == original_payload
                 assert row.dispatch_owner_token is None
                 assert row.dispatch_generation == 0
                 assert row.dispatch_lease_expires_at is None
@@ -4508,6 +4595,188 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
                 ) == "b2c3d4e5f6a7"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_receipt_hardening_repairs_nullable_requested_at() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_nullable_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    receipt_id = uuid.uuid4()
+    created_at = datetime(2099, 8, 17, 9, tzinfo=UTC)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_request_receipt "
+                        "ADD COLUMN requested_at TIMESTAMP WITH TIME ZONE"
+                    )
+                )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="e" * 64,
+                        requested_at=None,
+                        state="pending",
+                        owner_token=uuid.uuid4(),
+                        lease_expires_at=created_at + timedelta(minutes=5),
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            requested_at_column = next(
+                column
+                for column in sa.inspect(scoped_engine).get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "requested_at"
+            )
+            assert requested_at_column["nullable"] is False
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(receipt.c.id == receipt_id)
+                ).one()
+                assert row.requested_at == created_at
+                assert row.lease_generation == 1
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_offline_receipt_hardening_sql_executes() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_offline_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        rendered = _render_offline_decision_receipt_hardening_upgrade(
+            schema_url
+        )
+        assert (
+            "DROP CONSTRAINT "
+            "ck_decision_request_receipt_state_payload_consistent"
+            in rendered
+        )
+        assert (
+            "ck_decision_request_receipt_"
+            "ck_decision_request_receipt_state_payload_consistent"
+            not in rendered
+        )
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            raw_connection = scoped_engine.raw_connection()
+            try:
+                cursor = raw_connection.cursor()
+                try:
+                    cursor.execute(rendered, prepare=False)
+                finally:
+                    cursor.close()
+                raw_connection.commit()
+            finally:
+                raw_connection.close()
+
+            inspector = sa.inspect(scoped_engine)
+            requested_at_column = next(
+                column
+                for column in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "requested_at"
+            )
+            assert requested_at_column["nullable"] is False
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                (
+                    "ck_decision_request_receipt_"
+                    "lease_generation_positive"
+                ),
+                (
+                    "ck_decision_request_receipt_"
+                    "state_payload_consistent"
+                ),
+            }
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a1b2c3d4e5f6"
         finally:
             scoped_engine.dispose()
     finally:

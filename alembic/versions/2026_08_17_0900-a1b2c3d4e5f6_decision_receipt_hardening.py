@@ -44,13 +44,6 @@ _STATE_EXPRESSION = (
 )
 
 
-def _column_names(bind: sa.Connection) -> set[str]:
-    return {
-        column["name"]
-        for column in sa.inspect(bind).get_columns(_TABLE)
-    }
-
-
 def _receipt_table(
     *,
     include_requested_at: bool,
@@ -301,7 +294,7 @@ def _upgrade_offline() -> None:
             nullable=False,
         )
         op.drop_constraint(
-            _STATE_CONSTRAINT,
+            op.f(_STATE_CONSTRAINT),
             _TABLE,
             type_="check",
         )
@@ -323,8 +316,13 @@ def _upgrade_offline() -> None:
 
 
 def _add_columns(bind: sa.Connection) -> None:
-    columns = _column_names(bind)
-    if "requested_at" not in columns:
+    inspected_columns = {
+        column["name"]: column
+        for column in sa.inspect(bind).get_columns(_TABLE)
+    }
+    columns = set(inspected_columns)
+    requested_at_column = inspected_columns.get("requested_at")
+    if requested_at_column is None:
         with op.batch_alter_table(_TABLE) as batch:
             batch.add_column(
                 sa.Column(
@@ -333,23 +331,31 @@ def _add_columns(bind: sa.Connection) -> None:
                     nullable=True,
                 )
             )
-        receipt = sa.Table(
-            _TABLE,
-            sa.MetaData(),
-            autoload_with=bind,
-        )
-        bind.execute(
-            receipt.update()
-            .where(receipt.c.requested_at.is_(None))
-            .values(requested_at=receipt.c.created_at)
-        )
+
+    receipt = sa.Table(
+        _TABLE,
+        sa.MetaData(),
+        autoload_with=bind,
+    )
+    # A few stamped f0 deployments added this nullable column early. Preserve
+    # their explicit timestamps and deterministically recover only missing
+    # values from the receipt's immutable creation timestamp.
+    bind.execute(
+        receipt.update()
+        .where(receipt.c.requested_at.is_(None))
+        .values(requested_at=receipt.c.created_at)
+    )
+    if (
+        requested_at_column is None
+        or requested_at_column.get("nullable") is not False
+    ):
         with op.batch_alter_table(_TABLE) as batch:
             batch.alter_column(
                 "requested_at",
                 existing_type=sa.DateTime(timezone=True),
                 nullable=False,
             )
-        columns.add("requested_at")
+    columns.add("requested_at")
 
     with op.batch_alter_table(_TABLE) as batch:
         if "lease_generation" not in columns:

@@ -555,6 +555,7 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
         request, run, finalizer, _event_id = _decision_fixture(store)
         retention_holds_write_plane = threading.Event()
         release_retention = threading.Event()
+        sender_entered = threading.Event()
         finalizer_waiting_for_write_plane = threading.Event()
         retention_done = threading.Event()
         dispatch_results = []
@@ -566,6 +567,13 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
         original_guard = (
             finalizer_module.postgres_activity_write_plane_guard
         )
+
+        def separate_process_activity_lock(
+            *,
+            timeout_seconds: float | None = None,
+        ):
+            del timeout_seconds
+            return nullcontext()
 
         def pause_before_trigger_locks(session: Session) -> None:
             retention_holds_write_plane.set()
@@ -591,6 +599,19 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
             "lock_trigger_events_for_retention",
             pause_before_trigger_locks,
         )
+        # Process-local RLocks cannot model the production cross-process
+        # ordering hazard. Bypass only those locks so this regression reaches
+        # the PostgreSQL advisory and row locks used by separate workers.
+        monkeypatch.setattr(
+            storage_service,
+            "activity_write_lock",
+            separate_process_activity_lock,
+        )
+        monkeypatch.setattr(
+            finalizer_module,
+            "activity_write_lock",
+            separate_process_activity_lock,
+        )
         monkeypatch.setattr(
             finalizer_module,
             "postgres_activity_write_plane_guard",
@@ -613,6 +634,7 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
                 trigger_event_id: uuid.UUID,
             ) -> DecisionDispatchResult:
                 del fire, fired_at, trigger_event_id
+                sender_entered.set()
                 result = finalizer.finalize(request, run)
                 finalized_results.append(result)
                 return DecisionDispatchResult(
@@ -633,6 +655,8 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
                 database_url=_POSTGRES_URL,
                 native_alert_delivery=True,
                 scheduler_enabled=False,
+                quiet_hours_start="00:00",
+                quiet_hours_end="00:00",
                 _env_file=None,
             ),
             session_factory=store.factory,
@@ -688,6 +712,7 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
             retention_worker.start()
             assert retention_holds_write_plane.wait(timeout=5)
             dispatch_worker.start()
+            assert sender_entered.wait(timeout=5)
             assert finalizer_waiting_for_write_plane.wait(timeout=5)
 
             release_retention.set()

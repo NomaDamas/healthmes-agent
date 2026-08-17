@@ -573,7 +573,7 @@ def test_retention_shrink_after_final_check_scrubs_committed_answer(
         expired = original_check(session, event, now=now)
         with check_lock:
             check_count += 1
-            should_block = check_count == 3
+            should_block = check_count == 4
         if should_block:
             post_reasoning_check.set()
             if not release_finalization.wait(timeout=5):
@@ -761,6 +761,240 @@ def test_expired_dispatch_lease_takeover_rejects_stale_publisher(
         assert stored.dispatch_generation == 2
     finally:
         release_first.set()
+        worker.join(timeout=5)
+
+
+def test_late_sweep_claim_and_sender_preflight_use_fresh_clock(
+    settings,
+    session_factory,
+) -> None:
+    sweep_started_at = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    claimed_at = sweep_started_at + timedelta(seconds=10)
+    preflight_at = claimed_at + timedelta(seconds=1)
+    completed_at = preflight_at + timedelta(seconds=1)
+    clock_values = iter(
+        (sweep_started_at, claimed_at, preflight_at, completed_at)
+    )
+    observed_leases: list[datetime] = []
+
+    class LeaseInspectingSender:
+        requires_reasoning = False
+
+        def send(
+            self,
+            fire: TriggerFire,
+            *,
+            fired_at: datetime,
+            trigger_event_id: uuid.UUID,
+        ) -> DecisionDispatchResult:
+            del fire, fired_at
+            with session_factory() as session:
+                event = session.get(TriggerEvent, trigger_event_id)
+                assert event is not None
+                assert event.dispatch_lease_expires_at is not None
+                observed_leases.append(
+                    trigger_module._ensure_utc(
+                        event.dispatch_lease_expires_at
+                    )
+                )
+            return DecisionDispatchResult(
+                ok=True,
+                status_code=202,
+                channel="test",
+            )
+
+    evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=LeaseInspectingSender(),
+        rules=(fixed_rule,),
+        now_provider=lambda: next(clock_values),
+        dispatch_lease_duration=timedelta(seconds=5),
+    )
+
+    report = evaluator.evaluate_once()
+
+    assert report.count("pushed") == 1
+    assert observed_leases == [
+        preflight_at + timedelta(seconds=5)
+    ]
+
+
+def test_takeover_before_sender_preflight_fences_old_worker(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    first_now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    takeover_now = first_now + timedelta(seconds=2)
+    preflight_waiting = threading.Event()
+    release_preflight = threading.Event()
+    first_sender = FakeAlertSender()
+    takeover_sender = FakeAlertSender()
+    first_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=first_sender,
+        rules=(),
+        now_provider=lambda: first_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    takeover_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=takeover_sender,
+        rules=(),
+        now_provider=lambda: takeover_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    original_preflight = first_evaluator._preflight_dispatch_claim
+
+    def delayed_preflight(session, claim):
+        preflight_waiting.set()
+        assert release_preflight.wait(timeout=5)
+        return original_preflight(session, claim)
+
+    monkeypatch.setattr(
+        first_evaluator,
+        "_preflight_dispatch_claim",
+        delayed_preflight,
+    )
+    first_outcomes: list[Any] = []
+    failures: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            first_outcomes.append(
+                first_evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="preflight_takeover",
+                        dedup_key="preflight_takeover:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=first_now,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_first)
+    try:
+        worker.start()
+        assert preflight_waiting.wait(timeout=5)
+
+        takeover_report = takeover_evaluator.evaluate_once()
+        release_preflight.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert first_sender.sent == []
+        assert len(takeover_sender.sent) == 1
+        assert takeover_report.count("pushed") == 1
+        assert len(first_outcomes) == 1
+        assert first_outcomes[0].status == "deduplicated"
+        [stored] = all_events(session_factory)
+        assert stored.alert_sent is True
+        assert stored.dispatch_generation == 2
+        assert stored.dispatch_owner_token is None
+        assert stored.dispatch_lease_expires_at is None
+    finally:
+        release_preflight.set()
+        worker.join(timeout=5)
+
+
+def test_retention_expiry_during_sender_preflight_suppresses_sender(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    fired_at = now - timedelta(days=2)
+    with session_factory() as session:
+        update_retention_policy(
+            session,
+            "alert",
+            "7d",
+            now=now,
+        )
+        session.commit()
+
+    sender = FakeAlertSender()
+    evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=sender,
+        rules=(),
+        now_provider=lambda: now,
+    )
+    preflight_waiting = threading.Event()
+    release_preflight = threading.Event()
+    original_preflight = evaluator._preflight_dispatch_claim
+
+    def delayed_preflight(session, claim):
+        preflight_waiting.set()
+        assert release_preflight.wait(timeout=5)
+        return original_preflight(session, claim)
+
+    monkeypatch.setattr(
+        evaluator,
+        "_preflight_dispatch_claim",
+        delayed_preflight,
+    )
+    outcomes: list[Any] = []
+    failures: list[BaseException] = []
+
+    def dispatch() -> None:
+        try:
+            outcomes.append(
+                evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="preflight_retention",
+                        dedup_key="preflight_retention:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=fired_at,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=dispatch)
+    try:
+        worker.start()
+        assert preflight_waiting.wait(timeout=5)
+        with session_factory() as session:
+            update_retention_policy(
+                session,
+                "alert",
+                "1d",
+                now=now,
+            )
+            session.commit()
+        release_preflight.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert sender.sent == []
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "suppressed"
+        assert outcomes[0].reason == "retention_expired"
+        [stored] = all_events(session_factory)
+        assert stored.alert_sent is False
+        assert stored.payload["push"]["state"] == "expired"
+        assert stored.dispatch_owner_token is None
+        assert stored.dispatch_lease_expires_at is None
+    finally:
+        release_preflight.set()
         worker.join(timeout=5)
 
 

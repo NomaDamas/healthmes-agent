@@ -258,6 +258,122 @@ def test_postgres_pending_dispatch_has_one_concurrent_owner() -> None:
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
 )
+def test_postgres_takeover_before_preflight_fences_old_sender(
+    monkeypatch,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_preflight_takeover_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    settings = Settings(
+        database_url=database_url,
+        native_alert_delivery=False,
+        scheduler_enabled=False,
+        _env_file=None,
+    )
+    first_now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    takeover_now = first_now + timedelta(seconds=2)
+    first_sender = CountingSender()
+    takeover_sender = CountingSender()
+    first_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=factory,
+        health_reader=EmptyHealthReader(),
+        alert_sender=first_sender,
+        rules=(),
+        now_provider=lambda: first_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    takeover_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=factory,
+        health_reader=EmptyHealthReader(),
+        alert_sender=takeover_sender,
+        rules=(),
+        now_provider=lambda: takeover_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    preflight_waiting = threading.Event()
+    release_preflight = threading.Event()
+    original_preflight = first_evaluator._preflight_dispatch_claim
+
+    def delayed_preflight(session, claim):
+        preflight_waiting.set()
+        assert release_preflight.wait(timeout=5)
+        return original_preflight(session, claim)
+
+    monkeypatch.setattr(
+        first_evaluator,
+        "_preflight_dispatch_claim",
+        delayed_preflight,
+    )
+    first_outcomes: list[object] = []
+    errors: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            first_outcomes.append(
+                first_evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="postgres_preflight_takeover",
+                        dedup_key="postgres_preflight_takeover:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=first_now,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_first)
+    try:
+        worker.start()
+        assert preflight_waiting.wait(timeout=5)
+
+        takeover_report = takeover_evaluator.evaluate_once()
+        release_preflight.set()
+        worker.join(timeout=10)
+
+        assert not worker.is_alive()
+        assert errors == []
+        assert first_sender.calls == 0
+        assert takeover_sender.calls == 1
+        assert takeover_report.count("pushed") == 1
+        assert len(first_outcomes) == 1
+        assert first_outcomes[0].status == "deduplicated"
+        with factory() as session:
+            [stored] = session.scalars(sa.select(TriggerEvent)).all()
+            assert stored.alert_sent is True
+            assert stored.dispatch_generation == 2
+            assert stored.dispatch_owner_token is None
+            assert stored.dispatch_lease_expires_at is None
+    finally:
+        release_preflight.set()
+        worker.join(timeout=10)
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
 def test_postgres_retention_shrink_after_final_check_scrubs_answer(
     monkeypatch,
 ) -> None:
@@ -302,7 +418,7 @@ def test_postgres_retention_shrink_after_final_check_scrubs_answer(
         )
         with check_lock:
             check_count += 1
-            should_block = check_count == 3
+            should_block = check_count == 4
         if should_block:
             post_reasoning_check.set()
             if not release_finalization.wait(timeout=5):

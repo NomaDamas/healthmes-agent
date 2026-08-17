@@ -1331,6 +1331,7 @@ class DecisionFinalizer:
                                     _ensure_finalization_deadline(
                                         deadline
                                     )
+                                    session.commit()
                                     return stored_result
                                 if not insert_if_missing:
                                     raise _FinalizationRejected(
@@ -1551,7 +1552,6 @@ class DecisionFinalizer:
                 "decision_action_requires_retained_source",
                 "external_source_retention_unverified",
             )
-        session.rollback()
         return stored.result.model_copy(
             update={
                 "source_refs": list(validated_refs),

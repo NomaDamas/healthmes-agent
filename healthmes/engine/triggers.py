@@ -951,7 +951,6 @@ class TriggerEvaluator:
         with session_scope(self._session_factory) as session:
             retried, pending_keys = self._retry_pending_dispatches(
                 session,
-                now=now,
             )
             outcomes.extend(retried)
             signals = self._health_reader.read(now)
@@ -1030,8 +1029,6 @@ class TriggerEvaluator:
     def _retry_pending_dispatches(
         self,
         session: Session,
-        *,
-        now: datetime,
     ) -> tuple[list[FireOutcome], set[str]]:
         """Deliver committed outbox rows independently of rule conditions."""
         event_refs = tuple(
@@ -1054,7 +1051,6 @@ class TriggerEvaluator:
             attempt = self._claim_dispatch_event(
                 session,
                 event_id,
-                now=now,
             )
             if attempt.claim is None:
                 continue
@@ -1188,7 +1184,6 @@ class TriggerEvaluator:
         attempt = self._claim_dispatch_event(
             session,
             event.id,
-            now=now,
         )
         if attempt.claim is None:
             if attempt.state == "expired":
@@ -1216,8 +1211,6 @@ class TriggerEvaluator:
         self,
         session: Session,
         event_id: uuid.UUID,
-        *,
-        now: datetime,
     ) -> _DispatchClaimAttempt:
         """Claim one outbox row without holding its lock during reasoning."""
 
@@ -1234,7 +1227,7 @@ class TriggerEvaluator:
                 session.rollback()
                 return _DispatchClaimAttempt(None, "inactive")
 
-            current = _ensure_utc(now)
+            current = _ensure_utc(self._now())
             payload = dict(event.payload or {})
             if alert_retention_is_expired(
                 session,
@@ -1313,11 +1306,91 @@ class TriggerEvaluator:
                 return claim()
         return claim()
 
+    def _preflight_dispatch_claim(
+        self,
+        session: Session,
+        claim: _DispatchClaim,
+    ) -> _DispatchClaimAttempt:
+        """Fence one sender call with a fresh lease and retention check.
+
+        The production lease exceeds the sender's bounded decision timeout.
+        Renewing it immediately before the external call prevents a worker
+        delayed after its initial claim from racing a later takeover, while the
+        commit below ensures no TriggerEvent lock spans LLM/finalizer work.
+        """
+
+        def preflight() -> _DispatchClaimAttempt:
+            statement = (
+                select(TriggerEvent)
+                .where(TriggerEvent.id == claim.event_id)
+                .execution_options(populate_existing=True)
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            event = session.scalar(statement)
+            if (
+                event is None
+                or not self._is_dispatching(event)
+                or event.dispatch_owner_token != claim.owner_token
+                or event.dispatch_generation != claim.generation
+            ):
+                session.rollback()
+                return _DispatchClaimAttempt(None, "inactive")
+
+            current = _ensure_utc(self._now())
+            lease_expires_at = event.dispatch_lease_expires_at
+            if (
+                lease_expires_at is None
+                or _ensure_utc(lease_expires_at) <= current
+            ):
+                self._clear_dispatch_claim(event)
+                session.commit()
+                return _DispatchClaimAttempt(None, "lease_expired")
+
+            payload = dict(event.payload or {})
+            if alert_retention_is_expired(
+                session,
+                event,
+                now=current,
+            ):
+                event.payload = _expired_alert_payload(
+                    payload,
+                    now=current,
+                )
+                self._clear_dispatch_claim(event)
+                session.commit()
+                return _DispatchClaimAttempt(None, "expired")
+
+            event.dispatch_lease_expires_at = (
+                current + self._dispatch_lease_duration
+            )
+            session.commit()
+            return _DispatchClaimAttempt(claim, "ready")
+
+        if session.get_bind().dialect.name == "sqlite":
+            with activity_write_lock():
+                lock_activity_write_plane(session)
+                return preflight()
+        return preflight()
+
     def _deliver_claim(
         self,
         session: Session,
         claim: _DispatchClaim,
     ) -> FireOutcome:
+        attempt = self._preflight_dispatch_claim(session, claim)
+        if attempt.claim is None:
+            if attempt.state == "expired":
+                return FireOutcome(
+                    fire=claim.fire,
+                    status="suppressed",
+                    reason=_SUPPRESS_RETENTION_EXPIRED,
+                )
+            return FireOutcome(
+                fire=claim.fire,
+                status="deduplicated",
+            )
+        claim = attempt.claim
         try:
             result = self._alert_sender.send(
                 claim.fire,

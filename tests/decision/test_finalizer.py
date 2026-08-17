@@ -483,6 +483,17 @@ def test_finalizer_purge_scrubs_older_expired_trigger_answer(
             "1d",
             now=NOW,
         )
+        ref = _source_ref(_event(session))
+
+    request = _request()
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(
+        request,
+        _run(request, [ref]),
+    )
+    assert first.persistence_status is PersistenceStatus.PERSISTED
+
+    with factory() as session:
         trigger = TriggerEvent(
             fired_at=expired_basis,
             rule_id="finalizer-expired-purge",
@@ -529,23 +540,126 @@ def test_finalizer_purge_scrubs_older_expired_trigger_answer(
         session.commit()
         trigger_id = trigger.id
         expired_id = expired.id
-        ref = _source_ref(_event(session))
 
-    request = _request()
-    result = _finalizer(factory).finalize(
-        request,
-        _run(request, [ref]),
+    retry_request = request.model_copy(
+        update={"turn_id": uuid.uuid4()}
+    )
+    result = finalizer.finalize(
+        retry_request,
+        _run(retry_request, [ref]),
     )
 
     assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.decision_record_id == first.decision_record_id
     with factory() as session:
         assert session.get(DecisionRecord, expired_id) is None
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 1
         trigger = session.get(TriggerEvent, trigger_id)
         assert trigger is not None
         assert "message" not in trigger.payload
         assert "decision" not in trigger.payload
         assert "decision_record_id" not in trigger.payload
         assert trigger.payload["push"]["state"] == "expired"
+
+
+def test_retry_commit_failure_rolls_back_purge_and_trigger_scrub_atomically(
+    persistence,
+) -> None:
+    engine, factory = persistence
+    expired_basis = NOW - timedelta(days=1)
+    with factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "1d",
+            now=NOW,
+        )
+        ref = _source_ref(_event(session))
+
+    request = _request()
+    first = _finalizer(factory).finalize(
+        request,
+        _run(request, [ref]),
+    )
+    assert first.persistence_status is PersistenceStatus.PERSISTED
+
+    with factory() as session:
+        trigger = TriggerEvent(
+            fired_at=expired_basis,
+            rule_id="finalizer-expired-rollback",
+            payload={
+                "summary": "An older proactive prompt.",
+                "message": "Sensitive answer must roll back with its record.",
+                "decision": {"record_id": str(uuid.uuid4())},
+                "push": {
+                    "sent": False,
+                    "state": "app_available",
+                    "channel": "app_poll",
+                },
+            },
+            alert_sent=False,
+        )
+        session.add(trigger)
+        session.flush()
+        expired = DecisionRecord(
+            kind=DecisionKind.INSIGHT,
+            tree={"id": "expired-decision", "children": []},
+            summary="Expired decision",
+            trigger_event_id=trigger.id,
+            decision_request_id=uuid.uuid4(),
+            decision_turn_id=uuid.uuid4(),
+            decision_request_fingerprint=uuid.uuid4().hex * 2,
+            decision_payload={
+                "schema": "healthmes.decision-private.v2"
+            },
+            decision_payload_digest=uuid.uuid4().hex * 2,
+            created_at=expired_basis,
+        )
+        apply_decision_retention(
+            session,
+            expired,
+            basis_at=expired_basis,
+        )
+        session.add(expired)
+        session.flush()
+        trigger.payload = {
+            **trigger.payload,
+            "decision": {"record_id": str(expired.id)},
+            "decision_record_id": str(expired.id),
+        }
+        session.commit()
+        trigger_id = trigger.id
+        expired_id = expired.id
+
+    failing_factory = sessionmaker(
+        bind=engine,
+        class_=FailingCommitSession,
+        expire_on_commit=False,
+    )
+    retry_request = request.model_copy(
+        update={"turn_id": uuid.uuid4()}
+    )
+    result = _finalizer(failing_factory).finalize(
+        retry_request,
+        _run(retry_request, [ref]),
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert "decision_record_persistence_failed" in result.limitations
+    with factory() as session:
+        assert session.get(DecisionRecord, expired_id) is not None
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 2
+        trigger = session.get(TriggerEvent, trigger_id)
+        assert trigger is not None
+        assert trigger.payload["message"] == (
+            "Sensitive answer must roll back with its record."
+        )
+        assert trigger.payload["decision_record_id"] == str(expired_id)
 
 
 def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
