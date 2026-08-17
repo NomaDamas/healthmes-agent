@@ -553,6 +553,7 @@ def _run_local_runtime(
     kill_behavior: str = "exit",
     check: bool = True,
     env_overrides: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(harness["env"])
     env["FAKE_TERM_BEHAVIOR"] = term_behavior
@@ -565,6 +566,7 @@ def _run_local_runtime(
         check=check,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
 
 
@@ -586,6 +588,18 @@ def _run_native_identity_helper(
 
 def _event_lines(harness: dict[str, object]) -> list[str]:
     return Path(harness["event_log"]).read_text(encoding="utf-8").splitlines()
+
+
+def _nonreturning_ps(tmp_path: Path) -> Path:
+    path = tmp_path / "nonreturning-ps"
+    _write_executable(
+        path,
+        """
+        #!/usr/bin/env bash
+        /bin/sleep 30
+        """,
+    )
+    return path
 
 
 def _assert_identity_check_immediately_before(events: list[str], signal_line: str) -> None:
@@ -1200,8 +1214,24 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         "numeric PID still exists"
     ) in development
     assert (
-        "Replacement is allowed only after process absence or an identity "
-        "mismatch is positively proved"
+        "A formatted token mismatch for a still-live numeric PID is also "
+        "unknown"
+    ) in development
+    assert (
+        "Replacement is allowed only after numeric process absence is "
+        "positively proved"
+    ) in development
+    assert (
+        "Every configured `PS_BIN` invocation used by lifecycle acquisition "
+        "or startup recovery runs in a separate process group"
+    ) in development
+    assert (
+        "records larger than 1 KiB fail closed"
+        in development
+    )
+    assert (
+        "two consecutive, independently enumerated empty `/proc` group "
+        "observations"
     ) in development
     assert (
         "the supervisor first reaps that exact subprocess handle"
@@ -1659,6 +1689,42 @@ def test_decision_stop_ignores_budget_from_another_service_identity(
         event.startswith("kill ") for event in _event_lines(harness)
     )
     assert budget.exists()
+
+
+@pytest.mark.parametrize(
+    "path_kind",
+    ("symlink", "fifo", "hardlink", "oversized"),
+)
+def test_status_rejects_unsafe_shutdown_budget_paths(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = runtime / "hermes-decision-stop-budget"
+    source = tmp_path / "unsafe-budget-source"
+    if path_kind == "symlink":
+        source.write_bytes(b"version\t3\n")
+        budget.symlink_to(source)
+    elif path_kind == "fifo":
+        os.mkfifo(budget)
+    elif path_kind == "hardlink":
+        source.write_bytes(b"version\t3\n")
+        os.link(source, budget)
+    else:
+        budget.write_bytes(b"x" * 1025)
+
+    result = _run_local_runtime(
+        harness,
+        "status",
+        timeout=4,
+    )
+
+    assert (
+        "Hermes decision runtime: unknown "
+        "(shutdown budget is malformed or unsafe)"
+        in result.stdout
+    )
 
 
 @pytest.mark.parametrize("version", (1, 2))
@@ -2133,6 +2199,33 @@ def test_unknown_lifecycle_lock_owner_fails_closed_without_signal(
     )
 
 
+def test_nonreturning_ps_cannot_exceed_lifecycle_lock_budget(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lock = _write_decision_lifecycle_lock(
+        Path(harness["runtime"]),
+        owner_pid="999999",
+        owner_start_token="ps:Mon Aug 17 10:00:00 2026",
+    )
+    started = time.monotonic()
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "HEALTHMES_PS_BIN": str(_nonreturning_ps(tmp_path)),
+        },
+        timeout=4,
+    )
+
+    assert time.monotonic() - started < 3
+    assert result.returncode != 0
+    assert "owner identity is unknown" in result.stderr
+    assert lock.exists()
+
+
 def test_incomplete_lifecycle_lock_fails_closed_and_is_preserved(
     tmp_path: Path,
 ) -> None:
@@ -2359,6 +2452,34 @@ def test_interrupted_startup_lease_record_with_live_owner_is_preserved(
         event.startswith("kill ")
         for event in _event_lines(harness)
     )
+
+
+def test_nonreturning_ps_cannot_exceed_startup_recovery_budget(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lease = _write_decision_startup_lease(
+        Path(harness["runtime"]),
+        phase="intent",
+        owner_pid="999998",
+        owner_start_token="ps:Mon Aug 17 10:00:00 2026",
+    )
+    started = time.monotonic()
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "HEALTHMES_PS_BIN": str(_nonreturning_ps(tmp_path)),
+        },
+        timeout=4,
+    )
+
+    assert time.monotonic() - started < 3
+    assert result.returncode != 0
+    assert "owner identity is unknown" in result.stderr
+    assert lease.exists()
 
 
 @pytest.mark.parametrize("record_kind", ("lifecycle", "startup"))

@@ -19,9 +19,13 @@ import argparse
 import ctypes
 import errno
 import hashlib
+import math
 import os
+import signal
 import stat
+import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +51,10 @@ class _PublicationConflict(RuntimeError):
 
 
 class _GenerationChanged(RuntimeError):
+    pass
+
+
+class _ProcessAbsent(RuntimeError):
     pass
 
 
@@ -194,6 +202,270 @@ def _sha256_regular_file(path: Path) -> str:
     finally:
         os.close(descriptor)
     return digest.hexdigest()
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    max_bytes: int,
+    *,
+    require_ascii_text: bool,
+) -> bytes:
+    if max_bytes < 1:
+        raise _IdentityUnavailable(
+            "native_identity_bounded_read_limit_invalid"
+        )
+    try:
+        parent_metadata = path.parent.lstat()
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_bounded_read_parent_unavailable"
+        ) from exc
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.geteuid()
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_bounded_read_parent_invalid"
+        )
+    try:
+        candidate = path.lstat()
+    except FileNotFoundError as exc:
+        raise _ProcessAbsent(
+            "native_identity_bounded_read_file_absent"
+        ) from exc
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_bounded_read_file_unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(candidate.st_mode)
+        or candidate.st_uid != os.geteuid()
+        or candidate.st_nlink != 1
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_bounded_read_file_invalid"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif os.path.lexists(path):
+        try:
+            if stat.S_ISLNK(path.lstat().st_mode):
+                raise _IdentityUnavailable(
+                    "native_identity_bounded_read_file_invalid"
+                )
+        except OSError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_bounded_read_file_unavailable"
+            ) from exc
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise _ProcessAbsent(
+            "native_identity_bounded_read_file_absent"
+        ) from exc
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_bounded_read_file_unavailable"
+        ) from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+        except OSError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_bounded_read_file_unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_uid != os.geteuid()
+            or current.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or current.st_nlink != 1
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+            or opened.st_size != current.st_size
+            or opened.st_size < 1
+            or opened.st_size > max_bytes
+        ):
+            raise _IdentityUnavailable(
+                "native_identity_bounded_read_file_invalid"
+            )
+        payload = bytearray()
+        while len(payload) <= max_bytes:
+            chunk = os.read(
+                descriptor,
+                min(4096, max_bytes + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        try:
+            verified = os.fstat(descriptor)
+            final_path = path.lstat()
+        except OSError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_bounded_read_file_unavailable"
+            ) from exc
+        if (
+            len(payload) != opened.st_size
+            or len(payload) > max_bytes
+            or verified.st_dev != opened.st_dev
+            or verified.st_ino != opened.st_ino
+            or verified.st_size != opened.st_size
+            or final_path.st_dev != opened.st_dev
+            or final_path.st_ino != opened.st_ino
+            or final_path.st_size != opened.st_size
+            or not stat.S_ISREG(final_path.st_mode)
+            or final_path.st_uid != os.geteuid()
+            or final_path.st_nlink != 1
+        ):
+            raise _IdentityUnavailable(
+                "native_identity_bounded_read_file_changed"
+            )
+        result = bytes(payload)
+        if require_ascii_text:
+            try:
+                result.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise _IdentityUnavailable(
+                    "native_identity_bounded_read_text_invalid"
+                ) from exc
+            if b"\x00" in result or not result.endswith(b"\n"):
+                raise _IdentityUnavailable(
+                    "native_identity_bounded_read_text_invalid"
+                )
+        return result
+    finally:
+        os.close(descriptor)
+
+
+def _bounded_ps_value(
+    *,
+    ps_bin: str,
+    pid: int,
+    field: str,
+    timeout_seconds: float,
+) -> str:
+    if (
+        pid <= 1
+        or field not in {"pid", "pgid", "comm", "lstart", "command"}
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+        or timeout_seconds > 10
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_ps_probe_arguments_invalid"
+        )
+    environment = dict(os.environ)
+    environment["LANG"] = "C"
+    environment["LC_ALL"] = "C"
+    try:
+        process = subprocess.Popen(
+            [ps_bin, "-ww", "-p", str(pid), "-o", f"{field}="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_ps_probe_unavailable"
+        ) from exc
+    deadline = time.monotonic() + timeout_seconds
+    cleanup_reserve = min(0.1, timeout_seconds / 4)
+    try:
+        stdout, stderr = process.communicate(
+            timeout=max(0.001, timeout_seconds - cleanup_reserve)
+        )
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        # A hostile wrapper can detach a descendant that keeps inherited
+        # pipes open. Close our pipe ends and bound direct-child reap rather
+        # than calling communicate() without another deadline.
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            process.poll()
+        raise _IdentityUnavailable(
+            "native_identity_ps_probe_timeout"
+        ) from exc
+    output = stdout.strip()
+    error = stderr.strip()
+    if process.returncode != 0:
+        if not output and not error:
+            raise _ProcessAbsent("native_identity_ps_process_absent")
+        raise _IdentityUnavailable(
+            "native_identity_ps_probe_failed"
+        )
+    if (
+        error
+        or not output
+        or "\n" in output
+        or "\r" in output
+        or "\t" in output
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_ps_output_invalid"
+        )
+    return output
+
+
+def _bounded_ps_snapshot(
+    *,
+    ps_bin: str,
+    pid: int,
+    timeout_seconds: float,
+) -> tuple[str, str, str, str, str]:
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise _IdentityUnavailable(
+            "native_identity_ps_probe_arguments_invalid"
+        )
+    deadline = time.monotonic() + timeout_seconds
+    values: list[str] = []
+    for field in ("pid", "pgid", "comm", "lstart", "command"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _IdentityUnavailable(
+                "native_identity_ps_probe_timeout"
+            )
+        values.append(
+            _bounded_ps_value(
+                ps_bin=ps_bin,
+                pid=pid,
+                field=field,
+                timeout_seconds=remaining,
+            )
+        )
+    return (
+        values[0],
+        values[1],
+        values[2],
+        values[3],
+        values[4],
+    )
 
 
 def _validate_sha256(value: str) -> None:
@@ -480,6 +752,40 @@ def _parse_args() -> argparse.Namespace:
         "--expected-source-sha256",
         required=True,
     )
+    bounded_read = subparsers.add_parser(
+        "read-bounded",
+        add_help=False,
+    )
+    bounded_read.add_argument("path", type=Path)
+    bounded_read.add_argument(
+        "--max-bytes",
+        required=True,
+        type=int,
+    )
+    bounded_read.add_argument(
+        "--require-ascii-text",
+        action="store_true",
+    )
+    ps_value = subparsers.add_parser("ps-value", add_help=False)
+    ps_value.add_argument("--ps-bin", required=True)
+    ps_value.add_argument("--pid", required=True, type=int)
+    ps_value.add_argument("--field", required=True)
+    ps_value.add_argument(
+        "--timeout-seconds",
+        required=True,
+        type=float,
+    )
+    ps_snapshot = subparsers.add_parser(
+        "ps-snapshot",
+        add_help=False,
+    )
+    ps_snapshot.add_argument("--ps-bin", required=True)
+    ps_snapshot.add_argument("--pid", required=True, type=int)
+    ps_snapshot.add_argument(
+        "--timeout-seconds",
+        required=True,
+        type=float,
+    )
     return parser.parse_args()
 
 
@@ -513,6 +819,37 @@ def main() -> int:
                 expected_source_sha256=args.expected_source_sha256,
             )
             return 0
+        if args.action == "read-bounded":
+            sys.stdout.buffer.write(
+                _read_bounded_regular_file(
+                    args.path,
+                    args.max_bytes,
+                    require_ascii_text=args.require_ascii_text,
+                )
+            )
+            return 0
+        if args.action == "ps-value":
+            print(
+                _bounded_ps_value(
+                    ps_bin=args.ps_bin,
+                    pid=args.pid,
+                    field=args.field,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            )
+            return 0
+        if args.action == "ps-snapshot":
+            for field, value in zip(
+                ("pid", "pgid", "comm", "lstart", "command"),
+                _bounded_ps_snapshot(
+                    ps_bin=args.ps_bin,
+                    pid=args.pid,
+                    timeout_seconds=args.timeout_seconds,
+                ),
+                strict=True,
+            ):
+                print(f"{field}\t{value}")
+            return 0
         current = _start_token(args.pid)
         if current is None:
             return 3
@@ -528,6 +865,9 @@ def main() -> int:
     except _GenerationChanged as exc:
         print(str(exc), file=sys.stderr)
         return 7
+    except _ProcessAbsent as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
     except _IdentityUnavailable as exc:
         print(str(exc), file=sys.stderr)
         return 5

@@ -306,6 +306,11 @@ Python supervisor. The parent captures all five `ps` identity fields, changes
 the lease to `identity_verified`, and removes the exact lease generation.
 One failed or unreadable identity query is unknown, not evidence that the
 process is absent.
+Every configured `PS_BIN` invocation used by lifecycle acquisition or startup
+recovery runs in a separate process group with a one-second per-snapshot cap
+inside the shared 10-second lock or three-second recovery deadline. Timeout
+cleanup kills that probe group and bounds direct-child reap, so a non-returning
+wrapper or inherited pipe cannot extend either lifecycle budget.
 
 If the startup owner crashes, stop waits through a bounded three-second
 publication grace and repeatedly checks for a matching v3 budget. A matching
@@ -334,12 +339,22 @@ margin. An existing malformed record is preserved byte-for-byte and a new
 supervisor refuses to overwrite it without explicit validated repair.
 For legacy `ps:` owner identities, a failed, timed-out, or empty `ps` probe is
 unknown while the numeric PID still exists, so the existing record is
-preserved. Replacement is allowed only after process absence or an identity
-mismatch is positively proved. Malformed or unprovable records fail closed
-without signalling.
+preserved. A formatted token mismatch for a still-live numeric PID is also
+unknown. Replacement is allowed only after numeric process absence is
+positively proved. Malformed or unprovable records fail closed without
+signalling.
 A failed competing startup therefore cannot overwrite or delete the ready
 runtime's budget, even when both processes inherited the same launcher
 identity.
+
+The shutdown-budget directory, lock, canonical record, and publication
+temporary are validated through descriptors as current-user-owned paths.
+Symlinks, FIFOs, devices, directories, hard links, wrong-owner files, inode
+changes, and records larger than 1 KiB fail closed. `O_NOFOLLOW` and
+`O_NONBLOCK` are used where available; record reads validate size before
+loading content and revalidate the descriptor/path inode afterward. Unsafe
+records are preserved for explicit repair rather than opened, replaced, or
+treated as missing.
 
 When stop initially finds no budget during startup, it snapshots the exact
 Bash launcher generation and rechecks immediately before TERM. After that
@@ -389,7 +404,9 @@ then requires continuity between the pre/post-reap descendant snapshots before
 adopting and signalling individual members. An empty pre-reap snapshot followed
 by a non-empty snapshot is treated as reused-PGID identity loss; that generation
 remains fail-closed on later close retries and the newly observed members are
-never signalled. The launcher
+never signalled. On Linux, both supervisor drain and launcher recovery require
+two consecutive, independently enumerated empty `/proc` group observations;
+one transient empty scan is not proof that the group is gone. The launcher
 refuses to SIGKILL only the outer service group if that complete drain fails;
 it exits non-zero instead of orphaning the child or reporting a false stop.
 On any unproven cleanup, available launcher PID/identity metadata and the v3

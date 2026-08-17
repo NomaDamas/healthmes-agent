@@ -391,6 +391,11 @@ rename protocol로 원자적으로 만든다. Lease에는 `created_at_epoch`,
 게시가 모두 성공하기 전에는 Python supervisor를 시작하지 않는다. Parent는 다섯
 개 `ps` identity 필드를 검증해 완전한 metadata를 쓴 뒤 `identity_verified`를
 게시하고, 동일한 lease generation만 제거한다.
+Lifecycle lock 획득과 startup recovery에서 사용하는 모든 설정형 `PS_BIN` 호출은
+별도 process group에서 실행되고 snapshot당 최대 1초로 제한된다. 이 제한은 각각
+공유 10초 lock deadline과 3초 recovery deadline 안에서 계산된다. Timeout이면
+probe group을 종료하고 direct child reap도 bounded 처리하므로, 반환하지 않는
+wrapper나 pipe를 상속한 descendant가 전체 예산을 늘릴 수 없다.
 
 Startup owner가 crash하면 stop은 3초의 bounded publication grace 동안 동일
 세대 v3 budget을 반복 조회한다. Matching v3 budget이 나타나면 PID tombstone
@@ -416,13 +421,23 @@ metadata가 없어도 살아 있는 supervisor가 Hermes descendant를 drain하�
 기회를 잃지 않는다. v1/v2 record는 기존 launcher가 검증될 때만 보수적인
 317초 대기로 호환하며 짧은 값을 신뢰하지 않는다. Legacy `ps:` owner 조회가
 실패하거나 timeout, empty output이면 숫자 PID가 살아 있는 동안은 `unknown`으로
-처리해 기존 budget을 보존한다. Process 부재 또는 start identity mismatch가
-확실히 증명된 경우에만 새 record로 교체한다. 형식이 잘못됐거나 identity를
-증명할 수 없으면 숫자 PID로 fallback하지 않고 metadata를 보존한 채 fail
-closed한다. 같은 launcher identity를 상속한 두 번째 startup이 실패해도 기존
-runtime의 종료 record를 덮어쓰거나 삭제할 수 없다. 기존 record가 malformed이면
-새 supervisor도 명시적으로 검증된 repair 없이 그 byte를 덮어쓰지 않고 시작을
-거부한다. v3 native stop은 Python helper 하나가 최대 317초를 내부에서 대기하고,
+처리해 기존 budget을 보존한다. 살아 있는 숫자 PID의 formatted start token이
+다른 경우도 process 교체의 증거로 사용하지 않고 `unknown`으로 처리한다. 숫자
+process 부재가 확실히 증명된 경우에만 새 record로 교체한다. 형식이 잘못됐거나
+identity를 증명할 수 없으면 숫자 PID로 fallback하지 않고 metadata를 보존한 채
+fail closed한다. 같은 launcher identity를 상속한 두 번째 startup이 실패해도
+기존 runtime의 종료 record를 덮어쓰거나 삭제할 수 없다. 기존 record가
+malformed이면 새 supervisor도 명시적으로 검증된 repair 없이 그 byte를 덮어쓰지
+않고 시작을 거부한다.
+
+Shutdown-budget parent directory, lock, canonical record와 publication temp는
+descriptor와 path inode를 함께 검증한다. Symlink, FIFO, device, directory,
+hard link, wrong owner, inode 변경, 1 KiB 초과 record는 모두 fail closed한다.
+가능한 플랫폼에서는 `O_NOFOLLOW`와 `O_NONBLOCK`을 사용하고, record는 content를
+읽기 전에 크기를 제한한 뒤 read 후 inode/size를 다시 검증한다. Unsafe record는
+missing으로 간주하거나 덮어쓰지 않고 명시적 repair를 위해 보존한다.
+
+v3 native stop은 Python helper 하나가 최대 317초를 내부에서 대기하고,
 supervisor 종료 뒤 Bash wrapper reap 확인에는 최대 1초만 더 사용한다. 매초 새
 interpreter를 띄우지 않으므로 helper startup overhead가 반복되지 않는다.
 Compose와 LaunchAgent의 outer timeout은 모두 360초로 유지한다.
@@ -464,7 +479,10 @@ identity 연속성이 있을 때만 각 member를 adopt해 종료한다. 숫자 
 신호하지 않으므로 나중에 같은 PGID를 재사용한 무관한 process group은 건드리지
 않는다. 특히 reap 전 snapshot이 비었는데 reap 뒤에만 member가 나타나면 PGID
 재사용으로 보아 그 generation을 이후 close 재시도에서도 fail closed 상태로
-유지하고 새 member에는 신호하지 않는다. Hermes SSE proxy는
+유지하고 새 member에는 신호하지 않는다. Linux supervisor drain과 launcher
+recovery는 각각 독립적으로 다시 열거한 두 번의 연속된 빈 `/proc` group 관찰을
+요구한다. 한 번의 일시적 empty scan만으로 group 종료를 선언하지 않는다.
+Hermes SSE proxy는
 connect/write/pool에는 각각 명시적인 5초 제한을
 두되 read timeout은 없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만 전체
 decision wall-clock deadline은 그대로 적용된다.

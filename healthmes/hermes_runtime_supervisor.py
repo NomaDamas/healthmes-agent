@@ -15,6 +15,7 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,7 @@ _MAX_DECISION_TIMEOUT_SECONDS = 300.0
 _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
 _RUNTIME_SHUTDOWN_BUDGET_VERSION = 3
 _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES = 1024
+_PROCESS_GROUP_EMPTY_CONFIRMATIONS = 2
 _PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
 _PROXY_CONNECT_TIMEOUT_SECONDS = 5.0
@@ -322,21 +324,142 @@ def _lock_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.lock")
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeFileIdentity:
+    device: int
+    inode: int
+    size: int
+
+
+class _RuntimePathError(RuntimeError):
+    pass
+
+
+def _validate_runtime_directory(path: Path, *, label: str) -> None:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise _RuntimePathError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise _RuntimePathError(f"{label} is unsafe")
+
+
+def _validate_open_runtime_file(
+    descriptor: int,
+    path: Path,
+    *,
+    label: str,
+) -> _RuntimeFileIdentity:
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(path)
+    except OSError as exc:
+        raise _RuntimePathError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or opened.st_uid != os.geteuid()
+        or current.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or current.st_nlink != 1
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+        or opened.st_size != current.st_size
+    ):
+        raise _RuntimePathError(f"{label} is unsafe")
+    return _RuntimeFileIdentity(
+        device=opened.st_dev,
+        inode=opened.st_ino,
+        size=opened.st_size,
+    )
+
+
+def _open_runtime_file(
+    path: Path,
+    *,
+    flags: int,
+    mode: int | None = None,
+    label: str,
+) -> tuple[int, _RuntimeFileIdentity]:
+    try:
+        candidate = os.lstat(path)
+    except FileNotFoundError:
+        candidate = None
+    except OSError as exc:
+        raise _RuntimePathError(f"{label} is unavailable") from exc
+    if candidate is not None and (
+        not stat.S_ISREG(candidate.st_mode)
+        or candidate.st_uid != os.geteuid()
+        or candidate.st_nlink != 1
+    ):
+        # Reject FIFOs/devices before open(2), even when O_NONBLOCK would
+        # prevent the open itself from hanging.
+        raise _RuntimePathError(f"{label} is unsafe")
+    open_flags = (
+        flags
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    elif os.path.lexists(path):
+        try:
+            if stat.S_ISLNK(os.lstat(path).st_mode):
+                raise _RuntimePathError(f"{label} is unsafe")
+        except OSError as exc:
+            raise _RuntimePathError(f"{label} is unavailable") from exc
+    try:
+        descriptor = (
+            os.open(path, open_flags, mode)
+            if mode is not None
+            else os.open(path, open_flags)
+        )
+    except OSError as exc:
+        raise _RuntimePathError(f"{label} is unavailable") from exc
+    try:
+        identity = _validate_open_runtime_file(
+            descriptor,
+            path,
+            label=label,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, identity
+
+
 @contextmanager
 def _exclusive_file_lock(path: Path):
     target = path.expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
-        _lock_path(target),
-        os.O_CREAT | os.O_RDWR,
-        0o600,
+    _validate_runtime_directory(
+        target.parent,
+        label="runtime shutdown budget directory",
     )
+    lock_path = _lock_path(target)
+    descriptor, _ = _open_runtime_file(
+        lock_path,
+        flags=os.O_CREAT | os.O_RDWR,
+        mode=0o600,
+        label="runtime shutdown budget lock",
+    )
+    locked = False
     try:
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        _validate_open_runtime_file(
+            descriptor,
+            lock_path,
+            label="runtime shutdown budget lock",
+        )
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
@@ -532,7 +655,11 @@ def _runtime_launcher_identity_state(
             return "gone"
         raise
     if not hmac.compare_digest(current, identity.start_token):
-        return "changed"
+        if _numeric_process_existence_state(identity.pid) == "gone":
+            return "gone"
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_legacy_process_identity_mismatch_unprovable"
+        )
     return "live"
 
 
@@ -714,6 +841,11 @@ class _RuntimeShutdownBudgetPublication:
                     raise RuntimeError(
                         "runtime shutdown budget already has a live owner"
                     )
+                if owner_state != "gone":
+                    raise RuntimeError(
+                        "runtime shutdown budget owner disappearance is "
+                        "not proven; preserving the existing record"
+                    )
             persist_runtime_shutdown_budget(self.path, self.record)
             self._published = True
 
@@ -723,11 +855,16 @@ class _RuntimeShutdownBudgetPublication:
             if not self._published:
                 return
             try:
-                current = load_runtime_shutdown_budget(target)
+                current, identity = (
+                    _load_runtime_shutdown_budget_snapshot(target)
+                )
             except ValueError:
                 self._published = False
                 return
             if current != self.record:
+                self._published = False
+                return
+            if not _runtime_file_identity_matches(target, identity):
                 self._published = False
                 return
             target.unlink(missing_ok=True)
@@ -1766,6 +1903,11 @@ class HermesRuntimeProcess:
                 "hermes_runtime_child_group_identity_changed"
             )
         self._known_child_group_members = before_reap | after_reap
+        if not after_reap:
+            if not await self._wait_for_child_group_exit(
+                deadline=deadline
+            ):
+                raise RuntimeError("hermes_runtime_child_term_timeout")
         return after_reap
 
     def _owned_child_group_members(
@@ -1844,6 +1986,7 @@ class HermesRuntimeProcess:
 
     async def _wait_for_child_group_exit(self, *, deadline: float) -> bool:
         loop = asyncio.get_running_loop()
+        empty_observations = 0
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -1854,7 +1997,15 @@ class HermesRuntimeProcess:
                     remaining,
                 )
             ):
-                return True
+                empty_observations += 1
+                if (
+                    empty_observations
+                    >= _PROCESS_GROUP_EMPTY_CONFIRMATIONS
+                ):
+                    return True
+                await asyncio.sleep(0)
+                continue
+            empty_observations = 0
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
@@ -2424,17 +2575,38 @@ def _run_runtime_process_group_probe(
             raise ValueError(
                 "runtime launcher process-group probe timeout is invalid"
             )
-        members = _probe_process_group_members(pgid, timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+        empty_observations = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "hermes_runtime_child_group_probe_timeout"
+                )
+            members = _probe_process_group_members(
+                pgid,
+                min(
+                    _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                    remaining,
+                ),
+            )
+            if members:
+                break
+            empty_observations += 1
+            if (
+                not sys.platform.startswith("linux")
+                or empty_observations
+                >= _PROCESS_GROUP_EMPTY_CONFIRMATIONS
+            ):
+                return 0
     except (HermesRuntimeIdentityError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 5
-    if members:
-        print(
-            "hermes_runtime_launcher_group_not_empty",
-            file=sys.stderr,
-        )
-        return 6
-    return 0
+    print(
+        "hermes_runtime_launcher_group_not_empty",
+        file=sys.stderr,
+    )
+    return 6
 
 
 def _next_restart_backoff(
@@ -2901,6 +3073,18 @@ def persist_runtime_shutdown_budget(
         raise ValueError("runtime shutdown budget record is too large")
     target = path.expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
+    _validate_runtime_directory(
+        target.parent,
+        label="runtime shutdown budget directory",
+    )
+    existing_identity: _RuntimeFileIdentity | None = None
+    if os.path.lexists(target):
+        existing_descriptor, existing_identity = _open_runtime_file(
+            target,
+            flags=os.O_RDONLY,
+            label="runtime shutdown budget",
+        )
+        os.close(existing_descriptor)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         dir=target.parent,
@@ -2908,12 +3092,49 @@ def persist_runtime_shutdown_budget(
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
+        temporary_identity = _validate_open_runtime_file(
+            descriptor,
+            temporary,
+            label="runtime shutdown budget temporary file",
+        )
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        temporary_identity = _RuntimeFileIdentity(
+            device=temporary_identity.device,
+            inode=temporary_identity.inode,
+            size=len(payload),
+        )
+        if not _runtime_file_identity_matches(
+            temporary,
+            temporary_identity,
+        ):
+            raise _RuntimePathError(
+                "runtime shutdown budget temporary inode changed"
+            )
+        if existing_identity is None:
+            if os.path.lexists(target):
+                raise _RuntimePathError(
+                    "runtime shutdown budget target appeared before "
+                    "publication"
+                )
+        elif not _runtime_file_identity_matches(
+            target,
+            existing_identity,
+        ):
+            raise _RuntimePathError(
+                "runtime shutdown budget target inode changed before "
+                "publication"
+            )
         temporary.replace(target)
-        target.chmod(0o600)
+        if not _runtime_file_identity_matches(
+            target,
+            temporary_identity,
+        ):
+            raise _RuntimePathError(
+                "runtime shutdown budget publication inode changed"
+            )
         _fsync_parent(target)
     except BaseException:
         try:
@@ -2924,18 +3145,79 @@ def persist_runtime_shutdown_budget(
         raise
 
 
-def load_runtime_shutdown_budget(
+def _runtime_file_identity_matches(
     path: Path,
+    expected: _RuntimeFileIdentity,
+) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise _RuntimePathError(
+            "runtime shutdown budget path is unavailable"
+        ) from exc
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_nlink == 1
+        and metadata.st_dev == expected.device
+        and metadata.st_ino == expected.inode
+        and metadata.st_size == expected.size
+    )
+
+
+def _read_runtime_shutdown_budget_payload(
+    path: Path,
+) -> tuple[bytes, _RuntimeFileIdentity]:
+    target = path.expanduser()
+    _validate_runtime_directory(
+        target.parent,
+        label="runtime shutdown budget directory",
+    )
+    descriptor, identity = _open_runtime_file(
+        target,
+        flags=os.O_RDONLY,
+        label="runtime shutdown budget",
+    )
+    try:
+        if (
+            identity.size < 1
+            or identity.size > _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES
+        ):
+            raise ValueError("runtime shutdown budget is invalid")
+        payload = bytearray()
+        while len(payload) <= _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    4096,
+                    _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES
+                    + 1
+                    - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        verified = _validate_open_runtime_file(
+            descriptor,
+            target,
+            label="runtime shutdown budget",
+        )
+        if verified != identity or len(payload) != identity.size:
+            raise ValueError("runtime shutdown budget is invalid")
+        return bytes(payload), identity
+    finally:
+        os.close(descriptor)
+
+
+def _parse_runtime_shutdown_budget(
+    payload: bytes,
 ) -> (
     HermesRuntimeShutdownBudgetRecord
     | _LegacyRuntimeShutdownBudgetRecord
 ):
-    """Read a canonical identity-bound drain record."""
-
-    try:
-        payload = path.expanduser().read_bytes()
-    except OSError as exc:
-        raise ValueError("runtime shutdown budget is unavailable") from exc
     if (
         not payload
         or len(payload) > _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES
@@ -3023,6 +3305,34 @@ def load_runtime_shutdown_budget(
         raise ValueError
     except (KeyError, ValueError) as exc:
         raise ValueError("runtime shutdown budget is invalid") from exc
+
+
+def _load_runtime_shutdown_budget_snapshot(
+    path: Path,
+) -> tuple[
+    HermesRuntimeShutdownBudgetRecord
+    | _LegacyRuntimeShutdownBudgetRecord,
+    _RuntimeFileIdentity,
+]:
+    try:
+        payload, identity = _read_runtime_shutdown_budget_payload(path)
+    except _RuntimePathError as exc:
+        raise ValueError(
+            "runtime shutdown budget is unavailable"
+        ) from exc
+    return _parse_runtime_shutdown_budget(payload), identity
+
+
+def load_runtime_shutdown_budget(
+    path: Path,
+) -> (
+    HermesRuntimeShutdownBudgetRecord
+    | _LegacyRuntimeShutdownBudgetRecord
+):
+    """Read a canonical identity-bound drain record."""
+
+    record, _ = _load_runtime_shutdown_budget_snapshot(path)
+    return record
 
 
 def _build_supervisor_server(

@@ -40,6 +40,8 @@ DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2
 DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS=10
 DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS=2
 DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS=3
+DECISION_RUNTIME_PS_PROBE_TIMEOUT_SECONDS=1
+MAX_DECISION_RUNTIME_STOP_BUDGET_BYTES=1024
 DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION=2
 DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION=2
 MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
@@ -96,11 +98,34 @@ trim_whitespace() {
 }
 
 ps_value() {
-    local pid=$1 field=$2 value
-    value="$("$PS_BIN" -ww -p "$pid" -o "$field=" 2>/dev/null)" || return 1
+    local pid=$1 field=$2 deadline=${3:-} timeout value
+    timeout="$(bounded_ps_timeout_seconds "$deadline")" || return 1
+    value="$(run_native_identity_helper \
+        ps-value \
+        --ps-bin "$PS_BIN" \
+        --pid "$pid" \
+        --field "$field" \
+        --timeout-seconds "$timeout" \
+        2>/dev/null)" || return 1
     value="$(trim_whitespace "$value")"
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
+}
+
+bounded_ps_timeout_seconds() {
+    local deadline=${1:-} remaining
+    if [ -z "$deadline" ]; then
+        printf '%s\n' "$DECISION_RUNTIME_PS_PROBE_TIMEOUT_SECONDS"
+        return
+    fi
+    [[ "$deadline" =~ ^[0-9]+$ ]] || return 5
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -gt 0 ] || return 5
+    if [ "$remaining" -lt "$DECISION_RUNTIME_PS_PROBE_TIMEOUT_SECONDS" ]; then
+        printf '%s\n' "$remaining"
+    else
+        printf '%s\n' "$DECISION_RUNTIME_PS_PROBE_TIMEOUT_SECONDS"
+    fi
 }
 
 load_process_identity() {
@@ -133,19 +158,70 @@ load_process_identity() {
 }
 
 load_process_snapshot() {
-    local pid=$1
+    local pid=$1 deadline=${2:-} timeout output key value extra
+    local seen_pid= seen_pgid= seen_comm= seen_lstart= seen_command=
     valid_managed_pid "$pid" || return 1
-    SNAPSHOT_PID="$(ps_value "$pid" pid)" || return 1
-    SNAPSHOT_PGID="$(ps_value "$pid" pgid)" || return 1
-    SNAPSHOT_EXECUTABLE="$(ps_value "$pid" comm)" || return 1
-    SNAPSHOT_START_TIME="$(ps_value "$pid" lstart)" || return 1
-    SNAPSHOT_COMMAND="$(ps_value "$pid" command)" || return 1
+    timeout="$(bounded_ps_timeout_seconds "$deadline")" || return 5
+    if output="$(run_native_identity_helper \
+        ps-snapshot \
+        --ps-bin "$PS_BIN" \
+        --pid "$pid" \
+        --timeout-seconds "$timeout" \
+        2>/dev/null)"; then
+        :
+    else
+        return $?
+    fi
+    SNAPSHOT_PID=
+    SNAPSHOT_PGID=
+    SNAPSHOT_EXECUTABLE=
+    SNAPSHOT_START_TIME=
+    SNAPSHOT_COMMAND=
+    while IFS=$'\t' read -r key value extra; do
+        [ -z "$extra" ] || return 5
+        case "$key" in
+        pid)
+            [ -z "$seen_pid" ] || return 5
+            SNAPSHOT_PID=$value
+            seen_pid=1
+            ;;
+        pgid)
+            [ -z "$seen_pgid" ] || return 5
+            SNAPSHOT_PGID=$value
+            seen_pgid=1
+            ;;
+        comm)
+            [ -z "$seen_comm" ] || return 5
+            SNAPSHOT_EXECUTABLE=$value
+            seen_comm=1
+            ;;
+        lstart)
+            [ -z "$seen_lstart" ] || return 5
+            SNAPSHOT_START_TIME=$value
+            seen_lstart=1
+            ;;
+        command)
+            [ -z "$seen_command" ] || return 5
+            SNAPSHOT_COMMAND=$value
+            seen_command=1
+            ;;
+        *)
+            return 5
+            ;;
+        esac
+    done <<<"$output"
+    [ -n "$seen_pid" ] \
+        && [ -n "$seen_pgid" ] \
+        && [ -n "$seen_comm" ] \
+        && [ -n "$seen_lstart" ] \
+        && [ -n "$seen_command" ] \
+        || return 5
 }
 
 process_identity_matches() {
-    local pid_file=$1 marker
+    local pid_file=$1 deadline=${2:-} marker
     load_process_identity "$pid_file" || return 1
-    load_process_snapshot "$PROCESS_PID" || return 1
+    load_process_snapshot "$PROCESS_PID" "$deadline" || return 1
     marker="healthmes_local.sh __service_runner $PROCESS_NONCE "
 
     [ "$SNAPSHOT_PID" = "$PROCESS_PID" ] \
@@ -156,8 +232,9 @@ process_identity_matches() {
 }
 
 captured_process_identity_matches() {
-    local pid=$1 executable=$2 start_time=$3 nonce=$4 marker
-    load_process_snapshot "$pid" || return 1
+    local pid=$1 executable=$2 start_time=$3 nonce=$4
+    local deadline=${5:-} marker
+    load_process_snapshot "$pid" "$deadline" || return 1
     marker="healthmes_local.sh __service_runner $nonce "
 
     [ "$SNAPSHOT_PID" = "$pid" ] \
@@ -186,8 +263,8 @@ write_process_identity() {
 }
 
 capture_process_identity() {
-    local pid_file=$1 pid=$2 nonce=$3 marker
-    load_process_snapshot "$pid" || return 1
+    local pid_file=$1 pid=$2 nonce=$3 deadline=${4:-} marker
+    load_process_snapshot "$pid" "$deadline" || return 1
     marker="healthmes_local.sh __service_runner $nonce "
     [ "$SNAPSHOT_PID" = "$pid" ] \
         && [ "$SNAPSHOT_PGID" = "$pid" ] \
@@ -286,24 +363,24 @@ assert_lifecycle_script_generation_unchanged() {
 }
 
 probe_ps_value() {
-    local pid=$1 field=$2 output status error_file error
+    local pid=$1 field=$2 deadline=${3:-} timeout output status
     PROBED_PS_VALUE=
-    error_file="$(mktemp "$RUNTIME_DIR/.ps-probe.XXXXXX")" || return 5
-    if output="$("$PS_BIN" -ww -p "$pid" -o "$field=" 2>"$error_file")"; then
-        status=0
+    timeout="$(bounded_ps_timeout_seconds "$deadline")" || return 5
+    if output="$(run_native_identity_helper \
+        ps-value \
+        --ps-bin "$PS_BIN" \
+        --pid "$pid" \
+        --field "$field" \
+        --timeout-seconds "$timeout" \
+        2>/dev/null)"; then
+        :
     else
         status=$?
-    fi
-    error="$(<"$error_file")"
-    rm -f "$error_file"
-    output="$(trim_whitespace "$output")"
-    error="$(trim_whitespace "$error")"
-    if [ "$status" -ne 0 ]; then
-        [ -z "$output" ] && [ -z "$error" ] && return 3
+        [ "$status" -eq 3 ] && return 3
         return 5
     fi
-    [ -z "$error" ] \
-        && [ -n "$output" ] \
+    output="$(trim_whitespace "$output")"
+    [ -n "$output" ] \
         && [[ "$output" != *$'\n'* ]] \
         && [[ "$output" != *$'\t'* ]] \
         || return 5
@@ -311,7 +388,7 @@ probe_ps_value() {
 }
 
 process_start_token_status() {
-    local pid=$1 expected_start_token=$2 status
+    local pid=$1 expected_start_token=$2 deadline=${3:-} status
     valid_managed_pid "$pid" || return 5
     case "$expected_start_token" in
     linux:* | darwin:*)
@@ -321,14 +398,14 @@ process_start_token_status() {
     ps:*) ;;
     *) return 5 ;;
     esac
-    if probe_ps_value "$pid" pid; then
+    if probe_ps_value "$pid" pid "$deadline"; then
         [ "$PROBED_PS_VALUE" = "$pid" ] || return 5
     else
         status=$?
         [ "$status" -eq 3 ] && return 3
         return 5
     fi
-    if probe_ps_value "$pid" lstart; then
+    if probe_ps_value "$pid" lstart "$deadline"; then
         [ "ps:$PROBED_PS_VALUE" = "$expected_start_token" ] \
             && return 0
         # Legacy ps tokens are timezone/locale formatted. A mismatch while
@@ -792,14 +869,15 @@ mark_owned_decision_runtime_lifecycle_repair_required() {
 }
 
 recover_orphaned_decision_runtime_lifecycle_lock() {
-    local expected_generation=$1 status
+    local expected_generation=$1 deadline=${2:-} status
     load_decision_runtime_lifecycle_lock
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
         && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
         || return 1
     if process_start_token_status \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
-        "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN"; then
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" \
+        "$deadline"; then
         return 1
     else
         status=$?
@@ -854,7 +932,8 @@ find_interrupted_decision_runtime_lifecycle_record() {
 }
 
 recover_interrupted_decision_runtime_lifecycle_record() {
-    local candidate generation owner_pid owner_start_token updated_at
+    local deadline=${1:-} candidate generation owner_pid
+    local owner_start_token updated_at
     local status record candidate_sha256
     find_interrupted_decision_runtime_lifecycle_record || return $?
     candidate=$INTERRUPTED_DECISION_RUNTIME_RECORD
@@ -864,7 +943,8 @@ recover_interrupted_decision_runtime_lifecycle_record() {
     owner_pid=$DECISION_RUNTIME_LIFECYCLE_LOCK_PID
     owner_start_token=$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN
     updated_at=$DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT
-    if process_start_token_status "$owner_pid" "$owner_start_token"; then
+    if process_start_token_status \
+        "$owner_pid" "$owner_start_token" "$deadline"; then
         return 3
     else
         status=$?
@@ -901,7 +981,7 @@ recover_interrupted_decision_runtime_lifecycle_record() {
 acquire_decision_runtime_lifecycle_lock() {
     local operation=$1 owner_pid owner_start_token
     local owner_nonce acquired_at_epoch attempts=0 existing_generation status
-    local current_script_sha256 recovery_status stage
+    local current_script_sha256 recovery_status stage lifecycle_deadline
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = false ] \
         || die "decision runtime lifecycle lock is already held"
     [[ "$operation" =~ ^(start|stop|update|install|uninstall)$ ]] \
@@ -914,7 +994,14 @@ acquire_decision_runtime_lifecycle_lock() {
     owner_start_token=$NATIVE_PROCESS_START_TOKEN
     owner_nonce="$(new_service_nonce)" \
         || die "failed to generate decision runtime lifecycle nonce"
+    lifecycle_deadline=$((
+        SECONDS + DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS
+    ))
     while [ "$attempts" -le "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; do
+        if [ "$attempts" -gt 0 ] \
+            && [ "$SECONDS" -ge "$lifecycle_deadline" ]; then
+            die "decision runtime lifecycle lock could not be recovered within the bounded wait; preserving it"
+        fi
         assert_lifecycle_script_generation_unchanged
         load_decision_runtime_lifecycle_lock
         if [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = missing ]; then
@@ -964,7 +1051,8 @@ acquire_decision_runtime_lifecycle_lock() {
 
         case "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" in
         invalid)
-            if recover_interrupted_decision_runtime_lifecycle_record; then
+            if recover_interrupted_decision_runtime_lifecycle_record \
+                "$lifecycle_deadline"; then
                 info "restored an interrupted decision runtime lifecycle owner record"
                 attempts=$((attempts + 1))
                 continue
@@ -994,7 +1082,8 @@ acquire_decision_runtime_lifecycle_lock() {
             fi
             if process_start_token_status \
                 "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
-                "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN"; then
+                "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" \
+                "$lifecycle_deadline"; then
                 if [ "$attempts" -ge "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; then
                     die "decision runtime lifecycle lock is still owned by live ${DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION} pid ${DECISION_RUNTIME_LIFECYCLE_LOCK_PID}; timed out without mutating runtime state"
                 fi
@@ -1003,7 +1092,8 @@ acquire_decision_runtime_lifecycle_lock() {
                 case "$status" in
                 3)
                     if recover_orphaned_decision_runtime_lifecycle_lock \
-                        "$existing_generation"; then
+                        "$existing_generation" \
+                        "$lifecycle_deadline"; then
                         info "recovered stale decision runtime lifecycle lock without signalling its former PID"
                         attempts=$((attempts + 1))
                         continue
@@ -1778,7 +1868,7 @@ signal_process_group() {
 }
 
 load_decision_runtime_stop_bounds() {
-    local key value extra
+    local ps_deadline=${1:-} key value extra payload read_status
     local version= drain_timeout= launcher_pid= launcher_start_token=
     local launcher_service_nonce= supervisor_pid=
     local supervisor_start_token= service_nonce=
@@ -1799,7 +1889,20 @@ load_decision_runtime_stop_bounds() {
     DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN=
     DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE=
     DECISION_RUNTIME_BUDGET_PUBLICATION_NONCE=
-    if [ ! -f "$HERMES_DECISION_STOP_BUDGET" ]; then
+    if payload="$(run_native_identity_helper \
+        read-bounded \
+        "$HERMES_DECISION_STOP_BUDGET" \
+        --max-bytes "$MAX_DECISION_RUNTIME_STOP_BUDGET_BYTES" \
+        --require-ascii-text \
+        2>/dev/null)"; then
+        :
+    else
+        read_status=$?
+        if [ "$read_status" -eq 3 ]; then
+            return 0
+        fi
+        info "ignoring malformed or unsafe decision runtime stop budget"
+        DECISION_RUNTIME_BUDGET_STATUS=invalid
         return 0
     fi
     while IFS=$'\t' read -r key value extra; do
@@ -1896,7 +1999,7 @@ load_decision_runtime_stop_bounds() {
             return 0
             ;;
         esac
-    done <"$HERMES_DECISION_STOP_BUDGET"
+    done <<<"$payload"
     if ! [[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] \
         || [ "$drain_timeout" -gt "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ]; then
         info "ignoring stale or invalid decision runtime stop budget"
@@ -1937,7 +2040,8 @@ load_decision_runtime_stop_bounds() {
             drain_timeout
             + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
         ))
-        if process_identity_matches "$HERMES_DECISION_PID" \
+        if process_identity_matches \
+            "$HERMES_DECISION_PID" "$ps_deadline" \
             && [ "$launcher_pid" = "$PROCESS_PID" ] \
             && [ "$launcher_start_token" = "ps:$PROCESS_START_TIME" ] \
             && [ "$launcher_service_nonce" = "$PROCESS_NONCE" ]; then
@@ -1963,7 +2067,8 @@ load_decision_runtime_stop_bounds() {
             && [ -n "$seen_publication_instance_nonce" ] \
             && [[ "$publication_instance_nonce" =~ ^[A-Za-z0-9-]+$ ]]; }; }; then
         DECISION_RUNTIME_BUDGET_STATUS=legacy
-        if process_identity_matches "$HERMES_DECISION_PID" \
+        if process_identity_matches \
+            "$HERMES_DECISION_PID" "$ps_deadline" \
             && [ "$supervisor_pid" = "$PROCESS_PID" ] \
             && [ "$supervisor_start_token" = "ps:$PROCESS_START_TIME" ] \
             && [ "$service_nonce" = "$PROCESS_NONCE" ]; then
@@ -2016,13 +2121,14 @@ runtime_process_identity_action() {
 }
 
 runtime_launcher_group_is_empty() {
-    local pgid=$1
+    local pgid=$1 deadline=${2:-} timeout
     [ -x "$RUNTIME_PYTHON_BIN" ] \
         || die "runtime identity helper is unavailable: $RUNTIME_PYTHON_BIN"
+    timeout="$(bounded_ps_timeout_seconds "$deadline")" || return 5
     "$RUNTIME_PYTHON_BIN" \
         -m healthmes.hermes_runtime_supervisor \
         --runtime-process-group-pgid "$pgid" \
-        --runtime-process-timeout 1
+        --runtime-process-timeout "$timeout"
 }
 
 wait_for_decision_runtime_exit() {
@@ -2111,23 +2217,25 @@ stop_decision_launcher_without_budget() {
 }
 
 startup_lease_owner_identity_status() {
+    local deadline=${1:-}
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 5
     process_start_token_status \
         "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID" \
-        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN"
+        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN" \
+        "$deadline"
 }
 
 startup_lease_launcher_identity_status() {
+    local deadline=${1:-}
     local pid=$DECISION_RUNTIME_STARTUP_LEASE_PID status marker
     valid_managed_pid "$pid" || return 5
-    if probe_ps_value "$pid" pid; then
-        [ "$PROBED_PS_VALUE" = "$pid" ] || return 5
+    if load_process_snapshot "$pid" "$deadline"; then
+        :
     else
         status=$?
         [ "$status" -eq 3 ] && return 3
         return 5
     fi
-    load_process_snapshot "$pid" || return 5
     marker="healthmes_local.sh __service_runner $DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE "
     if [ "$SNAPSHOT_PID" = "$pid" ] \
         && [ "$SNAPSHOT_PGID" = "$pid" ] \
@@ -2169,7 +2277,7 @@ find_interrupted_decision_runtime_startup_record() {
 }
 
 recover_interrupted_decision_runtime_startup_record() {
-    local candidate generation owner_status record status
+    local deadline=${1:-} candidate generation owner_status record status
     local candidate_sha256
     find_interrupted_decision_runtime_startup_record || return $?
     candidate=$INTERRUPTED_DECISION_RUNTIME_RECORD
@@ -2179,7 +2287,7 @@ recover_interrupted_decision_runtime_startup_record() {
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
         || return 2
     generation="$(decision_runtime_startup_lease_generation)" || return 2
-    if startup_lease_owner_identity_status; then
+    if startup_lease_owner_identity_status "$deadline"; then
         return 3
     else
         owner_status=$?
@@ -2243,12 +2351,17 @@ clear_stale_startup_artifacts() {
 reconcile_stale_decision_runtime_startup() {
     local attempts=0 owner_status launcher_status group_status
     local expected_generation launcher_pid launcher_service_nonce
+    local recovery_deadline
+    recovery_deadline=$((
+        SECONDS + DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS
+    ))
 
     load_decision_runtime_startup_lease
     case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
     missing) return ;;
     invalid)
-        if recover_interrupted_decision_runtime_startup_record; then
+        if recover_interrupted_decision_runtime_startup_record \
+            "$recovery_deadline"; then
             info "restored an interrupted decision runtime startup lease record"
             load_decision_runtime_startup_lease
         else
@@ -2273,7 +2386,7 @@ reconcile_stale_decision_runtime_startup() {
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 0
 
     while [ "$attempts" -le "$DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS" ]; do
-        load_decision_runtime_stop_bounds
+        load_decision_runtime_stop_bounds "$recovery_deadline"
         if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
             startup_lease_matches_loaded_v3_budget \
                 || die "decision runtime stop budget does not match the startup lease generation"
@@ -2292,6 +2405,8 @@ reconcile_stale_decision_runtime_startup() {
         if [ "$attempts" -ge "$DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS" ]; then
             die "decision runtime startup lease did not become recoverable within the bounded grace; preserving it"
         fi
+        [ "$SECONDS" -lt "$recovery_deadline" ] \
+            || die "decision runtime startup lease did not become recoverable within the bounded grace; preserving it"
         "$SLEEP_BIN" 1
         attempts=$((attempts + 1))
         load_decision_runtime_startup_lease
@@ -2301,7 +2416,7 @@ reconcile_stale_decision_runtime_startup() {
             || die "decision runtime startup lease changed during bounded recovery; preserving runtime state"
     done
 
-    if startup_lease_owner_identity_status; then
+    if startup_lease_owner_identity_status "$recovery_deadline"; then
         die "decision runtime startup owner is still alive but its publication is incomplete; preserving the lease"
     else
         owner_status=$?
@@ -2309,7 +2424,7 @@ reconcile_stale_decision_runtime_startup() {
     [ "$owner_status" -eq 3 ] \
         || die "decision runtime startup owner identity is unknown; preserving the lease"
 
-    load_decision_runtime_stop_bounds
+    load_decision_runtime_stop_bounds "$recovery_deadline"
     if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
         startup_lease_matches_loaded_v3_budget \
             || die "decision runtime stop budget does not match the startup lease generation"
@@ -2331,7 +2446,7 @@ reconcile_stale_decision_runtime_startup() {
         return
     fi
 
-    if startup_lease_launcher_identity_status; then
+    if startup_lease_launcher_identity_status "$recovery_deadline"; then
         if [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
             load_process_identity "$HERMES_DECISION_PID" \
                 && [ "$PROCESS_PID" = "$launcher_pid" ] \
@@ -2359,7 +2474,8 @@ reconcile_stale_decision_runtime_startup() {
         ;;
     esac
 
-    if runtime_launcher_group_is_empty "$launcher_pid"; then
+    if runtime_launcher_group_is_empty \
+        "$launcher_pid" "$recovery_deadline"; then
         :
     else
         group_status=$?
@@ -2372,7 +2488,7 @@ reconcile_stale_decision_runtime_startup() {
             ;;
         esac
     fi
-    load_decision_runtime_stop_bounds
+    load_decision_runtime_stop_bounds "$recovery_deadline"
     if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
         startup_lease_matches_loaded_v3_budget \
             || die "late decision runtime stop budget does not match the startup lease generation"

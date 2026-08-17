@@ -26,6 +26,7 @@ from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeSupervisorConfig,
     _build_supervisor_server,
     _DarwinProcBsdInfo,
+    _exclusive_file_lock,
     _next_restart_backoff,
     _parse_pydantic_float,
     _probe_darwin_process_group_members,
@@ -1130,9 +1131,41 @@ async def test_leader_exit_before_first_snapshot_probes_empty_group(
 
     await process.aclose()
 
-    assert probes == [child.pid, child.pid]
+    assert probes == [child.pid] * 4
     assert process._process is None
     assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_single_empty_group_scan_is_not_treated_as_drained(
+    tmp_path: Path,
+) -> None:
+    member = _group_member(4242, "leader")
+    probes = 0
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            return frozenset()
+        return frozenset({member})
+
+    process = HermesRuntimeProcess(
+        _supervisor_config(tmp_path),
+        process_group_probe=probe,
+    )
+    process._child_pgid = member.pid
+    process._known_child_group_members = frozenset({member})
+
+    drained = await process._wait_for_child_group_exit(
+        deadline=asyncio.get_running_loop().time() + 0.2,
+    )
+
+    assert drained is False
+    assert probes >= 2
 
 
 @pytest.mark.asyncio
@@ -1858,6 +1891,29 @@ def test_runtime_launcher_group_probe_reports_nonempty_without_signalling(
     )
 
 
+def test_linux_launcher_group_probe_rechecks_transient_empty_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = _group_member(4242, "linux:12345")
+    snapshots = iter((frozenset(), frozenset({member})))
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "linux",
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_group_members",
+        lambda *_args: next(snapshots),
+    )
+
+    assert (
+        _run_runtime_process_group_probe(
+            pgid=4242,
+            timeout_seconds=1,
+        )
+        == 6
+    )
+
+
 def test_runtime_launcher_group_probe_fails_closed_on_unknown_state(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2404,6 +2460,149 @@ def test_publication_preserves_malformed_existing_shutdown_budget(
     assert path.read_bytes() == malformed
 
 
+@pytest.mark.parametrize(
+    "path_kind",
+    ("symlink", "fifo", "directory", "hardlink"),
+)
+def test_shutdown_budget_reader_rejects_unsafe_file_types(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    payload = b"version\t3\n"
+    if path_kind == "symlink":
+        source = tmp_path / "budget-source"
+        source.write_bytes(payload)
+        path.symlink_to(source)
+    elif path_kind == "fifo":
+        os.mkfifo(path)
+    elif path_kind == "directory":
+        path.mkdir()
+    else:
+        source = tmp_path / "budget-source"
+        source.write_bytes(payload)
+        os.link(source, path)
+
+    with pytest.raises(ValueError):
+        load_runtime_shutdown_budget(path)
+
+
+def test_shutdown_budget_reader_rejects_oversized_file_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x" * 1025)
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.read",
+        lambda *_args: pytest.fail(
+            "oversized shutdown budget must be rejected before reading"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="shutdown budget is invalid"):
+        load_runtime_shutdown_budget(path)
+
+
+def test_shutdown_budget_reader_rejects_fifo_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+    real_open = os.open
+
+    def guarded_open(
+        candidate: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if Path(candidate) == path:
+            pytest.fail("unsafe shutdown budget path must not be opened")
+        return real_open(candidate, flags, mode)
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.open",
+        guarded_open,
+    )
+
+    with pytest.raises(ValueError):
+        load_runtime_shutdown_budget(path)
+
+
+def test_shutdown_budget_reader_rejects_wrong_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"version\t3\n")
+    owner = os.geteuid()
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.geteuid",
+        lambda: owner + 1,
+    )
+
+    with pytest.raises(ValueError):
+        load_runtime_shutdown_budget(path)
+
+
+@pytest.mark.parametrize(
+    "path_kind",
+    ("symlink", "fifo", "hardlink"),
+)
+def test_shutdown_budget_lock_rejects_unsafe_file_types(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    source = tmp_path / "lock-source"
+    source.write_bytes(b"")
+    if path_kind == "symlink":
+        lock_path.symlink_to(source)
+    elif path_kind == "fifo":
+        os.mkfifo(lock_path)
+    else:
+        os.link(source, lock_path)
+
+    with pytest.raises(RuntimeError):
+        with _exclusive_file_lock(path):
+            pytest.fail("unsafe lock path must never be acquired")
+
+
+def test_shutdown_budget_lock_rejects_path_inode_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.write_bytes(b"")
+    real_lstat = os.lstat
+
+    def mismatched_lstat(candidate: os.PathLike[str] | str):
+        metadata = real_lstat(candidate)
+        if Path(candidate) != lock_path:
+            return metadata
+        fields = list(metadata)
+        fields[1] += 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.lstat",
+        mismatched_lstat,
+    )
+
+    with pytest.raises(RuntimeError):
+        with _exclusive_file_lock(path):
+            pytest.fail("mismatched lock inode must never be acquired")
+
+
 @pytest.mark.parametrize("version", (1, 2))
 def test_legacy_shutdown_budget_remains_readable_for_owner_protection(
     tmp_path: Path,
@@ -2553,12 +2752,12 @@ def test_publication_replaces_legacy_budget_only_after_owner_is_proved_gone(
     assert not path.exists()
 
 
-def test_publication_replaces_legacy_budget_after_proved_identity_mismatch(
+def test_publication_preserves_legacy_budget_after_identity_token_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "runtime" / "stop-budget"
-    _write_legacy_budget_owner(
+    original = _write_legacy_budget_owner(
         path,
         pid=os.getpid(),
         start_token="ps:Mon Aug 17 12:00:00 2026",
@@ -2574,11 +2773,15 @@ def test_publication_replaces_legacy_budget_after_proved_identity_mismatch(
         ),
     )
 
-    publication.publish()
+    with pytest.raises(
+        RuntimeError,
+        match="owner identity is unprovable",
+    ):
+        publication.publish()
 
-    assert load_runtime_shutdown_budget(path) == publication.record
+    assert path.read_bytes() == original
     publication.remove_if_owned()
-    assert not path.exists()
+    assert path.read_bytes() == original
 
 
 def test_publication_rejects_matching_live_legacy_budget_owner(
@@ -2611,6 +2814,45 @@ def test_publication_rejects_matching_live_legacy_budget_owner(
 
     assert path.read_bytes() == original
     publication.remove_if_owned()
+    assert path.read_bytes() == original
+
+
+def test_publication_preserves_native_owner_until_absence_is_proved(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
+    token_kind, _, token_value = supervisor.start_token.partition(":")
+    if token_kind == "linux":
+        changed_token = f"linux:{int(token_value) + 1}"
+    else:
+        seconds, microseconds = token_value.split(":", 1)
+        changed_token = (
+            f"darwin:{seconds}:{(int(microseconds) + 1) % 1_000_000:06d}"
+        )
+    existing = HermesRuntimeShutdownBudgetRecord(
+        drain_timeout_seconds=75,
+        launcher_pid=launcher.pid,
+        launcher_start_token=launcher.start_token,
+        launcher_service_nonce=launcher.service_nonce,
+        supervisor_pid=supervisor.pid,
+        supervisor_start_token=changed_token,
+    )
+    path.parent.mkdir(parents=True)
+    original = existing.to_bytes()
+    path.write_bytes(original)
+    publication = _new_shutdown_budget_publication(path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="owner disappearance is not proven",
+    ):
+        publication.publish()
+
     assert path.read_bytes() == original
 
 
