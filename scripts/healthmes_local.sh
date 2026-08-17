@@ -10,6 +10,7 @@ WORKER_PID="$RUNTIME_DIR/open-wearables-worker.pid"
 BEAT_PID="$RUNTIME_DIR/open-wearables-beat.pid"
 HERMES_DECISION_PID="$RUNTIME_DIR/hermes-decision.pid"
 HERMES_DECISION_VENV="$RUNTIME_DIR/hermes-decision-venv"
+HERMES_DECISION_STOP_BUDGET="$RUNTIME_DIR/hermes-decision-stop-budget"
 HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
@@ -27,7 +28,7 @@ KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
 SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
 BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
-AWK_BIN="${HEALTHMES_AWK_BIN:-awk}"
+MAX_DECISION_RUNTIME_DRAIN_SECONDS=315
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -211,45 +212,25 @@ signal_process_group() {
     "$KILL_BIN" -s "$signal" "-$pid"
 }
 
-bounded_timeout_seconds() {
-    local label=$1 value=$2 maximum=$3
-    "$AWK_BIN" -v label="$label" -v value="$value" -v maximum="$maximum" '
-        BEGIN {
-            valid = value ~ /^[0-9]+([.][0-9]+)?$/
-            if (!valid || value + 0 <= 0 || value + 0 > maximum) {
-                exit 1
-            }
-            rounded = int(value + 0)
-            if (rounded < value + 0) {
-                rounded += 1
-            }
-            print rounded
-        }
-    '
-}
-
 load_decision_runtime_stop_bounds() {
-    local response_timeout child_term_timeout child_kill_timeout
-    response_timeout="$(
-        bounded_timeout_seconds \
-            "decision response timeout" \
-            "${HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS:-120}" \
-            300
-    )" || die "decision response timeout must be within (0, 300] seconds"
-    child_term_timeout="$(
-        bounded_timeout_seconds \
-            "child TERM timeout" \
-            "${HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS:-10}" \
-            10
-    )" || die "child TERM timeout must be within (0, 10] seconds"
-    child_kill_timeout="$(
-        bounded_timeout_seconds \
-            "child KILL timeout" \
-            "${HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS:-5}" \
-            5
-    )" || die "child KILL timeout must be within (0, 5] seconds"
-    DECISION_RUNTIME_TERM_WAIT_SECONDS=$((response_timeout + child_term_timeout + child_kill_timeout))
-    DECISION_RUNTIME_KILL_WAIT_SECONDS=$child_kill_timeout
+    local saved_budget extra
+    DECISION_RUNTIME_TERM_WAIT_SECONDS=$MAX_DECISION_RUNTIME_DRAIN_SECONDS
+    DECISION_RUNTIME_KILL_WAIT_SECONDS=1
+    if [ ! -f "$HERMES_DECISION_STOP_BUDGET" ]; then
+        return 0
+    fi
+    {
+        IFS= read -r saved_budget \
+            || die "saved decision runtime stop budget is unreadable"
+        if IFS= read -r extra; then
+            die "saved decision runtime stop budget has trailing data"
+        fi
+    } <"$HERMES_DECISION_STOP_BUDGET"
+    [[ "$saved_budget" =~ ^[1-9][0-9]*$ ]] \
+        || die "saved decision runtime stop budget is invalid"
+    [ "$saved_budget" -le "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ] \
+        || die "saved decision runtime stop budget exceeds 315 seconds"
+    DECISION_RUNTIME_TERM_WAIT_SECONDS=$saved_budget
 }
 
 wait_for_process_exit() {
@@ -300,6 +281,7 @@ stop_decision_runtime() {
         "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
         "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
         false
+    rm -f "$HERMES_DECISION_STOP_BUDGET"
 }
 
 load_runtime_env() {
@@ -426,7 +408,8 @@ cmd_update() {
 }
 
 start_apps() {
-    local decision_home= quoted_home= quoted_vendor= decision_enabled=false
+    local decision_home= quoted_budget= quoted_home= quoted_vendor=
+    local decision_enabled=false
     load_runtime_env
     # Stop the old in-memory code before uv can replace the interpreter or
     # bootstrap can publish runtime intent for changed HealthMes sources.
@@ -445,6 +428,7 @@ start_apps() {
         [ -n "${HEALTHMES_DECISION_HERMES_PROFILE_PATH:-}" ] \
             || die "bootstrap did not configure the decision profile"
         decision_home="$(dirname "$HEALTHMES_DECISION_HERMES_PROFILE_PATH")"
+        printf -v quoted_budget '%q' "$HERMES_DECISION_STOP_BUDGET"
         printf -v quoted_home '%q' "$decision_home"
         printf -v quoted_vendor '%q' "$REPO_ROOT/vendor/hermes-agent"
     else
@@ -473,7 +457,7 @@ start_apps() {
     if [ "$decision_enabled" = true ]; then
         start_process "Hermes decision runtime" \
             "$HERMES_DECISION_PID" "$HERMES_DECISION_LOG" \
-            "exec env HERMES_HOME=$quoted_home uv run python -m healthmes.hermes_runtime_supervisor --hermes-home $quoted_home --vendor-root $quoted_vendor"
+            "exec env HERMES_HOME=$quoted_home uv run python -m healthmes.hermes_runtime_supervisor --hermes-home $quoted_home --vendor-root $quoted_vendor --shutdown-budget-path $quoted_budget"
         for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
             if curl --fail --silent --max-time 1 \
                 "http://127.0.0.1:${HEALTHMES_DECISION_RUNTIME_PORT:-8645}/healthmes/runtime-health" \

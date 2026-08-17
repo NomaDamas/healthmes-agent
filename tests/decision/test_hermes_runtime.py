@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,13 +53,19 @@ from healthmes.hermes_runtime_identity import (
 from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeProcess,
     HermesRuntimeResponseLease,
+    HermesRuntimeShutdownBudget,
     HermesRuntimeState,
     HermesRuntimeSupervisorConfig,
+    _build_supervisor_server,
     _ManagedStreamingResponse,
+    _ProcessGroupMember,
+    _proxy_timeout,
     _ProxyResponseResources,
     _stream_upstream_response,
     build_child_environment,
     create_supervisor_app,
+    load_runtime_shutdown_budget,
+    persist_runtime_shutdown_budget,
 )
 
 MODEL = "decision-model"
@@ -68,6 +75,20 @@ PUBLIC_ORIGIN = "http://127.0.0.1:8645"
 INTERNAL_ORIGIN = "http://127.0.0.1:8646"
 PROVIDER_ENV = {"OPENAI_API_KEY": "provider-secret"}
 EXPECTED_MCP_INVENTORY = expected_hermes_mcp_inventory()
+
+
+def _fake_leader_group(
+    pgid: int,
+    _timeout_seconds: float,
+) -> frozenset[_ProcessGroupMember]:
+    return frozenset(
+        {
+            _ProcessGroupMember(
+                pid=pgid,
+                start_token="fake-leader-start",
+            )
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -725,6 +746,7 @@ async def test_runtime_process_seals_manifest_before_child_launch(
             0,
             result=HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
         ),
+        process_group_probe=_fake_leader_group,
     )
     monkeypatch.setattr(
         process,
@@ -786,6 +808,7 @@ async def test_runtime_process_uses_the_manifest_venv_launcher_path(
             0,
             result=HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
         ),
+        process_group_probe=_fake_leader_group,
     )
     monkeypatch.setattr(
         process,
@@ -850,6 +873,7 @@ async def test_runtime_process_rejects_launcher_drift_during_startup(
             0,
             result=HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
         ),
+        process_group_probe=_fake_leader_group,
     )
     monkeypatch.setattr(
         process,
@@ -898,6 +922,12 @@ async def test_runtime_process_startup_fails_closed_on_live_inventory_drift(
         process._state = None
         process._launch_argv = None
 
+    async def fake_stop_child() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
     monkeypatch.setattr(
         asyncio,
         "create_subprocess_exec",
@@ -915,12 +945,14 @@ async def test_runtime_process_startup_fails_closed_on_live_inventory_drift(
             0,
             result=schema_digests,
         ),
+        process_group_probe=_fake_leader_group,
     )
     monkeypatch.setattr(
         process,
         "_wait_until_ready",
         fake_wait_until_ready,
     )
+    monkeypatch.setattr(process, "_stop_child", fake_stop_child)
     monkeypatch.setattr(process, "aclose", fake_aclose)
 
     with pytest.raises(
@@ -1190,6 +1222,7 @@ class _FakeController:
         self.revalidations = 0
         self.attestations = 0
         self.releases = 0
+        self.closing = False
 
     @property
     def state(self) -> HermesRuntimeState:
@@ -1222,8 +1255,125 @@ class _FakeController:
     async def start(self) -> None:
         return None
 
+    def begin_closing(self) -> None:
+        self.closing = True
+
     async def aclose(self) -> None:
+        self.begin_closing()
         return None
+
+
+def test_shutdown_budget_is_persisted_atomically_and_exactly(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    budget = HermesRuntimeShutdownBudget(
+        decision_timeout_seconds=60.25,
+        child_term_timeout_seconds=9.5,
+        child_kill_timeout_seconds=4.5,
+    )
+
+    persist_runtime_shutdown_budget(path, budget)
+
+    assert path.read_bytes() == b"75\n"
+    assert load_runtime_shutdown_budget(path) == 75
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_uvicorn_uses_the_exact_finite_runtime_drain_budget(
+    runtime_bundle: RuntimeBundle,
+) -> None:
+    controller = _FakeController(
+        HermesRuntimeState(
+            manifest=runtime_bundle.manifest,
+            attestation_key=runtime_bundle.key,
+            api_key=API_KEY,
+            mcp_inventory=EXPECTED_MCP_INVENTORY,
+        )
+    )
+    config = HermesRuntimeSupervisorConfig(
+        hermes_home=runtime_bundle.home,
+        manifest_path=runtime_bundle.manifest_path,
+        attestation_key_path=runtime_bundle.key_path,
+        vendor_root=runtime_bundle.vendor_root,
+        decision_timeout_seconds=60.25,
+        child_term_timeout_seconds=9.5,
+        child_kill_timeout_seconds=4.5,
+    )
+
+    server = _build_supervisor_server(controller, config)
+
+    assert config.shutdown_budget.drain_timeout_seconds == 75
+    assert server.config.timeout_graceful_shutdown == 75
+
+
+@pytest.mark.asyncio
+async def test_uvicorn_exit_blocks_new_leases_before_existing_lease_drains(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = HermesRuntimeSupervisorConfig(
+        hermes_home=runtime_bundle.home,
+        manifest_path=runtime_bundle.manifest_path,
+        attestation_key_path=runtime_bundle.key_path,
+        vendor_root=runtime_bundle.vendor_root,
+        decision_timeout_seconds=1,
+        child_term_timeout_seconds=0.1,
+        child_kill_timeout_seconds=0.1,
+    )
+    process = HermesRuntimeProcess(config)
+    child = SimpleNamespace(returncode=None)
+    state = HermesRuntimeState(
+        manifest=runtime_bundle.manifest,
+        attestation_key=runtime_bundle.key,
+        api_key=API_KEY,
+        mcp_inventory=EXPECTED_MCP_INVENTORY,
+    )
+    process._process = child
+    process._state = state
+    process._launch_argv = runtime_bundle.manifest.launch_argv
+    process._healthy = True
+    process._lifecycle_state = "running"
+
+    async def attest_pinned_generation(
+        *,
+        expected: HermesRuntimeState,
+        generation: int,
+    ) -> HermesRuntimeState:
+        assert generation == process._child_generation
+        return expected
+
+    async def stop_child() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
+    monkeypatch.setattr(
+        process,
+        "_attest_pinned_generation",
+        attest_pinned_generation,
+    )
+    monkeypatch.setattr(process, "_stop_child", stop_child)
+    active = await process.acquire_response_lease()
+    server = _build_supervisor_server(process, config)
+
+    server.handle_exit(signal.SIGTERM, None)
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_response_admission_closed",
+    ):
+        await process.acquire_response_lease()
+    assert process._process is child
+    assert not server._shutdown_coordinator.request_close().done()
+
+    await active.release()
+    await server._shutdown_coordinator.aclose()
+
+    assert process._lifecycle_state == "closed"
+    assert process._process is None
 
 
 def test_supervisor_exposes_only_bounded_runtime_ingress(
@@ -1509,4 +1659,108 @@ async def test_response_start_failure_closes_unstarted_proxy_resources() -> None
     assert client.closed.is_set()
     assert release_count == 1
     await resources.aclose()
+    assert release_count == 1
+
+
+def test_streaming_proxy_timeout_allows_silent_sse_reads() -> None:
+    streaming = _proxy_timeout(streaming=True)
+    regular = _proxy_timeout(streaming=False)
+
+    assert streaming.connect == 5
+    assert streaming.write == 5
+    assert streaming.pool == 5
+    assert streaming.read is None
+    assert regular.read == 5
+
+
+@pytest.mark.asyncio
+async def test_response_deadline_bounds_upstream_connection_and_releases_lease(
+    runtime_bundle: RuntimeBundle,
+) -> None:
+    upstream_started = asyncio.Event()
+    never_respond = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        upstream_started.set()
+        await never_respond.wait()
+        raise AssertionError("deadline must cancel the upstream request")
+
+    controller = _FakeController(
+        HermesRuntimeState(
+            manifest=runtime_bundle.manifest,
+            attestation_key=runtime_bundle.key,
+            api_key=API_KEY,
+            mcp_inventory=EXPECTED_MCP_INVENTORY,
+        )
+    )
+    app = create_supervisor_app(
+        controller,
+        proxy_transport=httpx.MockTransport(handler),
+        response_timeout_seconds=0.01,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://healthmes.test",
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"stream": True, "store": False},
+        )
+
+    assert upstream_started.is_set()
+    assert response.status_code == 504
+    assert controller.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_silent_sse_obeys_overall_deadline_and_closes_resources() -> None:
+    stream_started = asyncio.Event()
+    stream_closed = asyncio.Event()
+    client_closed = asyncio.Event()
+    release_count = 0
+
+    class SilentStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            stream_started.set()
+            await asyncio.Event().wait()
+            yield b"unreachable"
+
+        async def aclose(self) -> None:
+            stream_closed.set()
+
+    class ConnectedRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    class ClosingClient:
+        async def aclose(self) -> None:
+            client_closed.set()
+
+    async def release() -> None:
+        nonlocal release_count
+        release_count += 1
+
+    resources = _ProxyResponseResources(
+        client=ClosingClient(),  # type: ignore[arg-type]
+        response_lease=HermesRuntimeResponseLease(
+            state=SimpleNamespace(),  # type: ignore[arg-type]
+            generation=1,
+            _release_callback=release,
+        ),
+        upstream=httpx.Response(200, stream=SilentStream()),
+    )
+    stream = _stream_upstream_response(
+        request=ConnectedRequest(),  # type: ignore[arg-type]
+        resources=resources,
+        deadline=asyncio.get_running_loop().time() + 0.01,
+    )
+
+    with pytest.raises(TimeoutError):
+        await anext(stream)
+
+    assert stream_started.is_set()
+    assert stream_closed.is_set()
+    assert client_closed.is_set()
     assert release_count == 1

@@ -10,6 +10,10 @@ import json
 import math
 import os
 import signal
+import subprocess
+import sys
+import tempfile
+import time
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -19,6 +23,7 @@ from collections.abc import (
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
@@ -28,6 +33,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from pydantic import TypeAdapter, ValidationError
 from starlette.types import Receive, Scope, Send
 
 from healthmes.hermes_mcp_inventory import (
@@ -73,7 +79,47 @@ _LifecycleState = Literal[
 ]
 _MAX_CHILD_TERM_TIMEOUT_SECONDS = 10.0
 _MAX_CHILD_KILL_TIMEOUT_SECONDS = 5.0
+_MAX_DECISION_TIMEOUT_SECONDS = 300.0
+_MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
+_PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
+_PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
+_PROXY_CONNECT_TIMEOUT_SECONDS = 5.0
+_PROXY_READ_TIMEOUT_SECONDS = 5.0
+_PROXY_WRITE_TIMEOUT_SECONDS = 5.0
+_PROXY_POOL_TIMEOUT_SECONDS = 5.0
+_PYDANTIC_FLOAT = TypeAdapter(float)
 _SUPERVISOR_BOOT_IDENTITY = capture_runtime_boot_identity()
+
+
+@dataclass(frozen=True, slots=True)
+class HermesRuntimeShutdownBudget:
+    """Validated wall-clock budget shared by every runtime shutdown layer."""
+
+    decision_timeout_seconds: float
+    child_term_timeout_seconds: float
+    child_kill_timeout_seconds: float
+
+    @property
+    def drain_timeout_seconds(self) -> int:
+        return math.ceil(
+            self.decision_timeout_seconds
+            + self.child_term_timeout_seconds
+            + self.child_kill_timeout_seconds
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessGroupMember:
+    """Stable OS identity used to avoid signaling a reused process group."""
+
+    pid: int
+    start_token: str
+
+
+ProcessGroupProbe = Callable[
+    [int, float],
+    frozenset[_ProcessGroupMember],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +140,10 @@ class HermesRuntimeSupervisorConfig:
     restart_backoff_initial_seconds: float = 0.25
     restart_backoff_max_seconds: float = 5
     max_concurrent_responses: int = 8
+    decision_timeout_seconds: float = 60.0
     child_term_timeout_seconds: float = _MAX_CHILD_TERM_TIMEOUT_SECONDS
     child_kill_timeout_seconds: float = _MAX_CHILD_KILL_TIMEOUT_SECONDS
+    shutdown_budget_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65_535:
@@ -118,6 +166,7 @@ class HermesRuntimeSupervisorConfig:
             ),
             ("child TERM timeout", self.child_term_timeout_seconds),
             ("child KILL timeout", self.child_kill_timeout_seconds),
+            ("decision timeout", self.decision_timeout_seconds),
         )
         for label, value in durations:
             if not math.isfinite(value) or value <= 0:
@@ -140,6 +189,8 @@ class HermesRuntimeSupervisorConfig:
             > _MAX_CHILD_KILL_TIMEOUT_SECONDS
         ):
             raise ValueError("child KILL timeout must be at most 5 seconds")
+        if self.decision_timeout_seconds > _MAX_DECISION_TIMEOUT_SECONDS:
+            raise ValueError("decision timeout must be at most 300 seconds")
         if (
             self.restart_backoff_max_seconds
             < self.restart_backoff_initial_seconds
@@ -147,6 +198,14 @@ class HermesRuntimeSupervisorConfig:
             raise ValueError(
                 "restart backoff max must be at least the initial delay"
             )
+
+    @property
+    def shutdown_budget(self) -> HermesRuntimeShutdownBudget:
+        return HermesRuntimeShutdownBudget(
+            decision_timeout_seconds=self.decision_timeout_seconds,
+            child_term_timeout_seconds=self.child_term_timeout_seconds,
+            child_kill_timeout_seconds=self.child_kill_timeout_seconds,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,8 +344,52 @@ class RuntimeController(Protocol):
     async def start(self) -> None:
         """Start and verify the dedicated child."""
 
+    def begin_closing(self) -> None:
+        """Reject new response leases before asynchronous shutdown."""
+
     async def aclose(self) -> None:
         """Stop the dedicated child."""
+
+
+class _RuntimeShutdownCoordinator:
+    """Start controller shutdown once and let lifespan await the same task."""
+
+    def __init__(self, controller: RuntimeController) -> None:
+        self._controller = controller
+        self._close_task: asyncio.Task[None] | None = None
+
+    def request_close(self) -> asyncio.Task[None]:
+        begin_closing = getattr(self._controller, "begin_closing", None)
+        if callable(begin_closing):
+            begin_closing()
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(
+                self._controller.aclose(),
+                name="healthmes-hermes-uvicorn-controller-close",
+            )
+            self._close_task = task
+        return task
+
+    async def aclose(self) -> None:
+        await asyncio.shield(self.request_close())
+
+
+class _HermesRuntimeUvicornServer(uvicorn.Server):
+    """Close lease admission as soon as Uvicorn receives an exit signal."""
+
+    def __init__(
+        self,
+        config: uvicorn.Config,
+        *,
+        shutdown_coordinator: _RuntimeShutdownCoordinator,
+    ) -> None:
+        super().__init__(config)
+        self._shutdown_coordinator = shutdown_coordinator
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        self._shutdown_coordinator.request_close()
+        super().handle_exit(sig, frame)
 
 
 class HermesRuntimeProcess:
@@ -299,6 +402,7 @@ class HermesRuntimeProcess:
         environ: Mapping[str, str] | None = None,
         mcp_inventory_probe: McpInventoryProbe | None = None,
         boot_identity: HermesRuntimeBootIdentity | None = None,
+        process_group_probe: ProcessGroupProbe | None = None,
     ) -> None:
         self._config = config
         self._environ = dict(os.environ if environ is None else environ)
@@ -310,8 +414,17 @@ class HermesRuntimeProcess:
             if boot_identity is None
             else boot_identity
         )
+        self._process_group_probe = (
+            _probe_process_group_members
+            if process_group_probe is None
+            else process_group_probe
+        )
         self._state: HermesRuntimeState | None = None
         self._process: asyncio.subprocess.Process | None = None
+        self._child_pgid: int | None = None
+        self._known_child_group_members: frozenset[_ProcessGroupMember] = (
+            frozenset()
+        )
         self._launch_argv: tuple[str, ...] | None = None
         self._child_generation = 0
         self._healthy = False
@@ -324,6 +437,7 @@ class HermesRuntimeProcess:
         self._child_writer_active = False
         self._close_lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
+        self._response_admission_closed = False
 
     @property
     def state(self) -> HermesRuntimeState:
@@ -424,7 +538,10 @@ class HermesRuntimeProcess:
 
         async with self._child_condition:
             while True:
-                if self._lifecycle_state != "running":
+                if (
+                    self._response_admission_closed
+                    or self._lifecycle_state != "running"
+                ):
                     raise HermesRuntimeIdentityError(
                         "hermes_runtime_response_admission_closed"
                     )
@@ -461,6 +578,11 @@ class HermesRuntimeProcess:
         except BaseException:
             await lease.release()
             raise
+
+    def begin_closing(self) -> None:
+        """Synchronously reject new leases before async shutdown begins."""
+
+        self._response_admission_closed = True
 
     def _response_lease_available(self) -> bool:
         return (
@@ -597,8 +719,11 @@ class HermesRuntimeProcess:
             start_new_session=True,
         )
         self._process = process
+        self._child_pgid = process.pid
+        self._known_child_group_members = frozenset()
         self._launch_argv = launch_manifest.launch_argv
         try:
+            self._refresh_child_group_identity(require_leader=True)
             await self._wait_until_ready(
                 manifest=manifest,
                 api_key=api_key,
@@ -773,7 +898,10 @@ class HermesRuntimeProcess:
             return False
         if response.status_code != 200:
             return False
-        return self._validate_bound_state(expected=state) == state
+        if self._validate_bound_state(expected=state) != state:
+            return False
+        self._refresh_child_group_identity(require_leader=True)
+        return True
 
     async def _wait_until_ready(
         self,
@@ -840,48 +968,187 @@ class HermesRuntimeProcess:
                 "hermes_runtime_mcp_inventory_unavailable"
             ) from exc
 
+    def _refresh_child_group_identity(
+        self,
+        *,
+        require_leader: bool,
+        timeout_seconds: float = _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+    ) -> frozenset[_ProcessGroupMember]:
+        pgid = self._child_pgid
+        if pgid is None:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_missing"
+            )
+        current = self._process_group_probe(pgid, timeout_seconds)
+        if not current:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_not_running"
+            )
+        known = self._known_child_group_members
+        if known and current.isdisjoint(known):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_changed"
+            )
+        if require_leader and not any(
+            member.pid == pgid for member in current
+        ):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_leader_changed"
+            )
+        self._known_child_group_members = known | current
+        return current
+
+    def _owned_child_group_is_running(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        pgid = self._child_pgid
+        if pgid is None:
+            return False
+        current = self._process_group_probe(pgid, timeout_seconds)
+        if not current:
+            return False
+        known = self._known_child_group_members
+        if not known:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_missing"
+            )
+        if current.isdisjoint(known):
+            # Never report a reused numeric PGID as a successfully drained
+            # child, and never signal the unrelated replacement group.
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_changed"
+            )
+        self._known_child_group_members = known | current
+        return True
+
+    def _signal_owned_child_group(
+        self,
+        sent: signal.Signals,
+        *,
+        deadline: float,
+    ) -> bool:
+        pgid = self._child_pgid
+        if pgid is None:
+            return False
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        if not self._owned_child_group_is_running(
+            timeout_seconds=min(
+                _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                remaining,
+            )
+        ):
+            return False
+        try:
+            os.killpg(pgid, sent)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise RuntimeError(
+                "hermes_runtime_child_group_signal_denied"
+            ) from exc
+        return True
+
+    async def _wait_for_child_group_exit(self, *, deadline: float) -> bool:
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            if not self._owned_child_group_is_running(
+                timeout_seconds=min(
+                    _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                    remaining,
+                )
+            ):
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(
+                min(_PROCESS_GROUP_POLL_INTERVAL_SECONDS, remaining)
+            )
+
+    async def _wait_for_child_reap(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        deadline: float,
+    ) -> None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise RuntimeError("hermes_runtime_child_kill_timeout")
+        try:
+            await asyncio.wait_for(process.wait(), timeout=remaining)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "hermes_runtime_child_kill_timeout"
+            ) from exc
+
     async def _stop_child(self) -> None:
         process = self._process
         self._state = None
         self._launch_argv = None
         self._healthy = False
         if process is None:
+            self._child_pgid = None
+            self._known_child_group_members = frozenset()
             return
-        if process.returncode is not None:
-            if self._process is process:
-                self._process = None
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            if self._process is process:
-                self._process = None
-            return
-        try:
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=self._config.child_term_timeout_seconds,
-            )
-        except TimeoutError:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                if self._process is process:
-                    self._process = None
-                return
-            try:
-                await asyncio.wait_for(
-                    process.wait(),
-                    timeout=self._config.child_kill_timeout_seconds,
+        if self._child_pgid is None:
+            self._child_pgid = process.pid
+        loop = asyncio.get_running_loop()
+        term_deadline = (
+            loop.time() + self._config.child_term_timeout_seconds
+        )
+        if process.returncode is None:
+            remaining = term_deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "hermes_runtime_child_term_timeout"
                 )
-            except TimeoutError as exc:
+            self._refresh_child_group_identity(
+                require_leader=True,
+                timeout_seconds=min(
+                    _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                    remaining,
+                ),
+            )
+
+        self._signal_owned_child_group(
+            signal.SIGTERM,
+            deadline=term_deadline,
+        )
+        group_gone = await self._wait_for_child_group_exit(
+            deadline=term_deadline
+        )
+        kill_deadline = (
+            loop.time() + self._config.child_kill_timeout_seconds
+        )
+        if not group_gone:
+            self._signal_owned_child_group(
+                signal.SIGKILL,
+                deadline=kill_deadline,
+            )
+            if not await self._wait_for_child_group_exit(
+                deadline=kill_deadline
+            ):
                 raise RuntimeError(
                     "hermes_runtime_child_kill_timeout"
-                ) from exc
+                )
+        await self._wait_for_child_reap(
+            process,
+            deadline=kill_deadline,
+        )
         if self._process is process:
             self._process = None
+        self._child_pgid = None
+        self._known_child_group_members = frozenset()
 
     async def aclose(self) -> None:
+        self.begin_closing()
         async with self._close_lock:
             async with self._lifecycle_lock:
                 if self._lifecycle_state == "closed":
@@ -951,6 +1218,108 @@ async def _await_teardown_task(
                 current.uncancel()
             if task.done():
                 return caller_cancelled, task.result()
+
+
+def _probe_process_group_members(
+    pgid: int,
+    timeout_seconds: float,
+) -> frozenset[_ProcessGroupMember]:
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise RuntimeError(
+            "hermes_runtime_child_group_probe_timeout"
+        )
+    if sys.platform.startswith("linux") and Path("/proc/self/stat").exists():
+        return _probe_linux_process_group_members(
+            pgid,
+            timeout_seconds,
+        )
+    return _probe_ps_process_group_members(pgid, timeout_seconds)
+
+
+def _probe_linux_process_group_members(
+    pgid: int,
+    timeout_seconds: float,
+) -> frozenset[_ProcessGroupMember]:
+    members: set[_ProcessGroupMember] = set()
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        entries = Path("/proc").iterdir()
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "hermes_runtime_child_group_probe_timeout"
+                )
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="utf-8")
+                closing_parenthesis = stat.rfind(")")
+                fields = stat[closing_parenthesis + 1 :].split()
+                pid = int(entry.name)
+                process_group = int(fields[2])
+                start_ticks = fields[19]
+            except (IndexError, OSError, ValueError):
+                continue
+            if process_group == pgid:
+                members.add(
+                    _ProcessGroupMember(
+                        pid=pid,
+                        start_token=f"linux:{start_ticks}",
+                    )
+                )
+    except OSError as exc:
+        raise RuntimeError(
+            "hermes_runtime_child_group_probe_failed"
+        ) from exc
+    return frozenset(members)
+
+
+def _probe_ps_process_group_members(
+    pgid: int,
+    timeout_seconds: float,
+) -> frozenset[_ProcessGroupMember]:
+    environment = dict(os.environ)
+    environment["LC_ALL"] = "C"
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,pgid=,lstart="],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "hermes_runtime_child_group_probe_timeout"
+        ) from exc
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "hermes_runtime_child_group_probe_failed"
+        ) from exc
+    members: set[_ProcessGroupMember] = set()
+    for line in result.stdout.splitlines():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "hermes_runtime_child_group_probe_timeout"
+            )
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid = int(fields[0])
+            process_group = int(fields[1])
+        except ValueError:
+            continue
+        if process_group == pgid:
+            members.add(
+                _ProcessGroupMember(
+                    pid=pid,
+                    start_token=f"ps:{fields[2]}",
+                )
+            )
+    return frozenset(members)
 
 
 def _next_restart_backoff(
@@ -1030,8 +1399,22 @@ def create_supervisor_app(
     controller: RuntimeController,
     *,
     proxy_transport: httpx.AsyncBaseTransport | None = None,
+    response_timeout_seconds: float = _MAX_DECISION_TIMEOUT_SECONDS,
+    shutdown_coordinator: _RuntimeShutdownCoordinator | None = None,
 ) -> FastAPI:
     """Expose only attestation and the Responses/session endpoints."""
+
+    if (
+        not math.isfinite(response_timeout_seconds)
+        or response_timeout_seconds <= 0
+        or response_timeout_seconds > _MAX_DECISION_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "response timeout must be finite and within (0, 300]"
+        )
+    coordinator = shutdown_coordinator or _RuntimeShutdownCoordinator(
+        controller
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -1047,7 +1430,7 @@ def create_supervisor_app(
         try:
             yield
         finally:
-            await controller.aclose()
+            await coordinator.aclose()
 
     app = FastAPI(
         title="HealthMes Hermes Decision Runtime",
@@ -1132,9 +1515,19 @@ def create_supervisor_app(
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        deadline = (
+            asyncio.get_running_loop().time()
+            + response_timeout_seconds
+        )
         lease: HermesRuntimeResponseLease | None = None
         try:
-            lease = await controller.acquire_response_lease()
+            async with asyncio.timeout_at(deadline):
+                lease = await controller.acquire_response_lease()
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="runtime response deadline exceeded",
+            ) from exc
         except HermesRuntimeIdentityError as exc:
             raise HTTPException(
                 status_code=503,
@@ -1149,6 +1542,7 @@ def create_supervisor_app(
                 accept="text/event-stream",
                 state=lease.state,
                 response_lease=lease,
+                deadline=deadline,
             )
         except BaseException:
             await lease.release()
@@ -1178,6 +1572,7 @@ def create_supervisor_app(
         accept: str = "application/json",
         state: HermesRuntimeState | None = None,
         response_lease: HermesRuntimeResponseLease | None = None,
+        deadline: float | None = None,
     ) -> StreamingResponse:
         if state is None:
             try:
@@ -1205,6 +1600,7 @@ def create_supervisor_app(
                 base_url=state.manifest.internal_origin,
                 follow_redirects=False,
                 transport=proxy_transport,
+                timeout=_proxy_timeout(streaming=response_lease is not None),
             )
             resources = _ProxyResponseResources(
                 client=client,
@@ -1216,7 +1612,17 @@ def create_supervisor_app(
                 content=body,
                 headers=headers,
             )
-            upstream = await client.send(upstream_request, stream=True)
+            if deadline is None:
+                upstream = await client.send(
+                    upstream_request,
+                    stream=True,
+                )
+            else:
+                async with asyncio.timeout_at(deadline):
+                    upstream = await client.send(
+                        upstream_request,
+                        stream=True,
+                    )
             resources.upstream = upstream
             response_headers = {
                 key: value
@@ -1228,11 +1634,21 @@ def create_supervisor_app(
                 _stream_upstream_response(
                     request=request,
                     resources=resources,
+                    deadline=deadline,
                 ),
                 status_code=upstream.status_code,
                 headers=response_headers,
                 resources=resources,
             )
+        except TimeoutError as exc:
+            if resources is not None:
+                await resources.aclose()
+            elif response_lease is not None:
+                await response_lease.release()
+            raise HTTPException(
+                status_code=504,
+                detail="runtime response deadline exceeded",
+            ) from exc
         except httpx.HTTPError as exc:
             if resources is not None:
                 await resources.aclose()
@@ -1256,6 +1672,7 @@ async def _stream_upstream_response(
     *,
     request: Request,
     resources: _ProxyResponseResources,
+    deadline: float | None = None,
 ) -> AsyncIterator[bytes]:
     """Close Hermes immediately when the HealthMes caller goes away."""
 
@@ -1263,13 +1680,46 @@ async def _stream_upstream_response(
     if upstream is None:
         raise RuntimeError("Hermes upstream response is unavailable")
     try:
-        async for chunk in upstream.aiter_raw():
-            if await request.is_disconnected():
-                return
-            yield chunk
+        if deadline is None:
+            async for chunk in _connected_upstream_chunks(
+                request=request,
+                upstream=upstream,
+            ):
+                yield chunk
+        else:
+            async with asyncio.timeout_at(deadline):
+                async for chunk in _connected_upstream_chunks(
+                    request=request,
+                    upstream=upstream,
+                ):
+                    yield chunk
     finally:
         # Hermes maps this upstream disconnect to agent.interrupt().
         await resources.aclose()
+
+
+async def _connected_upstream_chunks(
+    *,
+    request: Request,
+    upstream: httpx.Response,
+) -> AsyncIterator[bytes]:
+    async for chunk in upstream.aiter_raw():
+        if await request.is_disconnected():
+            return
+        yield chunk
+
+
+def _proxy_timeout(*, streaming: bool) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
+        read=(
+            None
+            if streaming
+            else _PROXY_READ_TIMEOUT_SECONDS
+        ),
+        write=_PROXY_WRITE_TIMEOUT_SECONDS,
+        pool=_PROXY_POOL_TIMEOUT_SECONDS,
+    )
 
 
 async def _bounded_body(request: Request) -> bytes:
@@ -1316,6 +1766,92 @@ def _require_api_key(request: Request, expected: str) -> None:
 
     if not hmac.compare_digest(supplied[7:].strip(), expected):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _parse_pydantic_float(value: object, *, label: str) -> float:
+    try:
+        return _PYDANTIC_FLOAT.validate_python(value)
+    except ValidationError as exc:
+        raise ValueError(f"{label} must be a valid number") from exc
+
+
+def persist_runtime_shutdown_budget(
+    path: Path,
+    budget: HermesRuntimeShutdownBudget,
+) -> None:
+    """Atomically save the exact integer budget used by this supervisor."""
+
+    drain_timeout = budget.drain_timeout_seconds
+    if not 1 <= drain_timeout <= _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS:
+        raise ValueError("runtime drain timeout is outside the supported bound")
+    target = path.expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        dir=target.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(f"{drain_timeout}\n".encode("ascii"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(target)
+        target.chmod(0o600)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def load_runtime_shutdown_budget(path: Path) -> int:
+    """Read a canonical saved drain bound without consulting mutable env."""
+
+    try:
+        payload = path.expanduser().read_bytes()
+    except OSError as exc:
+        raise ValueError("runtime shutdown budget is unavailable") from exc
+    if (
+        len(payload) > 8
+        or not payload.endswith(b"\n")
+        or not payload[:-1].isdigit()
+        or payload[:1] == b"0"
+    ):
+        raise ValueError("runtime shutdown budget is invalid")
+    value = int(payload)
+    if not 1 <= value <= _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS:
+        raise ValueError("runtime shutdown budget is outside the supported bound")
+    return value
+
+
+def _build_supervisor_server(
+    controller: RuntimeController,
+    config: HermesRuntimeSupervisorConfig,
+) -> _HermesRuntimeUvicornServer:
+    coordinator = _RuntimeShutdownCoordinator(controller)
+    app = create_supervisor_app(
+        controller,
+        response_timeout_seconds=config.decision_timeout_seconds,
+        shutdown_coordinator=coordinator,
+    )
+    server_config = uvicorn.Config(
+        app,
+        host=config.host,
+        port=config.port,
+        access_log=False,
+        server_header=False,
+        timeout_graceful_shutdown=(
+            config.shutdown_budget.drain_timeout_seconds
+        ),
+    )
+    return _HermesRuntimeUvicornServer(
+        server_config,
+        shutdown_coordinator=coordinator,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1422,23 +1958,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--decision-timeout",
+        default=os.environ.get(
+            "HEALTHMES_DECISION_TIMEOUT_SECONDS",
+            "60",
+        ),
+    )
+    parser.add_argument(
         "--child-term-timeout",
-        type=float,
-        default=float(
-            os.environ.get(
-                "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS",
-                str(_MAX_CHILD_TERM_TIMEOUT_SECONDS),
-            )
+        default=os.environ.get(
+            "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS",
+            str(_MAX_CHILD_TERM_TIMEOUT_SECONDS),
         ),
     )
     parser.add_argument(
         "--child-kill-timeout",
-        type=float,
-        default=float(
-            os.environ.get(
-                "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS",
-                str(_MAX_CHILD_KILL_TIMEOUT_SECONDS),
-            )
+        default=os.environ.get(
+            "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS",
+            str(_MAX_CHILD_KILL_TIMEOUT_SECONDS),
+        ),
+    )
+    parser.add_argument(
+        "--shutdown-budget-path",
+        default=os.environ.get(
+            "HEALTHMES_DECISION_RUNTIME_SHUTDOWN_BUDGET_PATH",
         ),
     )
     return parser.parse_args(argv)
@@ -1448,6 +1991,18 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     home = Path(args.hermes_home).expanduser().resolve()
     try:
+        decision_timeout = _parse_pydantic_float(
+            args.decision_timeout,
+            label="decision timeout",
+        )
+        child_term_timeout = _parse_pydantic_float(
+            args.child_term_timeout,
+            label="child TERM timeout",
+        )
+        child_kill_timeout = _parse_pydantic_float(
+            args.child_kill_timeout,
+            label="child KILL timeout",
+        )
         config = HermesRuntimeSupervisorConfig(
             hermes_home=home,
             manifest_path=(
@@ -1471,19 +2026,24 @@ def main(argv: list[str] | None = None) -> None:
             restart_backoff_initial_seconds=args.restart_backoff_initial,
             restart_backoff_max_seconds=args.restart_backoff_max,
             max_concurrent_responses=args.max_concurrent_responses,
-            child_term_timeout_seconds=args.child_term_timeout,
-            child_kill_timeout_seconds=args.child_kill_timeout,
+            decision_timeout_seconds=decision_timeout,
+            child_term_timeout_seconds=child_term_timeout,
+            child_kill_timeout_seconds=child_kill_timeout,
+            shutdown_budget_path=(
+                Path(args.shutdown_budget_path).expanduser()
+                if args.shutdown_budget_path
+                else None
+            ),
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     controller = HermesRuntimeProcess(config)
-    uvicorn.run(
-        create_supervisor_app(controller),
-        host=config.host,
-        port=config.port,
-        access_log=False,
-        server_header=False,
-    )
+    if config.shutdown_budget_path is not None:
+        persist_runtime_shutdown_budget(
+            config.shutdown_budget_path,
+            config.shutdown_budget,
+        )
+    _build_supervisor_server(controller, config).run()
 
 
 if __name__ == "__main__":

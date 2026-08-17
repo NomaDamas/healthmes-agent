@@ -302,6 +302,8 @@ def test_install_registers_keepalive_login_launch_agent() -> None:
     assert "<key>LC_ALL</key>" in template
     assert template.count("<string>en_US.UTF-8</string>") == 2
     assert "<string>daemon</string>" in template
+    plist = plistlib.loads(LAUNCH_AGENT_TEMPLATE.read_bytes())
+    assert plist["ExitTimeOut"] == 360
 
 
 def test_launch_agent_enables_scheduler_for_background_calendar_polling() -> None:
@@ -326,6 +328,8 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert "uv sync --frozen --no-dev" in start_body
     assert "scripts/bootstrap.py" in start_body
     assert "healthmes.hermes_runtime_supervisor" in start_body
+    assert "--shutdown-budget-path" in start_body
+    assert '"$HERMES_DECISION_STOP_BUDGET"' in start_body
     assert start_body.index("stop_decision_runtime") < start_body.index(
         "uv sync --frozen --no-dev"
     )
@@ -481,14 +485,19 @@ def test_decision_stop_uses_full_bound_and_never_orphans_child_group(
         runtime,
         process_name="hermes-decision",
     )
+    (runtime / "hermes-decision-stop-budget").write_text(
+        "3\n",
+        encoding="utf-8",
+    )
     result = _run_local_runtime(
         harness,
         "stop",
         check=False,
         env_overrides={
+            "HEALTHMES_DECISION_TIMEOUT_SECONDS": "300",
             "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS": "1",
-            "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS": "1",
-            "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS": "1",
+            "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS": "10",
+            "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS": "5",
         },
     )
 
@@ -500,6 +509,37 @@ def test_decision_stop_uses_full_bound_and_never_orphans_child_group(
     assert "refusing to orphan its child process group" in result.stderr
     assert pid_file.exists()
     assert pid_file.with_suffix(".pid.identity").exists()
+    assert (runtime / "hermes-decision-stop-budget").exists()
+
+
+def test_decision_stop_uses_saved_startup_budget_not_mutable_env(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    budget = runtime / "hermes-decision-stop-budget"
+    budget.write_text("2\n", encoding="utf-8")
+
+    _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="exit",
+        env_overrides={
+            "HEALTHMES_DECISION_TIMEOUT_SECONDS": "300",
+            "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS": "1",
+            "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS": "10",
+            "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS": "5",
+        },
+    )
+
+    events = _event_lines(harness)
+    assert "kill -s TERM -4242" in events
+    assert events.count("sleep 1") == 0
+    assert not budget.exists()
 
 
 def test_generic_stop_bounds_term_and_post_kill_wait(

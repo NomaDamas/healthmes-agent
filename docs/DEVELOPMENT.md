@@ -228,17 +228,21 @@ on startup. A normal bootstrap rerun deliberately preserves an equivalent
 seal, so image replacement without the explicit refresh fails closed instead
 of silently trusting different runtime files. The explicit 360-second stop
 timeout matches the service's `stop_grace_period` and exceeds the maximum
-supported 300-second decision response plus the supervisor's bounded
+supported 300-second overall decision wall clock plus the supervisor's bounded
 10-second child TERM wait and 5-second post-SIGKILL wait.
 
 The canonical native launcher also drains the old decision supervisor before
-running the dedicated Hermes `uv sync` or bootstrap. Its TERM budget is the
-configured decision response timeout (rounded up, maximum 300 seconds) plus
-the configured child TERM and KILL waits (maximum 10 and 5 seconds). The
-decision supervisor owns a separate child process group, so the launcher
-refuses to SIGKILL only the outer service group if that complete drain fails;
-it retains the process identity and exits non-zero instead of orphaning the
-child or reporting a false stop.
+running the dedicated Hermes `uv sync` or bootstrap. At supervisor startup,
+the validated `HEALTHMES_DECISION_TIMEOUT_SECONDS` wall clock plus the child
+TERM and KILL waits is rounded up once and atomically saved in
+`data/runtime/hermes-decision-stop-budget`. Stop and update consume that saved
+value rather than reparsing mutable environment files; a legacy runtime with
+no saved value receives the conservative 315-second maximum. The decision
+supervisor owns a separate child process group, so the launcher refuses to
+SIGKILL only the outer service group if that complete drain fails; it retains
+the process identity and exits non-zero instead of orphaning the child or
+reporting a false stop. The login LaunchAgent's 360-second `ExitTimeOut` is
+longer than every valid saved drain budget.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general
@@ -290,6 +294,15 @@ child, preventing starvation and mid-response generation switches. Response
 resources and leases are released exactly once on authentication drift,
 upstream connection failure, ASGI response-start failure, caller disconnect,
 cancellation, or normal stream completion.
+
+On SIGTERM, the Uvicorn signal hook closes response admission immediately.
+Existing generation leases may drain for the same finite saved budget before
+the child group is terminated. The supervisor verifies the complete process
+group, not only its leader, and escalates remaining descendants to SIGKILL
+within the bounded cleanup window. Its Hermes-facing HTTPX stream uses
+explicit 5-second connect/write/pool bounds with no per-chunk read timeout, so
+a valid SSE turn may be silent for more than five seconds while the overall
+decision wall clock remains authoritative.
 
 Running the gateway natively (verified live on macOS with dummy creds):
 

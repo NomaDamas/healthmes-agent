@@ -316,10 +316,20 @@ uv run python scripts/bootstrap.py --mode docker --refresh-runtime-seal
 docker compose up -d --build --force-recreate hermes-decision
 ```
 
-`360`초는 최대 decision 응답 300초, child SIGTERM 대기 10초,
-SIGKILL 이후 process reap 대기 5초를 모두 포함하는 명시적 상한보다 길다.
-Native launcher도 같은 순서로 기존 supervisor를 먼저 drain한 뒤에만
-`uv sync`와 bootstrap을 실행한다.
+`360`초는 `HEALTHMES_DECISION_TIMEOUT_SECONDS`의 최대 전체 판단 시간 300초,
+child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5초를
+모두 포함하는 315초 상한보다 길다. Supervisor는 시작할 때 검증한 이 값을
+`data/runtime/hermes-decision-stop-budget`에 저장한다. Native stop/update는
+변경될 수 있는 현재 환경 변수를 다시 계산하지 않고 실행 중 runtime이 저장한
+값을 사용하며, 파일이 없는 구버전 runtime에는 안전한 최대 315초를 적용한다.
+LaunchAgent의 `ExitTimeOut`은 360초다.
+
+SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
+lease만 drain한다. 종료 시 leader process만 기다리지 않고 전체 child process
+group을 확인하며 남은 descendant는 제한 시간 안에 SIGKILL한다. Hermes SSE
+proxy는 connect/write/pool에는 각각 명시적인 5초 제한을 두되 read timeout은
+없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만 전체 decision wall-clock
+deadline은 그대로 적용된다.
 
 ### Legacy cron migration
 

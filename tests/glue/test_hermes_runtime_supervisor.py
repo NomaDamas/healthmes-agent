@@ -17,7 +17,10 @@ from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeProcess,
     HermesRuntimeSupervisorConfig,
     _next_restart_backoff,
+    _parse_pydantic_float,
+    _ProcessGroupMember,
     create_supervisor_app,
+    load_runtime_shutdown_budget,
 )
 from healthmes.hermes_runtime_supervisor import main as supervisor_main
 
@@ -38,6 +41,10 @@ def _supervisor_config(
         restart_backoff_initial_seconds=0.005,
         restart_backoff_max_seconds=0.01,
     )
+
+
+def _group_member(pid: int, token: str) -> _ProcessGroupMember:
+    return _ProcessGroupMember(pid=pid, start_token=token)
 
 
 def _install_lifecycle_harness(
@@ -642,12 +649,21 @@ async def test_child_kill_wait_is_bounded_and_close_reports_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    group = {_group_member(4242, "leader")}
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        return frozenset(group)
+
     process = HermesRuntimeProcess(
         replace(
             _supervisor_config(tmp_path),
             child_term_timeout_seconds=0.001,
             child_kill_timeout_seconds=0.001,
-        )
+        ),
+        process_group_probe=probe,
     )
     never_exits = asyncio.Event()
 
@@ -670,9 +686,15 @@ async def test_child_kill_wait_is_bounded_and_close_reports_failure(
     process._healthy = True
     process._lifecycle_state = "running"
     signals: list[tuple[int, signal.Signals]] = []
+
+    def kill_group(pid: int, sent: signal.Signals) -> None:
+        signals.append((pid, sent))
+        if sent == signal.SIGKILL:
+            group.clear()
+
     monkeypatch.setattr(
         "healthmes.hermes_runtime_supervisor.os.killpg",
-        lambda pid, sent: signals.append((pid, sent)),
+        kill_group,
     )
 
     with pytest.raises(
@@ -685,9 +707,164 @@ async def test_child_kill_wait_is_bounded_and_close_reports_failure(
         (4242, signal.SIGTERM),
         (4242, signal.SIGKILL),
     ]
-    assert child.wait_calls == 2
+    assert child.wait_calls == 1
     assert process._process is child
     assert process._state is None
+    assert process._lifecycle_state == "close_failed"
+
+
+@pytest.mark.asyncio
+async def test_sigterm_checks_descendants_and_sigkills_the_remaining_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = _group_member(4242, "leader")
+    descendant = _group_member(4243, "descendant")
+    group = {leader, descendant}
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        return frozenset(group)
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.001,
+            child_kill_timeout_seconds=0.01,
+        ),
+        process_group_probe=probe,
+    )
+
+    class Child:
+        returncode: int | None = None
+        pid = 4242
+
+        async def wait(self) -> int:
+            return 0
+
+    child = Child()
+    process._process = child  # type: ignore[assignment]
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[signal.Signals] = []
+
+    def kill_group(_pid: int, sent: signal.Signals) -> None:
+        signals.append(sent)
+        if sent == signal.SIGTERM:
+            child.returncode = 0
+            group.discard(leader)
+        else:
+            group.clear()
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        kill_group,
+    )
+
+    await process.aclose()
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert group == set()
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_reused_process_group_is_never_signaled_or_reported_drained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = {_group_member(4242, "original")}
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        return frozenset(group)
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.01,
+            child_kill_timeout_seconds=0.01,
+        ),
+        process_group_probe=probe,
+    )
+    child = SimpleNamespace(returncode=None, pid=4242)
+    process._process = child
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[signal.Signals] = []
+
+    def replace_after_term(_pid: int, sent: signal.Signals) -> None:
+        signals.append(sent)
+        if sent == signal.SIGTERM:
+            group.clear()
+            group.add(_group_member(4242, "reused"))
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        replace_after_term,
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_group_identity_changed",
+    ):
+        await process.aclose()
+
+    assert signals == [signal.SIGTERM]
+    assert process._process is child
+    assert process._lifecycle_state == "close_failed"
+
+
+@pytest.mark.asyncio
+async def test_post_sigkill_group_verification_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = _group_member(4242, "leader")
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        return frozenset({member})
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.001,
+            child_kill_timeout_seconds=0.001,
+        ),
+        process_group_probe=probe,
+    )
+    child = SimpleNamespace(returncode=None, pid=4242)
+    process._process = child
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[signal.Signals] = []
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        lambda _pid, sent: signals.append(sent),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="hermes_runtime_child_kill_timeout",
+    ):
+        await asyncio.wait_for(process.aclose(), timeout=1)
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process._process is child
     assert process._lifecycle_state == "close_failed"
 
 
@@ -709,6 +886,7 @@ def test_restart_backoff_is_exponential_and_capped() -> None:
         "restart_backoff_max_seconds",
         "child_term_timeout_seconds",
         "child_kill_timeout_seconds",
+        "decision_timeout_seconds",
     ),
 )
 @pytest.mark.parametrize(
@@ -739,6 +917,7 @@ def test_supervisor_config_rejects_nonfinite_lifecycle_values(
         "restart_backoff_max_seconds",
         "child_term_timeout_seconds",
         "child_kill_timeout_seconds",
+        "decision_timeout_seconds",
     ),
 )
 @pytest.mark.parametrize("value", (0, -1))
@@ -781,6 +960,11 @@ def test_supervisor_config_rejects_inverted_restart_backoff(
             5.001,
             "child KILL timeout must be at most 5 seconds",
         ),
+        (
+            "decision_timeout_seconds",
+            300.001,
+            "decision timeout must be at most 300 seconds",
+        ),
     ),
 )
 def test_supervisor_config_rejects_child_shutdown_timeout_above_bound(
@@ -807,6 +991,7 @@ def test_supervisor_config_rejects_child_shutdown_timeout_above_bound(
         "--restart-backoff-max",
         "--child-term-timeout",
         "--child-kill-timeout",
+        "--decision-timeout",
     ),
 )
 @pytest.mark.parametrize(
@@ -841,6 +1026,7 @@ def test_supervisor_cli_rejects_nonfinite_lifecycle_values(
         "--restart-backoff-max",
         "--child-term-timeout",
         "--child-kill-timeout",
+        "--decision-timeout",
     ),
 )
 @pytest.mark.parametrize("value", ("0", "-1"))
@@ -928,6 +1114,11 @@ def test_supervisor_cli_rejects_inverted_restart_backoff(
             "5.001",
             "child KILL timeout must be at most 5 seconds",
         ),
+        (
+            "--decision-timeout",
+            "300.001",
+            "decision timeout must be at most 300 seconds",
+        ),
     ),
 )
 def test_supervisor_cli_rejects_child_shutdown_timeout_above_bound(
@@ -946,6 +1137,72 @@ def test_supervisor_cli_rejects_child_shutdown_timeout_above_bound(
                 f"{flag}={value}",
             ]
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("60", 60.0),
+        ("60.0", 60.0),
+        ("6e1", 60.0),
+        ("+60", 60.0),
+        (" 60 ", 60.0),
+        ("1_0", 10.0),
+    ),
+)
+def test_shutdown_budget_numbers_follow_pydantic_numeric_formats(
+    value: str,
+    expected: float,
+) -> None:
+    assert _parse_pydantic_float(value, label="test") == expected
+
+
+def test_supervisor_persists_the_validated_startup_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget_path = tmp_path / "runtime" / "stop-budget"
+    captured: list[HermesRuntimeSupervisorConfig] = []
+
+    class FakeServer:
+        def run(self) -> None:
+            return None
+
+    def build_server(
+        _controller: HermesRuntimeProcess,
+        config: HermesRuntimeSupervisorConfig,
+    ) -> FakeServer:
+        captured.append(config)
+        return FakeServer()
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._build_supervisor_server",
+        build_server,
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS",
+        "1",
+    )
+
+    supervisor_main(
+        [
+            "--hermes-home",
+            str(tmp_path / "home"),
+            "--vendor-root",
+            str(tmp_path / "vendor"),
+            "--decision-timeout=6e1",
+            "--child-term-timeout=1_0",
+            "--child-kill-timeout=+5",
+            "--shutdown-budget-path",
+            str(budget_path),
+        ]
+    )
+
+    assert len(captured) == 1
+    assert captured[0].decision_timeout_seconds == 60
+    assert captured[0].shutdown_budget.drain_timeout_seconds == 75
+    assert load_runtime_shutdown_budget(budget_path) == 75
+    assert budget_path.read_bytes() == b"75\n"
 
 
 def test_parent_health_remains_observable_while_runtime_recovers() -> None:
