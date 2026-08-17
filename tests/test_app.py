@@ -715,6 +715,11 @@ def test_mandatory_receipt_maintenance_commits_bounded_progress(
     )
     database = init_engine(configured)
     Base.metadata.create_all(database)
+    original_busy_timeout_ms = 17_321
+    with database.connect() as connection:
+        connection.exec_driver_sql(
+            f"PRAGMA busy_timeout={original_busy_timeout_ms}"
+        )
     now = datetime.now(UTC)
     try:
         with store_session.session_scope() as session:
@@ -776,6 +781,12 @@ def test_mandatory_receipt_maintenance_commits_bounded_progress(
                 )
                 .limit(1)
             ) is None
+        with database.connect() as connection:
+            assert int(
+                connection.exec_driver_sql(
+                    "PRAGMA busy_timeout"
+                ).scalar_one()
+            ) == original_busy_timeout_ms
     finally:
         dispose_engine()
 

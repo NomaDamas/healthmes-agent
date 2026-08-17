@@ -1319,6 +1319,33 @@ async def test_persisted_receipt_replay_uses_stored_request_timezone(
     assert len(engine.replay_requests) == 1
     assert engine.replay_requests[0].timezone == "Asia/Seoul"
 
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        payload = copy.deepcopy(row.decision_payload)
+        payload["request"]["timezone"] = "Mars/Nowhere"
+        row.decision_payload = payload
+        row.decision_payload_digest = _payload_digest(payload)
+        session.commit()
+
+    corrupt_replay_service = HealthMesDecisionService(
+        settings=original_settings.model_copy(
+            update={"timezone": "UTC"}
+        ),
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: factory,
+        clock=lambda: NOW + timedelta(minutes=10),
+    )
+    rejected = await corrupt_replay_service.ask_wellness(submission)
+
+    assert rejected.status is DecisionStatus.FAILED
+    assert rejected.persistence_status is PersistenceStatus.FAILED
+    assert rejected.limitations == [
+        "decision_record_contract_invalid"
+    ]
+    assert engine.replay_requests[-1].timezone == "UTC"
+
 
 def test_compact_record_omits_prompt_caller_and_tool_payload(
     persistence,

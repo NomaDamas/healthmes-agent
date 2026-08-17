@@ -9,13 +9,14 @@ mcp_tool.py), and the in-process APScheduler loops.
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from threading import Event
 
 from fastapi import FastAPI
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from starlette.types import Receive, Scope, Send
@@ -187,6 +188,25 @@ def _receipt_maintenance_database_timeout(exc: DBAPIError) -> bool:
     return "database is locked" in str(original).casefold()
 
 
+@contextmanager
+def _receipt_maintenance_connection_guard(
+    session: Session,
+) -> Iterator[None]:
+    """Keep SQLite's connection-local timeout state checked out to cleanup."""
+
+    bind = session.get_bind()
+    if bind.dialect.name != "sqlite" or isinstance(bind, Connection):
+        yield
+        return
+    original_bind = session.bind
+    with bind.connect() as connection:
+        session.bind = connection
+        try:
+            yield
+        finally:
+            session.bind = original_bind
+
+
 def _run_receipt_maintenance_transaction[Result](
     operation: Callable[[Session], Result],
     *,
@@ -202,37 +222,41 @@ def _run_receipt_maintenance_transaction[Result](
     ):
         session = get_session_factory()()
         try:
-            lock_activity_write_plane(
-                session,
-                timeout_seconds=_receipt_maintenance_remaining(
-                    deadline
-                ),
-                cancellation_check=cancellation_check,
-            )
-            _configure_receipt_maintenance_database_timeout(
-                session,
-                deadline=deadline,
-            )
-            result = operation(session)
-            cancellation_check()
-            _configure_receipt_maintenance_database_timeout(
-                session,
-                deadline=deadline,
-            )
-            session.commit()
-            return result
-        except DBAPIError as exc:
-            session.rollback()
-            if _receipt_maintenance_database_timeout(exc):
-                raise TimeoutError(
-                    "timed out waiting for decision receipt maintenance"
-                ) from exc
-            raise
-        except BaseException:
-            session.rollback()
-            raise
+            with _receipt_maintenance_connection_guard(session):
+                try:
+                    lock_activity_write_plane(
+                        session,
+                        timeout_seconds=_receipt_maintenance_remaining(
+                            deadline
+                        ),
+                        cancellation_check=cancellation_check,
+                    )
+                    _configure_receipt_maintenance_database_timeout(
+                        session,
+                        deadline=deadline,
+                    )
+                    result = operation(session)
+                    cancellation_check()
+                    _configure_receipt_maintenance_database_timeout(
+                        session,
+                        deadline=deadline,
+                    )
+                    session.commit()
+                    return result
+                except DBAPIError as exc:
+                    session.rollback()
+                    if _receipt_maintenance_database_timeout(exc):
+                        raise TimeoutError(
+                            "timed out waiting for decision receipt "
+                            "maintenance"
+                        ) from exc
+                    raise
+                except BaseException:
+                    session.rollback()
+                    raise
+                finally:
+                    _restore_receipt_sqlite_busy_timeout(session)
         finally:
-            _restore_receipt_sqlite_busy_timeout(session)
             session.close()
 
 

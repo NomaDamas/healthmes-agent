@@ -22,6 +22,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    field_validator,
     model_validator,
 )
 from sqlalchemy import event, or_, select, text
@@ -72,6 +73,7 @@ from healthmes.storage import (
     purge_expired_decision_records,
 )
 from healthmes.store import DecisionKind, DecisionRecord
+from healthmes.timezones import parse_timezone
 from healthmes.timing import steady_time
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
@@ -233,6 +235,17 @@ class _StoredDecisionRequestMetadata(BaseModel):
     timezone: str = Field(min_length=1, max_length=64)
     execution_scope: str = Field(min_length=1, max_length=16)
     requested_privacy_level: str = Field(min_length=1, max_length=32)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            parse_timezone(value)
+        except ValueError as exc:
+            raise ValueError(
+                "stored timezone must be a valid IANA name or UTC offset"
+            ) from exc
+        return value
 
 
 class _StoredSourceAttestation(BaseModel):

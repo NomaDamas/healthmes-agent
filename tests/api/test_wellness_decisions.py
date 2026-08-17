@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -80,6 +81,17 @@ TOKEN = "wellness-decision-api-token"
 MODEL = "test-model"
 PROVIDER = "test-provider"
 FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
+
+
+def _payload_digest(payload: dict) -> str:
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _bearer(
@@ -1595,6 +1607,71 @@ def test_decision_recovery_rejects_corrupt_persisted_payload(
         response = client.get(
             f"/v1/wellness-decisions/{request_id}"
         )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_service_unavailable",
+        "message": (
+            "The stored wellness decision could not be revalidated."
+        ),
+        "detail": {
+            "reason_codes": ["decision_record_contract_invalid"],
+        },
+    }
+
+
+def test_decision_recovery_rejects_digest_valid_invalid_timezone(
+    settings,
+) -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+
+    def resolve_policy(_request):
+        return ContextAccessPolicy(
+            owner_principal_id="rest-owner",
+            grants=(DomainAccessGrant(domain="nutrition"),),
+        )
+
+    configured = settings.model_copy(
+        update={"decision_owner_principal_id": "rest-owner"}
+    )
+    app = create_app(configured, decision_clock=lambda: now)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        (
+            request,
+            persisted,
+            finalizer,
+            _registry,
+            _event_id,
+        ) = _persist_source_backed_recovery_decision(
+            now=now,
+            policy_resolver=resolve_policy,
+        )
+        app.state.decision_recovery_finalizer = finalizer
+        try:
+            with session_scope() as session:
+                row = session.get(
+                    DecisionRecord,
+                    persisted.decision_record_id,
+                )
+                assert row is not None
+                assert row.decision_payload is not None
+                payload = json.loads(
+                    json.dumps(row.decision_payload)
+                )
+                payload["request"]["timezone"] = "Mars/Nowhere"
+                row.decision_payload = payload
+                row.decision_payload_digest = _payload_digest(payload)
+
+            response = client.get(
+                f"/v1/wellness-decisions/{request.request_id}"
+            )
+        finally:
+            finalizer.close()
+            app.state.decision_recovery_finalizer = None
 
     assert response.status_code == 503
     assert response.json()["error"] == {
