@@ -73,8 +73,9 @@ def _write_decision_stop_budget(
     supervisor_start_token: str = "darwin:1786915200:123456",
     publication_instance_nonce: str = "publication123",
     version: int = 3,
+    filename: str = "hermes-decision-stop-budget",
 ) -> Path:
-    path = runtime_dir / "hermes-decision-stop-budget"
+    path = runtime_dir / filename
     if version == 3:
         fields = (
             f"version\t{version}",
@@ -195,6 +196,20 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
                 rm -f "$FAKE_PROCESS_STATE/alive"
                 rm -f "$FAKE_SUPERVISOR_STATE/alive"
                 ;;
+            late-budget-fail)
+                cp "$FAKE_LATE_STOP_BUDGET" "$FAKE_STOP_BUDGET"
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                ;;
+            late-budget-success)
+                cp "$FAKE_LATE_STOP_BUDGET" "$FAKE_STOP_BUDGET"
+                rm -f "$FAKE_STOP_BUDGET"
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                ;;
+            wrapper-exit-only)
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                ;;
             reuse)
                 printf '%s\\n' "Mon Aug  3 12:01:00 2026" \
                     >"$FAKE_PROCESS_STATE/start_time"
@@ -230,6 +245,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         pid=
         token=
         timeout=
+        group_pgid=
         while [ "$#" -gt 0 ]; do
             case "$1" in
             --runtime-process-action)
@@ -248,9 +264,41 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
                 shift
                 timeout=${1:-}
                 ;;
+            --runtime-process-group-pgid)
+                shift
+                group_pgid=${1:-}
+                ;;
             esac
             shift
         done
+        if [ -n "$group_pgid" ]; then
+            [ "$group_pgid" = "$(<"$FAKE_PROCESS_STATE/pgid")" ] || exit 5
+            case "${FAKE_GROUP_PROBE_BEHAVIOR:-auto}" in
+            empty)
+                exit 0
+                ;;
+            nonempty)
+                exit 6
+                ;;
+            publish-late-nonempty)
+                cp "$FAKE_LATE_STOP_BUDGET" "$FAKE_STOP_BUDGET"
+                exit 6
+                ;;
+            unknown)
+                exit 5
+                ;;
+            auto)
+                if [ -f "$FAKE_PROCESS_STATE/alive" ] \
+                    || [ -f "$FAKE_SUPERVISOR_STATE/alive" ]; then
+                    exit 6
+                fi
+                exit 0
+                ;;
+            *)
+                exit 5
+                ;;
+            esac
+        fi
         if [ ! -f "$FAKE_SUPERVISOR_STATE/alive" ]; then
             [ "$action" = "wait" ] && exit 0
             exit 3
@@ -272,6 +320,24 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
                 ;;
             supervisor-exit-only)
                 rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                ;;
+            replace-generation)
+                cp "$FAKE_LATE_STOP_BUDGET" "$FAKE_STOP_BUDGET"
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                ;;
+            replace-launcher-metadata)
+                rm -f "$FAKE_STOP_BUDGET"
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                printf '%s\\n' "5252" >"$FAKE_DECISION_PID"
+                {
+                    printf 'pid\\t5252\\n'
+                    printf 'pgid\\t5252\\n'
+                    printf 'executable\\t/bin/bash\\n'
+                    printf 'start_time\\tMon Aug  3 12:10:00 2026\\n'
+                    printf 'nonce\\tcompeting-generation\\n'
+                } >"$FAKE_DECISION_IDENTITY"
                 ;;
             esac
         fi
@@ -315,6 +381,15 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         "FAKE_SUPERVISOR_STATE": str(supervisor_state),
         "FAKE_STOP_BUDGET": str(
             runtime / "hermes-decision-stop-budget"
+        ),
+        "FAKE_DECISION_PID": str(
+            runtime / "hermes-decision.pid"
+        ),
+        "FAKE_DECISION_IDENTITY": str(
+            runtime / "hermes-decision.pid.identity"
+        ),
+        "FAKE_LATE_STOP_BUDGET": str(
+            process_state / "late-stop-budget"
         ),
         "HEALTHMES_DEV_MAC_SCRIPT": str(dev_mac),
         "HEALTHMES_LAUNCHCTL_BIN": str(fake_bin / "launchctl"),
@@ -466,6 +541,9 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert 'UV_PROJECT_ENVIRONMENT="$HERMES_DECISION_VENV"' in start_body
     assert "uv sync --frozen --no-dev" in start_body
     assert "scripts/bootstrap.py" in start_body
+    assert '[ -x "$RUNTIME_PYTHON_BIN" ]' in start_body
+    assert 'printf -v quoted_python \'%q\' "$RUNTIME_PYTHON_BIN"' in start_body
+    assert "uv run python -m healthmes.hermes_runtime_supervisor" not in start_body
     assert "healthmes.hermes_runtime_supervisor" in start_body
     assert "--shutdown-budget-path" in start_body
     assert '"$HERMES_DECISION_STOP_BUDGET"' in start_body
@@ -530,7 +608,7 @@ def test_local_runtime_supervises_and_stops_decision_process() -> None:
     assert '"$HERMES_DECISION_PID"' in daemon_body
     assert "decision_runtime_configured" in daemon_body
     assert "stop_decision_runtime" in stop_body
-    assert 'service_status "Hermes decision runtime"' in status_body
+    assert "decision_runtime_status" in status_body
 
 
 def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:
@@ -589,17 +667,25 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
     )
 
     assert (
-        "Legacy v1/v2 and missing records use the conservative 315-second "
-        "drain plus that margin; malformed or stale records fail closed "
-        "without signalling."
+        "before the ASGI lifespan can launch Hermes in its separate process "
+        "group"
+    ) in development
+    assert (
+        "Missing-budget stop reports success only after that proof"
+        in development
+    )
+    assert (
+        "Empty, partial, extra-column, duplicate, non-numeric, "
+        "stderr-bearing, or libproc-inconsistent output is unknown and "
+        "fails closed"
     ) in development
     assert (
         "native stop reports success only if the exact v3 record is gone"
         in development
     )
     assert (
-        "unreadable `/proc` process records, and unprovable identities fail "
-        "closed"
+        "unreadable `/proc` process records, malformed Darwin process "
+        "listings, and unprovable identities fail closed"
     ) in development
 
 
@@ -760,6 +846,261 @@ def test_decision_stop_rejects_exit_without_descendant_cleanup_proof(
     assert not (Path(harness["process_state"]) / "alive").exists()
 
 
+def test_decision_stop_rejects_v3_generation_change_during_cleanup(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+        publication_instance_nonce="initial-publication",
+    )
+    replacement = _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        publication_instance_nonce="replacement-publication",
+        filename="late-stop-budget",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "FAKE_SUPERVISOR_TERM_BEHAVIOR": "replace-generation",
+        },
+    )
+
+    published_budget = runtime / "hermes-decision-stop-budget"
+    assert result.returncode != 0
+    assert "budget generation changed during stop" in result.stderr
+    assert published_budget.read_bytes() == replacement.read_bytes()
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+
+
+def test_decision_stop_rechecks_budget_published_during_startup_stop(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    process_state = Path(harness["process_state"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    late_budget = _write_decision_stop_budget(
+        process_state,
+        drain_timeout_seconds=2,
+        filename="late-stop-budget",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="late-budget-fail",
+        check=False,
+    )
+
+    published_budget = runtime / "hermes-decision-stop-budget"
+    assert result.returncode != 0
+    assert "without proving Hermes descendant cleanup" in result.stderr
+    assert published_budget.read_bytes() == late_budget.read_bytes()
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+    assert "kill -s TERM -4242" in _event_lines(harness)
+
+
+def test_decision_stop_accepts_late_budget_only_after_cleanup_removes_it(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        filename="late-stop-budget",
+    )
+
+    _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="late-budget-success",
+    )
+
+    assert not (runtime / "hermes-decision-stop-budget").exists()
+    assert not (runtime / "hermes-decision.pid").exists()
+    assert not (runtime / "hermes-decision.pid.identity").exists()
+
+
+def test_decision_stop_hands_off_budget_published_during_group_probe(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        filename="late-stop-budget",
+    )
+
+    _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="wrapper-exit-only",
+        env_overrides={
+            "FAKE_GROUP_PROBE_BEHAVIOR": "publish-late-nonempty",
+            "FAKE_SUPERVISOR_TERM_BEHAVIOR": "exit",
+        },
+    )
+
+    events = _event_lines(harness)
+    assert "kill -s TERM -4242" in events
+    assert any(
+        "--runtime-process-group-pgid 4242" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert not (runtime / "hermes-decision-stop-budget").exists()
+    assert not (runtime / "hermes-decision.pid").exists()
+    assert not (runtime / "hermes-decision.pid.identity").exists()
+
+
+def test_decision_stop_preserves_late_budget_when_handoff_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    late_budget = _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        filename="late-stop-budget",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="wrapper-exit-only",
+        check=False,
+        env_overrides={
+            "FAKE_GROUP_PROBE_BEHAVIOR": "publish-late-nonempty",
+            "FAKE_SUPERVISOR_TERM_BEHAVIOR": "exit",
+            "FAKE_SUPERVISOR_CLEANUP_PROOF": "retain",
+        },
+    )
+
+    published_budget = runtime / "hermes-decision-stop-budget"
+    assert result.returncode != 0
+    assert "without proving Hermes descendant cleanup" in result.stderr
+    assert published_budget.read_bytes() == late_budget.read_bytes()
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+
+
+def test_decision_stop_fails_closed_when_group_survives_without_budget(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="wrapper-exit-only",
+        check=False,
+        env_overrides={
+            "FAKE_GROUP_PROBE_BEHAVIOR": "nonempty",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "untracked descendants" in result.stderr
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+
+
+def test_decision_stop_fails_closed_when_group_probe_is_unknown(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="wrapper-exit-only",
+        check=False,
+        env_overrides={
+            "FAKE_GROUP_PROBE_BEHAVIOR": "unknown",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "cleanup cannot be proven" in result.stderr
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+
+
+def test_decision_stop_rejects_late_budget_from_another_launcher_generation(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        nonce="other-generation",
+        filename="late-stop-budget",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="late-budget-fail",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "generation changed during launcher handoff" in result.stderr
+    assert (runtime / "hermes-decision-stop-budget").exists()
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+
+
 def test_decision_stop_ignores_budget_from_another_service_identity(
     tmp_path: Path,
 ) -> None:
@@ -871,11 +1212,43 @@ def test_decision_stop_recovers_when_wrapper_metadata_is_missing(
     )
 
     events = _event_lines(harness)
-    assert "managed launcher metadata missing" in result.stdout
+    assert "managed launcher unavailable" in result.stdout
     assert any(
         "--runtime-process-action signal" in event
         for event in events
         if event.startswith("runtime-python ")
+    )
+    assert not budget.exists()
+
+
+def test_decision_stop_never_deletes_a_competing_launcher_generation(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "FAKE_SUPERVISOR_TERM_BEHAVIOR": (
+                "replace-launcher-metadata"
+            ),
+        },
+    )
+
+    pid_file = runtime / "hermes-decision.pid"
+    identity_file = runtime / "hermes-decision.pid.identity"
+    assert result.returncode != 0
+    assert "metadata ownership changed" in result.stderr
+    assert pid_file.read_text(encoding="utf-8") == "5252\n"
+    assert "competing-generation" in identity_file.read_text(
+        encoding="utf-8"
     )
     assert not budget.exists()
 
@@ -965,7 +1338,10 @@ def test_generic_stop_bounds_term_and_post_kill_wait(
 @pytest.mark.parametrize("pid", ("0", "1"))
 def test_stop_rejects_system_pids_without_inspection_or_signal(tmp_path: Path, pid: str) -> None:
     harness = _local_runtime_harness(tmp_path)
-    _write_process_identity(Path(harness["runtime"]), pid=pid)
+    _write_process_identity(
+        Path(harness["runtime"]),
+        pid=pid,
+    )
 
     _run_local_runtime(harness, "stop")
 
@@ -1018,10 +1394,79 @@ def test_status_never_signals_a_stale_process(tmp_path: Path) -> None:
         "Mon Aug  3 12:05:00 2026\n", encoding="utf-8"
     )
 
-    _run_local_runtime(harness, "status")
+    result = _run_local_runtime(harness, "status")
 
     assert pid_file.exists()
     assert pid_file.with_suffix(".pid.identity").exists()
+    assert "HealthMes: stopped" in result.stdout
+    assert not any(event.startswith("kill ") for event in _event_lines(harness))
+
+
+def test_status_preserves_stale_decision_launcher_metadata_as_unknown(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    (Path(harness["process_state"]) / "start_time").write_text(
+        "Mon Aug  3 12:05:00 2026\n",
+        encoding="utf-8",
+    )
+
+    result = _run_local_runtime(harness, "status")
+
+    assert (
+        "Hermes decision runtime: unknown "
+        "(launcher metadata remains without a v3 shutdown record)"
+        in result.stdout
+    )
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+    assert not any(event.startswith("kill ") for event in _event_lines(harness))
+
+
+def test_status_recovers_live_supervisor_when_wrapper_metadata_is_missing(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+
+    result = _run_local_runtime(harness, "status")
+
+    assert (
+        "Hermes decision runtime: running "
+        "(verified supervisor pid 4343; wrapper metadata unavailable)"
+        in result.stdout
+    )
+    assert budget.exists()
+    assert not any(event.startswith("kill ") for event in _event_lines(harness))
+
+
+def test_status_reports_dead_supervisor_cleanup_record_without_signalling(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+    (Path(harness["supervisor_state"]) / "alive").unlink()
+
+    result = _run_local_runtime(harness, "status")
+
+    assert (
+        "Hermes decision runtime: stopped with incomplete cleanup record"
+        in result.stdout
+    )
+    assert budget.exists()
     assert not any(event.startswith("kill ") for event in _event_lines(harness))
 
 

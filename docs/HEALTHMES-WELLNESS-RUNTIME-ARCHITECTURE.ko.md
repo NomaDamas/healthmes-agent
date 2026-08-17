@@ -323,8 +323,8 @@ docker compose up -d --build --force-recreate hermes-decision
 
 `360`초는 `HEALTHMES_DECISION_TIMEOUT_SECONDS`의 최대 전체 판단 시간 300초,
 child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5초를
-모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하지만
-Uvicorn이 실제 serving startup을 완료한 뒤에만
+모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하고,
+ASGI lifespan이 별도 process group의 Hermes child를 시작하기 전에
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain
 시간뿐 아니라 관리 중인 Bash launcher의 PID, OS start token, service nonce,
 실제 Python supervisor의 PID와 native OS start token, 각 publication마다 새로
@@ -343,6 +343,14 @@ reap 확인에는 최대 1초만 더 사용한다. 매초 새 interpreter를 띄
 helper startup overhead가 반복되지 않는다. Compose와 LaunchAgent의 outer
 timeout은 모두 360초로 유지한다.
 
+Native launcher는 중간 `uv run` wrapper 없이 HealthMes root venv의 Python으로
+supervisor를 직접 실행한다. 전용 Hermes decision venv의 Python은 manifest에
+고정된 Hermes child 실행에만 사용한다. 시작 도중 budget이 아직 보이지 않으면
+stop은 Bash launcher의 정확한 세대를 보존하고 TERM 직전, launcher 종료 뒤,
+process-group 확인 뒤에 budget을 다시 읽는다. 같은 세대의 늦은 v3 record가
+나타나면 실제 supervisor identity로 handoff하고, group이 비었음이 증명되지
+않거나 cleanup record가 남으면 metadata를 지우지 않고 실패한다.
+
 SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
 lease만 drain한다. 종료 시 leader process만 기다리지 않고 child group의 각
 PID/start-token identity를 확인한다. Linux에서는 pidfd를 연 뒤 `/proc`
@@ -350,9 +358,12 @@ start identity를 다시 확인하고 안정된 pidfd handle로 신호하므로 
 신호 사이의 PID 재사용 race를 제거한다. pidfd를 사용할 수 없으면 숫자 PID로
 fallback하지 않고 fail closed한다. macOS에서는 초 단위 `ps lstart` 대신
 `libproc PROC_PIDTBSDINFO`의 초+마이크로초 start identity를 사용하며, identity를
-증명하지 못하면 신호하지 않는다. 다만 macOS 공개 API에는 pidfd와 같은 atomic
-signal handle이 없으므로 최종 libproc 확인과 `kill(2)` 사이의 아주 작은 OS
-한계는 남으며 이를 명시적으로 문서화한다.
+증명하지 못하면 신호하지 않는다. Group enumeration은 절대 경로 `/bin/ps`와
+고정된 최소 환경을 사용하며, 빈 결과, 잘린 마지막 행, 열 개수 오류, 중복 PID,
+숫자가 아닌 값, stderr, `ps`와 libproc의 불일치를 모두 unknown으로 처리한다.
+다만 macOS 공개 API에는 pidfd와 같은 atomic signal handle이 없으므로 최종
+libproc 확인과 `kill(2)` 사이의 아주 작은 OS 한계는 남으며 이를 명시적으로
+문서화한다.
 
 Leader가 먼저 끝나도 이미 검증된 descendant는 TERM/KILL 대상이지만, 숫자 PGID
 자체에는 신호하지 않으므로 나중에 같은 PGID를 재사용한 무관한 process group은

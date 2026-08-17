@@ -27,11 +27,13 @@ from healthmes.hermes_runtime_supervisor import (
     _DarwinProcBsdInfo,
     _next_restart_backoff,
     _parse_pydantic_float,
+    _probe_darwin_process_group_members,
     _probe_darwin_process_snapshot,
     _probe_linux_process_group_members,
     _probe_process_group_members,
     _ProcessGroupMember,
     _run_runtime_process_action,
+    _run_runtime_process_group_probe,
     _RuntimeShutdownBudgetPublication,
     _signal_process_group_member,
     capture_runtime_launcher_identity,
@@ -1547,6 +1549,214 @@ def test_linux_group_probe_only_treats_missing_stat_as_gone(
     assert _probe_linux_process_group_members(4242, 1) == frozenset()
 
 
+def test_darwin_group_probe_uses_trusted_ps_and_minimal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(
+        arguments: list[str],
+        **kwargs: Any,
+    ) -> SimpleNamespace:
+        calls.append((arguments, kwargs))
+        return SimpleNamespace(
+            stdout="4242 4000\n5000 5000\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_darwin_process_snapshot",
+        lambda pid: (
+            (4000, "darwin:1786915200:123456")
+            if pid == 4242
+            else pytest.fail("non-target process was inspected")
+        ),
+    )
+
+    assert _probe_darwin_process_group_members(4000, 1) == frozenset(
+        {
+            _group_member(
+                4242,
+                "darwin:1786915200:123456",
+            )
+        }
+    )
+    assert calls == [
+        (
+            ["/bin/ps", "-axo", "pid=,pgid="],
+            {
+                "check": True,
+                "capture_output": True,
+                "text": True,
+                "env": {
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin",
+                },
+                "timeout": 1,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "error"),
+    (
+        ("", "", "ps_output_invalid"),
+        ("4242\n", "", "ps_output_invalid"),
+        ("4242 4242", "", "ps_output_invalid"),
+        ("4242 4242 extra\n", "", "ps_output_invalid"),
+        ("not-a-pid 4242\n", "", "ps_output_invalid"),
+        ("0 4242\n", "", "ps_output_invalid"),
+        (
+            "4242 4242\n4242 4242\n",
+            "",
+            "ps_output_duplicate",
+        ),
+        (
+            "4242 4242\nbad partial row\n",
+            "",
+            "ps_output_invalid",
+        ),
+        (
+            "4242 4242\n",
+            "unexpected warning\n",
+            "ps_output_invalid",
+        ),
+    ),
+)
+def test_darwin_group_probe_rejects_malformed_or_partial_ps_output(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    stderr: str,
+    error: str,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout=stdout,
+            stderr=stderr,
+        ),
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_darwin_process_snapshot",
+        lambda _pid: (4242, "darwin:1786915200:123456"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match=error,
+    ):
+        _probe_darwin_process_group_members(4242, 1)
+
+
+def test_darwin_group_probe_rejects_ps_and_libproc_pgid_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="4242 4000\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_darwin_process_snapshot",
+        lambda _pid: (5000, "darwin:1786915200:123456"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="ps_output_inconsistent",
+    ):
+        _probe_darwin_process_group_members(4000, 1)
+
+
+def test_darwin_group_probe_rejects_target_that_disappears_from_libproc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="4242 4000\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_darwin_process_snapshot",
+        lambda _pid: None,
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="ps_output_inconsistent",
+    ):
+        _probe_darwin_process_group_members(4000, 1)
+
+
+def test_runtime_launcher_group_probe_reports_nonempty_without_signalling(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_group_members",
+        lambda _pgid, _timeout: frozenset(
+            {_group_member(4242, "darwin:1786915200:123456")}
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("group proof must never signal"),
+    )
+
+    assert (
+        _run_runtime_process_group_probe(
+            pgid=4242,
+            timeout_seconds=1,
+        )
+        == 6
+    )
+    assert (
+        "hermes_runtime_launcher_group_not_empty"
+        in capsys.readouterr().err
+    )
+
+
+def test_runtime_launcher_group_probe_fails_closed_on_unknown_state(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_probe(
+        _pgid: int,
+        _timeout: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_child_group_ps_output_invalid"
+        )
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_group_members",
+        fail_probe,
+    )
+
+    assert (
+        _run_runtime_process_group_probe(
+            pgid=4242,
+            timeout_seconds=1,
+        )
+        == 5
+    )
+    assert (
+        "hermes_runtime_child_group_ps_output_invalid"
+        in capsys.readouterr().err
+    )
+
+
 def test_darwin_libproc_identity_uses_microsecond_start_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2238,6 +2448,10 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
         sockets: list[Any] | None = None,
     ) -> None:
         del sockets
+        assert (
+            load_runtime_shutdown_budget(path)
+            == ready_publication.record
+        )
         server.started = True
 
     monkeypatch.setattr(uvicorn.Server, "startup", ready_startup)
@@ -2249,11 +2463,15 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
     await ready_server.startup()
     assert load_runtime_shutdown_budget(path) == ready_publication.record
 
+    failed_startup_called = False
+
     async def failed_startup(
         _server: uvicorn.Server,
         sockets: list[Any] | None = None,
     ) -> None:
+        nonlocal failed_startup_called
         del sockets
+        failed_startup_called = True
         raise OSError("port already owned")
 
     monkeypatch.setattr(uvicorn.Server, "startup", failed_startup)
@@ -2262,10 +2480,14 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
         config,
         shutdown_budget_publication=competing_publication,
     )
-    with pytest.raises(OSError, match="port already owned"):
+    with pytest.raises(
+        RuntimeError,
+        match="shutdown budget already has a live owner",
+    ):
         await competing_server.startup()
     competing_publication.remove_if_owned()
 
+    assert failed_startup_called is False
     assert load_runtime_shutdown_budget(path) == ready_publication.record
     ready_publication.remove_if_owned()
     assert not path.exists()

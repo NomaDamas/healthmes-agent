@@ -101,6 +101,7 @@ _PYDANTIC_FLOAT = TypeAdapter(float)
 _SUPERVISOR_BOOT_IDENTITY = capture_runtime_boot_identity()
 _DARWIN_PROC_PIDTBSDINFO = 3
 _DARWIN_MAXCOMLEN = 16
+_DARWIN_PS_PATH = "/bin/ps"
 
 
 @dataclass(frozen=True, slots=True)
@@ -965,19 +966,36 @@ class _HermesRuntimeUvicornServer(uvicorn.Server):
         self,
         sockets: list[socket.socket] | None = None,
     ) -> None:
-        await super().startup(sockets=sockets)
         publication = self._shutdown_budget_publication
-        if publication is None or not self.started:
-            return
-        try:
+        if publication is not None:
+            # Publish the supervisor identity before the ASGI lifespan can
+            # launch Hermes in its separate process group. Native stop can
+            # therefore use either this record or a proven-empty launcher
+            # group; there is no unrecorded Hermes child in between.
             publication.publish()
+        try:
+            await super().startup(sockets=sockets)
         except BaseException:
             self.should_exit = True
             try:
-                await super().shutdown(sockets=sockets)
+                await self._shutdown_coordinator.aclose()
             finally:
-                publication.remove_if_owned()
+                if (
+                    publication is not None
+                    and self._shutdown_coordinator.cleanup_succeeded
+                ):
+                    publication.remove_if_owned()
             raise
+        if self.started:
+            return
+        try:
+            await self._shutdown_coordinator.aclose()
+        finally:
+            if (
+                publication is not None
+                and self._shutdown_coordinator.cleanup_succeeded
+            ):
+                publication.remove_if_owned()
 
     async def shutdown(
         self,
@@ -1950,12 +1968,15 @@ def _probe_darwin_process_group_members(
 ) -> frozenset[_ProcessGroupMember]:
     """Enumerate a group with ps, but identify every PID through libproc."""
 
-    environment = dict(os.environ)
-    environment["LC_ALL"] = "C"
+    environment = {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
     deadline = time.monotonic() + timeout_seconds
     try:
         result = subprocess.run(
-            ["ps", "-axo", "pid=,pgid="],
+            [_DARWIN_PS_PATH, "-axo", "pid=,pgid="],
             check=True,
             capture_output=True,
             text=True,
@@ -1970,33 +1991,68 @@ def _probe_darwin_process_group_members(
         raise RuntimeError(
             "hermes_runtime_child_group_probe_failed"
         ) from exc
+    if result.stderr.strip():
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_child_group_ps_output_invalid"
+        )
+    if result.stdout and not result.stdout.endswith("\n"):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_child_group_ps_output_invalid"
+        )
     members: set[_ProcessGroupMember] = set()
+    seen_pids: set[int] = set()
+    saw_process_row = False
     for line in result.stdout.splitlines():
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "hermes_runtime_child_group_probe_timeout"
             )
-        fields = line.strip().split()
-        if len(fields) != 2:
+        stripped = line.strip()
+        if not stripped:
             continue
+        saw_process_row = True
+        fields = stripped.split()
+        if len(fields) != 2:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_ps_output_invalid"
+            )
         try:
             pid = int(fields[0])
             process_group = int(fields[1])
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_ps_output_invalid"
+            ) from exc
+        if pid < 1 or process_group < 1:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_ps_output_invalid"
+            )
+        if pid in seen_pids:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_ps_output_duplicate"
+            )
+        seen_pids.add(pid)
         if process_group != pgid:
             continue
         snapshot = _probe_darwin_process_snapshot(pid)
         if snapshot is None:
-            continue
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_ps_output_inconsistent"
+            )
         verified_pgid, start_token = snapshot
         if verified_pgid != pgid:
-            continue
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_ps_output_inconsistent"
+            )
         members.add(
             _ProcessGroupMember(
                 pid=pid,
                 start_token=start_token,
             )
+        )
+    if not saw_process_row:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_child_group_ps_output_invalid"
         )
     return frozenset(members)
 
@@ -2219,6 +2275,38 @@ def _run_runtime_process_action(
     except (HermesRuntimeIdentityError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 5
+
+
+def _run_runtime_process_group_probe(
+    *,
+    pgid: int,
+    timeout_seconds: float | None,
+) -> int:
+    """Prove that a launcher's process group has no surviving members."""
+
+    try:
+        if pgid <= 1:
+            raise ValueError("runtime launcher process group is invalid")
+        if (
+            timeout_seconds is None
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+            or timeout_seconds > _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "runtime launcher process-group probe timeout is invalid"
+            )
+        members = _probe_process_group_members(pgid, timeout_seconds)
+    except (HermesRuntimeIdentityError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 5
+    if members:
+        print(
+            "hermes_runtime_launcher_group_not_empty",
+            file=sys.stderr,
+        )
+        return 6
+    return 0
 
 
 def _next_restart_backoff(
@@ -2989,11 +3077,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--runtime-process-group-pgid",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.runtime_process_group_pgid is not None:
+        status = _run_runtime_process_group_probe(
+            pgid=args.runtime_process_group_pgid,
+            timeout_seconds=args.runtime_process_timeout,
+        )
+        if status:
+            raise SystemExit(status)
+        return
     if args.runtime_process_action is not None:
         if (
             args.runtime_process_pid is None

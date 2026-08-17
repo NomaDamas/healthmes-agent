@@ -124,6 +124,18 @@ process_identity_matches() {
         && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]
 }
 
+captured_process_identity_matches() {
+    local pid=$1 executable=$2 start_time=$3 nonce=$4 marker
+    load_process_snapshot "$pid" || return 1
+    marker="healthmes_local.sh __service_runner $nonce "
+
+    [ "$SNAPSHOT_PID" = "$pid" ] \
+        && [ "$SNAPSHOT_PGID" = "$pid" ] \
+        && [ "$SNAPSHOT_EXECUTABLE" = "$executable" ] \
+        && [ "$SNAPSHOT_START_TIME" = "$start_time" ] \
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]
+}
+
 write_process_identity() {
     local pid_file=$1 pid=$2 nonce=$3 file temp pid_temp
     file="$(identity_file "$pid_file")"
@@ -241,6 +253,11 @@ load_decision_runtime_stop_bounds() {
     DECISION_RUNTIME_LAUNCHER_MATCHES=false
     DECISION_RUNTIME_SUPERVISOR_PID=
     DECISION_RUNTIME_SUPERVISOR_START_TOKEN=
+    DECISION_RUNTIME_BUDGET_DRAIN_SECONDS=
+    DECISION_RUNTIME_BUDGET_LAUNCHER_PID=
+    DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN=
+    DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE=
+    DECISION_RUNTIME_BUDGET_PUBLICATION_NONCE=
     if [ ! -f "$HERMES_DECISION_STOP_BUDGET" ]; then
         return 0
     fi
@@ -368,6 +385,11 @@ load_decision_runtime_stop_bounds() {
             return 0
         fi
         DECISION_RUNTIME_BUDGET_STATUS=v3
+        DECISION_RUNTIME_BUDGET_DRAIN_SECONDS=$drain_timeout
+        DECISION_RUNTIME_BUDGET_LAUNCHER_PID=$launcher_pid
+        DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN=$launcher_start_token
+        DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE=$launcher_service_nonce
+        DECISION_RUNTIME_BUDGET_PUBLICATION_NONCE=$publication_instance_nonce
         DECISION_RUNTIME_SUPERVISOR_PID=$supervisor_pid
         DECISION_RUNTIME_SUPERVISOR_START_TOKEN=$supervisor_start_token
         DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
@@ -412,6 +434,26 @@ load_decision_runtime_stop_bounds() {
     DECISION_RUNTIME_BUDGET_STATUS=invalid
 }
 
+decision_runtime_budget_matches_launcher_snapshot() {
+    local launcher_pid=$1 launcher_start_token=$2 launcher_service_nonce=$3
+    [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ] \
+        && [ "$DECISION_RUNTIME_BUDGET_LAUNCHER_PID" = "$launcher_pid" ] \
+        && [ "$DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN" = "$launcher_start_token" ] \
+        && [ "$DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE" = "$launcher_service_nonce" ]
+}
+
+decision_runtime_budget_generation() {
+    [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ] || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$DECISION_RUNTIME_BUDGET_DRAIN_SECONDS" \
+        "$DECISION_RUNTIME_BUDGET_LAUNCHER_PID" \
+        "$DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN" \
+        "$DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE" \
+        "$DECISION_RUNTIME_SUPERVISOR_PID" \
+        "$DECISION_RUNTIME_SUPERVISOR_START_TOKEN" \
+        "$DECISION_RUNTIME_BUDGET_PUBLICATION_NONCE"
+}
+
 runtime_process_identity_action() {
     local action=$1
     local timeout_seconds=${2:-}
@@ -430,6 +472,16 @@ runtime_process_identity_action() {
         )
     fi
     "$RUNTIME_PYTHON_BIN" "${helper_args[@]}"
+}
+
+runtime_launcher_group_is_empty() {
+    local pgid=$1
+    [ -x "$RUNTIME_PYTHON_BIN" ] \
+        || die "runtime identity helper is unavailable: $RUNTIME_PYTHON_BIN"
+    "$RUNTIME_PYTHON_BIN" \
+        -m healthmes.hermes_runtime_supervisor \
+        --runtime-process-group-pgid "$pgid" \
+        --runtime-process-timeout 1
 }
 
 wait_for_decision_runtime_exit() {
@@ -493,31 +545,225 @@ stop_process() {
     info "$name stopped"
 }
 
-stop_decision_runtime() {
-    local wrapper_alive=false signal_status
-    load_decision_runtime_stop_bounds
-    if process_identity_matches "$HERMES_DECISION_PID"; then
-        wrapper_alive=true
+stop_decision_launcher_without_budget() {
+    local launcher_pid=$1 launcher_executable=$2
+    local launcher_start_time=$3 launcher_service_nonce=$4
+    captured_process_identity_matches \
+        "$launcher_pid" \
+        "$launcher_executable" \
+        "$launcher_start_time" \
+        "$launcher_service_nonce" \
+        || die "decision runtime launcher identity changed before shutdown handoff; preserving metadata"
+    "$KILL_BIN" -s TERM "-$launcher_pid" \
+        || die "failed to signal verified decision runtime launcher; preserving metadata"
+    local polls=$MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS
+    while captured_process_identity_matches \
+        "$launcher_pid" \
+        "$launcher_executable" \
+        "$launcher_start_time" \
+        "$launcher_service_nonce"; do
+        [ "$polls" -gt 0 ] \
+            || die "Hermes decision runtime did not stop within ${MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
+        "$SLEEP_BIN" 1
+        polls=$((polls - 1))
+    done
+}
+
+clear_decision_launcher_metadata_if_owned() {
+    local metadata_present=$1 metadata_valid=$2
+    local launcher_pid=$3 launcher_executable=$4
+    local launcher_start_time=$5 launcher_service_nonce=$6
+    local pid_file_present=false identity_file_present=false
+
+    [ -f "$HERMES_DECISION_PID" ] && pid_file_present=true
+    [ -f "$(identity_file "$HERMES_DECISION_PID")" ] \
+        && identity_file_present=true
+    if [ "$pid_file_present" = false ] \
+        && [ "$identity_file_present" = false ]; then
+        return
     fi
-    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
-        if [ "$wrapper_alive" = true ] \
-            && [ "$DECISION_RUNTIME_LAUNCHER_MATCHES" != true ]; then
-            die "decision runtime stop budget does not match the managed launcher"
+    [ "$metadata_present" = true ] \
+        && [ "$metadata_valid" = true ] \
+        || die "decision runtime stopped but launcher metadata ownership changed; preserving metadata"
+    load_process_identity "$HERMES_DECISION_PID" \
+        || die "decision runtime stopped but launcher metadata became invalid; preserving metadata"
+    [ "$PROCESS_PID" = "$launcher_pid" ] \
+        && [ "$PROCESS_EXECUTABLE" = "$launcher_executable" ] \
+        && [ "$PROCESS_START_TIME" = "$launcher_start_time" ] \
+        && [ "$PROCESS_NONCE" = "$launcher_service_nonce" ] \
+        || die "decision runtime stopped but launcher metadata generation changed; preserving metadata"
+    clear_process_identity "$HERMES_DECISION_PID"
+}
+
+finish_decision_launcher_handoff() {
+    local launcher_pid=$1 launcher_start_token=$2
+    local launcher_service_nonce=$3 group_status
+
+    # A late v3 publication wins the handoff and identifies the supervisor.
+    load_decision_runtime_stop_bounds
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" != missing ]; then
+        return
+    fi
+
+    if runtime_launcher_group_is_empty "$launcher_pid"; then
+        # The budget is published before Hermes can enter its separate process
+        # group. Once the launcher group is empty, no matching publisher can
+        # create a new record, so this final read is stable.
+        load_decision_runtime_stop_bounds
+        return
+    else
+        group_status=$?
+    fi
+
+    # The supervisor may have published while the native group probe ran.
+    load_decision_runtime_stop_bounds
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" != missing ]; then
+        return
+    fi
+    case "$group_status" in
+    6)
+        die "decision runtime launcher exited with untracked descendants and no v3 shutdown record; preserving launcher metadata"
+        ;;
+    *)
+        die "decision runtime launcher-group cleanup cannot be proven; preserving launcher metadata"
+        ;;
+    esac
+}
+
+stop_decision_runtime() {
+    local wrapper_alive=false launcher_metadata_present=false
+    local launcher_metadata_valid=false
+    local launcher_pid= launcher_executable= launcher_start_time=
+    local launcher_start_token= launcher_service_nonce=
+
+    if [ -f "$HERMES_DECISION_PID" ] \
+        || [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+        launcher_metadata_present=true
+        if load_process_identity "$HERMES_DECISION_PID"; then
+            launcher_metadata_valid=true
+            launcher_pid=$PROCESS_PID
+            launcher_executable=$PROCESS_EXECUTABLE
+            launcher_start_time=$PROCESS_START_TIME
+            launcher_start_token="ps:$PROCESS_START_TIME"
+            launcher_service_nonce=$PROCESS_NONCE
+            if captured_process_identity_matches \
+                "$launcher_pid" \
+                "$launcher_executable" \
+                "$launcher_start_time" \
+                "$launcher_service_nonce"; then
+                wrapper_alive=true
+            fi
         fi
-        if runtime_process_identity_action probe; then
-            :
-        else
-            signal_status=$?
-            case "$signal_status" in
-            3) die "decision runtime supervisor disappeared before verified shutdown" ;;
-            4) die "decision runtime supervisor PID was reused; refusing to signal it" ;;
-            *) die "decision runtime supervisor identity cannot be verified" ;;
-            esac
+    fi
+    load_decision_runtime_stop_bounds
+
+    while true; do
+        if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+            if [ "$launcher_metadata_valid" = true ] \
+                && ! decision_runtime_budget_matches_launcher_snapshot \
+                    "$launcher_pid" \
+                    "$launcher_start_token" \
+                    "$launcher_service_nonce"; then
+                die "decision runtime stop budget does not match the managed launcher generation"
+            fi
+            stop_verified_decision_runtime "$wrapper_alive"
+            clear_decision_launcher_metadata_if_owned \
+                "$launcher_metadata_present" \
+                "$launcher_metadata_valid" \
+                "$launcher_pid" \
+                "$launcher_executable" \
+                "$launcher_start_time" \
+                "$launcher_service_nonce"
+            info "Hermes decision runtime stopped"
+            return
         fi
+        if [ "$DECISION_RUNTIME_BUDGET_STATUS" = legacy ]; then
+            [ "$wrapper_alive" = true ] \
+                || die "legacy decision runtime budget cannot identify a surviving Python supervisor"
+            [ "$DECISION_RUNTIME_LAUNCHER_MATCHES" = true ] \
+                || die "legacy decision runtime budget does not match the managed launcher"
+            stop_process \
+                "Hermes decision runtime" \
+                "$HERMES_DECISION_PID" \
+                "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
+                "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
+                false
+            rm -f "$HERMES_DECISION_STOP_BUDGET"
+            return
+        fi
+        if [ "$DECISION_RUNTIME_BUDGET_STATUS" = invalid ]; then
+            die "decision runtime stop budget is invalid; refusing unverified shutdown"
+        fi
+        if [ "$launcher_metadata_present" = false ]; then
+            info "Hermes decision runtime stopped"
+            return
+        fi
+        [ "$launcher_metadata_valid" = true ] \
+            || die "decision runtime launcher metadata is invalid and no v3 supervisor record is available; preserving metadata"
+
+        if [ "$wrapper_alive" = true ]; then
+            # Close the startup race immediately before signalling the exact
+            # launcher generation captured at the beginning of stop.
+            load_decision_runtime_stop_bounds
+            if [ "$DECISION_RUNTIME_BUDGET_STATUS" != missing ]; then
+                continue
+            fi
+            stop_decision_launcher_without_budget \
+                "$launcher_pid" \
+                "$launcher_executable" \
+                "$launcher_start_time" \
+                "$launcher_service_nonce"
+            wrapper_alive=false
+        fi
+
+        finish_decision_launcher_handoff \
+            "$launcher_pid" \
+            "$launcher_start_token" \
+            "$launcher_service_nonce"
+        if [ "$DECISION_RUNTIME_BUDGET_STATUS" = missing ]; then
+            clear_decision_launcher_metadata_if_owned \
+                "$launcher_metadata_present" \
+                "$launcher_metadata_valid" \
+                "$launcher_pid" \
+                "$launcher_executable" \
+                "$launcher_start_time" \
+                "$launcher_service_nonce"
+            info "Hermes decision runtime stopped"
+            return
+        fi
+        if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+            decision_runtime_budget_matches_launcher_snapshot \
+                "$launcher_pid" \
+                "$launcher_start_token" \
+                "$launcher_service_nonce" \
+                || die "decision runtime shutdown budget generation changed during launcher handoff; preserving shutdown budget and launcher metadata"
+            continue
+        fi
+        die "decision runtime shutdown evidence appeared malformed during launcher handoff; preserving launcher metadata"
+    done
+}
+
+stop_verified_decision_runtime() {
+    local wrapper_alive=$1 signal_status supervisor_live=false
+    local active_generation
+    active_generation="$(decision_runtime_budget_generation)" \
+        || die "decision runtime v3 shutdown generation is unavailable"
+
+    if runtime_process_identity_action probe; then
+        supervisor_live=true
+    else
+        signal_status=$?
+        case "$signal_status" in
+        3) ;;
+        4) die "decision runtime supervisor PID was reused; refusing unverified cleanup" ;;
+        *) die "decision runtime supervisor identity cannot be verified" ;;
+        esac
+    fi
+    if [ "$supervisor_live" = true ]; then
         if [ "$wrapper_alive" = true ]; then
             info "signaling verified Python supervisor through native identity"
         else
-            info "managed launcher metadata missing; signaling verified Python supervisor"
+            info "managed launcher unavailable; signaling verified Python supervisor"
         fi
         if runtime_process_identity_action signal; then
             :
@@ -530,45 +776,23 @@ stop_decision_runtime() {
             *) die "failed to signal verified decision runtime supervisor" ;;
             esac
         fi
-        if ! wait_for_decision_runtime_exit \
-            "$DECISION_RUNTIME_TERM_WAIT_SECONDS"; then
-            die "Hermes decision runtime did not stop within ${DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
+    fi
+    if ! wait_for_decision_runtime_exit \
+        "$DECISION_RUNTIME_TERM_WAIT_SECONDS"; then
+        die "Hermes decision runtime did not stop within ${DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
+    fi
+
+    load_decision_runtime_stop_bounds
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = missing ]; then
+        return
+    fi
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+        if [ "$(decision_runtime_budget_generation)" != "$active_generation" ]; then
+            die "decision runtime shutdown budget generation changed during stop; preserving shutdown budget and launcher metadata"
         fi
-        if [ -e "$HERMES_DECISION_STOP_BUDGET" ]; then
-            die "decision runtime supervisor exited without proving Hermes descendant cleanup; preserving shutdown budget and launcher metadata"
-        fi
-        clear_process_identity "$HERMES_DECISION_PID"
-        info "Hermes decision runtime stopped"
-        return
+        die "decision runtime supervisor exited without proving Hermes descendant cleanup; preserving shutdown budget and launcher metadata"
     fi
-    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = legacy ]; then
-        [ "$wrapper_alive" = true ] \
-            || die "legacy decision runtime budget cannot identify a surviving Python supervisor"
-        [ "$DECISION_RUNTIME_LAUNCHER_MATCHES" = true ] \
-            || die "legacy decision runtime budget does not match the managed launcher"
-        stop_process \
-            "Hermes decision runtime" \
-            "$HERMES_DECISION_PID" \
-            "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
-            "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
-            false
-        rm -f "$HERMES_DECISION_STOP_BUDGET"
-        return
-    fi
-    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = invalid ]; then
-        die "decision runtime stop budget is invalid; refusing unverified shutdown"
-    fi
-    if [ "$wrapper_alive" = true ]; then
-        stop_process \
-            "Hermes decision runtime" \
-            "$HERMES_DECISION_PID" \
-            "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
-            "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
-            false
-        return
-    fi
-    clear_process_identity "$HERMES_DECISION_PID"
-    info "Hermes decision runtime stopped"
+    die "decision runtime shutdown evidence became invalid during stop; preserving launcher metadata"
 }
 
 load_runtime_env() {
@@ -695,7 +919,8 @@ cmd_update() {
 }
 
 start_apps() {
-    local decision_home= quoted_budget= quoted_home= quoted_vendor=
+    local decision_home= quoted_budget= quoted_home= quoted_python=
+    local quoted_vendor=
     local decision_enabled=false
     load_runtime_env
     # Stop the old in-memory code before uv can replace the interpreter or
@@ -715,8 +940,11 @@ start_apps() {
         [ -n "${HEALTHMES_DECISION_HERMES_PROFILE_PATH:-}" ] \
             || die "bootstrap did not configure the decision profile"
         decision_home="$(dirname "$HEALTHMES_DECISION_HERMES_PROFILE_PATH")"
+        [ -x "$RUNTIME_PYTHON_BIN" ] \
+            || die "HealthMes runtime Python is unavailable: $RUNTIME_PYTHON_BIN"
         printf -v quoted_budget '%q' "$HERMES_DECISION_STOP_BUDGET"
         printf -v quoted_home '%q' "$decision_home"
+        printf -v quoted_python '%q' "$RUNTIME_PYTHON_BIN"
         printf -v quoted_vendor '%q' "$REPO_ROOT/vendor/hermes-agent"
     else
         info "Hermes decision runtime disabled (model/provider not configured)"
@@ -744,7 +972,7 @@ start_apps() {
     if [ "$decision_enabled" = true ]; then
         start_process "Hermes decision runtime" \
             "$HERMES_DECISION_PID" "$HERMES_DECISION_LOG" \
-            "exec env HERMES_HOME=$quoted_home uv run python -m healthmes.hermes_runtime_supervisor --hermes-home $quoted_home --vendor-root $quoted_vendor --shutdown-budget-path $quoted_budget"
+            "exec env HERMES_HOME=$quoted_home $quoted_python -m healthmes.hermes_runtime_supervisor --hermes-home $quoted_home --vendor-root $quoted_vendor --shutdown-budget-path $quoted_budget"
         for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
             if curl --fail --silent --max-time 1 \
                 "http://127.0.0.1:${HEALTHMES_DECISION_RUNTIME_PORT:-8645}/healthmes/runtime-health" \
@@ -811,8 +1039,41 @@ service_status() {
     fi
 }
 
+decision_runtime_status() {
+    local probe_status
+    if pid_running "$HERMES_DECISION_PID"; then
+        info "Hermes decision runtime: running (launcher pid $PROCESS_PID)"
+        return
+    fi
+    load_decision_runtime_stop_bounds
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+        if runtime_process_identity_action probe; then
+            info "Hermes decision runtime: running (verified supervisor pid $DECISION_RUNTIME_SUPERVISOR_PID; wrapper metadata unavailable)"
+            return
+        else
+            probe_status=$?
+        fi
+        case "$probe_status" in
+        3) info "Hermes decision runtime: stopped with incomplete cleanup record" ;;
+        4) info "Hermes decision runtime: unknown (supervisor PID was reused)" ;;
+        *) info "Hermes decision runtime: unknown (supervisor identity is unprovable)" ;;
+        esac
+        return
+    fi
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = missing ]; then
+        if [ -f "$HERMES_DECISION_PID" ] \
+            || [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+            info "Hermes decision runtime: unknown (launcher metadata remains without a v3 shutdown record)"
+        else
+            info "Hermes decision runtime: stopped"
+        fi
+    else
+        info "Hermes decision runtime: unknown (shutdown budget is not a usable v3 record)"
+    fi
+}
+
 cmd_status() {
-    service_status "Hermes decision runtime" "$HERMES_DECISION_PID"
+    decision_runtime_status
     service_status "HealthMes" "$HEALTHMES_PID"
     service_status "Open Wearables" "$OW_PID"
     service_status "Open Wearables worker" "$WORKER_PID"
