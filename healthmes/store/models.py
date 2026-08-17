@@ -22,6 +22,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     false,
+    func,
     true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -482,6 +483,10 @@ class DecisionRequestReceipt(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(index=True)
     result_payload: Mapped[JSONDict | None]
     result_expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    retention_basis_at: Mapped[datetime] = mapped_column(
+        index=True,
+        server_default=func.now(),
+    )
     expires_at: Mapped[datetime] = mapped_column(index=True)
 
 

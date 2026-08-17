@@ -772,6 +772,72 @@ def test_sqlite_expired_lease_preserves_first_committed_result(
     assert delayed_completion.result_payload == canonical
 
 
+def test_sqlite_takeover_preserves_first_server_retention_basis(
+    service_session_factory,
+) -> None:
+    with service_session_factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "1d",
+            now=NOW,
+        )
+        session.commit()
+
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(seconds=1),
+        retention=timedelta(days=30),
+    )
+    request_id = uuid.uuid4()
+    fingerprint = "a" * 64
+    first_owner = uuid.uuid4()
+    takeover_owner = uuid.uuid4()
+    semantic_requested_at = NOW + timedelta(days=365)
+
+    first = store.claim(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=first_owner,
+        now=NOW,
+        requested_at=semantic_requested_at,
+    )
+    takeover = store.claim(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=takeover_owner,
+        now=NOW + timedelta(seconds=2),
+        requested_at=semantic_requested_at,
+    )
+
+    assert first.lease_generation == 1
+    assert takeover.lease_generation == 2
+    completion = store.complete(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=takeover_owner,
+        lease_generation=2,
+        result_payload={"schema": "test", "winner": "takeover"},
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert completion.expires_at == NOW + timedelta(days=1)
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        stored_basis = receipt.retention_basis_at
+        if stored_basis.tzinfo is None:
+            stored_basis = stored_basis.replace(tzinfo=UTC)
+        assert stored_basis.astimezone(UTC) == NOW
+        assert receipt.requested_at == semantic_requested_at.replace(
+            tzinfo=None
+        )
+
+
 def test_sqlite_stale_generation_cannot_publish_or_release_takeover(
     service_session_factory,
 ) -> None:
@@ -1014,7 +1080,7 @@ async def test_retention_shrink_serializes_with_receipt_completion(
 
     store = DecisionReceiptStore(
         session_factory=service_session_factory,
-        lease_duration=timedelta(minutes=5),
+        lease_duration=timedelta(days=3),
         retention=timedelta(days=30),
     )
     request_id = uuid.uuid4()
@@ -1024,8 +1090,8 @@ async def test_retention_shrink_serializes_with_receipt_completion(
         request_id=request_id,
         fingerprint=fingerprint,
         owner_token=owner_token,
-        now=NOW,
-        requested_at=NOW - timedelta(days=2),
+        now=NOW - timedelta(days=2),
+        requested_at=NOW + timedelta(days=365),
     )
     assert claim.lease_generation is not None
 
@@ -1357,6 +1423,76 @@ async def test_decision_retention_tombstone_blocks_sensitive_replay(
         assert receipt.state == "tombstone"
         assert receipt.result_payload is None
         assert receipt.expires_at > receipt.requested_at
+
+
+@pytest.mark.parametrize(
+    "semantic_offset",
+    (
+        timedelta(days=-365),
+        timedelta(days=365),
+    ),
+    ids=("one-year-past", "one-year-future"),
+)
+@pytest.mark.asyncio
+async def test_receipt_retention_uses_server_receive_time_not_requested_at(
+    settings,
+    service_session_factory,
+    semantic_offset,
+) -> None:
+    with service_session_factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "1d",
+            now=NOW,
+        )
+        session.commit()
+
+    clock = MutableClock(NOW)
+    engine = RecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    semantic_requested_at = NOW + semantic_offset
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+        requested_at=semantic_requested_at,
+    )
+
+    result = await service.ask_wellness(submission)
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert engine.requests[0].requested_at == semantic_requested_at
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id
+                == submission.request_id
+            )
+        )
+        assert receipt is not None
+        stored_basis = receipt.retention_basis_at
+        if stored_basis.tzinfo is None:
+            stored_basis = stored_basis.replace(tzinfo=UTC)
+        stored_expiry = receipt.result_expires_at
+        assert stored_expiry is not None
+        if stored_expiry.tzinfo is None:
+            stored_expiry = stored_expiry.replace(tzinfo=UTC)
+        assert stored_basis.astimezone(UTC) == NOW
+        assert stored_expiry.astimezone(UTC) == (
+            NOW + timedelta(days=1)
+        )
+
+    clock.advance(timedelta(days=1))
+    with pytest.raises(DecisionIdempotencyExpiredError):
+        await service.ask_wellness(submission)
+    assert len(engine.requests) == 1
 
 
 @pytest.mark.asyncio

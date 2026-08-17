@@ -469,6 +469,71 @@ async def test_postgres_unknown_retry_reuses_first_requested_at(
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires HEALTHMES_TEST_POSTGRES_URL",
 )
+def test_postgres_takeover_preserves_first_server_retention_basis() -> None:
+    with _isolated_postgres_factory() as factory:
+        with factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "1d",
+                now=NOW,
+            )
+            session.commit()
+
+        store = DecisionReceiptStore(
+            session_factory=factory,
+            lease_duration=timedelta(seconds=1),
+            retention=timedelta(days=30),
+        )
+        request_id = uuid.uuid4()
+        fingerprint = "f" * 64
+        semantic_requested_at = NOW + timedelta(days=365)
+        first = store.claim(
+            request_id=request_id,
+            fingerprint=fingerprint,
+            owner_token=uuid.uuid4(),
+            now=NOW,
+            requested_at=semantic_requested_at,
+        )
+        takeover_owner = uuid.uuid4()
+        takeover = store.claim(
+            request_id=request_id,
+            fingerprint=fingerprint,
+            owner_token=takeover_owner,
+            now=NOW + timedelta(seconds=2),
+            requested_at=semantic_requested_at,
+        )
+
+        assert first.lease_generation == 1
+        assert takeover.lease_generation == 2
+        completion = store.complete(
+            request_id=request_id,
+            fingerprint=fingerprint,
+            owner_token=takeover_owner,
+            lease_generation=2,
+            result_payload={"schema": "test", "winner": "takeover"},
+            now=NOW + timedelta(seconds=2),
+        )
+
+        assert completion.expires_at == NOW + timedelta(days=1)
+        with factory() as session:
+            receipt = session.scalar(
+                sa.select(DecisionRequestReceipt).where(
+                    DecisionRequestReceipt.request_id == request_id
+                )
+            )
+            assert receipt is not None
+            assert receipt.retention_basis_at == NOW
+            assert receipt.requested_at == semantic_requested_at
+            assert receipt.result_expires_at == (
+                NOW + timedelta(days=1)
+            )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires HEALTHMES_TEST_POSTGRES_URL",
+)
 @pytest.mark.asyncio
 async def test_postgres_stale_owner_waits_for_canonical_result(
     settings,
@@ -550,7 +615,7 @@ async def test_postgres_retention_shrink_serializes_with_receipt_completion(
 
         store = DecisionReceiptStore(
             session_factory=factory,
-            lease_duration=timedelta(minutes=5),
+            lease_duration=timedelta(days=3),
             retention=timedelta(days=30),
         )
         request_id = uuid.uuid4()
@@ -560,8 +625,8 @@ async def test_postgres_retention_shrink_serializes_with_receipt_completion(
             request_id=request_id,
             fingerprint=fingerprint,
             owner_token=owner_token,
-            now=NOW,
-            requested_at=NOW - timedelta(days=2),
+            now=NOW - timedelta(days=2),
+            requested_at=NOW + timedelta(days=365),
         )
         assert claim.lease_generation is not None
 

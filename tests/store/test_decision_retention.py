@@ -219,6 +219,7 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
             "result": {"status": "completed"},
         },
         result_expires_at=current,
+        retention_basis_at=current - timedelta(minutes=1),
         expires_at=current,
     )
     future = DecisionRequestReceipt(
@@ -231,6 +232,7 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
             "result": {"status": "completed"},
         },
         result_expires_at=current + timedelta(microseconds=1),
+        retention_basis_at=current - timedelta(minutes=1),
         expires_at=current + timedelta(microseconds=1),
     )
     session.add_all((expired, future))
@@ -536,6 +538,7 @@ def test_retention_shrink_scrubs_trigger_and_receipt_but_keeps_identity(
             "result": {"answer": "Sensitive generated wellness answer."},
         },
         result_expires_at=identity_expires_at,
+        retention_basis_at=basis,
         expires_at=identity_expires_at,
     )
     session.add(receipt)
@@ -591,6 +594,7 @@ def test_retention_extension_cannot_revive_expired_receipt_result(
             "result": {"answer": "Already expired sensitive answer."},
         },
         result_expires_at=original_deadline,
+        retention_basis_at=requested_at,
         expires_at=identity_expires_at,
     )
     session.add(receipt)

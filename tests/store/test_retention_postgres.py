@@ -281,6 +281,7 @@ def test_postgres_retention_extension_cannot_revive_expired_receipt() -> None:
                     "result": {"answer": "expired sensitive answer"},
                 },
                 result_expires_at=original_deadline,
+                retention_basis_at=requested_at,
                 expires_at=identity_expires_at,
             )
             session.add(receipt)

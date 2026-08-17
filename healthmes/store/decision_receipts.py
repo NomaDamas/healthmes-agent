@@ -361,6 +361,10 @@ class DecisionReceiptStore:
             # default. Pending-state constraints require SQL NULL.
             "result_payload": null(),
             "result_expires_at": None,
+            # Unlike requested_at, this is a trusted server receive time.
+            # It is immutable after the winning insert and therefore remains
+            # stable across waiters, lease takeover, and replay.
+            "retention_basis_at": now,
             "expires_at": now + self._retention,
         }
         dialect = session.get_bind().dialect.name
@@ -526,7 +530,7 @@ def _result_expiry(
     ):
         return identity_deadline
     decision_deadline = _as_utc(
-        receipt.requested_at
+        receipt.retention_basis_at
     ) + timedelta(days=policy.retention_days)
     return min(identity_deadline, decision_deadline)
 
