@@ -69,23 +69,47 @@ def _write_decision_stop_budget(
     pid: str = "4242",
     start_time: str = "Mon Aug  3 12:00:00 2026",
     nonce: str = "abc123",
+    supervisor_pid: str = "4343",
+    supervisor_start_token: str = "darwin:1786915200:123456",
     publication_instance_nonce: str = "publication123",
-    version: int = 2,
+    version: int = 3,
 ) -> Path:
     path = runtime_dir / "hermes-decision-stop-budget"
+    if version == 3:
+        fields = (
+            f"version\t{version}",
+            f"drain_timeout_seconds\t{drain_timeout_seconds}",
+            f"launcher_pid\t{pid}",
+            f"launcher_start_token\tps:{start_time}",
+            f"launcher_service_nonce\t{nonce}",
+            f"supervisor_pid\t{supervisor_pid}",
+            f"supervisor_start_token\t{supervisor_start_token}",
+            "publication_instance_nonce\t"
+            f"{publication_instance_nonce}",
+            "",
+        )
+    elif version == 2:
+        fields = (
+            f"version\t{version}",
+            f"drain_timeout_seconds\t{drain_timeout_seconds}",
+            f"supervisor_pid\t{pid}",
+            f"supervisor_start_token\tps:{start_time}",
+            f"service_nonce\t{nonce}",
+            "publication_instance_nonce\t"
+            f"{publication_instance_nonce}",
+            "",
+        )
+    else:
+        fields = (
+            f"version\t{version}",
+            f"drain_timeout_seconds\t{drain_timeout_seconds}",
+            f"supervisor_pid\t{pid}",
+            f"supervisor_start_token\tps:{start_time}",
+            f"service_nonce\t{nonce}",
+            "",
+        )
     path.write_text(
-        "\n".join(
-            (
-                f"version\t{version}",
-                f"drain_timeout_seconds\t{drain_timeout_seconds}",
-                f"supervisor_pid\t{pid}",
-                f"supervisor_start_token\tps:{start_time}",
-                f"service_nonce\t{nonce}",
-                "publication_instance_nonce\t"
-                f"{publication_instance_nonce}",
-                "",
-            )
-        ),
+        "\n".join(fields),
         encoding="ascii",
     )
     return path
@@ -98,9 +122,11 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
     home = tmp_path / "home"
     fake_bin = tmp_path / "fake-bin"
     process_state = tmp_path / "process-state"
+    supervisor_state = process_state / "supervisor"
     for directory in (scripts, runtime, home / "Library" / "LaunchAgents", fake_bin):
         directory.mkdir(parents=True, exist_ok=True)
     process_state.mkdir()
+    supervisor_state.mkdir()
 
     local_script = scripts / "healthmes_local.sh"
     shutil.copy2(LOCAL_SCRIPT, local_script)
@@ -167,6 +193,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
             case "${FAKE_TERM_BEHAVIOR:-stay}" in
             exit)
                 rm -f "$FAKE_PROCESS_STATE/alive"
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
                 ;;
             reuse)
                 printf '%s\\n' "Mon Aug  3 12:01:00 2026" \
@@ -195,6 +222,59 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         """,
     )
     _write_executable(
+        fake_bin / "runtime-python",
+        """
+        #!/usr/bin/env bash
+        printf 'runtime-python %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        action=
+        pid=
+        token=
+        timeout=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+            --runtime-process-action)
+                shift
+                action=${1:-}
+                ;;
+            --runtime-process-pid)
+                shift
+                pid=${1:-}
+                ;;
+            --runtime-process-start-token)
+                shift
+                token=${1:-}
+                ;;
+            --runtime-process-timeout)
+                shift
+                timeout=${1:-}
+                ;;
+            esac
+            shift
+        done
+        if [ ! -f "$FAKE_SUPERVISOR_STATE/alive" ]; then
+            [ "$action" = "wait" ] && exit 0
+            exit 3
+        fi
+        [ "$pid" = "$(<"$FAKE_SUPERVISOR_STATE/pid")" ] || exit 4
+        [ "$token" = "$(<"$FAKE_SUPERVISOR_STATE/start_token")" ] || exit 4
+        if [ "$action" = "wait" ]; then
+            [ -n "$timeout" ] || exit 5
+            exit 6
+        fi
+        if [ "$action" = "signal" ]; then
+            case "${FAKE_SUPERVISOR_TERM_BEHAVIOR:-exit}" in
+            exit)
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                ;;
+            supervisor-exit-only)
+                rm -f "$FAKE_SUPERVISOR_STATE/alive"
+                ;;
+            esac
+        fi
+        """,
+    )
+    _write_executable(
         fake_bin / "curl",
         """
         #!/usr/bin/env bash
@@ -217,23 +297,34 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         ),
     ):
         (process_state / name).write_text(f"{value}\n", encoding="utf-8")
+    (supervisor_state / "alive").touch()
+    (supervisor_state / "pid").write_text("4343\n", encoding="utf-8")
+    (supervisor_state / "start_token").write_text(
+        "darwin:1786915200:123456\n",
+        encoding="utf-8",
+    )
 
     env = {
         "HOME": str(home),
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "FAKE_EVENT_LOG": str(event_log),
         "FAKE_PROCESS_STATE": str(process_state),
+        "FAKE_SUPERVISOR_STATE": str(supervisor_state),
         "HEALTHMES_DEV_MAC_SCRIPT": str(dev_mac),
         "HEALTHMES_LAUNCHCTL_BIN": str(fake_bin / "launchctl"),
         "HEALTHMES_PS_BIN": str(fake_bin / "ps"),
         "HEALTHMES_KILL_BIN": str(fake_bin / "kill"),
         "HEALTHMES_SLEEP_BIN": str(fake_bin / "sleep"),
+        "HEALTHMES_RUNTIME_PYTHON_BIN": str(
+            fake_bin / "runtime-python"
+        ),
     }
     return {
         "env": env,
         "event_log": event_log,
         "local_script": local_script,
         "process_state": process_state,
+        "supervisor_state": supervisor_state,
         "runtime": runtime,
     }
 
@@ -250,6 +341,7 @@ def _run_local_runtime(
     env = dict(harness["env"])
     env["FAKE_TERM_BEHAVIOR"] = term_behavior
     env["FAKE_KILL_BEHAVIOR"] = kill_behavior
+    env["FAKE_SUPERVISOR_TERM_BEHAVIOR"] = term_behavior
     env.update(env_overrides or {})
     return subprocess.run(
         ["bash", str(harness["local_script"]), command],
@@ -544,9 +636,19 @@ def test_decision_stop_adds_bounded_margin_to_exact_saved_budget(
 
     events = _event_lines(harness)
     assert result.returncode != 0
-    assert "kill -s TERM -4242" in events
-    assert "kill -s KILL -4242" not in events
-    assert events.count("sleep 1") == 5
+    assert not any(event.startswith("kill ") for event in events)
+    assert any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert any(
+        "--runtime-process-action wait" in event
+        and "--runtime-process-timeout 5" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert events.count("sleep 1") == 0
     assert "did not stop within 5s" in result.stderr
     assert "refusing to orphan its child process group" in result.stderr
     assert pid_file.exists()
@@ -581,7 +683,12 @@ def test_decision_stop_uses_saved_startup_budget_not_mutable_env(
     )
 
     events = _event_lines(harness)
-    assert "kill -s TERM -4242" in events
+    assert not any(event.startswith("kill ") for event in events)
+    assert any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
     assert events.count("sleep 1") == 0
     assert not budget.exists()
 
@@ -608,14 +715,45 @@ def test_decision_stop_ignores_budget_from_another_service_identity(
     )
 
     assert result.returncode != 0
-    assert "ignoring stale or invalid decision runtime stop budget" in (
-        result.stdout
+    assert "stop budget does not match the managed launcher" in (
+        result.stderr
     )
-    assert _event_lines(harness).count("sleep 1") == 317
+    assert not any(
+        event.startswith("kill ") for event in _event_lines(harness)
+    )
     assert budget.exists()
 
 
-def test_decision_stop_treats_v1_budget_as_stale(
+@pytest.mark.parametrize("version", (1, 2))
+def test_decision_stop_uses_conservative_legacy_compatibility_budget(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+        version=version,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert _event_lines(harness).count("sleep 1") == 317
+    assert "kill -s TERM -4242" in _event_lines(harness)
+    assert budget.exists()
+
+
+def test_decision_stop_signals_live_supervisor_after_launcher_dies(
     tmp_path: Path,
 ) -> None:
     harness = _local_runtime_harness(tmp_path)
@@ -627,20 +765,108 @@ def test_decision_stop_treats_v1_budget_as_stale(
     budget = _write_decision_stop_budget(
         runtime,
         drain_timeout_seconds=2,
-        version=1,
+    )
+    (Path(harness["process_state"]) / "alive").unlink()
+
+    _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="exit",
+    )
+
+    events = _event_lines(harness)
+    assert any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert not any(event.startswith("kill ") for event in events)
+    assert not budget.exists()
+    assert not (
+        Path(harness["supervisor_state"]) / "alive"
+    ).exists()
+
+
+def test_decision_stop_recovers_when_wrapper_metadata_is_missing(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
     )
 
     result = _run_local_runtime(
         harness,
         "stop",
+        term_behavior="exit",
+    )
+
+    events = _event_lines(harness)
+    assert "managed launcher metadata missing" in result.stdout
+    assert any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert not budget.exists()
+
+
+def test_decision_stop_rejects_reused_supervisor_pid_without_signal(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+    (Path(harness["supervisor_state"]) / "start_token").write_text(
+        "darwin:1786915201:654321\n",
+        encoding="utf-8",
+    )
+
+    result = _run_local_runtime(harness, "stop", check=False)
+
+    events = _event_lines(harness)
+    assert result.returncode != 0
+    assert "supervisor PID was reused" in result.stderr
+    assert not any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert not any(event.startswith("kill ") for event in events)
+    assert budget.exists()
+
+
+def test_decision_stop_does_not_hide_a_surviving_wrapper(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="supervisor-exit-only",
         check=False,
     )
 
     assert result.returncode != 0
-    assert "ignoring stale or invalid decision runtime stop budget" in (
-        result.stdout
-    )
-    assert _event_lines(harness).count("sleep 1") == 317
+    assert "managed launcher remained alive" in result.stderr
+    assert _event_lines(harness).count("sleep 1") == 1
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
     assert budget.exists()
 
 

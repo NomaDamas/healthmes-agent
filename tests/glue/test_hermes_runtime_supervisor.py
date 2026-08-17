@@ -17,18 +17,22 @@ from fastapi.testclient import TestClient
 
 from healthmes.hermes_runtime_identity import HermesRuntimeIdentityError
 from healthmes.hermes_runtime_supervisor import (
+    HermesRuntimeLauncherIdentity,
     HermesRuntimeProcess,
+    HermesRuntimeProcessIdentity,
     HermesRuntimeShutdownBudgetRecord,
     HermesRuntimeSupervisorConfig,
-    HermesRuntimeSupervisorIdentity,
     _build_supervisor_server,
     _DarwinProcBsdInfo,
     _next_restart_backoff,
     _parse_pydantic_float,
     _probe_darwin_process_snapshot,
+    _probe_process_group_members,
     _ProcessGroupMember,
+    _run_runtime_process_action,
     _RuntimeShutdownBudgetPublication,
     _signal_process_group_member,
+    capture_runtime_launcher_identity,
     capture_runtime_supervisor_identity,
     create_supervisor_app,
     load_runtime_shutdown_budget,
@@ -704,8 +708,10 @@ async def test_child_kill_wait_is_bounded_and_close_reports_failure(
             group.clear()
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.kill",
-        kill_member,
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        lambda member, sent: (
+            kill_member(member.pid, sent) is None
+        ),
     )
 
     with pytest.raises(
@@ -772,8 +778,10 @@ async def test_sigterm_checks_descendants_and_sigkills_the_remaining_group(
             group.clear()
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.kill",
-        kill_member,
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        lambda member, sent: (
+            kill_member(member.pid, sent) is None
+        ),
     )
 
     await process.aclose()
@@ -824,8 +832,10 @@ async def test_reused_process_group_is_never_signaled_or_reported_drained(
             group.add(_group_member(4242, "reused"))
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.kill",
-        replace_after_term,
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        lambda member, sent: (
+            replace_after_term(member.pid, sent) is None
+        ),
     )
 
     with pytest.raises(
@@ -868,8 +878,10 @@ async def test_post_sigkill_group_verification_is_bounded(
     process._lifecycle_state = "running"
     signals: list[signal.Signals] = []
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.kill",
-        lambda _pid, sent: signals.append(sent),
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        lambda _member, sent: (
+            signals.append(sent) is None
+        ),
     )
 
     with pytest.raises(
@@ -931,8 +943,10 @@ async def test_verified_descendant_is_stopped_after_leader_exits_first(
         group.discard(descendant)
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.kill",
-        kill_member,
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        lambda member, sent: (
+            kill_member(member.pid, sent) is None
+        ),
     )
     monkeypatch.setattr(
         "healthmes.hermes_runtime_supervisor.os.killpg",
@@ -1077,6 +1091,298 @@ def test_linux_without_pidfd_fails_closed_without_numeric_signal(
         match="hermes_runtime_child_pidfd_unavailable",
     ):
         _signal_process_group_member(member, signal.SIGTERM)
+
+
+def test_runtime_stop_linux_without_pidfd_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = "linux:12345"
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "linux",
+    )
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: str(path) == "/proc",
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_start_token",
+        lambda pid, expected_style=None: (
+            token if pid == 4242 and expected_style == "linux" else None
+        ),
+    )
+    monkeypatch.setattr(os, "pidfd_open", None, raising=False)
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unverified Linux PID was signaled"),
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="signal",
+            pid=4242,
+            start_token=token,
+        )
+        == 5
+    )
+    assert "hermes_runtime_child_pidfd_unavailable" in capsys.readouterr().err
+
+
+def test_runtime_stop_unreadable_linux_proc_identity_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "linux",
+    )
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: str(path) == "/proc",
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("denied")
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unverified Linux PID was signaled"),
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="probe",
+            pid=4242,
+            start_token="linux:12345",
+        )
+        == 5
+    )
+    assert (
+        "hermes_runtime_linux_process_identity_unavailable"
+        in capsys.readouterr().err
+    )
+
+
+def test_runtime_stop_linux_without_proc_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "linux",
+    )
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda _path: False,
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unverified Linux PID was signaled"),
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="signal",
+            pid=4242,
+            start_token="linux:12345",
+        )
+        == 5
+    )
+    assert (
+        "hermes_runtime_supervisor_proc_unavailable"
+        in capsys.readouterr().err
+    )
+
+
+def test_runtime_stop_unsupported_platform_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "freebsd14",
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unsupported platform was signaled"),
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="signal",
+            pid=4242,
+            start_token="darwin:1786915200:123456",
+        )
+        == 5
+    )
+    assert (
+        "hermes_runtime_supervisor_platform_mismatch"
+        in capsys.readouterr().err
+    )
+
+
+def test_runtime_process_wait_returns_after_exact_identity_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = iter(("live", "gone"))
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._runtime_process_identity_state",
+        lambda _identity: next(states),
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.time.sleep",
+        lambda _seconds: None,
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="wait",
+            pid=4242,
+            start_token="darwin:1786915200:123456",
+            timeout_seconds=1,
+        )
+        == 0
+    )
+
+
+def test_runtime_process_wait_timeout_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    times = iter((0.0, 2.0))
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._runtime_process_identity_state",
+        lambda _identity: "live",
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.time.monotonic",
+        lambda: next(times),
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="wait",
+            pid=4242,
+            start_token="darwin:1786915200:123456",
+            timeout_seconds=1,
+        )
+        == 6
+    )
+    assert (
+        "hermes_runtime_supervisor_wait_timeout"
+        in capsys.readouterr().err
+    )
+
+
+def test_generic_ps_identity_is_never_signaled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = _group_member(
+        4242,
+        "ps:Mon Aug 17 12:00:00 2026",
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("generic ps identity was signaled"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_group_identity_unsupported",
+    ):
+        _signal_process_group_member(member, signal.SIGTERM)
+
+
+def test_runtime_stop_generic_ps_identity_is_never_signaled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("generic ps identity was signaled"),
+    )
+
+    assert (
+        _run_runtime_process_action(
+            action="signal",
+            pid=4242,
+            start_token="ps:Mon Aug 17 12:00:00 2026",
+        )
+        == 5
+    )
+    assert (
+        "runtime process start token is invalid"
+        in capsys.readouterr().err
+    )
+
+
+def test_unsupported_platform_group_probe_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "freebsd14",
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unsupported platform was signaled"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_group_platform_unsupported",
+    ):
+        _probe_process_group_members(4242, 1)
+
+
+def test_linux_without_proc_group_identity_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.sys.platform",
+        "linux",
+    )
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda path: (
+            False
+            if str(path) == "/proc/self/stat"
+            else original_exists(path)
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unverified Linux PID was signaled"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_group_proc_unavailable",
+    ):
+        _probe_process_group_members(4242, 1)
 
 
 def test_darwin_libproc_identity_uses_microsecond_start_time(
@@ -1493,13 +1799,54 @@ def test_supervisor_persists_the_validated_startup_budget(
     assert captured[0].shutdown_budget.drain_timeout_seconds == 75
     assert len(published) == 1
     assert published[0].drain_timeout_seconds == 75
+    assert published[0].supervisor_pid == os.getpid()
+    assert published[0].supervisor_start_token.startswith(
+        ("linux:", "darwin:")
+    )
+    assert published[0].launcher_pid == published[0].supervisor_pid
+    assert (
+        published[0].launcher_start_token
+        == published[0].supervisor_start_token
+    )
     assert not budget_path.exists()
 
 
-def test_inherited_supervisor_identity_must_match_live_process(
+@pytest.mark.parametrize("version", (1, 2))
+def test_legacy_shutdown_budget_remains_readable_for_owner_protection(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    lines = [
+        f"version\t{version}",
+        "drain_timeout_seconds\t75",
+        "supervisor_pid\t4242",
+        "supervisor_start_token\tps:Mon Aug 17 12:00:00 2026",
+        "service_nonce\tservice-nonce",
+    ]
+    if version == 2:
+        lines.append("publication_instance_nonce\tpublication-nonce")
+    path.parent.mkdir(parents=True)
+    path.write_text("\n".join((*lines, "")), encoding="ascii")
+
+    record = load_runtime_shutdown_budget(path)
+
+    assert record.drain_timeout_seconds == 75
+    assert record.launcher_identity == HermesRuntimeLauncherIdentity(
+        pid=4242,
+        start_token="ps:Mon Aug 17 12:00:00 2026",
+        service_nonce="service-nonce",
+    )
+
+
+def test_inherited_launcher_identity_must_match_live_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    identity = HermesRuntimeSupervisorIdentity(
+    supervisor = HermesRuntimeProcessIdentity(
+        pid=5252,
+        start_token="darwin:1786915200:123456",
+    )
+    identity = HermesRuntimeLauncherIdentity(
         pid=4242,
         start_token="ps:Mon Aug 17 12:00:00 2026",
         service_nonce="service-nonce",
@@ -1511,12 +1858,13 @@ def test_inherited_supervisor_identity_must_match_live_process(
         ),
     )
 
-    captured = capture_runtime_supervisor_identity(
+    captured = capture_runtime_launcher_identity(
         {
             "HEALTHMES_SERVICE_PID": str(identity.pid),
             "HEALTHMES_SERVICE_START_TOKEN": identity.start_token,
             "HEALTHMES_SERVICE_NONCE": identity.service_nonce,
-        }
+        },
+        supervisor_identity=supervisor,
     )
 
     assert captured == identity
@@ -1528,12 +1876,18 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "runtime" / "stop-budget"
-    identity = capture_runtime_supervisor_identity({})
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
     inherited_record = HermesRuntimeShutdownBudgetRecord(
         drain_timeout_seconds=75,
-        supervisor_pid=identity.pid,
-        supervisor_start_token=identity.start_token,
-        service_nonce=identity.service_nonce,
+        launcher_pid=launcher.pid,
+        launcher_start_token=launcher.start_token,
+        launcher_service_nonce=launcher.service_nonce,
+        supervisor_pid=supervisor.pid,
+        supervisor_start_token=supervisor.start_token,
     )
     ready_publication = _RuntimeShutdownBudgetPublication(
         path=path,
@@ -1597,12 +1951,18 @@ def test_unpublished_competitor_cannot_delete_identical_budget_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "runtime" / "stop-budget"
-    identity = capture_runtime_supervisor_identity({})
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
     inherited_record = HermesRuntimeShutdownBudgetRecord(
         drain_timeout_seconds=75,
-        supervisor_pid=identity.pid,
-        supervisor_start_token=identity.start_token,
-        service_nonce=identity.service_nonce,
+        launcher_pid=launcher.pid,
+        launcher_start_token=launcher.start_token,
+        launcher_service_nonce=launcher.service_nonce,
+        supervisor_pid=supervisor.pid,
+        supervisor_start_token=supervisor.start_token,
     )
     monkeypatch.setattr(
         "healthmes.hermes_runtime_supervisor.secrets.token_hex",

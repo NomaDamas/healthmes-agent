@@ -1269,9 +1269,11 @@ def test_shutdown_budget_is_persisted_atomically_and_exactly(
     path = tmp_path / "runtime" / "stop-budget"
     record = HermesRuntimeShutdownBudgetRecord(
         drain_timeout_seconds=75,
-        supervisor_pid=4242,
-        supervisor_start_token="ps:Mon Aug 17 12:00:00 2026",
-        service_nonce="service-nonce",
+        launcher_pid=4242,
+        launcher_start_token="ps:Mon Aug 17 12:00:00 2026",
+        launcher_service_nonce="service-nonce",
+        supervisor_pid=4343,
+        supervisor_start_token="darwin:1786915200:123456",
     )
 
     persist_runtime_shutdown_budget(path, record)

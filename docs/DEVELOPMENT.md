@@ -263,8 +263,11 @@ a later unrelated process group that reuses the numeric PGID. The launcher
 refuses to SIGKILL only the outer service group if that complete drain fails;
 it retains the process identity and exits non-zero instead of orphaning the
 child or reporting a false stop. The maximum native TERM wait is 317 seconds,
-while both Compose and the login LaunchAgent retain their consistent
-360-second outer shutdown budgets.
+followed by at most one second to verify that the managed Bash wrapper reaped
+the exited supervisor. A single native identity helper owns the bounded wait,
+so interpreter startup overhead is not repeated on every poll. Both Compose
+and the login LaunchAgent retain their consistent 360-second outer shutdown
+budgets.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general
@@ -302,9 +305,12 @@ The runtime manifest detects drift in its declared launch-control artifacts
 at startup and during operation. It does not hash every transitive Python
 package or native library, and it is not a sandbox against a process that
 already has the same OS user and can rewrite the runtime, venv, and manifest
-concurrently. Protect the repository, runtime venv, decision home, and
-attestation key with OS ownership and filesystem permissions. The supervisor
-executes the original
+concurrently. The supervisor's boot snapshot is captured after Python has
+imported its control modules: it detects later on-disk drift, but is not proof
+that the already-loaded bytecode came from exactly those captured bytes.
+No authorization or sandbox decision may rely on that stronger claim.
+Protect the repository, runtime venv, decision home, and attestation key with
+OS ownership and filesystem permissions. The supervisor executes the original
 manifest-bound venv Python path on every platform (required for macOS
 `@executable_path` library resolution), revalidates the manifest immediately
 around startup, and holds generation-aware child leases from response
@@ -325,6 +331,16 @@ within the bounded cleanup window. Its Hermes-facing HTTPX stream uses
 explicit 5-second connect/write/pool bounds with no per-chunk read timeout, so
 a valid SSE turn may be silent for more than five seconds while the overall
 decision wall clock remains authoritative.
+
+The native shutdown budget v3 records both the managed Bash launcher
+PID/start token/service nonce and the actual Python supervisor PID/native start
+token. Stop validates both identities and always sends TERM to the verified
+Python supervisor, which owns Hermes descendant draining. Missing or dead
+launcher metadata therefore cannot hide a surviving supervisor. Legacy v1/v2
+budgets remain readable only for conservative launcher-group shutdown; they
+never shorten the 317-second native wait. Generic `ps:` identities are not
+eligible for Python numeric signalling. Unsupported platforms, Linux without
+`/proc` or pidfd signalling, and unprovable identities fail closed.
 
 Running the gateway natively (verified live on macOS with dummy creds):
 

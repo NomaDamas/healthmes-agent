@@ -299,6 +299,11 @@ Python package와 native library를 전부 봉인하는 것은 아니며, 같은
 sandbox도 아니다. 따라서 repository, runtime venv, decision home과
 attestation key의 OS 소유권과 파일 권한이 신뢰 경계다.
 
+Supervisor boot snapshot은 Python이 control module을 이미 import한 뒤 디스크
+파일을 읽어 만든다. 따라서 snapshot 이후의 디스크 drift는 탐지하지만, 현재
+메모리에서 실행 중인 bytecode가 그 파일 bytes에서 정확히 로드됐다는 증명은
+아니다. 권한 부여나 sandbox 보장을 이보다 강한 주장에 의존시키지 않는다.
+
 macOS의 Python은 동적 라이브러리를 `@executable_path` 기준으로 찾을 수 있으므로
 검증된 실행 파일을 임시 위치에 복사해 실행하지 않는다. 모든 플랫폼에서
 manifest에 기록된 원래 venv Python 경로를 실행하고, launch 직전과 startup 완료
@@ -321,16 +326,22 @@ child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5
 모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하지만
 Uvicorn이 실제 serving startup을 완료한 뒤에만
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain
-시간뿐 아니라 실행 중 launcher의 PID, OS start token, service nonce와 각
-publication마다 새로 생성되는 publication instance nonce가 함께 들어간다.
+시간뿐 아니라 관리 중인 Bash launcher의 PID, OS start token, service nonce,
+실제 Python supervisor의 PID와 native OS start token, 각 publication마다 새로
+생성되는 publication instance nonce가 함께 들어간다.
 실제로 publish에 성공한 process만 자신의 정확한 record를 삭제할 수 있다.
-Native stop/update는 launcher identity가 현재 관리 중인 PID와 모두 맞을 때만
-그 값을 사용한다. 파일이 없거나, 형식이 잘못됐거나, 과거 v1 record이거나,
-이전/경쟁 process의 identity이면 짧은 값을 믿지 않고 안전한 최대 315초 drain에
-2초의 bounded launcher margin을 더한 317초를 적용한다. 따라서 같은 launcher
-identity를 상속한 두 번째 startup이 실패해도 기존 runtime의 종료 record를
-덮어쓰거나 삭제할 수 없다. Compose와 LaunchAgent의 outer timeout은 모두
-360초로 유지한다.
+Native stop/update는 두 identity를 모두 검증하고, TERM은 native identity로
+검증한 실제 Python supervisor에 보낸다. 따라서 Bash launcher가 먼저 죽거나
+metadata가 없어도 살아 있는 supervisor가 Hermes descendant를 drain하고 reap할
+기회를 잃지 않는다. v1/v2 record는 기존 launcher가 검증될 때만 보수적인
+317초 대기로 호환하며 짧은 값을 신뢰하지 않는다. 형식이 잘못됐거나 identity를
+증명할 수 없으면 숫자 PID로 fallback하지 않고 metadata를 보존한 채 fail
+closed한다. 같은 launcher identity를 상속한 두 번째 startup이 실패해도 기존
+runtime의 종료 record를 덮어쓰거나 삭제할 수 없다. v3 native stop은 Python
+helper 하나가 최대 317초를 내부에서 대기하고, supervisor 종료 뒤 Bash wrapper
+reap 확인에는 최대 1초만 더 사용한다. 매초 새 interpreter를 띄우지 않으므로
+helper startup overhead가 반복되지 않는다. Compose와 LaunchAgent의 outer
+timeout은 모두 360초로 유지한다.
 
 SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
 lease만 drain한다. 종료 시 leader process만 기다리지 않고 child group의 각

@@ -87,7 +87,7 @@ _MAX_CHILD_TERM_TIMEOUT_SECONDS = 10.0
 _MAX_CHILD_KILL_TIMEOUT_SECONDS = 5.0
 _MAX_DECISION_TIMEOUT_SECONDS = 300.0
 _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
-_RUNTIME_SHUTDOWN_BUDGET_VERSION = 2
+_RUNTIME_SHUTDOWN_BUDGET_VERSION = 3
 _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES = 1024
 _PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
@@ -96,6 +96,8 @@ _PROXY_READ_TIMEOUT_SECONDS = 5.0
 _PROXY_WRITE_TIMEOUT_SECONDS = 5.0
 _PROXY_POOL_TIMEOUT_SECONDS = 5.0
 _PYDANTIC_FLOAT = TypeAdapter(float)
+# This post-import disk snapshot detects later control-source drift. It is not
+# proof that already-loaded Python bytecode came from those exact file bytes.
 _SUPERVISOR_BOOT_IDENTITY = capture_runtime_boot_identity()
 _DARWIN_PROC_PIDTBSDINFO = 3
 _DARWIN_MAXCOMLEN = 16
@@ -119,8 +121,30 @@ class HermesRuntimeShutdownBudget:
 
 
 @dataclass(frozen=True, slots=True)
-class HermesRuntimeSupervisorIdentity:
-    """Immutable launcher identity bound to one published stop budget."""
+class HermesRuntimeProcessIdentity:
+    """Stable native process identity suitable for verified signalling."""
+
+    pid: int
+    start_token: str
+
+    def __post_init__(self) -> None:
+        if self.pid < 1:
+            raise ValueError("runtime process PID must be positive")
+        if (
+            not self.start_token
+            or len(self.start_token) > 256
+            or not self.start_token.isascii()
+            or not self.start_token.startswith(("linux:", "darwin:"))
+            or "\t" in self.start_token
+            or "\n" in self.start_token
+            or "\r" in self.start_token
+        ):
+            raise ValueError("runtime process start token is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class HermesRuntimeLauncherIdentity:
+    """Managed launcher identity inherited by the Python supervisor."""
 
     pid: int
     start_token: str
@@ -128,7 +152,7 @@ class HermesRuntimeSupervisorIdentity:
 
     def __post_init__(self) -> None:
         if self.pid < 1:
-            raise ValueError("runtime supervisor PID must be positive")
+            raise ValueError("runtime launcher PID must be positive")
         if (
             not self.start_token
             or len(self.start_token) > 256
@@ -140,7 +164,7 @@ class HermesRuntimeSupervisorIdentity:
             or "\n" in self.start_token
             or "\r" in self.start_token
         ):
-            raise ValueError("runtime supervisor start token is invalid")
+            raise ValueError("runtime launcher start token is invalid")
         if (
             not self.service_nonce
             or len(self.service_nonce) > 128
@@ -150,7 +174,7 @@ class HermesRuntimeSupervisorIdentity:
                 for character in self.service_nonce
             )
         ):
-            raise ValueError("runtime supervisor service nonce is invalid")
+            raise ValueError("runtime launcher service nonce is invalid")
 
 
 def _validate_identity_nonce(value: str, *, label: str) -> None:
@@ -171,9 +195,11 @@ class HermesRuntimeShutdownBudgetRecord:
     """Identity-bound, canonical stop budget published by a live server."""
 
     drain_timeout_seconds: int
+    launcher_pid: int
+    launcher_start_token: str
+    launcher_service_nonce: str
     supervisor_pid: int
     supervisor_start_token: str
-    service_nonce: str
     publication_instance_nonce: str = field(
         default_factory=lambda: secrets.token_hex(16)
     )
@@ -185,10 +211,14 @@ class HermesRuntimeShutdownBudgetRecord:
             raise ValueError(
                 "runtime drain timeout is outside the supported bound"
             )
-        HermesRuntimeSupervisorIdentity(
+        HermesRuntimeLauncherIdentity(
+            pid=self.launcher_pid,
+            start_token=self.launcher_start_token,
+            service_nonce=self.launcher_service_nonce,
+        )
+        HermesRuntimeProcessIdentity(
             pid=self.supervisor_pid,
             start_token=self.supervisor_start_token,
-            service_nonce=self.service_nonce,
         )
         _validate_identity_nonce(
             self.publication_instance_nonce,
@@ -196,23 +226,52 @@ class HermesRuntimeShutdownBudgetRecord:
         )
 
     @property
-    def supervisor_identity(self) -> HermesRuntimeSupervisorIdentity:
-        return HermesRuntimeSupervisorIdentity(
+    def launcher_identity(self) -> HermesRuntimeLauncherIdentity:
+        return HermesRuntimeLauncherIdentity(
+            pid=self.launcher_pid,
+            start_token=self.launcher_start_token,
+            service_nonce=self.launcher_service_nonce,
+        )
+
+    @property
+    def supervisor_identity(self) -> HermesRuntimeProcessIdentity:
+        return HermesRuntimeProcessIdentity(
             pid=self.supervisor_pid,
             start_token=self.supervisor_start_token,
-            service_nonce=self.service_nonce,
         )
 
     def to_bytes(self) -> bytes:
         return (
             f"version\t{_RUNTIME_SHUTDOWN_BUDGET_VERSION}\n"
             f"drain_timeout_seconds\t{self.drain_timeout_seconds}\n"
+            f"launcher_pid\t{self.launcher_pid}\n"
+            f"launcher_start_token\t{self.launcher_start_token}\n"
+            "launcher_service_nonce\t"
+            f"{self.launcher_service_nonce}\n"
             f"supervisor_pid\t{self.supervisor_pid}\n"
             f"supervisor_start_token\t{self.supervisor_start_token}\n"
-            f"service_nonce\t{self.service_nonce}\n"
             "publication_instance_nonce\t"
             f"{self.publication_instance_nonce}\n"
         ).encode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyRuntimeShutdownBudgetRecord:
+    """Read-only v1/v2 budget used only to protect a live legacy owner."""
+
+    drain_timeout_seconds: int
+    supervisor_pid: int
+    supervisor_start_token: str
+    service_nonce: str
+    publication_instance_nonce: str | None = None
+
+    @property
+    def launcher_identity(self) -> HermesRuntimeLauncherIdentity:
+        return HermesRuntimeLauncherIdentity(
+            pid=self.supervisor_pid,
+            start_token=self.supervisor_start_token,
+            service_nonce=self.service_nonce,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,15 +428,29 @@ def _probe_process_start_token(
     if (
         expected_style in (None, "linux")
         and sys.platform.startswith("linux")
-        and Path(f"/proc/{pid}/stat").exists()
     ):
+        stat_path = Path(f"/proc/{pid}/stat")
         try:
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-            closing_parenthesis = stat.rfind(")")
-            fields = stat[closing_parenthesis + 1 :].split()
-            return f"linux:{fields[19]}"
-        except (IndexError, OSError):
+            stat = stat_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
+        except OSError as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_linux_process_identity_unavailable"
+            ) from exc
+        closing_parenthesis = stat.rfind(")")
+        fields = stat[closing_parenthesis + 1 :].split()
+        try:
+            start_ticks = int(fields[19])
+        except (IndexError, ValueError) as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_linux_process_identity_invalid"
+            ) from exc
+        if closing_parenthesis < 1 or start_ticks < 1:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_linux_process_identity_invalid"
+            )
+        return f"linux:{start_ticks}"
     if (
         expected_style in (None, "darwin")
         and sys.platform == "darwin"
@@ -403,10 +476,12 @@ def _probe_process_start_token(
     return f"ps:{start_time}" if start_time else None
 
 
-def capture_runtime_supervisor_identity(
+def capture_runtime_launcher_identity(
     environment: Mapping[str, str],
-) -> HermesRuntimeSupervisorIdentity:
-    """Capture the launcher identity inherited by this serving process."""
+    *,
+    supervisor_identity: HermesRuntimeProcessIdentity,
+) -> HermesRuntimeLauncherIdentity:
+    """Capture the managed launcher, or bind a direct launch to this process."""
 
     pid_value = environment.get("HEALTHMES_SERVICE_PID", "").strip()
     start_token = environment.get(
@@ -424,32 +499,56 @@ def capture_runtime_supervisor_identity(
             pid = int(pid_value)
         except ValueError as exc:
             raise ValueError(
-                "runtime supervisor launcher PID is invalid"
+                "runtime launcher PID is invalid"
             ) from exc
-        identity = HermesRuntimeSupervisorIdentity(
+        identity = HermesRuntimeLauncherIdentity(
             pid=pid,
             start_token=start_token,
             service_nonce=service_nonce,
         )
     else:
-        pid = os.getpid()
-        token = _probe_process_start_token(pid)
-        if token is None:
-            raise ValueError(
-                "runtime supervisor start token is unavailable"
-            )
-        identity = HermesRuntimeSupervisorIdentity(
-            pid=pid,
-            start_token=token,
+        identity = HermesRuntimeLauncherIdentity(
+            pid=supervisor_identity.pid,
+            start_token=supervisor_identity.start_token,
             service_nonce=secrets.token_hex(16),
         )
-    if not runtime_supervisor_identity_is_live(identity):
-        raise ValueError("runtime supervisor launcher identity is stale")
+    if not runtime_launcher_identity_is_live(identity):
+        raise ValueError("runtime launcher identity is stale")
     return identity
 
 
-def runtime_supervisor_identity_is_live(
-    identity: HermesRuntimeSupervisorIdentity,
+def capture_runtime_supervisor_identity() -> HermesRuntimeProcessIdentity:
+    """Capture the actual Python supervisor through native OS identity."""
+
+    pid = os.getpid()
+    if sys.platform.startswith("linux"):
+        if not Path("/proc/self/stat").is_file():
+            raise ValueError(
+                "runtime supervisor Linux /proc identity is unavailable"
+            )
+        if not callable(getattr(os, "pidfd_open", None)) or not callable(
+            getattr(signal, "pidfd_send_signal", None)
+        ):
+            raise ValueError(
+                "runtime supervisor Linux pidfd signalling is unavailable"
+            )
+        token = _probe_process_start_token(pid, expected_style="linux")
+    elif sys.platform == "darwin":
+        token = _probe_process_start_token(pid, expected_style="darwin")
+    else:
+        raise ValueError(
+            f"runtime supervisor identity is unsupported on {sys.platform}"
+        )
+    if token is None:
+        raise ValueError("runtime supervisor start token is unavailable")
+    identity = HermesRuntimeProcessIdentity(pid=pid, start_token=token)
+    if _runtime_process_identity_state(identity) != "live":
+        raise ValueError("runtime supervisor identity is stale")
+    return identity
+
+
+def runtime_launcher_identity_is_live(
+    identity: HermesRuntimeLauncherIdentity,
 ) -> bool:
     style = identity.start_token.partition(":")[0]
     return hmac.compare_digest(
@@ -460,6 +559,58 @@ def runtime_supervisor_identity_is_live(
         or "",
         identity.start_token,
     )
+
+
+def _runtime_process_identity_state(
+    identity: HermesRuntimeProcessIdentity,
+) -> Literal["live", "gone", "changed"]:
+    style = identity.start_token.partition(":")[0]
+    if style == "linux":
+        if not sys.platform.startswith("linux"):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_supervisor_platform_mismatch"
+            )
+        if not Path("/proc").is_dir():
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_supervisor_proc_unavailable"
+            )
+    elif style == "darwin":
+        if sys.platform != "darwin":
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_supervisor_platform_mismatch"
+            )
+    else:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_supervisor_identity_unsupported"
+        )
+    current = _probe_process_start_token(
+        identity.pid,
+        expected_style=style,
+    )
+    if current is None:
+        return "gone"
+    if not hmac.compare_digest(current, identity.start_token):
+        return "changed"
+    return "live"
+
+
+def runtime_supervisor_identity_is_live(
+    identity: HermesRuntimeProcessIdentity,
+) -> bool:
+    return _runtime_process_identity_state(identity) == "live"
+
+
+def _shutdown_budget_owner_is_live(
+    record: (
+        HermesRuntimeShutdownBudgetRecord
+        | _LegacyRuntimeShutdownBudgetRecord
+    ),
+) -> bool:
+    if isinstance(record, HermesRuntimeShutdownBudgetRecord):
+        return runtime_supervisor_identity_is_live(
+            record.supervisor_identity
+        )
+    return runtime_launcher_identity_is_live(record.launcher_identity)
 
 
 @dataclass(slots=True)
@@ -477,6 +628,12 @@ class _RuntimeShutdownBudgetPublication:
         )
 
     def publish(self) -> None:
+        if not runtime_launcher_identity_is_live(
+            self.record.launcher_identity
+        ):
+            raise RuntimeError(
+                "runtime shutdown budget launcher is not running"
+            )
         if not runtime_supervisor_identity_is_live(
             self.record.supervisor_identity
         ):
@@ -491,9 +648,7 @@ class _RuntimeShutdownBudgetPublication:
             if (
                 current is not None
                 and current != self.record
-                and runtime_supervisor_identity_is_live(
-                    current.supervisor_identity
-                )
+                and _shutdown_budget_owner_is_live(current)
             ):
                 raise RuntimeError(
                     "runtime shutdown budget already has a live owner"
@@ -1683,7 +1838,11 @@ def _probe_process_group_members(
         raise RuntimeError(
             "hermes_runtime_child_group_probe_timeout"
         )
-    if sys.platform.startswith("linux") and Path("/proc/self/stat").exists():
+    if sys.platform.startswith("linux"):
+        if not Path("/proc/self/stat").exists():
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_proc_unavailable"
+            )
         return _probe_linux_process_group_members(
             pgid,
             timeout_seconds,
@@ -1693,7 +1852,9 @@ def _probe_process_group_members(
             pgid,
             timeout_seconds,
         )
-    return _probe_ps_process_group_members(pgid, timeout_seconds)
+    raise HermesRuntimeIdentityError(
+        "hermes_runtime_child_group_platform_unsupported"
+    )
 
 
 def _probe_linux_process_group_members(
@@ -1847,8 +2008,9 @@ def _signal_process_group_member(
         return _signal_linux_process_group_member(member, sent)
     if member.start_token.startswith("darwin:"):
         return _signal_darwin_process_group_member(member, sent)
-    os.kill(member.pid, sent)
-    return True
+    raise HermesRuntimeIdentityError(
+        "hermes_runtime_child_group_identity_unsupported"
+    )
 
 
 def _signal_linux_process_group_member(
@@ -1939,6 +2101,75 @@ def _signal_darwin_process_group_member(
     # interval; an unprovable identity is never signaled.
     os.kill(member.pid, sent)
     return True
+
+
+def _run_runtime_process_action(
+    *,
+    action: Literal["probe", "signal", "wait"],
+    pid: int,
+    start_token: str,
+    timeout_seconds: float | None = None,
+) -> int:
+    """Probe or TERM one exact supervisor identity for the native launcher."""
+
+    try:
+        identity = HermesRuntimeProcessIdentity(
+            pid=pid,
+            start_token=start_token,
+        )
+        if action == "wait":
+            if (
+                timeout_seconds is None
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+                or timeout_seconds
+                > _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS
+                + 2
+            ):
+                raise ValueError(
+                    "runtime supervisor wait timeout is invalid"
+                )
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                state = _runtime_process_identity_state(identity)
+                if state == "gone":
+                    return 0
+                if state == "changed":
+                    print(
+                        "hermes_runtime_supervisor_identity_changed",
+                        file=sys.stderr,
+                    )
+                    return 4
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(
+                        "hermes_runtime_supervisor_wait_timeout",
+                        file=sys.stderr,
+                    )
+                    return 6
+                time.sleep(min(0.1, remaining))
+        state = _runtime_process_identity_state(identity)
+        if state == "gone":
+            return 3
+        if state == "changed":
+            print(
+                "hermes_runtime_supervisor_identity_changed",
+                file=sys.stderr,
+            )
+            return 4
+        if action == "probe":
+            return 0
+        signaled = _signal_process_group_member(
+            _ProcessGroupMember(
+                pid=identity.pid,
+                start_token=identity.start_token,
+            ),
+            signal.SIGTERM,
+        )
+        return 0 if signaled else 3
+    except (HermesRuntimeIdentityError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 5
 
 
 def _next_restart_backoff(
@@ -2430,7 +2661,10 @@ def persist_runtime_shutdown_budget(
 
 def load_runtime_shutdown_budget(
     path: Path,
-) -> HermesRuntimeShutdownBudgetRecord:
+) -> (
+    HermesRuntimeShutdownBudgetRecord
+    | _LegacyRuntimeShutdownBudgetRecord
+):
     """Read a canonical identity-bound drain record."""
 
     try:
@@ -2453,29 +2687,76 @@ def load_runtime_shutdown_budget(
         if not separator or key in fields:
             raise ValueError("runtime shutdown budget is invalid")
         fields[key] = value
-    expected = {
-        "version",
-        "drain_timeout_seconds",
-        "supervisor_pid",
-        "supervisor_start_token",
-        "service_nonce",
-        "publication_instance_nonce",
-    }
-    if set(fields) != expected or fields["version"] != str(
-        _RUNTIME_SHUTDOWN_BUDGET_VERSION
-    ):
-        raise ValueError("runtime shutdown budget is invalid")
+    version = fields.get("version")
     try:
-        return HermesRuntimeShutdownBudgetRecord(
-            drain_timeout_seconds=int(fields["drain_timeout_seconds"]),
-            supervisor_pid=int(fields["supervisor_pid"]),
-            supervisor_start_token=fields["supervisor_start_token"],
-            service_nonce=fields["service_nonce"],
-            publication_instance_nonce=fields[
-                "publication_instance_nonce"
-            ],
-        )
-    except ValueError as exc:
+        if version == str(_RUNTIME_SHUTDOWN_BUDGET_VERSION):
+            expected = {
+                "version",
+                "drain_timeout_seconds",
+                "launcher_pid",
+                "launcher_start_token",
+                "launcher_service_nonce",
+                "supervisor_pid",
+                "supervisor_start_token",
+                "publication_instance_nonce",
+            }
+            if set(fields) != expected:
+                raise ValueError
+            return HermesRuntimeShutdownBudgetRecord(
+                drain_timeout_seconds=int(
+                    fields["drain_timeout_seconds"]
+                ),
+                launcher_pid=int(fields["launcher_pid"]),
+                launcher_start_token=fields["launcher_start_token"],
+                launcher_service_nonce=fields[
+                    "launcher_service_nonce"
+                ],
+                supervisor_pid=int(fields["supervisor_pid"]),
+                supervisor_start_token=fields[
+                    "supervisor_start_token"
+                ],
+                publication_instance_nonce=fields[
+                    "publication_instance_nonce"
+                ],
+            )
+        if version in {"1", "2"}:
+            expected = {
+                "version",
+                "drain_timeout_seconds",
+                "supervisor_pid",
+                "supervisor_start_token",
+                "service_nonce",
+            }
+            if version == "2":
+                expected.add("publication_instance_nonce")
+            if set(fields) != expected:
+                raise ValueError
+            record = _LegacyRuntimeShutdownBudgetRecord(
+                drain_timeout_seconds=int(
+                    fields["drain_timeout_seconds"]
+                ),
+                supervisor_pid=int(fields["supervisor_pid"]),
+                supervisor_start_token=fields[
+                    "supervisor_start_token"
+                ],
+                service_nonce=fields["service_nonce"],
+                publication_instance_nonce=fields.get(
+                    "publication_instance_nonce"
+                ),
+            )
+            if not 1 <= record.drain_timeout_seconds <= (
+                _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS
+            ):
+                raise ValueError
+            _ = record.launcher_identity
+            if record.publication_instance_nonce is not None:
+                _validate_identity_nonce(
+                    record.publication_instance_nonce,
+                    label="runtime publication instance nonce",
+                )
+            return record
+        raise ValueError
+    except (KeyError, ValueError) as exc:
         raise ValueError("runtime shutdown budget is invalid") from exc
 
 
@@ -2640,11 +2921,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "HEALTHMES_DECISION_RUNTIME_SHUTDOWN_BUDGET_PATH",
         ),
     )
+    parser.add_argument(
+        "--runtime-process-action",
+        choices=("probe", "signal", "wait"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-process-pid",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-process-start-token",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-process-timeout",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.runtime_process_action is not None:
+        if (
+            args.runtime_process_pid is None
+            or args.runtime_process_start_token is None
+        ):
+            raise SystemExit(
+                "runtime process action requires PID and start token"
+            )
+        status = _run_runtime_process_action(
+            action=args.runtime_process_action,
+            pid=args.runtime_process_pid,
+            start_token=args.runtime_process_start_token,
+            timeout_seconds=args.runtime_process_timeout,
+        )
+        if status:
+            raise SystemExit(status)
+        return
     home = Path(args.hermes_home).expanduser().resolve()
     try:
         decision_timeout = _parse_pydantic_float(
@@ -2697,7 +3014,11 @@ def main(argv: list[str] | None = None) -> None:
     publication: _RuntimeShutdownBudgetPublication | None = None
     if config.shutdown_budget_path is not None:
         try:
-            identity = capture_runtime_supervisor_identity(os.environ)
+            supervisor_identity = capture_runtime_supervisor_identity()
+            launcher_identity = capture_runtime_launcher_identity(
+                os.environ,
+                supervisor_identity=supervisor_identity,
+            )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         publication = _RuntimeShutdownBudgetPublication(
@@ -2706,9 +3027,15 @@ def main(argv: list[str] | None = None) -> None:
                 drain_timeout_seconds=(
                     config.shutdown_budget.drain_timeout_seconds
                 ),
-                supervisor_pid=identity.pid,
-                supervisor_start_token=identity.start_token,
-                service_nonce=identity.service_nonce,
+                launcher_pid=launcher_identity.pid,
+                launcher_start_token=launcher_identity.start_token,
+                launcher_service_nonce=(
+                    launcher_identity.service_nonce
+                ),
+                supervisor_pid=supervisor_identity.pid,
+                supervisor_start_token=(
+                    supervisor_identity.start_token
+                ),
             ),
         )
     server = _build_supervisor_server(

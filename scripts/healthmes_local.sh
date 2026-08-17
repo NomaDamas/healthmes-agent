@@ -28,6 +28,7 @@ KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
 SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
 BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
+RUNTIME_PYTHON_BIN="${HEALTHMES_RUNTIME_PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 MAX_DECISION_RUNTIME_DRAIN_SECONDS=315
 DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2
 MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
@@ -225,27 +226,35 @@ signal_process_group() {
 
 load_decision_runtime_stop_bounds() {
     local key value extra
-    local version= drain_timeout= supervisor_pid=
+    local version= drain_timeout= launcher_pid= launcher_start_token=
+    local launcher_service_nonce= supervisor_pid=
     local supervisor_start_token= service_nonce=
     local publication_instance_nonce=
-    local seen_version= seen_drain_timeout= seen_supervisor_pid=
-    local seen_supervisor_start_token= seen_service_nonce=
+    local seen_version= seen_drain_timeout= seen_launcher_pid=
+    local seen_launcher_start_token= seen_launcher_service_nonce=
+    local seen_supervisor_pid= seen_supervisor_start_token=
+    local seen_service_nonce=
     local seen_publication_instance_nonce=
     DECISION_RUNTIME_TERM_WAIT_SECONDS=$MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS
     DECISION_RUNTIME_KILL_WAIT_SECONDS=1
+    DECISION_RUNTIME_BUDGET_STATUS=missing
+    DECISION_RUNTIME_LAUNCHER_MATCHES=false
+    DECISION_RUNTIME_SUPERVISOR_PID=
+    DECISION_RUNTIME_SUPERVISOR_START_TOKEN=
     if [ ! -f "$HERMES_DECISION_STOP_BUDGET" ]; then
         return 0
     fi
-    process_identity_matches "$HERMES_DECISION_PID" || return 0
     while IFS=$'\t' read -r key value extra; do
         [ -z "$extra" ] || {
             info "ignoring malformed decision runtime stop budget"
+            DECISION_RUNTIME_BUDGET_STATUS=invalid
             return 0
         }
         case "$key" in
         version)
             [ -z "$seen_version" ] || {
                 info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
                 return 0
             }
             version=$value
@@ -254,14 +263,43 @@ load_decision_runtime_stop_bounds() {
         drain_timeout_seconds)
             [ -z "$seen_drain_timeout" ] || {
                 info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
                 return 0
             }
             drain_timeout=$value
             seen_drain_timeout=1
             ;;
+        launcher_pid)
+            [ -z "$seen_launcher_pid" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
+                return 0
+            }
+            launcher_pid=$value
+            seen_launcher_pid=1
+            ;;
+        launcher_start_token)
+            [ -z "$seen_launcher_start_token" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
+                return 0
+            }
+            launcher_start_token=$value
+            seen_launcher_start_token=1
+            ;;
+        launcher_service_nonce)
+            [ -z "$seen_launcher_service_nonce" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
+                return 0
+            }
+            launcher_service_nonce=$value
+            seen_launcher_service_nonce=1
+            ;;
         supervisor_pid)
             [ -z "$seen_supervisor_pid" ] || {
                 info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
                 return 0
             }
             supervisor_pid=$value
@@ -270,6 +308,7 @@ load_decision_runtime_stop_bounds() {
         supervisor_start_token)
             [ -z "$seen_supervisor_start_token" ] || {
                 info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
                 return 0
             }
             supervisor_start_token=$value
@@ -278,6 +317,7 @@ load_decision_runtime_stop_bounds() {
         service_nonce)
             [ -z "$seen_service_nonce" ] || {
                 info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
                 return 0
             }
             service_nonce=$value
@@ -286,6 +326,7 @@ load_decision_runtime_stop_bounds() {
         publication_instance_nonce)
             [ -z "$seen_publication_instance_nonce" ] || {
                 info "ignoring malformed decision runtime stop budget"
+                DECISION_RUNTIME_BUDGET_STATUS=invalid
                 return 0
             }
             publication_instance_nonce=$value
@@ -293,24 +334,125 @@ load_decision_runtime_stop_bounds() {
             ;;
         *)
             info "ignoring malformed decision runtime stop budget"
+            DECISION_RUNTIME_BUDGET_STATUS=invalid
             return 0
             ;;
         esac
     done <"$HERMES_DECISION_STOP_BUDGET"
-    if [ "$version" != 2 ] \
-        || ! [[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] \
-        || [ "$drain_timeout" -gt "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ] \
-        || [ "$supervisor_pid" != "$PROCESS_PID" ] \
-        || [ "$supervisor_start_token" != "ps:$PROCESS_START_TIME" ] \
-        || [ "$service_nonce" != "$PROCESS_NONCE" ] \
-        || ! [[ "$publication_instance_nonce" =~ ^[A-Za-z0-9-]+$ ]]; then
+    if ! [[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] \
+        || [ "$drain_timeout" -gt "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ]; then
         info "ignoring stale or invalid decision runtime stop budget"
+        DECISION_RUNTIME_BUDGET_STATUS=invalid
         return 0
     fi
-    DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
-        drain_timeout
-        + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
-    ))
+    if [ "$version" = 3 ]; then
+        if [ -z "$seen_version" ] \
+            || [ -z "$seen_drain_timeout" ] \
+            || [ -z "$seen_launcher_pid" ] \
+            || [ -z "$seen_launcher_start_token" ] \
+            || [ -z "$seen_launcher_service_nonce" ] \
+            || [ -z "$seen_supervisor_pid" ] \
+            || [ -z "$seen_supervisor_start_token" ] \
+            || [ -z "$seen_publication_instance_nonce" ] \
+            || [ -n "$seen_service_nonce" ] \
+            || ! [[ "$launcher_pid" =~ ^[1-9][0-9]*$ ]] \
+            || [ "$launcher_pid" -le 1 ] \
+            || [[ "$launcher_start_token" != *:* ]] \
+            || ! [[ "$launcher_service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+            || ! [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
+            || [ "$supervisor_pid" -le 1 ] \
+            || ! [[ "$supervisor_start_token" =~ ^(linux|darwin):.+$ ]] \
+            || ! [[ "$publication_instance_nonce" =~ ^[A-Za-z0-9-]+$ ]]; then
+            info "ignoring stale or invalid decision runtime stop budget"
+            DECISION_RUNTIME_BUDGET_STATUS=invalid
+            return 0
+        fi
+        DECISION_RUNTIME_BUDGET_STATUS=v3
+        DECISION_RUNTIME_SUPERVISOR_PID=$supervisor_pid
+        DECISION_RUNTIME_SUPERVISOR_START_TOKEN=$supervisor_start_token
+        DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
+            drain_timeout
+            + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
+        ))
+        if process_identity_matches "$HERMES_DECISION_PID" \
+            && [ "$launcher_pid" = "$PROCESS_PID" ] \
+            && [ "$launcher_start_token" = "ps:$PROCESS_START_TIME" ] \
+            && [ "$launcher_service_nonce" = "$PROCESS_NONCE" ]; then
+            DECISION_RUNTIME_LAUNCHER_MATCHES=true
+        fi
+        return 0
+    fi
+    if { [ "$version" = 1 ] || [ "$version" = 2 ]; } \
+        && [ -n "$seen_version" ] \
+        && [ -n "$seen_drain_timeout" ] \
+        && [ -n "$seen_supervisor_pid" ] \
+        && [ -n "$seen_supervisor_start_token" ] \
+        && [ -n "$seen_service_nonce" ] \
+        && [ -z "$seen_launcher_pid$seen_launcher_start_token" ] \
+        && [ -z "$seen_launcher_service_nonce" ] \
+        && [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
+        && [ "$supervisor_pid" -gt 1 ] \
+        && [[ "$supervisor_start_token" == *:* ]] \
+        && [[ "$service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+        && { { [ "$version" = 1 ] \
+            && [ -z "$seen_publication_instance_nonce" ]; } \
+            || { [ "$version" = 2 ] \
+            && [ -n "$seen_publication_instance_nonce" ] \
+            && [[ "$publication_instance_nonce" =~ ^[A-Za-z0-9-]+$ ]]; }; }; then
+        DECISION_RUNTIME_BUDGET_STATUS=legacy
+        if process_identity_matches "$HERMES_DECISION_PID" \
+            && [ "$supervisor_pid" = "$PROCESS_PID" ] \
+            && [ "$supervisor_start_token" = "ps:$PROCESS_START_TIME" ] \
+            && [ "$service_nonce" = "$PROCESS_NONCE" ]; then
+            DECISION_RUNTIME_LAUNCHER_MATCHES=true
+        fi
+        return 0
+    fi
+    info "ignoring stale or invalid decision runtime stop budget"
+    DECISION_RUNTIME_BUDGET_STATUS=invalid
+}
+
+runtime_process_identity_action() {
+    local action=$1
+    local timeout_seconds=${2:-}
+    local -a helper_args=(
+        -m healthmes.hermes_runtime_supervisor
+        --runtime-process-action "$action"
+        --runtime-process-pid "$DECISION_RUNTIME_SUPERVISOR_PID"
+        --runtime-process-start-token
+        "$DECISION_RUNTIME_SUPERVISOR_START_TOKEN"
+    )
+    [ -x "$RUNTIME_PYTHON_BIN" ] \
+        || die "runtime identity helper is unavailable: $RUNTIME_PYTHON_BIN"
+    if [ -n "$timeout_seconds" ]; then
+        helper_args+=(
+            --runtime-process-timeout "$timeout_seconds"
+        )
+    fi
+    "$RUNTIME_PYTHON_BIN" "${helper_args[@]}"
+}
+
+wait_for_decision_runtime_exit() {
+    local timeout_seconds=$1 status
+    if runtime_process_identity_action wait "$timeout_seconds"; then
+        :
+    else
+        status=$?
+        case "$status" in
+        4) die "decision runtime supervisor PID was reused while waiting; refusing unverified cleanup" ;;
+        5) die "decision runtime supervisor identity cannot be verified while waiting" ;;
+        6) return 1 ;;
+        *) die "decision runtime supervisor wait failed with status $status" ;;
+        esac
+    fi
+    if process_identity_matches "$HERMES_DECISION_PID"; then
+        # The wrapper normally exits as soon as its supervised Python process
+        # does. Bound this final reap check without consuming the drain budget.
+        "$SLEEP_BIN" 1
+        process_identity_matches "$HERMES_DECISION_PID" \
+            && die "managed launcher remained alive after its Python supervisor exited"
+    fi
+    return 0
 }
 
 wait_for_process_exit() {
@@ -352,16 +494,79 @@ stop_process() {
 }
 
 stop_decision_runtime() {
+    local wrapper_alive=false signal_status
     load_decision_runtime_stop_bounds
-    # Hermes owns a separate child process group. Let the supervisor perform
-    # its bounded TERM/KILL cleanup; killing only the outer group can orphan it.
-    stop_process \
-        "Hermes decision runtime" \
-        "$HERMES_DECISION_PID" \
-        "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
-        "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
-        false
-    rm -f "$HERMES_DECISION_STOP_BUDGET"
+    if process_identity_matches "$HERMES_DECISION_PID"; then
+        wrapper_alive=true
+    fi
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+        if [ "$wrapper_alive" = true ] \
+            && [ "$DECISION_RUNTIME_LAUNCHER_MATCHES" != true ]; then
+            die "decision runtime stop budget does not match the managed launcher"
+        fi
+        if runtime_process_identity_action probe; then
+            :
+        else
+            signal_status=$?
+            case "$signal_status" in
+            3) die "decision runtime supervisor disappeared before verified shutdown" ;;
+            4) die "decision runtime supervisor PID was reused; refusing to signal it" ;;
+            *) die "decision runtime supervisor identity cannot be verified" ;;
+            esac
+        fi
+        if [ "$wrapper_alive" = true ]; then
+            info "signaling verified Python supervisor through native identity"
+        else
+            info "managed launcher metadata missing; signaling verified Python supervisor"
+        fi
+        if runtime_process_identity_action signal; then
+            :
+        else
+            signal_status=$?
+            case "$signal_status" in
+            3) ;;
+            4) die "decision runtime supervisor PID was reused before signal; refusing unverified cleanup" ;;
+            5) die "decision runtime supervisor identity cannot be verified for signal" ;;
+            *) die "failed to signal verified decision runtime supervisor" ;;
+            esac
+        fi
+        if ! wait_for_decision_runtime_exit \
+            "$DECISION_RUNTIME_TERM_WAIT_SECONDS"; then
+            die "Hermes decision runtime did not stop within ${DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
+        fi
+        clear_process_identity "$HERMES_DECISION_PID"
+        rm -f "$HERMES_DECISION_STOP_BUDGET"
+        info "Hermes decision runtime stopped"
+        return
+    fi
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = legacy ]; then
+        [ "$wrapper_alive" = true ] \
+            || die "legacy decision runtime budget cannot identify a surviving Python supervisor"
+        [ "$DECISION_RUNTIME_LAUNCHER_MATCHES" = true ] \
+            || die "legacy decision runtime budget does not match the managed launcher"
+        stop_process \
+            "Hermes decision runtime" \
+            "$HERMES_DECISION_PID" \
+            "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
+            "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
+            false
+        rm -f "$HERMES_DECISION_STOP_BUDGET"
+        return
+    fi
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = invalid ]; then
+        die "decision runtime stop budget is invalid; refusing unverified shutdown"
+    fi
+    if [ "$wrapper_alive" = true ]; then
+        stop_process \
+            "Hermes decision runtime" \
+            "$HERMES_DECISION_PID" \
+            "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
+            "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
+            false
+        return
+    fi
+    clear_process_identity "$HERMES_DECISION_PID"
+    info "Hermes decision runtime stopped"
 }
 
 load_runtime_env() {

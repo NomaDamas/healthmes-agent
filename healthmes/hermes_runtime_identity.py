@@ -1005,7 +1005,13 @@ def capture_runtime_boot_identity(
     identity_module: Path | None = None,
     mcp_inventory_module: Path | None = None,
 ) -> HermesRuntimeBootIdentity:
-    """Capture immutable code identity before a supervisor can seal files."""
+    """Snapshot control files to detect later on-disk drift.
+
+    Python has already loaded this module before this function runs. The
+    snapshot therefore does not attest that the in-memory bytecode came from
+    exactly these bytes; it only binds subsequent validation to this captured
+    disk state.
+    """
 
     interpreter = (
         Path(sys.executable)
