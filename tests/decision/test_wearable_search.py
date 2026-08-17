@@ -49,6 +49,7 @@ from healthmes.wearables.provenance import (
     OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
     open_wearables_retention_policy_binding,
     persist_open_wearables_query_snapshot,
+    retained_open_wearables_query_snapshots,
 )
 from healthmes.wearables.search import (
     BoundedOpenWearablesSearch,
@@ -557,7 +558,7 @@ async def test_retention_cutoff_timeseries_bucket_remains_persistable(
     }
 
 
-async def test_retention_snapshot_stays_valid_at_turn_effective_now(
+async def test_retention_snapshot_expires_during_provider_call(
     session,
 ) -> None:
     update_retention_policy(
@@ -621,14 +622,13 @@ async def test_retention_snapshot_stays_valid_at_turn_effective_now(
         ),
     )
 
-    assert result.status is ContextStatus.PARTIAL
-    assert "source_ref_expired" not in result.limitations
-    assert result.payload["records"][0]["timestamp"] == (
-        observed_at.isoformat()
-    )
-    event = session.get(
-        WellnessEvent,
-        UUID(result.source_refs[0].record_id),
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == ["source_ref_expired"]
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type
+            == OPEN_WEARABLES_QUERY_EVENT_TYPE
+        )
     )
     assert event is not None
     assert event.expires_at.replace(tzinfo=UTC) == (
@@ -752,6 +752,343 @@ async def test_detail_query_clamps_to_shorter_retention_policy(
     assert event.coverage is None
     assert event.payload["result"]["status"] == "partial"
     assert "coverage" not in event.payload["result"]
+
+
+async def test_live_detail_reapplies_retention_time_after_upstream(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "7d",
+        now=NOW,
+    )
+    cutoff = NOW - timedelta(days=7)
+
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": (
+                        cutoff + timedelta(seconds=1)
+                    ).isoformat(),
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    result = await WearableContextProvider(
+        search_reader=search_reader,
+        clock=lambda: NOW + timedelta(seconds=2),
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=cutoff,
+            end=cutoff + timedelta(hours=1),
+            granularity="record",
+            parameters={"category": "stress"},
+        ),
+        now=NOW,
+    )
+
+    live_cutoff = cutoff + timedelta(seconds=2)
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["records"] == []
+    assert "wearable_rows_discarded" in result.limitations
+    assert result.source_refs[0].observed_start == live_cutoff
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.payload["result"]["retention_window"][
+        "effective_now"
+    ] == (NOW + timedelta(seconds=2)).isoformat()
+    assert event.payload["result"]["retention_window"][
+        "retained_after"
+    ] == live_cutoff.isoformat()
+
+
+async def test_fallback_rewrites_records_after_retention_revision_race(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-retention-revision-race.db",
+    )
+    with factory() as setup:
+        update_retention_policy(
+            setup,
+            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+            "14d",
+            now=NOW,
+        )
+        setup.commit()
+
+    recent_recorded_at = NOW - timedelta(days=1)
+
+    async def initial_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": recent_recorded_at.isoformat(),
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.health-scores",
+        start=NOW - timedelta(days=12),
+        end=NOW,
+        granularity="record",
+        parameters={"category": "stress"},
+    )
+    try:
+        with factory() as session:
+            initial = await WearableContextProvider(
+                search_reader=initial_reader,
+                snapshot_session_factory=factory,
+            ).query(session, query, now=NOW)
+        assert len(initial.payload["records"]) == 1
+
+        async def unavailable_reader(
+            _request: WearableSearchRequest,
+        ) -> WearableSearchFetch:
+            with factory() as writer:
+                update_retention_policy(
+                    writer,
+                    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+                    "7d",
+                    now=NOW,
+                )
+                writer.commit()
+            raise RuntimeError("upstream unavailable")
+
+        with factory() as session:
+            fallback = await WearableContextProvider(
+                search_reader=unavailable_reader,
+                snapshot_session_factory=factory,
+            ).query(session, query, now=NOW)
+
+        cutoff = NOW - timedelta(days=7)
+        assert fallback.status is ContextStatus.PARTIAL
+        assert [
+            record["recorded_at"]
+            for record in fallback.payload["records"]
+        ] == [recent_recorded_at.isoformat()]
+        assert fallback.payload["window"]["start"] == cutoff.isoformat()
+        assert fallback.source_refs[0].observed_start == cutoff
+        assert (
+            fallback.source_refs[0].record_id
+            != initial.source_refs[0].record_id
+        )
+        assert {
+            "open_wearables_detail_unavailable",
+            "wearable_query_snapshot_fallback_used",
+            "wearable_retention_window_trimmed",
+        } <= set(fallback.limitations)
+        with factory() as observer:
+            event = observer.get(
+                WellnessEvent,
+                UUID(fallback.source_refs[0].record_id),
+            )
+            assert event is not None
+            assert event.payload["result"]["retention_window"][
+                "retention_policy"
+            ] == open_wearables_retention_policy_binding(observer)
+    finally:
+        engine.dispose()
+
+
+async def test_live_result_filters_records_after_retention_revision_race(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-live-retention-revision-race.db",
+    )
+    with factory() as setup:
+        update_retention_policy(
+            setup,
+            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+            "14d",
+            now=NOW,
+        )
+        setup.commit()
+
+    old_recorded_at = NOW - timedelta(days=10)
+    recent_recorded_at = NOW - timedelta(days=1)
+
+    async def racing_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        with factory() as writer:
+            update_retention_policy(
+                writer,
+                OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+                "7d",
+                now=NOW,
+            )
+            writer.commit()
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": old_recorded_at.isoformat(),
+                    "provider": "garmin",
+                    "value": 40,
+                },
+                {
+                    "category": "stress",
+                    "recorded_at": recent_recorded_at.isoformat(),
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    try:
+        with factory() as session:
+            result = await WearableContextProvider(
+                search_reader=racing_reader,
+                snapshot_session_factory=factory,
+            ).query(
+                session,
+                ContextQuery(
+                    provider_id="wearable",
+                    capability="wearable.health-scores",
+                    start=NOW - timedelta(days=12),
+                    end=NOW,
+                    granularity="record",
+                    parameters={"category": "stress"},
+                ),
+                now=NOW,
+            )
+
+        cutoff = NOW - timedelta(days=7)
+        assert [
+            record["recorded_at"]
+            for record in result.payload["records"]
+        ] == [recent_recorded_at.isoformat()]
+        assert result.source_refs[0].observed_start == cutoff
+        assert "wearable_rows_discarded" in result.limitations
+        with factory() as observer:
+            event = observer.get(
+                WellnessEvent,
+                UUID(result.source_refs[0].record_id),
+            )
+            assert event is not None
+            assert event.payload["result"]["retention_window"][
+                "retention_policy"
+            ] == open_wearables_retention_policy_binding(observer)
+    finally:
+        engine.dispose()
+
+
+async def test_fallback_fails_closed_if_retention_changes_again(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-retention-double-race.db",
+    )
+    with factory() as setup:
+        update_retention_policy(
+            setup,
+            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+            "14d",
+            now=NOW,
+        )
+        persist_open_wearables_query_snapshot(
+            setup,
+            capability="wearable.health-scores",
+            start=NOW - timedelta(days=12),
+            end=NOW,
+            timezone="UTC",
+            parameters={"category": "stress"},
+            result={
+                "status": "ok",
+                "records": [
+                    {
+                        "category": "stress",
+                        "recorded_at": (
+                            NOW - timedelta(hours=1)
+                        ).isoformat(),
+                        "provider": "garmin",
+                        "value": 40,
+                    }
+                ],
+            },
+            collected_at=NOW,
+            now=NOW,
+        )
+        setup.commit()
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        with factory() as writer:
+            update_retention_policy(
+                writer,
+                OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+                "7d",
+                now=NOW,
+            )
+            writer.commit()
+        raise RuntimeError("upstream unavailable")
+
+    class DoubleRaceProvider(WearableContextProvider):
+        def _store_detail_snapshot(self, *args, **kwargs):
+            with factory() as writer:
+                update_retention_policy(
+                    writer,
+                    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+                    "1d",
+                    now=NOW,
+                )
+                writer.commit()
+            return super()._store_detail_snapshot(*args, **kwargs)
+
+    try:
+        with factory() as session:
+            result = await DoubleRaceProvider(
+                search_reader=unavailable_reader,
+                snapshot_session_factory=factory,
+            ).query(
+                session,
+                ContextQuery(
+                    provider_id="wearable",
+                    capability="wearable.health-scores",
+                    start=NOW - timedelta(days=12),
+                    end=NOW,
+                    granularity="record",
+                    parameters={"category": "stress"},
+                ),
+                now=NOW,
+            )
+
+        assert result.status is ContextStatus.FAILED
+        assert result.source_refs == []
+        assert result.payload == {}
+        assert {
+            "open_wearables_detail_unavailable",
+            "wearable_query_snapshot_fallback_used",
+            "wearable_snapshot_persistence_failed",
+        } <= set(result.limitations)
+    finally:
+        engine.dispose()
 
 
 async def test_detail_query_fully_before_retention_skips_upstream(
@@ -997,7 +1334,7 @@ async def test_cursor_freezes_retention_window_and_never_refetches(
             records=(
                 {
                     "timestamp": (
-                        cutoff + timedelta(seconds=1)
+                        cutoff + timedelta(hours=2)
                     ).isoformat(),
                     "series_type": "heart_rate",
                     "value": 72,
@@ -1006,7 +1343,8 @@ async def test_cursor_freezes_retention_window_and_never_refetches(
                 },
                 {
                     "timestamp": (
-                        cutoff + timedelta(hours=2)
+                        cutoff
+                        + timedelta(hours=2, minutes=30)
                     ).isoformat(),
                     "series_type": "heart_rate",
                     "value": 76,
@@ -1085,6 +1423,145 @@ async def test_cursor_freezes_retention_window_and_never_refetches(
     finally:
         service.close()
         engine.dispose()
+
+
+async def test_cursor_resolves_snapshot_older_than_newest_32(
+    session,
+) -> None:
+    calls = 0
+
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        nonlocal calls
+        calls += 1
+        value = calls * 100
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": (
+                        DETAIL_START + timedelta(minutes=5)
+                    ).isoformat(),
+                    "provider": "garmin",
+                    "value": value + 1,
+                },
+                {
+                    "category": "stress",
+                    "recorded_at": (
+                        DETAIL_START + timedelta(minutes=10)
+                    ).isoformat(),
+                    "provider": "garmin",
+                    "value": value + 2,
+                },
+            )
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.health-scores",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        granularity="record",
+        limit=1,
+        parameters={"category": "stress"},
+    )
+    base_now = NOW - timedelta(minutes=40)
+    first = await provider.query(session, query, now=base_now)
+    assert first.next_cursor is not None
+
+    for offset in range(1, 40):
+        await provider.query(
+            session,
+            query,
+            now=base_now + timedelta(minutes=offset),
+        )
+
+    newest = retained_open_wearables_query_snapshots(
+        session,
+        capability=query.capability,
+        start=DETAIL_START,
+        end=DETAIL_END,
+        timezone="UTC",
+        parameters={"category": "stress"},
+        now=NOW,
+    )
+    assert len(newest) == 32
+    assert all(
+        str(snapshot.event_id) != first.source_refs[0].record_id
+        for snapshot in newest
+    )
+
+    second = await provider.query(
+        session,
+        query.model_copy(
+            update={
+                "parameters": {
+                    "category": "stress",
+                    "cursor": first.next_cursor,
+                }
+            }
+        ),
+        now=NOW,
+    )
+
+    assert calls == 40
+    assert second.payload["records"][0]["value"] == 102
+    assert second.source_refs == first.source_refs
+
+
+def test_retained_snapshot_order_uses_event_id_as_final_tiebreaker(
+    session,
+) -> None:
+    event_ids: list[UUID] = []
+    collected_at = NOW - timedelta(hours=1)
+    for value in (41, 42, 43):
+        snapshot = persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            timezone="UTC",
+            parameters={"category": "stress"},
+            result={
+                "status": "ok",
+                "records": [
+                    {
+                        "category": "stress",
+                        "recorded_at": (
+                            DETAIL_START + timedelta(minutes=5)
+                        ).isoformat(),
+                        "provider": "garmin",
+                        "value": value,
+                    }
+                ],
+            },
+            collected_at=collected_at,
+            now=NOW,
+        )
+        event_ids.append(snapshot.event_id)
+    tied_created_at = NOW - timedelta(days=1)
+    for event_id in event_ids:
+        event = session.get(WellnessEvent, event_id)
+        assert event is not None
+        event.created_at = tied_created_at
+    session.flush()
+
+    snapshots = retained_open_wearables_query_snapshots(
+        session,
+        capability="wearable.health-scores",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        timezone="UTC",
+        parameters={"category": "stress"},
+        now=NOW,
+    )
+
+    assert [snapshot.event_id for snapshot in snapshots] == sorted(
+        event_ids,
+        reverse=True,
+    )
 
 
 async def test_detail_digest_ignores_private_source_identifiers(

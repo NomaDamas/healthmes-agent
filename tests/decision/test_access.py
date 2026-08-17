@@ -1038,7 +1038,7 @@ async def test_activity_permission_is_rechecked_after_provider_execution(
     assert result.limitations == ["activity_permission_revoked"]
 
 
-async def test_source_retention_uses_request_captured_effective_now(
+async def test_source_retention_uses_post_provider_wall_clock(
     session,
 ):
     event = _event(
@@ -1077,12 +1077,12 @@ async def test_source_retention_uses_request_captured_effective_now(
         ),
     )
 
-    assert result.status is ContextStatus.OK
-    assert result.limitations == []
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == ["source_ref_expired"]
     assert turn.trace[0].occurred_at == NOW + timedelta(seconds=2)
 
 
-async def test_cross_session_retention_uses_request_captured_effective_now(
+async def test_cross_session_retention_uses_post_provider_wall_clock(
     tmp_path,
 ):
     engine = create_db_engine(
@@ -1144,8 +1144,8 @@ async def test_cross_session_retention_uses_request_captured_effective_now(
                 ),
             )
 
-        assert result.status is ContextStatus.OK
-        assert result.limitations == []
+        assert result.status is ContextStatus.DENIED
+        assert result.limitations == ["source_ref_expired"]
         assert turn.trace[0].occurred_at == NOW + timedelta(seconds=2)
     finally:
         engine.dispose()

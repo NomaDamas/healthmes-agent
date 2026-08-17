@@ -74,6 +74,7 @@ def build_context_provider_registry(
     calendar_account_generation_resolver: (
         Callable[[CalendarSource], str | None] | None
     ) = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> ContextProviderRegistry:
     """Build the default registry without import-time global registration."""
 
@@ -85,6 +86,7 @@ def build_context_provider_registry(
                 wearable_reader,
                 search_reader=wearable_search_reader,
                 snapshot_session_factory=session_factory,
+                clock=clock,
             ),
             CalendarContextProvider(
                 settings=calendar_settings,
@@ -274,6 +276,7 @@ def build_decision_context_search_session_service(
         calendar_account_generation_resolver=(
             account_generation_resolver
         ),
+        clock=clock,
     )
     access_layer = ContextAccessLayer(
         registry,

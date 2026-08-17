@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from healthmes.activity.aggregation import local_day_bounds
 from healthmes.activity.context import (
@@ -118,6 +119,7 @@ from healthmes.wearables.search import (
     WearableSearchFetch,
     WearableSearchReader,
     WearableSearchRequest,
+    normalize_retained_wearable_health_scores,
     normalize_retained_wearable_summaries,
     normalize_retained_wearable_timeseries,
     normalize_retained_wearable_workouts,
@@ -1041,6 +1043,76 @@ def _wearable_fetch_with_required_provider(
         ),
         stream_attribution_unavailable=(
             fetched.stream_attribution_unavailable
+        ),
+    )
+
+
+def _wearable_fetch_with_current_retention(
+    fetched: WearableSearchFetch,
+    *,
+    query: ContextQuery,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+) -> WearableSearchFetch:
+    if query.capability == "wearable.health-scores":
+        normalized = normalize_retained_wearable_health_scores(
+            fetched.records,
+            category=(
+                str(query.parameters["category"])
+                if query.parameters.get("category") is not None
+                else None
+            ),
+            start=start,
+            end=end,
+            retained_after=retained_after,
+        )
+    elif query.capability == "wearable.summaries":
+        normalized = normalize_retained_wearable_summaries(
+            fetched.records,
+            kind=str(query.parameters["summary_kind"]),
+            start=start,
+            end=end,
+            timezone=query.timezone,
+            retained_after=retained_after,
+        )
+    elif query.capability == "wearable.workouts":
+        normalized = normalize_retained_wearable_workouts(
+            fetched.records,
+            start=start,
+            end=end,
+            retained_after=retained_after,
+        )
+    else:
+        normalized = normalize_retained_wearable_timeseries(
+            fetched.records,
+            series_type=str(query.parameters["series_type"]),
+            resolution=str(query.parameters["resolution"]),
+            start=start,
+            end=end,
+            stream_attribution_verified=(
+                not fetched.stream_attribution_unavailable
+            ),
+            retained_after=retained_after,
+        )
+    return WearableSearchFetch(
+        records=normalized.records,
+        upstream_truncated=fetched.upstream_truncated,
+        payload_trimmed=fetched.payload_trimmed,
+        discarded_rows=(
+            fetched.discarded_rows + normalized.discarded_rows
+        ),
+        summary_window_partial=(
+            fetched.summary_window_partial
+            or normalized.summary_window_partial
+        ),
+        conflicting_duplicate_rows=(
+            fetched.conflicting_duplicate_rows
+            or normalized.conflicting_duplicate_rows
+        ),
+        stream_attribution_unavailable=(
+            fetched.stream_attribution_unavailable
+            or normalized.stream_attribution_unavailable
         ),
     )
 
@@ -3214,6 +3286,7 @@ class WearableContextProvider:
         search_reader: WearableSearchReader | None = None,
         snapshot_session_factory: sessionmaker[Session] | None = None,
         upstream_timeout_seconds: float = 8.0,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
             not isfinite(upstream_timeout_seconds)
@@ -3227,6 +3300,28 @@ class WearableContextProvider:
         self._search_reader = search_reader
         self._snapshot_session_factory = snapshot_session_factory
         self._upstream_timeout_seconds = upstream_timeout_seconds
+        self._clock = clock
+
+    def _operation_now(self, baseline: datetime) -> datetime:
+        current = _as_utc(baseline)
+        if self._clock is None:
+            return current
+        return max(current, _as_utc(self._clock()))
+
+    def _current_retention_policy(
+        self,
+        session: Session,
+    ) -> dict[str, Any]:
+        factory = self._snapshot_session_factory
+        if (
+            factory is None
+            or isinstance(session.get_bind().pool, StaticPool)
+        ):
+            return open_wearables_retention_policy_binding(session)
+        with factory() as current_session:
+            return open_wearables_retention_policy_binding(
+                current_session
+            )
 
     async def query(
         self,
@@ -3442,7 +3537,7 @@ class WearableContextProvider:
             for key, value in query.parameters.items()
             if key not in {"cursor", "date"}
         }
-        retention_policy = open_wearables_retention_policy_binding(session)
+        retention_policy = self._current_retention_policy(session)
         retained_after = _wearable_retention_cutoff(
             retention_policy,
             effective_now=now,
@@ -3466,6 +3561,7 @@ class WearableContextProvider:
                 timezone=query.timezone,
                 parameters=parameters,
                 now=now,
+                candidate_limit=None,
             )
             for retained in retained_snapshots:
                 try:
@@ -3517,8 +3613,44 @@ class WearableContextProvider:
         else:
             limitations.add("open_wearables_detail_unavailable")
 
+        now = self._operation_now(now)
+        retention_policy = self._current_retention_policy(session)
+        retained_after = _wearable_retention_cutoff(
+            retention_policy,
+            effective_now=now,
+        )
+        if retained_after is not None:
+            if end <= retained_after:
+                return ContextResult(
+                    query_id=query.query_id,
+                    provider_id=query.provider_id,
+                    capability=query.capability,
+                    status=ContextStatus.UNAVAILABLE,
+                    freshness=ContextFreshness(
+                        status=FreshnessStatus.UNAVAILABLE
+                    ),
+                    coverage=ContextCoverage(
+                        status=CoverageStatus.UNAVAILABLE
+                    ),
+                    limitations=sorted(
+                        {
+                            *limitations,
+                            "wearable_query_outside_retention_window",
+                        }
+                    ),
+                )
+            if start <= retained_after:
+                limitations.add("wearable_retention_window_trimmed")
+
         if fetched is not None:
             fetched = _wearable_fetch_with_required_provider(fetched)
+            fetched = _wearable_fetch_with_current_retention(
+                fetched,
+                query=query,
+                start=start,
+                end=end,
+                retained_after=retained_after,
+            )
             stored_limitations = {
                 *fetched.limitations,
                 *limitations,
@@ -3563,15 +3695,28 @@ class WearableContextProvider:
                 now=now,
             )
             if snapshot is not None:
-                return self._detail_result(
-                    query,
-                    snapshot,
-                    provenance_mode="live_upstream_mirrored",
-                    now=now,
-                    expected_retention_policy=retention_policy,
+                current_policy = self._current_retention_policy(
+                    session
                 )
-            limitations.add(store_limitation)
+                if current_policy == retention_policy:
+                    return self._detail_result(
+                        query,
+                        snapshot,
+                        provenance_mode="live_upstream_mirrored",
+                        now=now,
+                        expected_retention_policy=current_policy,
+                    )
+                limitations.add(
+                    "wearable_snapshot_persistence_failed"
+                )
+            if store_limitation:
+                limitations.add(store_limitation)
 
+        retention_policy = self._current_retention_policy(session)
+        retained_after = _wearable_retention_cutoff(
+            retention_policy,
+            effective_now=now,
+        )
         retained = latest_retained_open_wearables_query_snapshot(
             session,
             capability=query.capability,
@@ -3584,11 +3729,43 @@ class WearableContextProvider:
         if retained is not None:
             limitations.add("wearable_query_snapshot_fallback_used")
             fallback_result = dict(retained.result)
+            fallback_records = fallback_result.get("records")
+            fallback_fetch = _wearable_fetch_with_required_provider(
+                WearableSearchFetch(
+                    records=tuple(
+                        dict(record)
+                        for record in (
+                            fallback_records
+                            if isinstance(fallback_records, list)
+                            else []
+                        )
+                        if isinstance(record, Mapping)
+                    ),
+                    stream_attribution_unavailable=(
+                        query.capability == "wearable.timeseries"
+                        and fallback_result.get(
+                            "stream_attribution_status"
+                        )
+                        != "verified"
+                    ),
+                )
+            )
+            fallback_fetch = _wearable_fetch_with_current_retention(
+                fallback_fetch,
+                query=query,
+                start=start,
+                end=end,
+                retained_after=retained_after,
+            )
             fallback_result["status"] = "partial"
+            fallback_result["records"] = list(
+                fallback_fetch.records
+            )
             fallback_result["coverage"] = {"status": "unknown"}
             fallback_result["limitations"] = sorted(
                 {
                     *_limitations(retained.result),
+                    *fallback_fetch.limitations,
                     *limitations,
                 }
             )
@@ -3613,22 +3790,22 @@ class WearableContextProvider:
                 )
             )
             if fallback_snapshot is not None:
-                return self._detail_result(
-                    query,
-                    fallback_snapshot,
-                    provenance_mode="retained_local_mirror",
-                    now=now,
-                    expected_retention_policy=retention_policy,
+                current_policy = self._current_retention_policy(
+                    session
                 )
-            limitations.add(fallback_store_limitation)
-            return self._detail_result(
-                query,
-                retained,
-                provenance_mode="retained_local_mirror",
-                now=now,
-                extra_limitations=tuple(limitations),
-                allow_cursor=False,
-            )
+                if current_policy == retention_policy:
+                    return self._detail_result(
+                        query,
+                        fallback_snapshot,
+                        provenance_mode="retained_local_mirror",
+                        now=now,
+                        expected_retention_policy=current_policy,
+                    )
+                limitations.add(
+                    "wearable_snapshot_persistence_failed"
+                )
+            if fallback_store_limitation:
+                limitations.add(fallback_store_limitation)
 
         failed = bool(
             {
@@ -3776,7 +3953,21 @@ class WearableContextProvider:
             if isinstance(record, Mapping)
         ]
         retained_limitations = set(_limitations(stored))
-        if query.capability == "wearable.summaries":
+        if query.capability == "wearable.health-scores":
+            normalized_fetch = normalize_retained_wearable_health_scores(
+                public_records,
+                category=(
+                    str(query.parameters["category"])
+                    if query.parameters.get("category") is not None
+                    else None
+                ),
+                start=snapshot.start,
+                end=snapshot.end,
+                retained_after=retained_after,
+            )
+            public_records = list(normalized_fetch.records)
+            retained_limitations.update(normalized_fetch.limitations)
+        elif query.capability == "wearable.summaries":
             normalized_fetch = normalize_retained_wearable_summaries(
                 public_records,
                 kind=str(query.parameters["summary_kind"]),

@@ -1365,6 +1365,67 @@ async def test_same_page_identical_rows_without_ids_remain_distinct(
     assert "wearable_conflicting_duplicate_rows" not in fetched.limitations
 
 
+class SamePageStableIdClient(SamePageDuplicateClient):
+    def __init__(
+        self,
+        capability: str,
+        *,
+        conflicting: bool,
+    ) -> None:
+        super().__init__(capability)
+        self.conflicting = conflicting
+
+    def _rows(self) -> list[dict]:
+        baseline = _overlap_row(
+            self.capability,
+            provider="apple",
+            conflicting=False,
+            include_id=True,
+        )
+        duplicate = _overlap_row(
+            self.capability,
+            provider="apple_health",
+            conflicting=self.conflicting,
+            include_id=True,
+        )
+        return [baseline, duplicate]
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+@pytest.mark.parametrize("conflicting", (False, True))
+async def test_same_page_stable_ids_deduplicate_or_surface_conflicts(
+    capability: str,
+    conflicting: bool,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        SamePageStableIdClient(
+            capability,
+            conflicting=conflicting,
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    assert len(fetched.records) == (2 if conflicting else 1)
+    assert (
+        "wearable_conflicting_duplicate_rows" in fetched.limitations
+    ) is conflicting
+    if capability == "wearable.timeseries":
+        assert [record["value"] for record in fetched.records] == (
+            [10, 20] if conflicting else [10]
+        )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-provider-row-id" not in encoded
+    assert "private-provider-stream-id" not in encoded
+
+
 class ExactOverlapAfterPriorVariantClient:
     def __init__(self, capability: str) -> None:
         self.capability = capability
@@ -1929,6 +1990,92 @@ async def test_search_uses_declared_provider_and_exact_legacy_aliases() -> None:
         ("google_health_connect", "source_exact_alias"),
         ("samsung_health", "source_exact_alias"),
     ]
+
+
+class RealOpenWearablesTimeseriesClient:
+    async def get_timeseries(
+        self,
+        _user_id,
+        _start,
+        _end,
+        series_types,
+        *,
+        resolution,
+        **_kwargs,
+    ):
+        assert series_types == ["steps"]
+        assert resolution == "1hour"
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:05:00Z",
+                    "zone_offset": "+00:00",
+                    "type": "steps",
+                    "value": 10.0,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple_health_sdk",
+                        "device": "Watch7,1",
+                    },
+                    "is_daily_total": False,
+                },
+                {
+                    "timestamp": "2026-08-10T10:25:00Z",
+                    "zone_offset": "+00:00",
+                    "type": "steps",
+                    "value": 20.0,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple_health_sdk",
+                        "device": "Watch7,1",
+                    },
+                    "is_daily_total": False,
+                },
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "previous_cursor": None,
+                "has_more": False,
+                "total_count": 2,
+            },
+            "metadata": {
+                "sample_count": 2,
+                "start_time": "2026-08-10T09:00:00Z",
+                "end_time": "2026-08-10T11:00:00Z",
+            },
+        }
+
+
+async def test_real_open_wearables_timeseries_schema_is_supported() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        RealOpenWearablesTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T10:00:00+00:00",
+        "2026-08-10T10:00:00+00:00",
+    ]
+    assert all(
+        record["provider"] == "apple_health"
+        and record["provider_attribution"] == "source_exact_alias"
+        for record in fetched.records
+    )
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "Watch7,1" not in encoded
+    assert "data_source_id" not in encoded
 
 
 class DistinctSensorStreamsClient:

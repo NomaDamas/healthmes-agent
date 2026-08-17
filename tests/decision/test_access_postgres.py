@@ -296,7 +296,7 @@ async def test_postgres_enforces_activity_control_and_retention() -> None:
         "HEALTHMES_TEST_POSTGRES_URL"
     ),
 )
-async def test_postgres_retention_uses_request_captured_effective_now() -> None:
+async def test_postgres_retention_uses_post_provider_wall_clock() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
     schema = f"hm_test_{uuid.uuid4().hex}"
@@ -380,8 +380,8 @@ async def test_postgres_retention_uses_request_captured_effective_now() -> None:
                 ),
             )
 
-        assert result.status is ContextStatus.OK
-        assert result.limitations == []
+        assert result.status is ContextStatus.DENIED
+        assert result.limitations == ["source_ref_expired"]
     finally:
         engine.dispose()
         with admin_engine.begin() as connection:

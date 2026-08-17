@@ -110,10 +110,12 @@ _PRIVATE_KEYS = frozenset(
 _PROVIDER_FAMILY_ALIASES = {
     "apple": "apple_health",
     "applehealth": "apple_health",
+    "applehealthsdk": "apple_health",
     "fitbit": "fitbit",
     "garmin": "garmin",
     "google": "google_health_connect",
     "googlehealthconnect": "google_health_connect",
+    "googlehealthconnectsdk": "google_health_connect",
     "internal": "internal",
     "oura": "oura",
     "polar": "polar",
@@ -127,6 +129,7 @@ _PROVIDER_FAMILY_ALIASES = {
 _INTERNAL_PAGE_INDEX = "_healthmes_page_index"
 _INTERNAL_PAGE_ORDINAL = "_healthmes_page_ordinal"
 _INTERNAL_ROW_IDENTITY = "_healthmes_row_identity"
+_INTERNAL_STABLE_ROW_ID = "_healthmes_stable_row_id"
 _INTERNAL_STREAM_KEY = "_healthmes_stream_key"
 _PROVIDER_ROW_ID_FIELDS = (
     "id",
@@ -199,6 +202,55 @@ WearableSearchReader = Callable[
     [WearableSearchRequest],
     Awaitable[WearableSearchFetch],
 ]
+
+
+def normalize_retained_wearable_health_scores(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    category: str | None,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None = None,
+) -> WearableSearchFetch:
+    """Reapply the current window to retained health-score records."""
+
+    if (
+        category is not None
+        and category not in WEARABLE_HEALTH_SCORE_CATEGORIES
+    ):
+        raise ValueError("wearable health score category is not allowlisted")
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
+    normalized: list[dict[str, Any]] = []
+    discarded = 0
+    for record in records:
+        recorded_at = _timestamp(record.get("recorded_at"))
+        retained_category = _safe_text(
+            record.get("category"),
+            max_length=32,
+        )
+        if (
+            recorded_at is None
+            or not start_utc <= recorded_at < end_utc
+            or not _observation_is_retained(
+                recorded_at,
+                retained_after=retained_after,
+            )
+            or retained_category
+            not in WEARABLE_HEALTH_SCORE_CATEGORIES
+            or (
+                category is not None
+                and retained_category != category
+            )
+        ):
+            discarded += 1
+            continue
+        normalized.append(dict(record))
+    normalized.sort(key=_row_sort_key)
+    return WearableSearchFetch(
+        records=tuple(normalized),
+        discarded_rows=discarded,
+    )
 
 
 def normalize_retained_wearable_summaries(
@@ -1045,6 +1097,9 @@ def _with_row_identity(
     row: Mapping[str, Any],
 ) -> dict[str, Any]:
     record[_INTERNAL_ROW_IDENTITY] = _row_identity(row, record)
+    record[_INTERNAL_STABLE_ROW_ID] = (
+        _provider_row_identifier(row) is not None
+    )
     for field in (_INTERNAL_PAGE_INDEX, _INTERNAL_PAGE_ORDINAL):
         value = row.get(field)
         if type(value) is int and value >= 0:
@@ -1437,11 +1492,12 @@ def _summary_window_is_partial(
 def _deduplicate_wearable_records(
     records: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Collapse exact page overlap and retain conflicting observations."""
+    """Collapse authoritative duplicates and retain ambiguous observations."""
 
     selected: list[dict[str, Any]] = []
     selected_indexes: dict[str, list[int]] = {}
     variant_origins: dict[str, dict[str, set[int]]] = {}
+    stable_identities: set[str] = set()
     page_occurrences: dict[tuple[int, str, str], int] = {}
     occurrence_origins: dict[
         tuple[str, str, int],
@@ -1470,6 +1526,12 @@ def _deduplicate_wearable_records(
                     sort_keys=True,
                 ).encode("utf-8")
                 ).hexdigest()
+        stable_identity = (
+            record.pop(_INTERNAL_STABLE_ROW_ID, False) is True
+        )
+        if stable_identity:
+            stable_identities.add(identity)
+        stable_identity = identity in stable_identities
         raw_page_index = record.pop(_INTERNAL_PAGE_INDEX, None)
         raw_page_ordinal = record.pop(_INTERNAL_PAGE_ORDINAL, None)
         page_index = (
@@ -1492,23 +1554,36 @@ def _deduplicate_wearable_records(
             ).encode("utf-8")
         ).hexdigest()
         occurrence_key = (page_index, identity, digest)
-        occurrence = page_occurrences.get(occurrence_key, 0)
-        page_occurrences[occurrence_key] = occurrence + 1
+        occurrence = (
+            0
+            if stable_identity
+            else page_occurrences.get(occurrence_key, 0)
+        )
+        if not stable_identity:
+            page_occurrences[occurrence_key] = occurrence + 1
         cross_page_key = (identity, digest, occurrence)
         identity_variants = variant_origins.setdefault(identity, {})
-        has_cross_page_conflict = any(
+        has_conflict = any(
             variant_digest != digest
-            and any(origin_page != page_index for origin_page in origin_pages)
+            and (
+                stable_identity
+                or any(
+                    origin_page != page_index
+                    for origin_page in origin_pages
+                )
+            )
             for variant_digest, origin_pages in identity_variants.items()
         )
-        if has_cross_page_conflict:
+        if has_conflict:
             conflicting = True
             for index in selected_indexes.get(identity, ()):
                 selected[index].pop(_INTERNAL_STREAM_KEY, None)
             record.pop(_INTERNAL_STREAM_KEY, None)
 
         prior_origin = occurrence_origins.get(cross_page_key)
-        if prior_origin is not None and prior_origin[0] != page_index:
+        if prior_origin is not None and (
+            stable_identity or prior_origin[0] != page_index
+        ):
             identity_variants.setdefault(digest, set()).add(page_index)
             continue
         occurrence_origins[cross_page_key] = (page_index, page_ordinal)

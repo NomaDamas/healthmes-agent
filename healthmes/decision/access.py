@@ -1094,7 +1094,6 @@ class ContextAccessTurn:
             if self._normalization_now is None:
                 self._normalization_now = now
             normalization_now = self._normalization_now
-            effective_now = normalization_now
             self._calls += 1
             tool_budget_exhausted = (
                 self._calls > self.request.budget.max_tool_calls
@@ -1145,7 +1144,7 @@ class ContextAccessTurn:
             result = await self._layer.registry.execute(
                 session,
                 effective_query,
-                now=effective_now,
+                now=now,
                 ensure_active=ensure_active,
             )
         except (
@@ -1273,7 +1272,7 @@ class ContextAccessTurn:
         freshness = result.freshness
         if (
             freshness.as_of is not None
-            and freshness.as_of > effective_now + _MAX_FUTURE_SKEW
+            and freshness.as_of > now + _MAX_FUTURE_SKEW
         ):
             return self._deny(
                 query,
@@ -1288,7 +1287,7 @@ class ContextAccessTurn:
                         0,
                         int(
                             (
-                                effective_now - freshness.as_of
+                                now - freshness.as_of
                             ).total_seconds()
                         ),
                     )
@@ -1301,7 +1300,7 @@ class ContextAccessTurn:
             effective_query,
             capability=capability,
             grant=grant,
-            now=effective_now,
+            now=now,
             calendar_visibility_snapshot=calendar_snapshot,
         )
         if ensure_active is not None:
@@ -1329,7 +1328,7 @@ class ContextAccessTurn:
                 selected_record_ids=frozenset(
                     self.request.hints.related_record_ids.values()
                 ),
-                now=effective_now,
+                now=now,
             )
             if not raw_sources:
                 return self._deny(
@@ -1397,7 +1396,7 @@ class ContextAccessTurn:
         observed_start, observed_end, collected_at = _source_ref_times(
             session,
             refs,
-            now=effective_now,
+            now=now,
         )
         if not refs and verified_empty_metadata:
             observed_start = result.observed_start

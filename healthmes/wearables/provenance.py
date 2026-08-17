@@ -1365,8 +1365,9 @@ def retained_open_wearables_query_snapshots(
     timezone: str,
     parameters: Mapping[str, Any],
     now: datetime,
+    candidate_limit: int | None = _MAX_RETAINED_QUERY_CANDIDATES,
 ) -> tuple[WearableQuerySnapshot, ...]:
-    """Load bounded retained mirrors for one exact query, newest first."""
+    """Load retained mirrors for one exact query, newest first."""
 
     _scope, query_digest = _normalize_query_scope(
         capability=capability,
@@ -1377,7 +1378,7 @@ def retained_open_wearables_query_snapshots(
     )
     current = _aware_utc(now, field="now")
     prefix = f"query:{query_digest}:%"
-    rows = session.scalars(
+    statement = (
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE,
@@ -1392,9 +1393,14 @@ def retained_open_wearables_query_snapshots(
         .order_by(
             WellnessEvent.recorded_at.desc(),
             WellnessEvent.created_at.desc(),
+            WellnessEvent.id.desc(),
         )
-        .limit(_MAX_RETAINED_QUERY_CANDIDATES)
     )
+    if candidate_limit is not None:
+        if candidate_limit < 1:
+            raise ValueError("candidate_limit must be positive or None")
+        statement = statement.limit(candidate_limit)
+    rows = session.scalars(statement)
     snapshots: list[WearableQuerySnapshot] = []
     for event in rows:
         snapshot = wearable_query_snapshot_from_event(
