@@ -42,6 +42,7 @@ from healthmes.hermes_runtime_supervisor import (
     capture_runtime_supervisor_identity,
     create_supervisor_app,
     load_runtime_shutdown_budget,
+    parse_args,
 )
 from healthmes.hermes_runtime_supervisor import main as supervisor_main
 
@@ -98,6 +99,56 @@ def test_runtime_identities_accept_managed_pid_boundaries(
         start_token="linux:1",
         service_nonce="service",
     ).pid == pid
+
+
+@pytest.mark.parametrize(
+    ("flag", "attribute"),
+    (
+        ("--runtime-process-pid", "runtime_process_pid"),
+        (
+            "--runtime-process-group-pgid",
+            "runtime_process_group_pgid",
+        ),
+    ),
+)
+@pytest.mark.parametrize("value", ("2", "2147483647"))
+def test_supervisor_runtime_cli_accepts_managed_id_boundaries(
+    flag: str,
+    attribute: str,
+    value: str,
+) -> None:
+    args = parse_args([f"{flag}={value}"])
+
+    assert getattr(args, attribute) == int(value)
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ("--runtime-process-pid", "--runtime-process-group-pgid"),
+)
+@pytest.mark.parametrize(
+    "value",
+    (
+        "1",
+        "02",
+        "+2",
+        " 2",
+        "2 ",
+        "2_0",
+        "2147483648",
+        "9" * 128,
+    ),
+)
+def test_supervisor_runtime_cli_rejects_noncanonical_managed_id(
+    capsys: pytest.CaptureFixture[str],
+    flag: str,
+    value: str,
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        parse_args([f"{flag}={value}"])
+
+    assert raised.value.code == 2
+    assert "invalid managed process ID" in capsys.readouterr().err
 
 
 def _install_lifecycle_harness(
@@ -1972,6 +2023,30 @@ def test_runtime_launcher_group_probe_fails_closed_on_unknown_state(
     )
     assert (
         "hermes_runtime_child_group_ps_output_invalid"
+        in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("pgid", (1, 2_147_483_648))
+def test_runtime_launcher_group_probe_rejects_out_of_range_pgid(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pgid: int,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_group_members",
+        lambda *_args: pytest.fail("invalid process group was probed"),
+    )
+
+    assert (
+        _run_runtime_process_group_probe(
+            pgid=pgid,
+            timeout_seconds=1,
+        )
+        == 5
+    )
+    assert (
+        "runtime launcher process group is invalid"
         in capsys.readouterr().err
     )
 

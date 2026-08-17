@@ -2049,6 +2049,69 @@ def test_shell_shutdown_budget_numeric_parser_matches_canonical_rule(
     )
 
 
+@pytest.mark.parametrize("version", (1, 2))
+@pytest.mark.parametrize(
+    ("field", "original", "invalid"),
+    (
+        ("drain_timeout_seconds", "2", "02"),
+        ("drain_timeout_seconds", "2", "316"),
+        ("drain_timeout_seconds", "2", "9" * 128),
+        ("supervisor_pid", FAKE_MANAGED_PID, f"0{FAKE_MANAGED_PID}"),
+        ("supervisor_pid", FAKE_MANAGED_PID, "2147483648"),
+        ("supervisor_pid", FAKE_MANAGED_PID, "9" * 128),
+    ),
+)
+def test_legacy_shutdown_budget_numeric_parser_parity(
+    tmp_path: Path,
+    version: int,
+    field: str,
+    original: str,
+    invalid: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+        version=version,
+    )
+    budget.write_bytes(
+        budget.read_bytes().replace(
+            f"{field}\t{original}\n".encode(),
+            f"{field}\t{invalid}\n".encode(),
+        )
+    )
+
+    with pytest.raises(ValueError, match="shutdown budget is invalid"):
+        load_runtime_shutdown_budget(budget)
+    native = _run_native_identity_helper(
+        "read-shutdown-budget",
+        str(budget),
+        "--max-bytes",
+        "1024",
+        "--max-drain-seconds",
+        "315",
+        check=False,
+    )
+    result = _run_local_runtime(
+        harness,
+        "status",
+        env_overrides={
+            "HEALTHMES_NATIVE_IDENTITY_HELPER": str(
+                _passthrough_shutdown_budget_helper(tmp_path)
+            )
+        },
+        timeout=4,
+    )
+
+    assert native.returncode != 0
+    assert (
+        "Hermes decision runtime: unknown "
+        "(shutdown budget is malformed or unsafe)"
+        in result.stdout
+    )
+
+
 @pytest.mark.parametrize(
     ("drain_timeout", "launcher_pid", "supervisor_pid"),
     (

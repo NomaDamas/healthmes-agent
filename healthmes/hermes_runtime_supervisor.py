@@ -134,6 +134,19 @@ def _parse_bounded_ascii_decimal(
     return parsed
 
 
+def _parse_managed_process_id_argument(value: str) -> int:
+    try:
+        return _parse_bounded_ascii_decimal(
+            value,
+            minimum=_MIN_MANAGED_PROCESS_PID,
+            maximum=_MAX_MANAGED_PROCESS_PID,
+        )
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "invalid managed process ID"
+        ) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class HermesRuntimeShutdownBudget:
     """Validated wall-clock budget shared by every runtime shutdown layer."""
@@ -2606,7 +2619,11 @@ def _run_runtime_process_group_probe(
     """Prove that a launcher's process group has no surviving members."""
 
     try:
-        if pgid <= 1:
+        if not (
+            _MIN_MANAGED_PROCESS_PID
+            <= pgid
+            <= _MAX_MANAGED_PROCESS_PID
+        ):
             raise ValueError("runtime launcher process group is invalid")
         if (
             timeout_seconds is None
@@ -3575,7 +3592,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--runtime-process-pid",
-        type=int,
+        type=_parse_managed_process_id_argument,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -3589,7 +3606,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--runtime-process-group-pgid",
-        type=int,
+        type=_parse_managed_process_id_argument,
         help=argparse.SUPPRESS,
     )
     return parser.parse_args(argv)
