@@ -154,19 +154,11 @@ Hermes runtime 경계는
 context는 HealthMes MCP의 bounded 도구를 거쳐 Hermes의 단일 autonomous turn이
 종합하고, HealthMes가 source reference와 저장 결과를 검증한다.
 
-**소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
-담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
-입력 계약으로 받아 다른 맥락과 연결한다. 중복 모델 조사·구현은 하지 않는다.
-
-**다입력 플랫폼 해자:** Open Wearables 외 건강·행동·환경·일정·주관 상태·의료
-입력을 계속 추가할 수 있는 범용 인터페이스 자체를 독립적인 해자로 둔다. 모든
-입력은 provenance/confidence/consent/retention을 포함한 공통 계약으로 들어오며,
-지원 범위는 넓게 설계하고 실제 adapter는 검증 순서대로 확장한다. 상세 전략은
-[`WELLNESS-DATA-PLATFORM.ko.md`](WELLNESS-DATA-PLATFORM.ko.md)를 따른다.
-
-**소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
-담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
-입력 계약으로 받아 다른 맥락과 연결한다. 중복 모델 조사·구현은 하지 않는다.
+**Nutrition 경계 (2026-08-17):** Sake의 카페인 관찰 계약은 HealthMes
+Nutrition input의 하위 호환 부분집합이다. HealthMes는 사진 VLM, 텍스트와
+기기에서 생성한 음성 transcript를 공통 intake 계약으로 구조화하고, 관찰·확인·
+섭취 결과를 중앙 저장소에 보존해 이후 MCP 검색과 교차 영역 판단에 재사용한다.
+실제 촬영·녹음 UI와 기기별 권한 화면은 device team이 소유한다.
 
 ### 지표 신뢰도 경계 (도구에 내장)
 
