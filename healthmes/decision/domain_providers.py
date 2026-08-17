@@ -102,6 +102,7 @@ from healthmes.wearables.provenance import (
     commit_open_wearables_snapshot,
     latest_retained_open_wearables_query_snapshot,
     latest_retained_open_wearables_snapshot,
+    open_wearables_retention_policy_binding,
     persist_open_wearables_observation,
     persist_open_wearables_query_snapshot,
     retained_open_wearables_query_snapshots,
@@ -119,6 +120,7 @@ from healthmes.wearables.search import (
     WearableSearchRequest,
     normalize_retained_wearable_summaries,
     normalize_retained_wearable_timeseries,
+    normalize_retained_wearable_workouts,
     validate_wearable_search_request,
 )
 
@@ -771,14 +773,13 @@ def _wearable_retention_window(
     start: datetime,
     end: datetime,
     effective_now: datetime,
-    retained_after: datetime | None,
+    retention_policy: Mapping[str, Any],
 ) -> dict[str, Any]:
     query_start = _as_utc(start)
     query_end = _as_utc(end)
-    cutoff = (
-        _as_utc(retained_after)
-        if retained_after is not None
-        else None
+    cutoff = _wearable_retention_cutoff(
+        retention_policy,
+        effective_now=effective_now,
     )
     effective_start = (
         max(query_start, cutoff)
@@ -797,25 +798,74 @@ def _wearable_retention_window(
             cutoff is None or query_start > cutoff
         ),
         "effective_end": query_end.isoformat(),
+        "retention_policy": dict(retention_policy),
     }
+
+
+def _wearable_retention_cutoff(
+    retention_policy: Mapping[str, Any],
+    *,
+    effective_now: datetime,
+) -> datetime | None:
+    if (
+        retention_policy.get("data_class")
+        != OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS
+        or type(retention_policy.get("enabled")) is not bool
+    ):
+        raise ValueError("wearable retention policy binding is invalid")
+    retention_days = retention_policy.get("retention_days")
+    if retention_days is not None and (
+        type(retention_days) is not int or retention_days <= 0
+    ):
+        raise ValueError("wearable retention policy binding is invalid")
+    revision = retention_policy.get("revision")
+    if (
+        not isinstance(revision, str)
+        or not revision.startswith("sha256:")
+        or len(revision) != len("sha256:") + 64
+    ):
+        raise ValueError("wearable retention policy binding is invalid")
+    if not retention_policy["enabled"] or retention_days is None:
+        return None
+    return _as_utc(effective_now) - timedelta(days=retention_days)
 
 
 def _stored_wearable_retention_window(
     stored: Mapping[str, Any],
     *,
     snapshot: WearableQuerySnapshot,
+    expected_retention_policy: Mapping[str, Any] | None = None,
 ) -> tuple[datetime | None, dict[str, Any]]:
     raw = stored.get("retention_window")
     if raw is None:
+        if expected_retention_policy is not None:
+            raise ValueError("wearable retention policy binding is missing")
         legacy = _wearable_retention_window(
             start=snapshot.start,
             end=snapshot.end,
             effective_now=snapshot.collected_at,
-            retained_after=None,
+            retention_policy={
+                "data_class": OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+                "enabled": False,
+                "retention_days": None,
+                "revision": "sha256:" + ("0" * 64),
+            },
         )
+        legacy.pop("retention_policy")
         return None, legacy
     if not isinstance(raw, Mapping):
         raise ValueError("wearable retention window is invalid")
+    raw_policy = raw.get("retention_policy")
+    if raw_policy is None:
+        if expected_retention_policy is not None:
+            raise ValueError("wearable retention policy binding is missing")
+    elif not isinstance(raw_policy, Mapping):
+        raise ValueError("wearable retention policy binding is invalid")
+    elif (
+        expected_retention_policy is not None
+        and dict(raw_policy) != dict(expected_retention_policy)
+    ):
+        raise ValueError("wearable retention policy binding changed")
     try:
         effective_now = _as_utc(
             datetime.fromisoformat(str(raw["effective_now"]))
@@ -840,14 +890,35 @@ def _stored_wearable_retention_window(
         )
     except (KeyError, TypeError, ValueError):
         raise ValueError("wearable retention window is invalid") from None
-    expected = _wearable_retention_window(
-        start=snapshot.start,
-        end=snapshot.end,
-        effective_now=effective_now,
-        retained_after=retained_after,
-    )
+    if raw_policy is None:
+        expected = {
+            "effective_now": effective_now.isoformat(),
+            "query_start": snapshot.start.isoformat(),
+            "query_end": snapshot.end.isoformat(),
+            "retained_after": (
+                retained_after.isoformat()
+                if retained_after is not None
+                else None
+            ),
+            "effective_start": (
+                max(snapshot.start, retained_after).isoformat()
+                if retained_after is not None
+                else snapshot.start.isoformat()
+            ),
+            "effective_start_inclusive": (
+                retained_after is None or snapshot.start > retained_after
+            ),
+            "effective_end": snapshot.end.isoformat(),
+        }
+    else:
+        expected = _wearable_retention_window(
+            start=snapshot.start,
+            end=snapshot.end,
+            effective_now=effective_now,
+            retention_policy=raw_policy,
+        )
     if (
-        effective_now != snapshot.collected_at
+        effective_now < snapshot.collected_at
         or query_start != snapshot.start
         or query_end != snapshot.end
         or (
@@ -871,6 +942,7 @@ def _wearable_cursor_scope(
     snapshot: WearableQuerySnapshot,
     retention_window: Mapping[str, Any],
     records: Sequence[Mapping[str, Any]],
+    stored: Mapping[str, Any],
 ) -> dict[str, Any]:
     scope = _cursor_scope(query)
     scope["wearable_snapshot"] = {
@@ -879,6 +951,14 @@ def _wearable_cursor_scope(
             {"records": [dict(record) for record in records]}
         ),
         "query_digest": snapshot.query_digest,
+        "result_state": {
+            "coverage": _json_value(stored.get("coverage")),
+            "limitations": _limitations(stored),
+            "status": str(stored.get("status") or "partial"),
+            "stream_attribution_status": stored.get(
+                "stream_attribution_status"
+            ),
+        },
         "window": dict(retention_window),
     }
     return scope
@@ -1015,6 +1095,22 @@ def _wearable_record_observed_at(
         raise ValueError(
             "wearable record observation is outside source ref"
         )
+    if "workout_type" in record:
+        raw_end = record.get("end_time")
+        if not isinstance(raw_end, str):
+            raise ValueError("wearable workout interval is invalid")
+        workout_end = datetime.fromisoformat(
+            raw_end.replace("Z", "+00:00")
+        )
+        if (
+            workout_end.tzinfo is None
+            or workout_end <= observed
+            or source_ref.observed_end is None
+            or workout_end.astimezone(UTC) > source_ref.observed_end
+        ):
+            raise ValueError(
+                "wearable workout interval is outside source ref"
+            )
     return observed.isoformat()
 
 
@@ -3341,36 +3437,16 @@ class WearableContextProvider:
         now: datetime,
     ) -> ContextResult:
         start, end = self._detail_bounds(query, now=now)
-        limitations: set[str] = set()
-        retained_after = retention_cutoff(
-            session,
-            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
-            now=now,
-        )
-        if retained_after is not None:
-            if end <= retained_after:
-                return ContextResult(
-                    query_id=query.query_id,
-                    provider_id=query.provider_id,
-                    capability=query.capability,
-                    status=ContextStatus.UNAVAILABLE,
-                    freshness=ContextFreshness(
-                        status=FreshnessStatus.UNAVAILABLE
-                    ),
-                    coverage=ContextCoverage(
-                        status=CoverageStatus.UNAVAILABLE
-                    ),
-                    limitations=[
-                        "wearable_query_outside_retention_window"
-                    ],
-                )
-            if start <= retained_after:
-                limitations.add("wearable_retention_window_trimmed")
         parameters = {
             key: value
             for key, value in query.parameters.items()
             if key not in {"cursor", "date"}
         }
+        retention_policy = open_wearables_retention_policy_binding(session)
+        retained_after = _wearable_retention_cutoff(
+            retention_policy,
+            effective_now=now,
+        )
         request = WearableSearchRequest(
             capability=query.capability,
             start=start,
@@ -3398,13 +3474,34 @@ class WearableContextProvider:
                         retained,
                         provenance_mode="retained_local_mirror",
                         now=now,
-                        extra_limitations=tuple(limitations),
+                        expected_retention_policy=retention_policy,
                     )
-                except InvalidContextCursorError:
+                except (InvalidContextCursorError, ValueError):
                     continue
             raise InvalidContextCursorError(
                 "cursor is invalid or its wearable snapshot expired"
             )
+
+        limitations: set[str] = set()
+        if retained_after is not None:
+            if end <= retained_after:
+                return ContextResult(
+                    query_id=query.query_id,
+                    provider_id=query.provider_id,
+                    capability=query.capability,
+                    status=ContextStatus.UNAVAILABLE,
+                    freshness=ContextFreshness(
+                        status=FreshnessStatus.UNAVAILABLE
+                    ),
+                    coverage=ContextCoverage(
+                        status=CoverageStatus.UNAVAILABLE
+                    ),
+                    limitations=[
+                        "wearable_query_outside_retention_window"
+                    ],
+                )
+            if start <= retained_after:
+                limitations.add("wearable_retention_window_trimmed")
 
         fetched: WearableSearchFetch | None = None
         if self._search_reader is not None:
@@ -3444,7 +3541,7 @@ class WearableContextProvider:
                     start=start,
                     end=end,
                     effective_now=now,
-                    retained_after=retained_after,
+                    retention_policy=retention_policy,
                 ),
             }
             if query.capability == "wearable.timeseries":
@@ -3462,6 +3559,7 @@ class WearableContextProvider:
                 end=end,
                 parameters=parameters,
                 result=stored_result,
+                collected_at=now,
                 now=now,
             )
             if snapshot is not None:
@@ -3470,6 +3568,7 @@ class WearableContextProvider:
                     snapshot,
                     provenance_mode="live_upstream_mirrored",
                     now=now,
+                    expected_retention_policy=retention_policy,
                 )
             limitations.add(store_limitation)
 
@@ -3484,12 +3583,51 @@ class WearableContextProvider:
         )
         if retained is not None:
             limitations.add("wearable_query_snapshot_fallback_used")
+            fallback_result = dict(retained.result)
+            fallback_result["status"] = "partial"
+            fallback_result["coverage"] = {"status": "unknown"}
+            fallback_result["limitations"] = sorted(
+                {
+                    *_limitations(retained.result),
+                    *limitations,
+                }
+            )
+            fallback_result["retention_window"] = (
+                _wearable_retention_window(
+                    start=start,
+                    end=end,
+                    effective_now=now,
+                    retention_policy=retention_policy,
+                )
+            )
+            fallback_snapshot, fallback_store_limitation = (
+                self._store_detail_snapshot(
+                    session,
+                    query=query,
+                    start=start,
+                    end=end,
+                    parameters=parameters,
+                    result=fallback_result,
+                    collected_at=retained.collected_at,
+                    now=now,
+                )
+            )
+            if fallback_snapshot is not None:
+                return self._detail_result(
+                    query,
+                    fallback_snapshot,
+                    provenance_mode="retained_local_mirror",
+                    now=now,
+                    expected_retention_policy=retention_policy,
+                )
+            limitations.add(fallback_store_limitation)
             return self._detail_result(
                 query,
                 retained,
                 provenance_mode="retained_local_mirror",
                 now=now,
                 extra_limitations=tuple(limitations),
+                allow_cursor=False,
             )
 
         failed = bool(
@@ -3541,6 +3679,7 @@ class WearableContextProvider:
         end: datetime,
         parameters: Mapping[str, Any],
         result: Mapping[str, Any],
+        collected_at: datetime,
         now: datetime,
     ) -> tuple[WearableQuerySnapshot | None, str]:
         factory = self._snapshot_session_factory
@@ -3554,7 +3693,7 @@ class WearableContextProvider:
                     timezone=query.timezone,
                     parameters=parameters,
                     result=result,
-                    collected_at=now,
+                    collected_at=collected_at,
                     now=now,
                 )
             except RuntimeError:
@@ -3590,7 +3729,7 @@ class WearableContextProvider:
                 timezone=query.timezone,
                 parameters=parameters,
                 result=result,
-                collected_at=now,
+                collected_at=collected_at,
                 now=now,
             )
         except Exception:
@@ -3605,12 +3744,15 @@ class WearableContextProvider:
         provenance_mode: str,
         now: datetime,
         extra_limitations: Sequence[str] = (),
+        expected_retention_policy: Mapping[str, Any] | None = None,
+        allow_cursor: bool = True,
     ) -> ContextResult:
         stored = dict(snapshot.result)
         retained_after, retention_window = (
             _stored_wearable_retention_window(
                 stored,
                 snapshot=snapshot,
+                expected_retention_policy=expected_retention_policy,
             )
         )
         effective_start = _as_utc(
@@ -3641,6 +3783,15 @@ class WearableContextProvider:
                 start=snapshot.start,
                 end=snapshot.end,
                 timezone=query.timezone,
+                retained_after=retained_after,
+            )
+            public_records = list(normalized_fetch.records)
+            retained_limitations.update(normalized_fetch.limitations)
+        elif query.capability == "wearable.workouts":
+            normalized_fetch = normalize_retained_wearable_workouts(
+                public_records,
+                start=snapshot.start,
+                end=snapshot.end,
                 retained_after=retained_after,
             )
             public_records = list(normalized_fetch.records)
@@ -3685,8 +3836,12 @@ class WearableContextProvider:
                 snapshot=snapshot,
                 retention_window=retention_window,
                 records=public_records,
+                stored=stored,
             ),
         )
+        cursor_truncated = next_cursor is not None
+        if not allow_cursor:
+            next_cursor = None
         selected = [entry["record"] for entry in selected_entries]
         limitations = {
             *retained_limitations,
@@ -3783,7 +3938,7 @@ class WearableContextProvider:
             refs_complete=True,
             now=now,
             truncated=(
-                next_cursor is not None or upstream_truncated
+                cursor_truncated or upstream_truncated
             ),
             next_cursor=next_cursor,
         )

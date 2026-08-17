@@ -20,7 +20,11 @@ from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
 )
-from healthmes.storage.service import ensure_default_policies
+from healthmes.storage.service import (
+    DEFAULT_RETENTION,
+    RETENTION_PRESETS,
+    ensure_default_policies,
+)
 from healthmes.store import RetentionPolicy, WellnessEvent
 from healthmes.store.session import session_scope
 from healthmes.timezones import parse_timezone
@@ -36,6 +40,7 @@ OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS = "wearable_normalized"
 _SNAPSHOT_SCHEMA = "healthmes.open-wearables-snapshot.v1"
 _OBSERVATION_SCHEMA = "healthmes.open-wearables-observation.v1"
 _QUERY_SCHEMA = "healthmes.open-wearables-query.v1"
+_RETENTION_BINDING_SCHEMA = "healthmes.retention-policy-binding.v1"
 _MAX_CONTEXT_BYTES = 1_000_000
 _MAX_PAYLOAD_BYTES = 2_000_000
 _MAX_QUERY_RESULT_BYTES = 220_000
@@ -284,6 +289,61 @@ def _retention_policy(session: Session) -> RetentionPolicy:
         for policy in ensure_default_policies(session)
     }
     return policies[OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS]
+
+
+def _retention_policy_binding(
+    *,
+    enabled: bool,
+    retention_days: int | None,
+) -> dict[str, Any]:
+    state = {
+        "data_class": OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "enabled": enabled,
+        "retention_days": retention_days,
+    }
+    revision = hashlib.sha256(
+        _canonical_json(
+            {
+                "schema": _RETENTION_BINDING_SCHEMA,
+                **state,
+            }
+        )
+    ).hexdigest()
+    return {
+        **state,
+        "revision": f"sha256:{revision}",
+    }
+
+
+def open_wearables_retention_policy_binding(
+    session: Session,
+) -> dict[str, Any]:
+    """Return the semantic retention revision without mutating read sessions."""
+
+    policy_state = session.execute(
+        select(
+            RetentionPolicy.enabled,
+            RetentionPolicy.retention_days,
+        ).where(
+            RetentionPolicy.data_class
+            == OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS
+        )
+    ).one_or_none()
+    if policy_state is not None:
+        enabled, retention_days = policy_state
+        return _retention_policy_binding(
+            enabled=bool(enabled),
+            retention_days=retention_days,
+        )
+    preset = DEFAULT_RETENTION.get(
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS
+    )
+    return _retention_policy_binding(
+        enabled=preset is not None,
+        retention_days=(
+            RETENTION_PRESETS[preset] if preset is not None else None
+        ),
+    )
 
 
 def _expiry(
@@ -836,6 +896,7 @@ def _query_source_record_id(
 def _query_retention_basis(
     result: Mapping[str, Any],
     *,
+    capability: str,
     start: datetime,
     end: datetime,
     timezone: str,
@@ -918,6 +979,28 @@ def _query_retention_basis(
             raise ValueError(
                 "wearable query result record observation is invalid"
             )
+        if capability == "wearable.workouts":
+            raw_end = record.get("end_time")
+            if not isinstance(raw_end, str):
+                raise ValueError(
+                    "wearable workout result interval is invalid"
+                )
+            try:
+                workout_end = datetime.fromisoformat(
+                    raw_end.replace("Z", "+00:00")
+                )
+            except ValueError:
+                workout_end = None
+            if (
+                workout_end is None
+                or workout_end.tzinfo is None
+                or not observation
+                < workout_end.astimezone(UTC)
+                <= observed_end
+            ):
+                raise ValueError(
+                    "wearable workout result interval is invalid"
+                )
         observations.append(observation)
     return min(observations)
 
@@ -979,6 +1062,7 @@ def persist_open_wearables_query_snapshot(
         normalized_result = _normalize_query_result(result)
         retention_basis_at = _query_retention_basis(
             normalized_result,
+            capability=capability,
             start=datetime.fromisoformat(str(scope["start"])),
             end=datetime.fromisoformat(str(scope["end"])),
             timezone=timezone,
@@ -1001,6 +1085,23 @@ def persist_open_wearables_query_snapshot(
             retention_basis_at=retention_basis_at,
         )
         coverage = _context_coverage(normalized_result)
+        policy = _retention_policy(session)
+        retention_window = normalized_result.get("retention_window")
+        stored_policy_binding = (
+            retention_window.get("retention_policy")
+            if isinstance(retention_window, Mapping)
+            else None
+        )
+        expected_policy_binding = open_wearables_retention_policy_binding(
+            session
+        )
+        if (
+            stored_policy_binding is not None
+            and stored_policy_binding != expected_policy_binding
+        ):
+            raise ValueError(
+                "wearable retention policy changed before snapshot commit"
+            )
         event = session.scalar(
             select(WellnessEvent).where(
                 WellnessEvent.source_provider
@@ -1009,10 +1110,12 @@ def persist_open_wearables_query_snapshot(
             )
         )
         if event is None:
-            policy = _retention_policy(session)
-            expires_at = _expiry(
-                policy,
-                observed_at=retention_basis_at,
+            retention_days = expected_policy_binding["retention_days"]
+            expires_at = (
+                retention_basis_at + timedelta(days=retention_days)
+                if expected_policy_binding["enabled"]
+                and retention_days is not None
+                else None
             )
             if expires_at is not None and expires_at <= current:
                 raise ValueError(
@@ -1156,6 +1259,7 @@ def wearable_query_snapshot_from_event(
         )
         retention_basis_at = _query_retention_basis(
             normalized_result,
+            capability=capability,
             start=start,
             end=end,
             timezone=timezone,

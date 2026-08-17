@@ -109,21 +109,23 @@ _PRIVATE_KEYS = frozenset(
 )
 _PROVIDER_FAMILY_ALIASES = {
     "apple": "apple_health",
-    "apple_health": "apple_health",
+    "applehealth": "apple_health",
     "fitbit": "fitbit",
     "garmin": "garmin",
     "google": "google_health_connect",
-    "google_health_connect": "google_health_connect",
+    "googlehealthconnect": "google_health_connect",
     "internal": "internal",
     "oura": "oura",
     "polar": "polar",
     "samsung": "samsung_health",
-    "samsung_health": "samsung_health",
+    "samsunghealth": "samsung_health",
     "strava": "strava",
     "suunto": "suunto",
     "ultrahuman": "ultrahuman",
     "whoop": "whoop",
 }
+_INTERNAL_PAGE_INDEX = "_healthmes_page_index"
+_INTERNAL_PAGE_ORDINAL = "_healthmes_page_ordinal"
 _INTERNAL_ROW_IDENTITY = "_healthmes_row_identity"
 _INTERNAL_STREAM_KEY = "_healthmes_stream_key"
 _PROVIDER_ROW_ID_FIELDS = (
@@ -335,6 +337,37 @@ def normalize_retained_wearable_timeseries(
     )
 
 
+def normalize_retained_wearable_workouts(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None = None,
+) -> WearableSearchFetch:
+    """Reject retained workouts whose complete interval is no longer valid."""
+
+    normalized: list[dict[str, Any]] = []
+    discarded = 0
+    for record in records:
+        start_time = _timestamp(record.get("start_time"))
+        end_time = _timestamp(record.get("end_time"))
+        if not _workout_interval_is_allowed(
+            start_time,
+            end_time,
+            start=start,
+            end=end,
+            retained_after=retained_after,
+        ):
+            discarded += 1
+            continue
+        normalized.append(dict(record))
+    normalized.sort(key=_row_sort_key)
+    return WearableSearchFetch(
+        records=tuple(normalized),
+        discarded_rows=discarded,
+    )
+
+
 def validate_wearable_search_request(
     request: WearableSearchRequest,
 ) -> None:
@@ -482,14 +515,9 @@ class BoundedOpenWearablesSearch:
             sanitized.append(clean)
         conflicting_duplicate_rows = False
         stream_attribution_unavailable = False
-        if request.capability in {
-            "wearable.summaries",
-            "wearable.workouts",
-            "wearable.timeseries",
-        }:
-            sanitized, conflicting_duplicate_rows = (
-                _deduplicate_wearable_records(sanitized)
-            )
+        sanitized, conflicting_duplicate_rows = (
+            _deduplicate_wearable_records(sanitized)
+        )
         if request.capability == "wearable.timeseries":
             sanitized, stream_attribution_unavailable = _aggregate_timeseries(
                 sanitized,
@@ -633,14 +661,19 @@ async def _collect_offset_pages(
     discarded_rows = 0
     offset = 0
     has_more = False
-    for _ in range(MAX_WEARABLE_SEARCH_PAGES):
+    for page_index in range(MAX_WEARABLE_SEARCH_PAGES):
         remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - raw_rows
         if remaining <= 0:
             return rows, True, discarded_rows
         page_limit = min(_PAGE_SIZE, remaining)
         payload = await fetch(page_limit, offset)
         page = _response_page(payload, max_rows=page_limit)
-        rows.extend(page.rows)
+        rows.extend(
+            _rows_with_page_provenance(
+                page.rows,
+                page_index=page_index,
+            )
+        )
         raw_rows += page.raw_count
         discarded_rows += page.discarded_rows
         pagination = _response_pagination(payload)
@@ -672,7 +705,7 @@ async def _collect_cursor_pages(
     cursor: str | None = None
     seen_cursors: set[str] = set()
     has_more = False
-    for _ in range(MAX_WEARABLE_SEARCH_PAGES):
+    for page_index in range(MAX_WEARABLE_SEARCH_PAGES):
         remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - raw_rows
         if remaining <= 0:
             return rows, True, discarded_rows
@@ -713,7 +746,12 @@ async def _collect_cursor_pages(
             or next_cursor in seen_cursors
         ):
             return rows, True, discarded_rows
-        rows.extend(page.rows)
+        rows.extend(
+            _rows_with_page_provenance(
+                page.rows,
+                page_index=page_index,
+            )
+        )
         raw_rows += page.raw_count
         discarded_rows += page.discarded_rows
         if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
@@ -757,6 +795,20 @@ def _response_pagination(
             "open-wearables returned invalid pagination metadata"
         )
     return pagination
+
+
+def _rows_with_page_provenance(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    page_index: int,
+) -> list[dict[str, Any]]:
+    tagged: list[dict[str, Any]] = []
+    for page_ordinal, row in enumerate(rows):
+        value = dict(row)
+        value[_INTERNAL_PAGE_INDEX] = page_index
+        value[_INTERNAL_PAGE_ORDINAL] = page_ordinal
+        tagged.append(value)
+    return tagged
 
 
 def _normalized_key(value: str) -> str:
@@ -830,7 +882,7 @@ def _provider_family(value: Any) -> str | None:
     cleaned = _safe_text(value, max_length=64)
     if cleaned is None:
         return None
-    return _PROVIDER_FAMILY_ALIASES.get(cleaned.casefold())
+    return _PROVIDER_FAMILY_ALIASES.get(_normalized_key(cleaned))
 
 
 def _provider(row: Mapping[str, Any]) -> tuple[str, str]:
@@ -872,6 +924,21 @@ def _trusted_stream_key(row: Mapping[str, Any]) -> str | None:
 
 
 def _provider_identity_token(row: Mapping[str, Any]) -> str:
+    family, _attribution = _provider(row)
+    if family != "unknown":
+        identity: Mapping[str, Any] = {
+            "kind": "canonical-family",
+            "family": family,
+        }
+        return hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
     declared = _safe_text(row.get("provider"), max_length=512)
     source = row.get("source")
     source_provider = (
@@ -881,8 +948,15 @@ def _provider_identity_token(row: Mapping[str, Any]) -> str:
     )
     encoded = json.dumps(
         {
-            "declared_provider": declared,
-            "source_provider": source_provider,
+            "kind": "unclassified-provider",
+            "declared_provider": (
+                _normalized_key(declared) if declared is not None else None
+            ),
+            "source_provider": (
+                _normalized_key(source_provider)
+                if source_provider is not None
+                else None
+            ),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -904,6 +978,11 @@ def _provider_row_identifier(
 def _structural_row_locator(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if "category" in record and "recorded_at" in record:
+        return {
+            "category": record.get("category"),
+            "recorded_at": record.get("recorded_at"),
+        }
     if "summary_kind" in record:
         return {
             "summary_kind": record.get("summary_kind"),
@@ -966,6 +1045,10 @@ def _with_row_identity(
     row: Mapping[str, Any],
 ) -> dict[str, Any]:
     record[_INTERNAL_ROW_IDENTITY] = _row_identity(row, record)
+    for field in (_INTERNAL_PAGE_INDEX, _INTERNAL_PAGE_ORDINAL):
+        value = row.get(field)
+        if type(value) is int and value >= 0:
+            record[field] = value
     return record
 
 
@@ -1047,7 +1130,7 @@ def _sanitize_health_score(
             clean_components.append(component)
         if clean_components:
             result["components"] = clean_components
-    return result
+    return _with_row_identity(result, row=row)
 
 
 def _sanitize_summary(
@@ -1197,18 +1280,16 @@ def _sanitize_workout(
     end_time = _timestamp(row.get("end_time"))
     workout_type = _safe_text(row.get("type"), max_length=64)
     provider, attribution = _provider(row)
-    if (
-        start_time is None
-        or end_time is None
-        or end_time <= start_time
-        or not start.astimezone(UTC) <= start_time < end.astimezone(UTC)
-        or not _observation_is_retained(
-            start_time,
-            retained_after=retained_after,
-        )
-        or workout_type is None
+    if workout_type is None or not _workout_interval_is_allowed(
+        start_time,
+        end_time,
+        start=start,
+        end=end,
+        retained_after=retained_after,
     ):
         return None
+    assert start_time is not None
+    assert end_time is not None
     result: dict[str, Any] = {
         "workout_type": workout_type,
         "start_time": start_time.isoformat(),
@@ -1233,6 +1314,27 @@ def _sanitize_workout(
     ):
         _put_number(result, row, field)
     return _with_row_identity(result, row=row)
+
+
+def _workout_interval_is_allowed(
+    start_time: datetime | None,
+    end_time: datetime | None,
+    *,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+) -> bool:
+    if start_time is None or end_time is None:
+        return False
+    query_start = start.astimezone(UTC)
+    query_end = end.astimezone(UTC)
+    return (
+        query_start <= start_time < end_time <= query_end
+        and _observation_is_retained(
+            start_time,
+            retained_after=retained_after,
+        )
+    )
 
 
 def _sanitize_timeseries(
@@ -1338,9 +1440,17 @@ def _deduplicate_wearable_records(
     """Collapse exact page overlap and retain conflicting observations."""
 
     selected: list[dict[str, Any]] = []
-    variants: dict[str, dict[str, int]] = {}
+    selected_indexes: dict[str, list[int]] = {}
+    variant_origins: dict[str, dict[str, set[int]]] = {}
+    page_occurrences: dict[tuple[int, str, str], int] = {}
+    occurrence_origins: dict[
+        tuple[str, str, int],
+        tuple[int, int],
+    ] = {}
     conflicting = False
-    for raw_record in records[: MAX_WEARABLE_SEARCH_ROWS + 1]:
+    for fallback_ordinal, raw_record in enumerate(
+        records[: MAX_WEARABLE_SEARCH_ROWS + 1]
+    ):
         record = dict(raw_record)
         identity = _safe_text(
             record.pop(_INTERNAL_ROW_IDENTITY, None),
@@ -1359,7 +1469,19 @@ def _deduplicate_wearable_records(
                     separators=(",", ":"),
                     sort_keys=True,
                 ).encode("utf-8")
-            ).hexdigest()
+                ).hexdigest()
+        raw_page_index = record.pop(_INTERNAL_PAGE_INDEX, None)
+        raw_page_ordinal = record.pop(_INTERNAL_PAGE_ORDINAL, None)
+        page_index = (
+            raw_page_index
+            if type(raw_page_index) is int and raw_page_index >= 0
+            else fallback_ordinal
+        )
+        page_ordinal = (
+            raw_page_ordinal
+            if type(raw_page_ordinal) is int and raw_page_ordinal >= 0
+            else 0
+        )
         digest = hashlib.sha256(
             json.dumps(
                 record,
@@ -1369,15 +1491,30 @@ def _deduplicate_wearable_records(
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
-        identity_variants = variants.setdefault(identity, {})
-        if digest in identity_variants:
-            continue
-        if identity_variants:
+        occurrence_key = (page_index, identity, digest)
+        occurrence = page_occurrences.get(occurrence_key, 0)
+        page_occurrences[occurrence_key] = occurrence + 1
+        cross_page_key = (identity, digest, occurrence)
+        identity_variants = variant_origins.setdefault(identity, {})
+        has_cross_page_conflict = any(
+            variant_digest != digest
+            and any(origin_page != page_index for origin_page in origin_pages)
+            for variant_digest, origin_pages in identity_variants.items()
+        )
+        if has_cross_page_conflict:
             conflicting = True
-            for index in identity_variants.values():
+            for index in selected_indexes.get(identity, ()):
                 selected[index].pop(_INTERNAL_STREAM_KEY, None)
             record.pop(_INTERNAL_STREAM_KEY, None)
-        identity_variants[digest] = len(selected)
+
+        prior_origin = occurrence_origins.get(cross_page_key)
+        if prior_origin is not None and prior_origin[0] != page_index:
+            identity_variants.setdefault(digest, set()).add(page_index)
+            continue
+        occurrence_origins[cross_page_key] = (page_index, page_ordinal)
+
+        identity_variants.setdefault(digest, set()).add(page_index)
+        selected_indexes.setdefault(identity, []).append(len(selected))
         selected.append(record)
     return selected, conflicting
 

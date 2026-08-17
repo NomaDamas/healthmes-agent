@@ -12,6 +12,7 @@ from healthmes.wearables.search import (
     BoundedOpenWearablesSearch,
     WearableSearchRequest,
     normalize_retained_wearable_timeseries,
+    normalize_retained_wearable_workouts,
     validate_wearable_search_request,
 )
 
@@ -1117,6 +1118,392 @@ async def test_unattributed_timeseries_cursor_overlap_is_not_summed(
 
     assert [record["value"] for record in fetched.records] == expected_values
     assert fetched.limitations == expected_limitations
+
+
+def _overlap_row(
+    capability: str,
+    *,
+    provider: str,
+    conflicting: bool,
+    include_id: bool,
+) -> dict:
+    row: dict = {"provider": provider}
+    if include_id:
+        row["id"] = "private-provider-row-id"
+    if capability == "wearable.health-scores":
+        row.update(
+            {
+                "category": "stress",
+                "recorded_at": "2026-08-10T08:00:00Z",
+                "value": 43 if conflicting else 42,
+            }
+        )
+    elif capability == "wearable.summaries":
+        row.update(
+            {
+                "date": "2026-08-10",
+                "steps": 9000 if conflicting else 8000,
+            }
+        )
+    elif capability == "wearable.workouts":
+        row.update(
+            {
+                "type": "running",
+                "start_time": "2026-08-10T09:00:00Z",
+                "end_time": "2026-08-10T09:30:00Z",
+                "distance_meters": 6000 if conflicting else 5000,
+            }
+        )
+    else:
+        row.update(
+            {
+                "timestamp": "2026-08-10T10:10:00Z",
+                "type": "steps",
+                "value": 20 if conflicting else 10,
+                "unit": "count",
+            }
+        )
+        if include_id:
+            row["data_source_id"] = "private-provider-stream-id"
+    return row
+
+
+def _overlap_request(capability: str) -> WearableSearchRequest:
+    if capability == "wearable.summaries":
+        return _request(capability, summary_kind="activity")
+    if capability == "wearable.timeseries":
+        return _request(
+            capability,
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    return _request(capability)
+
+
+def _overlap_values(
+    capability: str,
+    records: tuple[dict[str, object], ...],
+) -> list[int | float]:
+    field = {
+        "wearable.health-scores": "value",
+        "wearable.summaries": "steps",
+        "wearable.workouts": "distance_meters",
+        "wearable.timeseries": "value",
+    }[capability]
+    return [record[field] for record in records]  # type: ignore[misc]
+
+
+class ProviderAliasOverlapClient:
+    def __init__(self, capability: str, *, conflicting: bool) -> None:
+        self.capability = capability
+        self.conflicting = conflicting
+
+    def _page(self, *, second: bool) -> dict:
+        return _overlap_row(
+            self.capability,
+            provider="apple_health" if second else "apple",
+            conflicting=second and self.conflicting,
+            include_id=True,
+        )
+
+    async def get_health_scores(self, _user_id, *, offset: int, **_kwargs):
+        second = offset > 0
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {"has_more": not second},
+        }
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+@pytest.mark.parametrize("conflicting", (False, True))
+async def test_provider_aliases_share_cross_page_row_identity(
+    capability: str,
+    conflicting: bool,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        ProviderAliasOverlapClient(
+            capability,
+            conflicting=conflicting,
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    expected = [42, 43] if conflicting else [42]
+    if capability == "wearable.summaries":
+        expected = [8000, 9000] if conflicting else [8000]
+    elif capability == "wearable.workouts":
+        expected = [5000, 6000] if conflicting else [5000]
+    elif capability == "wearable.timeseries":
+        expected = [10, 20] if conflicting else [10]
+    assert _overlap_values(capability, fetched.records) == expected
+    assert (
+        "wearable_conflicting_duplicate_rows" in fetched.limitations
+    ) is conflicting
+    assert all(
+        record["provider"] == "apple_health"
+        for record in fetched.records
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-provider-row-id" not in encoded
+    assert "private-provider-stream-id" not in encoded
+
+
+class SamePageDuplicateClient:
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+
+    def _rows(self) -> list[dict]:
+        row = _overlap_row(
+            self.capability,
+            provider="apple",
+            conflicting=False,
+            include_id=False,
+        )
+        return [dict(row), dict(row)]
+
+    async def get_health_scores(self, _user_id, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"has_more": False},
+        }
+
+    async def get_activity_summaries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+async def test_same_page_identical_rows_without_ids_remain_distinct(
+    capability: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        SamePageDuplicateClient(capability),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    assert len(fetched.records) == 2
+    assert "wearable_conflicting_duplicate_rows" not in fetched.limitations
+
+
+class ExactOverlapAfterPriorVariantClient:
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+
+    def _rows(self, *, second: bool) -> list[dict]:
+        baseline = _overlap_row(
+            self.capability,
+            provider="apple",
+            conflicting=False,
+            include_id=True,
+        )
+        if second:
+            return [baseline]
+        return [
+            baseline,
+            _overlap_row(
+                self.capability,
+                provider="apple_health",
+                conflicting=True,
+                include_id=True,
+            ),
+        ]
+
+    async def get_health_scores(self, _user_id, *, offset: int, **_kwargs):
+        second = offset > 0
+        return {
+            "data": self._rows(second=second),
+            "pagination": {"has_more": not second},
+        }
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": self._rows(second=second),
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": self._rows(second=second),
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": self._rows(second=second),
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+async def test_exact_overlap_cannot_hide_cross_page_conflict(
+    capability: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        ExactOverlapAfterPriorVariantClient(
+            capability
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    assert len(fetched.records) == 2
+    assert (
+        "wearable_conflicting_duplicate_rows" in fetched.limitations
+    )
+
+
+def test_retained_workouts_require_the_complete_interval() -> None:
+    retained_after = START + timedelta(hours=8)
+    fetched = normalize_retained_wearable_workouts(
+        (
+            {
+                "workout_type": "running",
+                "start_time": "2026-08-10T09:00:00+00:00",
+                "end_time": END.isoformat(),
+                "provider": "apple_health",
+                "provider_attribution": "declared",
+            },
+            {
+                "workout_type": "running",
+                "start_time": retained_after.isoformat(),
+                "end_time": "2026-08-10T09:00:00+00:00",
+                "provider": "apple_health",
+                "provider_attribution": "declared",
+            },
+            {
+                "workout_type": "running",
+                "start_time": "2026-08-10T09:00:00+00:00",
+                "end_time": (END + timedelta(seconds=1)).isoformat(),
+                "provider": "apple_health",
+                "provider_attribution": "declared",
+            },
+        ),
+        start=START,
+        end=END,
+        retained_after=retained_after,
+    )
+
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["end_time"] == END.isoformat()
+    assert fetched.discarded_rows == 2
+    assert fetched.limitations == ("wearable_rows_discarded",)
 
 
 class MissingOffsetPaginationClient:
