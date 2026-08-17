@@ -264,6 +264,61 @@ cd vendor/hermes-agent && \
 #   ... hermes chat -q "How was my sleep this week?"
 ```
 
+### Discord via Hermes: current boundary
+
+Hermes supports interactive terminal setup for Discord. Run it only after
+`scripts/bootstrap.py` has rendered the HealthMes MCP servers and copied the
+HealthMes skills into the same `HERMES_HOME`:
+
+```bash
+cd vendor/hermes-agent
+
+HERMES_HOME=~/.hermes \
+UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+uv run --frozen --no-dev --extra messaging hermes setup gateway
+```
+
+Choose Discord in the wizard. Before starting the gateway:
+
+1. Create and invite a Discord bot with `bot` and `applications.commands`
+   scopes.
+2. Enable Message Content Intent in the Discord Developer Portal.
+3. Configure at least one fail-closed access rule, normally
+   `DISCORD_ALLOWED_USERS`; a token without an access policy connects but
+   denies inbound users.
+4. Start the gateway, then run `/sethome` in the Discord channel that should
+   receive normal Hermes cron or direct delivery.
+
+```bash
+HERMES_HOME=~/.hermes \
+UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+uv run --frozen --no-dev --extra messaging hermes gateway run
+```
+
+At that point Discord messages run through the normal Hermes session and tool
+loop, so they can use the HealthMes skills and MCP tools installed by
+bootstrap. This proves interactive Discord access to the wellness context
+layer.
+
+The full HealthMes proactive path is still Telegram-specific in the current
+repository:
+
+| Capability | Terminal | Discord | Telegram |
+|---|---:|---:|---:|
+| Interactive HealthMes tool/skill chat | yes | yes | yes |
+| Hermes session, memory and slash commands | yes | yes | yes |
+| HealthMes webhook alert delivery | no | not wired | yes |
+| HealthMes morning/evening/weekly briefing delivery | no | not wired | yes |
+| Owner-bound live schedule/calendar approval proof | no | not wired | yes |
+
+The limitation comes from HealthMes-owned glue, not from Hermes: the current
+`config/hermes-config.yaml.tmpl` alert route and `scripts/bootstrap.py`
+briefing jobs set `deliver: telegram`, and trusted confirmation identity is
+bound to Telegram owner/chat IDs. Do not document Discord as a drop-in
+replacement until a separate implementation task makes channel delivery and
+confirmation identity platform-neutral, adds contract tests, and verifies the
+flow with a real Discord bot.
+
 ### Choosing the LLM (not just Claude)
 
 The vendor ships ~29 model-provider plugins

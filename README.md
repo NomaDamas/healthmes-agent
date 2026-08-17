@@ -1,37 +1,83 @@
-# HealthMes Agent
+# HealthMes
 
-HealthMes Agent is a **proactive, health-aware personal assistant**: it reads
-your wearable data (11 providers via open-wearables), your calendar and your
-app usage, estimates your cognitive energy hour by hour, plans your week
-around it, and **messages you first** on Telegram when something needs to
-change — every proactive decision explorable as a flowchart in the browser.
+HealthMes is **open, local-first infrastructure for wellness agents**.
+It turns wearable, activity, nutrition, calendar, environment and subjective
+signals into permission-aware context that an agent can use to make
+explainable, reversible decisions.
 
-It is glue around two unmodified vendored upstreams:
+The first product built on that infrastructure is a proactive personal
+assistant: it estimates cognitive capacity, plans work around it, proposes
+schedule or recovery interventions, and records what happened afterward.
+The infrastructure is the product boundary; the assistant, native apps and
+chat channels are reference experiences on top.
 
-- `vendor/hermes-agent/` — agent runtime (skills, memory, cron, Telegram
-  gateway, MCP client, Claude API)
-- `vendor/open-wearables/` — wearable data plane (Garmin/Oura/Fitbit/Whoop/
-  Polar/Suunto/Ultrahuman/Strava/Apple/Google/Samsung; sleep/stress/HRV
-  scores; FastAPI + Postgres + Celery; its own MCP server)
+## Platform boundary
 
-Everything HealthMes adds lives at the repo root (`healthmes/`, `skills/`,
-`config/`, `scripts/`, `apps/`), talking to the vendors only over their
-public contracts (REST, MCP, webhook, rendered config). Architecture and
-rationale: [`docs/PLAN.md`](docs/PLAN.md).
-
+```text
+CLI / Discord / Telegram / native apps / custom clients
+                         |
+                         v
+┌──────────────── Agent runtime adapters ────────────────┐
+│ Hermes today; other runtimes can implement the contract│
+│ model loop · sessions · memory · cron · channel I/O    │
+└────────────────────────┬───────────────────────────────┘
+                         │ MCP / typed tool contract
+                         v
+┌────────────────── HealthMes core ──────────────────────┐
+│ Decision Agent contract · Context Access Layer         │
+│ deterministic domain providers · source_refs           │
+│ decision/outcome graph · consent · retention · backup  │
+└───────────────┬───────────────┬───────────────┬────────┘
+                v               v               v
+        Open Wearables      Activity        Nutrition /
+        + HealthKit         collectors      Calendar / more
 ```
-Telegram (phone + watch)          decision viewer (web)
-        │  chat/push                     ▲ links in alerts
-┌───────▼──────────┐    MCP    ┌─────────┴─────────────┐
-│  agent plane     │◄─────────►│  healthmes service    │
-│  hermes-agent    │◄──webhook─│  FastAPI + /mcp       │
-│  (vendored)      │           │  store·engines·sync   │
-└───────┬──────────┘           └─────────┬─────────────┘
-        │ MCP (stdio)                    │ REST (read-only)
-┌───────▼─────────────────────────────── ▼──────────────┐
-│  data plane — open-wearables (vendored)               │
-└───────────────────────────────────────────────────────┘
+
+HealthMes owns the wellness-specific contracts and safety boundaries:
+
+- a common `WellnessEvent` envelope with provenance, freshness, confidence,
+  consent, sensitivity and retention;
+- deterministic activity, wearable, nutrition, calendar and capacity
+  providers that calculate facts instead of asking an LLM to invent numbers;
+- a Context Access Layer that limits which data, time range and privacy level
+  an agent may read;
+- explainable decisions linked to the exact `source_refs`, user response,
+  execution and later outcome;
+- a Personal Data Node with local storage, deletion controls and
+  client-encrypted backup.
+
+HealthMes deliberately delegates commodity infrastructure:
+
+- `vendor/hermes-agent/` provides the current LLM/tool loop, skills, memory,
+  cron and multi-channel gateway, including CLI, Discord and Telegram;
+- `vendor/open-wearables/` provides wearable integrations and health scores;
+- native apps and chat surfaces consume stable HealthMes contracts rather
+  than becoming the source of wellness policy.
+
+Both vendored trees are read-only from HealthMes work. Integration uses only
+documented REST, MCP, webhook, configuration, skill and delivery contracts.
+See [`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+and [`docs/PLAN.md`](docs/PLAN.md).
+
+## Why this can compound
+
+Wearable connectors, MCP, chat, automatic scheduling and native widgets are
+useful but are not a durable moat by themselves. The potential moat is the
+private, user-owned graph accumulated over time:
+
+```text
+state + context -> decision -> proposed intervention
+                -> accept / edit / reject / ignore
+                -> actual behavior -> later wellness and work outcome
 ```
+
+That graph can answer the harder personal question: **under which conditions
+did which intervention actually help this user?** Cross-domain context,
+expert protocols and calibrated trust compound around it. This is still a
+product hypothesis, not a proven market moat; it requires sustained dogfood
+and measured outcomes. See
+[`docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md)
+and [`docs/COMPETITIVE-LANDSCAPE.ko.md`](docs/COMPETITIVE-LANDSCAPE.ko.md).
 
 ## What works today
 
@@ -213,28 +259,122 @@ read-only bounded preparation proposal),
 decision), `healthmes-stress` (source-aware stress/recovery evidence →
 keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
 
-## Quickstart (mac-native, primary path)
+## Quickstart (macOS)
 
-Requires [uv](https://docs.astral.sh/uv/) and Homebrew; everything is
-repo-local without `brew services`; `scripts/healthmes_local.sh install`
-registers a per-user macOS LaunchAgent so the stack starts at login and is
-kept alive, including the Open Wearables worker and periodic sync scheduler.
+The shortest path needs Git, [Homebrew](https://brew.sh/) and
+[uv](https://docs.astral.sh/uv/). It does not need Docker, PostgreSQL, Redis
+or an `.env` file.
+
+### 1. Run the HealthMes core locally
+
+From a fresh terminal:
 
 ```bash
-make mac-setup            # brew postgresql@16 + redis if missing, initdb,
-                          # create DBs, uv sync
-install -m 600 .env.example .env  # optional: sqlite works with zero config
-make mac-run              # alembic upgrade head + service on :8100
-curl http://localhost:8100/health
-make mac-test             # full offline test suite
-make mac-services-stop    # stop the ephemeral postgres + redis
+git clone https://github.com/NomaDamas/healthmes-agent.git
+cd healthmes-agent
+command -v uv >/dev/null || brew install uv
+make mac-run
 ```
 
-With no `.env` at all, the service runs against a repo-local sqlite file —
-`make mac-run` alone is a working single-process demo. The full experience
-(Telegram agent + wearable syncs) needs the credentials matrix in
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) and
-`uv run python scripts/bootstrap.py` for the Hermes side.
+The first run downloads the pinned Python toolchain and dependencies, applies
+the local database migrations, then serves HealthMes on
+`http://127.0.0.1:8100`. Keep that terminal open. In a second terminal:
+
+```bash
+curl http://127.0.0.1:8100/health
+# {"status":"ok"}
+```
+
+That response confirms that the HealthMes API, local SQLite store and MCP
+endpoint are running. Press `Ctrl-C` in the first terminal to stop the
+service. All generated state stays under the repository's ignored `data/`
+directory.
+
+If port 8100 is already occupied, choose another local port:
+
+```bash
+HEALTHMES_PORT=8110 make mac-run
+curl http://127.0.0.1:8110/health
+```
+
+For the full local data stack, install and start repo-local PostgreSQL and
+Redis as well:
+
+```bash
+make mac-setup
+make mac-run
+```
+
+`make mac-setup` is safe to re-run. It installs `postgresql@16` and Redis
+through Homebrew when missing, initializes them under `data/`, creates the
+HealthMes and Open Wearables databases, and syncs dependencies. It never
+registers `brew services`; stop these processes with
+`make mac-services-stop`.
+
+Copy `.env.example` only when you are ready to select PostgreSQL, expose the
+API to another device, or add wearable, calendar, model or messaging
+credentials:
+
+```bash
+install -m 600 .env.example .env
+```
+
+The zero-config run proves the local HealthMes infrastructure. Live wearable
+data, the Hermes agent and external channels require their respective
+credentials and the following steps.
+
+### 2. Configure and chat from the terminal
+
+Set one supported model/provider credential in `.env`, then render the
+HealthMes MCP servers, skills and briefing jobs into a Hermes home:
+
+```bash
+uv run python scripts/bootstrap.py --dry-run
+uv run python scripts/bootstrap.py
+
+cd vendor/hermes-agent
+HERMES_HOME=~/.hermes \
+UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+uv run --frozen --no-dev --extra messaging hermes
+```
+
+The terminal agent uses the same HealthMes tools and skills as messaging
+channels. This is the shortest path to validate the agent before creating a
+bot.
+
+### 3. Connect Discord or Telegram through Hermes
+
+From `vendor/hermes-agent/`, run the interactive Hermes gateway setup against
+the same home, choose Discord or Telegram, then start the gateway:
+
+```bash
+HERMES_HOME=~/.hermes \
+UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+uv run --frozen --no-dev --extra messaging hermes setup gateway
+
+HERMES_HOME=~/.hermes \
+UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+uv run --frozen --no-dev --extra messaging hermes gateway run
+```
+
+For Discord, enable Message Content Intent, configure an explicit allowlist,
+invite the bot, and use `/sethome` in the delivery channel. Hermes can then
+chat through Discord with the HealthMes MCP tools and skills.
+
+**Current setup UX is not yet one command.** The core service and terminal
+agent are usable from the terminal today, and Hermes can independently connect
+Discord. However, HealthMes bootstrap still renders proactive webhook alerts,
+scheduled briefings and live approval proofs for Telegram. Discord is therefore
+a working interactive agent channel, but it is not yet a complete replacement
+for Telegram's proactive HealthMes flow. The exact setup and limitation matrix
+is in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#discord-via-hermes-current-boundary).
+
+Run the offline suite and stop ephemeral services when finished:
+
+```bash
+make mac-test
+make mac-services-stop
+```
 
 ### Docker alternative
 
