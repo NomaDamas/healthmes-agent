@@ -195,7 +195,7 @@ struct SpeakView: View {
                         .fill(
                             model.isListening
                                 ? Color.red.gradient
-                                : Color(red: 0.02, green: 0.34, blue: 0.25).gradient
+                                : HealthMesVisualStyle.brand.gradient
                         )
                         .frame(width: 116, height: 116)
                         .shadow(color: .black.opacity(0.18), radius: 16, y: 7)
@@ -246,7 +246,7 @@ struct SpeakView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .tint(Color(red: 0.02, green: 0.34, blue: 0.25))
+            .tint(HealthMesVisualStyle.brand)
             .disabled(!model.canSave)
         }
         .padding(20)

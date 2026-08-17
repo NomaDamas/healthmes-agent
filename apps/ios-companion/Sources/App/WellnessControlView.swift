@@ -30,7 +30,7 @@ struct WellnessControlView: View {
     @State private var lastHomeRequest = 0
     @FocusState private var commandFocused: Bool
 
-    private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
+    private let moss = HealthMesVisualStyle.capacity
     private let receivesAgentCommands: Bool
 
     init(receivesAgentCommands: Bool = false) {
@@ -62,14 +62,7 @@ struct WellnessControlView: View {
             quickActionDock
         }
         .background(
-            LinearGradient(
-                colors: [
-                    Color(red: 0.94, green: 0.96, blue: 0.92),
-                    Color(uiColor: .systemGroupedBackground),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            HealthMesVisualStyle.canvas
         )
         .environment(\.timeZone, displayTimeZone)
         .navigationTitle(Text("HealthMes"))
@@ -1318,8 +1311,8 @@ private struct ProportionalDayTimeline: View {
     private func providerColor(_ provider: String) -> Color {
         switch provider.lowercased() {
         case "google": return Color(red: 0.26, green: 0.52, blue: 0.96)
-        case "caldav", "icloud": return Color(red: 0.08, green: 0.58, blue: 0.49)
-        case "healthmes": return Color(red: 0.84, green: 0.45, blue: 0.12)
+        case "caldav", "icloud": return Color(red: 0.22, green: 0.24, blue: 0.28)
+        case "healthmes": return HealthMesVisualStyle.proposal
         default: return .secondary
         }
     }
@@ -1334,7 +1327,7 @@ struct HealthMesOnboardingView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     Image(systemName: "bolt.heart.fill")
                         .font(.system(size: 44))
-                        .foregroundStyle(Color(red: 0.08, green: 0.38, blue: 0.28))
+                        .foregroundStyle(HealthMesVisualStyle.brand)
                     Text("HealthMes 시작하기")
                         .font(.system(.largeTitle, design: .rounded).bold())
                     Text("내 Mac 또는 Linux의 HealthMes를 iPhone과 Apple Watch에 5단계로 연결합니다.")
@@ -1376,7 +1369,7 @@ struct HealthMesOnboardingView: View {
                 .font(.caption.bold().monospacedDigit())
                 .foregroundStyle(.white)
                 .frame(width: 24, height: 24)
-                .background(HealthMesVisualStyle.capacity, in: Circle())
+                .background(HealthMesVisualStyle.brand, in: Circle())
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: step.title).font(.headline)
                 Text(verbatim: step.detail)

@@ -75,7 +75,7 @@ struct SettingsView: View {
                             .font(.caption.bold().monospacedDigit())
                             .foregroundStyle(.white)
                             .frame(width: 22, height: 22)
-                            .background(HealthMesVisualStyle.capacity, in: Circle())
+                            .background(HealthMesVisualStyle.brand, in: Circle())
                         VStack(alignment: .leading, spacing: 2) {
                             Text(verbatim: step.title)
                                 .font(.subheadline.weight(.semibold))

@@ -2,17 +2,23 @@ import SwiftUI
 import UIKit
 
 enum HealthMesVisualStyle {
-    static let capacity = Color(red: 0.02, green: 0.47, blue: 0.42)
-    static let capacityDeep = dynamicColor(
-        light: UIColor(red: 0.02, green: 0.29, blue: 0.27, alpha: 1),
-        dark: UIColor(red: 0.44, green: 0.91, blue: 0.79, alpha: 1)
+    // Sunrise: warm brand expression, blue measured data, neutral surfaces.
+    static let brand = Color(red: 0.89, green: 0.29, blue: 0.15)
+    static let brandDeep = dynamicColor(
+        light: UIColor(red: 0.72, green: 0.20, blue: 0.10, alpha: 1),
+        dark: UIColor(red: 1.0, green: 0.53, blue: 0.38, alpha: 1)
     )
-    static let calendar = Color(red: 0.16, green: 0.42, blue: 0.78)
-    static let proposal = Color(red: 0.83, green: 0.48, blue: 0.12)
-    static let recovery = Color(red: 0.35, green: 0.57, blue: 0.38)
-    static let graphite = Color(red: 0.10, green: 0.13, blue: 0.13)
+    static let capacity = Color(red: 0.24, green: 0.44, blue: 0.84)
+    static let capacityDeep = dynamicColor(
+        light: UIColor(red: 0.16, green: 0.31, blue: 0.67, alpha: 1),
+        dark: UIColor(red: 0.47, green: 0.66, blue: 1.0, alpha: 1)
+    )
+    static let calendar = Color(red: 0.20, green: 0.40, blue: 0.82)
+    static let proposal = Color(red: 0.78, green: 0.36, blue: 0.08)
+    static let recovery = Color(red: 0.39, green: 0.56, blue: 0.86)
+    static let graphite = Color(red: 0.12, green: 0.14, blue: 0.17)
     static let line = dynamicColor(
-        light: UIColor.black.withAlphaComponent(0.09),
+        light: UIColor(red: 0.31, green: 0.27, blue: 0.22, alpha: 0.12),
         dark: UIColor.white.withAlphaComponent(0.12)
     )
 
@@ -20,12 +26,12 @@ enum HealthMesVisualStyle {
         LinearGradient(
             colors: [
                 dynamicColor(
-                    light: UIColor(red: 0.965, green: 0.965, blue: 0.945, alpha: 1),
-                    dark: UIColor(red: 0.045, green: 0.075, blue: 0.07, alpha: 1)
+                    light: UIColor(red: 0.98, green: 0.965, blue: 0.94, alpha: 1),
+                    dark: UIColor(red: 0.075, green: 0.085, blue: 0.11, alpha: 1)
                 ),
                 dynamicColor(
-                    light: UIColor(red: 0.925, green: 0.955, blue: 0.945, alpha: 1),
-                    dark: UIColor(red: 0.055, green: 0.105, blue: 0.095, alpha: 1)
+                    light: UIColor(red: 0.965, green: 0.94, blue: 0.91, alpha: 1),
+                    dark: UIColor(red: 0.105, green: 0.115, blue: 0.15, alpha: 1)
                 ),
                 Color(uiColor: .systemGroupedBackground),
             ],
@@ -37,8 +43,8 @@ enum HealthMesVisualStyle {
     static var drawer: LinearGradient {
         LinearGradient(
             colors: [
-                Color(red: 0.055, green: 0.12, blue: 0.115),
-                Color(red: 0.075, green: 0.18, blue: 0.165),
+                Color(red: 0.11, green: 0.125, blue: 0.16),
+                Color(red: 0.16, green: 0.18, blue: 0.23),
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -47,15 +53,15 @@ enum HealthMesVisualStyle {
 
     static var surfaceFill: Color {
         dynamicColor(
-            light: UIColor.white.withAlphaComponent(0.76),
-            dark: UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.78)
+            light: UIColor(red: 1.0, green: 0.992, blue: 0.976, alpha: 0.94),
+            dark: UIColor(red: 0.13, green: 0.145, blue: 0.18, alpha: 0.92)
         )
     }
 
     static func capacityColor(_ score: Int?) -> Color {
         switch score {
         case .some(70...): return capacity
-        case .some(45..<70): return Color(red: 0.58, green: 0.57, blue: 0.20)
+        case .some(45..<70): return Color(red: 0.40, green: 0.50, blue: 0.74)
         case .some: return proposal
         case .none: return .secondary.opacity(0.3)
         }
@@ -79,15 +85,11 @@ struct HealthMesSurfaceModifier: ViewModifier {
                 HealthMesVisualStyle.surfaceFill,
                 in: RoundedRectangle(cornerRadius: radius, style: .continuous)
             )
-            .background(
-                .regularMaterial,
-                in: RoundedRectangle(cornerRadius: radius, style: .continuous)
-            )
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .stroke(HealthMesVisualStyle.line)
             }
-            .shadow(color: HealthMesVisualStyle.capacityDeep.opacity(0.055), radius: 18, y: 8)
+            .shadow(color: HealthMesVisualStyle.graphite.opacity(0.06), radius: 14, y: 6)
     }
 }
 

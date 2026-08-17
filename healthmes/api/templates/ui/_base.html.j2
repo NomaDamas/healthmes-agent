@@ -1,11 +1,7 @@
 {# HealthMes viewer shell (docs/PLAN.md §5, §8.5) — the shared design system.
-   Theme: "건강한 자연, 밝게" — four BRIGHT daylight landscapes (봄 벚꽃 /
-   여름 숲 / 가을 단풍 / 겨울 설원), CSS/SVG-generated only (no photos, no
-   external assets). Bright-first: the daylight look is served regardless of
-   the OS color scheme (no dark variant is shipped). The season is
-   auto-picked server-side from the month in the user's timezone
-   (shell_context "season") and can be overridden with the header switcher
-   (🌸☀️🍂❄️), persisted in localStorage — display-only state.
+   The wellness product uses a warm neutral canvas, a sunrise brand accent,
+   and blue for measured data. Legacy seasonal scenery remains in the markup
+   for route compatibility but the dashboard hides it.
    Rules: local-first (zero external requests), mobile-first, WCAG-AA
    contrast on the glass cards over all four backdrops, visible focus
    states, prefers-reduced-motion respected (particle drift pauses).
@@ -24,27 +20,31 @@
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex">
 <title>{% block title %}HealthMes{% endblock %}</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M4 17h6l3-8 5 15 3-7h7' fill='none' stroke='%2312806c' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%23e34a26' stroke-width='3'/%3E%3Cpath d='M16 3v4M16 25v4M3 16h4M25 16h4M6.8 6.8l2.8 2.8M22.4 22.4l2.8 2.8M25.2 6.8l-2.8 2.8M9.6 22.4l-2.8 2.8' stroke='%23e34a26' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
   /* ---- tokens (bright-first: one light theme, tinted per season) -------- */
   :root {
-    --bg: #eef4ef;
-    --surface: #ffffff;
-    --surface-2: rgba(31, 51, 42, 0.07);
-    --ink: #1c2823;
-    --ink-2: #4e5f57;
-    --ink-3: #75847c;
-    --line: rgba(31, 51, 42, 0.16);
-    --line-soft: rgba(31, 51, 42, 0.1);
-    --brand: #12806c;
-    --brand-deep: #0b5c4d;
-    --brand-soft: rgba(18, 128, 108, 0.14);
-    --brand-wash: rgba(18, 128, 108, 0.07);
-    --danger: #a63a26;
-    --glass: rgba(255, 255, 255, 0.64);
-    --glass-solid: rgba(255, 255, 255, 0.8);
-    --glass-line: rgba(255, 255, 255, 0.62);
-    --shadow: 0 1px 2px rgba(17, 38, 30, 0.06), 0 10px 30px rgba(17, 38, 30, 0.08);
+    --bg: #f8f4ed;
+    --surface: #fffdf9;
+    --surface-2: rgba(62, 51, 43, 0.065);
+    --ink: #20242c;
+    --ink-2: #5f6570;
+    --ink-3: #7d828c;
+    --line: rgba(73, 62, 51, 0.17);
+    --line-soft: rgba(73, 62, 51, 0.1);
+    --brand: #e34a26;
+    --brand-deep: #b73319;
+    --brand-soft: rgba(227, 74, 38, 0.15);
+    --brand-wash: rgba(227, 74, 38, 0.07);
+    --data: #3d6fd6;
+    --data-deep: #284fa8;
+    --data-soft: rgba(61, 111, 214, 0.14);
+    --proposal: #b8520f;
+    --danger: #c9363e;
+    --glass: rgba(255, 253, 249, 0.82);
+    --glass-solid: rgba(255, 253, 249, 0.94);
+    --glass-line: rgba(73, 62, 51, 0.11);
+    --shadow: 0 1px 2px rgba(40, 36, 32, 0.05), 0 10px 28px rgba(40, 36, 32, 0.07);
     --radius: 16px;
     --radius-sm: 10px;
     /* scenery defaults = 여름 낮 (deep lush green, clear sky, strong sun).
@@ -121,13 +121,15 @@
     --sky-3: color-mix(in srgb, var(--night-accent) 62%, #0a150f 38%);
     --sun: #dfe9ef; --sun-op: 0.3; --ray-op: 0;
     --mist: rgba(4, 9, 7, 0.35);
-    --ink: #e8efeb; --ink-2: #b0bfb6; --ink-3: #8a998f;
-    --line: rgba(232, 239, 235, 0.18); --line-soft: rgba(232, 239, 235, 0.1);
-    --surface: #131c17; --surface-2: rgba(255, 255, 255, 0.07);
-    --brand: #3fc0a4; --brand-deep: #8adcc8;
-    --brand-soft: rgba(76, 196, 168, 0.2); --brand-wash: rgba(76, 196, 168, 0.1);
-    --danger: #e79c89;
-    --glass: rgba(10, 17, 14, 0.62); --glass-solid: rgba(13, 21, 17, 0.84);
+    --ink: #f4f1ec; --ink-2: #b9bbc3; --ink-3: #9296a1;
+    --line: rgba(244, 241, 236, 0.18); --line-soft: rgba(244, 241, 236, 0.1);
+    --surface: #20242c; --surface-2: rgba(255, 255, 255, 0.07);
+    --brand: #ff7958; --brand-deep: #ff9b82;
+    --brand-soft: rgba(255, 121, 88, 0.2); --brand-wash: rgba(255, 121, 88, 0.1);
+    --data: #7da2f5; --data-deep: #a9c0ff; --data-soft: rgba(125, 162, 245, 0.2);
+    --proposal: #f2a35e;
+    --danger: #ff8d94;
+    --glass: rgba(24, 27, 34, 0.76); --glass-solid: rgba(30, 34, 43, 0.92);
     --glass-line: rgba(255, 255, 255, 0.11);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 12px 34px rgba(0, 0, 0, 0.45);
   }

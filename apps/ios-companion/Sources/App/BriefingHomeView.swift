@@ -149,7 +149,7 @@ struct BriefingHomeView: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(Color(red: 0.02, green: 0.34, blue: 0.25))
+                        .tint(HealthMesVisualStyle.capacity)
                     }
                     .disabled(model.busyProposalIDs.contains(decision.id))
 

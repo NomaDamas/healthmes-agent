@@ -7,9 +7,9 @@
 
 ## 1. 목표
 
-HealthMes를 일반 Todo 또는 채팅 앱처럼 보이게 하지 않고, 사용자의 현재
-가용 능력과 실제 일정의 관계를 빠르게 읽을 수 있는 Wellness Control
-System으로 표현한다.
+HealthMes를 일반 Todo, 의료 모니터링, 친환경 SaaS처럼 보이게 하지 않고,
+사용자의 현재 가용 능력과 실제 일정의 관계를 빠르게 읽을 수 있는 Wellness
+Control System으로 표현한다.
 
 기본 화면에서 사용자는 10초 안에 다음을 확인해야 한다.
 
@@ -21,14 +21,29 @@ System으로 표현한다.
 
 | 의미 | 색상 역할 | 사용 위치 |
 |---|---|---|
-| Capacity | 청록 | 가용 에너지, 정상 상태, 적용 완료 |
-| Calendar | 파랑 | Apple·Google의 확정된 일정 |
-| Proposal | 호박색 | 아직 승인되지 않은 HealthMes 변경안 |
-| Recovery | 녹색 | 회복 블록과 보호할 시간 |
+| Brand / Voice | 선라이즈 오렌지 | HealthMes 정체성, Speak, 핵심 진입점 |
+| Capacity | 블루 | 측정된 가용 에너지와 데이터 |
+| Calendar | 블루 | Apple·Google의 확정된 일정 |
+| Proposal | 앰버 | 아직 승인되지 않은 HealthMes 변경안 |
+| Recovery | 소프트 블루 | 회복 블록과 보호할 시간 |
 | Risk | 빨강 | 실제 오류와 위험만 표시 |
 
-색은 장식이 아니라 상태 의미를 전달한다. Calendar와 Proposal을 같은 색으로
-표시하지 않으며, 낮은 Capacity를 곧바로 위험으로 표현하지 않는다.
+녹색은 HealthMes 브랜드 색으로 사용하지 않는다. 색은 장식이 아니라 역할을
+전달한다. Calendar와 Proposal을 같은 색으로 표시하지 않으며, 낮은 Capacity를
+곧바로 위험으로 표현하지 않는다. Capacity는 신호등처럼 색을 바꾸기보다 같은
+블루 계열의 양과 명도로 표현한다.
+
+기본 토큰:
+
+```text
+brand        #E34A26
+brand-deep   #B73319
+data         #3D6FD6
+proposal     #B8520F
+canvas       #F8F4ED
+surface      #FFFDF9
+ink          #20242C
+```
 
 ## 3. 플랫폼 규칙
 
@@ -38,7 +53,7 @@ System으로 표현한다.
 - 카드 반경, 경계선, 그림자를 하나의 Surface 문법으로 통일한다.
 - 둥근 Display 서체 남용을 제거하고 시스템 본문 서체의 가독성을 우선한다.
 - Agent composer는 화면 하단의 지속적인 제어 장치로 보이게 한다.
-- Sidebar는 본문과 분리되는 짙은 청록색 Workspace rail로 표현한다.
+- Sidebar는 본문과 분리되는 중성 잉크색 Workspace rail로 표현한다.
 
 ### Mac
 
@@ -49,23 +64,29 @@ System으로 표현한다.
 ### Apple Watch
 
 - 결론 한 개, 핵심 이유 한 줄, 변경 전후, Yes/No를 한 화면 흐름으로 구성한다.
-- 승인 버튼은 Capacity 청록을 사용한다.
-- 알림 액션은 `No → Yes → Alternative` 순서로 등록한다. 첫 액션은
+- 승인 버튼은 Decision 블루를 사용한다.
+- 알림 액션은 실제 계약인 `No → Yes → Speak` 순서로 등록한다. 첫 액션은
   비파괴적인 `No`로 유지해 우발 승인을 막고, 42 mm 화면에서는 핵심 결정인
-  No/Yes가 대안 입력보다 먼저 보이게 한다.
+  No/Yes가 음성 대안 입력보다 먼저 보이게 한다.
+- `Speak`는 선라이즈 브랜드 색을 사용하고, 받아쓴 내용을 검토한 뒤 iPhone
+  HealthMes 명령 파이프라인으로 전달한다.
 - 추가 근거는 `Why?`를 통해 스크롤 화면으로 분리한다.
 
 ### Web
 
 - 웹만 별도 제품처럼 보이지 않도록 Apple 앱과 의미 색상을 공유한다.
-- Sidebar는 짙은 Workspace rail, 본문은 밝은 분석 Canvas로 분리한다.
+- Sidebar는 중성 잉크색 Workspace rail, 본문은 웜 뉴트럴 Canvas로 분리한다.
 - Advanced와 원시 데이터는 기본 화면의 시각 우선순위를 침범하지 않는다.
+- 계절 풍경, 달, 별, 날씨 이모지는 기본 dashboard에서 제거한다.
 
 ## 4. 참고와 독자성
 
-Slack의 Sidebar와 Thread 배치, Discord의 Category 계층, Raycast의 단일
-Control Surface, Apple Human Interface Guidelines의 플랫폼 밀도를
-참고했다. 외부 제품의 색상, 컴포넌트 코드, 브랜드 자산은 복사하지 않았다.
+Toss Consumer UX Guide의 명확한 CTA·장식 절제·다크패턴 방지, Radix Colors의
+역할별 단계, Material 3와 Adobe Spectrum의 semantic color, Carbon의 데이터
+시각화 구분, Apple Human Interface Guidelines의 플랫폼 밀도와 접근성을
+참고했다. Wellness 브랜드 사례는 녹색이나 의료 상징을 답습하지 않고 활력,
+생활감, 개인성을 표현하는 방향만 참고했다. 외부 제품의 색상, 컴포넌트 코드,
+그래픽 자산은 복사하지 않았다.
 
 HealthMes 고유 요소는 다음 조합이다.
 

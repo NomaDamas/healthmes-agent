@@ -5,13 +5,14 @@
     import WidgetKit
 
     struct DecisionLiveActivity: Widget {
-        private let healthGreen = Color(red: 0.02, green: 0.34, blue: 0.25)
+        private let brand = Color(red: 0.89, green: 0.29, blue: 0.15)
+        private let decisionBlue = Color(red: 0.24, green: 0.44, blue: 0.84)
 
         var body: some WidgetConfiguration {
             ActivityConfiguration(for: DecisionActivityAttributes.self) { context in
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
-                        Image(systemName: "waveform.path.ecg")
+                        Image(systemName: "sun.max.fill")
                         Text(verbatim: "HEALTHMES")
                         Spacer()
                         if isActionable(context) {
@@ -23,7 +24,7 @@
                         }
                     }
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(healthGreen)
+                    .foregroundStyle(brand)
 
                     Text(verbatim: context.state.title)
                         .font(.headline)
@@ -39,7 +40,7 @@
                             Image(systemName: "calendar.badge.clock")
                         }
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(healthGreen)
+                        .foregroundStyle(decisionBlue)
 
                         Text(verbatim: context.state.reason)
                             .font(.caption)
@@ -68,7 +69,7 @@
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(healthGreen)
+                            .tint(decisionBlue)
 
                             Link(destination: speakURL(context.attributes.proposalID)) {
                                 Label("Speak", systemImage: "microphone.fill")
@@ -76,7 +77,7 @@
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.bordered)
-                            .tint(healthGreen)
+                            .tint(brand)
                         }
                         .font(.caption.weight(.semibold))
                         .controlSize(.small)
@@ -84,7 +85,7 @@
                         Text(verbatim: statusReason(context.state, isStale: context.isStale))
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(
-                                context.state.status == .failed ? Color.red : healthGreen
+                                context.state.status == .failed ? Color.red : decisionBlue
                             )
                             .lineLimit(2)
                     }
@@ -97,8 +98,8 @@
             } dynamicIsland: { context in
                 DynamicIsland {
                     DynamicIslandExpandedRegion(.leading) {
-                        Image(systemName: "waveform.path.ecg")
-                            .foregroundStyle(healthGreen)
+                        Image(systemName: "sun.max.fill")
+                            .foregroundStyle(brand)
                     }
                     DynamicIslandExpandedRegion(.trailing) {
                         if isActionable(context) {
@@ -151,13 +152,13 @@
                         }
                     }
                 } compactLeading: {
-                    Image(systemName: "waveform.path.ecg")
-                        .foregroundStyle(healthGreen)
+                    Image(systemName: "sun.max.fill")
+                        .foregroundStyle(brand)
                 } compactTrailing: {
                     Image(systemName: "questionmark.circle.fill")
                 } minimal: {
-                    Image(systemName: "waveform.path.ecg")
-                        .foregroundStyle(healthGreen)
+                    Image(systemName: "sun.max.fill")
+                        .foregroundStyle(brand)
                 }
                 .widgetURL(URL(string: "healthmes://proposal?id=\(context.attributes.proposalID)"))
             }

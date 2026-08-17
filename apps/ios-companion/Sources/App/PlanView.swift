@@ -367,7 +367,7 @@ struct PlanView: View {
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(Color(red: 0.02, green: 0.34, blue: 0.25))
+                            .tint(HealthMesVisualStyle.brand)
                         }
                         .disabled(model.busyProposalIDs.contains(proposal.id))
                     }

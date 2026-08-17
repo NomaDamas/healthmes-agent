@@ -17,7 +17,8 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private let yesButton = UIButton(type: .system)
     private var proposalID: UUID?
     private var expiresAt: Date?
-    private let healthGreen = UIColor(red: 0.02, green: 0.34, blue: 0.25, alpha: 1)
+    private let brand = UIColor(red: 0.89, green: 0.29, blue: 0.15, alpha: 1)
+    private let decisionBlue = UIColor(red: 0.24, green: 0.44, blue: 0.84, alpha: 1)
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -25,19 +26,19 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         // this view clear avoids stacking an opaque card inside that material.
         view.backgroundColor = .clear
 
-        signalIconView.image = UIImage(systemName: "waveform.path.ecg")
+        signalIconView.image = UIImage(systemName: "sun.max.fill")
         signalIconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
             pointSize: 13,
             weight: .semibold
         )
-        signalIconView.tintColor = healthGreen
+        signalIconView.tintColor = brand
         signalIconView.contentMode = .scaleAspectFit
         signalIconView.setContentHuggingPriority(.required, for: .horizontal)
 
-        signalLabel.text = String(localized: "HEALTHMES · DECISION")
+        signalLabel.text = String(localized: "HEALTHMES · WELLNESS")
         signalLabel.font = .preferredFont(forTextStyle: .caption1)
         signalLabel.adjustsFontForContentSizeCategory = true
-        signalLabel.textColor = healthGreen
+        signalLabel.textColor = brand
 
         actionLabel.font = .preferredFont(forTextStyle: .title3)
         actionLabel.adjustsFontForContentSizeCategory = true
@@ -46,7 +47,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
 
         reasonLabel.font = .preferredFont(forTextStyle: .subheadline)
         reasonLabel.adjustsFontForContentSizeCategory = true
-        reasonLabel.textColor = healthGreen
+        reasonLabel.textColor = .secondaryLabel
         reasonLabel.numberOfLines = 0
 
         timeLabel.font = .preferredFont(forTextStyle: .subheadline)
@@ -96,7 +97,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         yesConfiguration.image = UIImage(systemName: "checkmark")
         yesConfiguration.imagePadding = 6
         yesConfiguration.cornerStyle = .large
-        yesConfiguration.baseBackgroundColor = healthGreen
+        yesConfiguration.baseBackgroundColor = decisionBlue
         yesConfiguration.baseForegroundColor = .white
         yesButton.configuration = yesConfiguration
         yesButton.accessibilityIdentifier = "healthmes-decision-yes"
@@ -361,7 +362,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
                     hintLabel.textColor =
                         proposalStatus == .declined || proposalStatus == .invalidated
                         ? .secondaryLabel
-                        : healthGreen
+                        : decisionBlue
                     noButton.isHidden = true
                     yesButton.isHidden = true
                 }
@@ -409,9 +410,9 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         case .notActionable(let status):
             switch status {
             case "accepted":
-                showTerminal(String(localized: "Already approved"), color: healthGreen)
+                showTerminal(String(localized: "Already approved"), color: decisionBlue)
             case "pushed":
-                showTerminal(String(localized: "Applied to calendar"), color: healthGreen)
+                showTerminal(String(localized: "Applied to calendar"), color: decisionBlue)
             case "declined":
                 showTerminal(String(localized: "Already declined"), color: .secondaryLabel)
             default:

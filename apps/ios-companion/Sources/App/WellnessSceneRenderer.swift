@@ -7,8 +7,8 @@ struct WellnessSceneRenderer: View {
     let showsActions: Bool
     let onAction: (WellnessSceneAction) -> Void
 
-    private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
-    private let amber = Color(red: 0.78, green: 0.42, blue: 0.12)
+    private let moss = HealthMesVisualStyle.capacity
+    private let amber = HealthMesVisualStyle.proposal
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {

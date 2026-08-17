@@ -241,7 +241,7 @@ struct DecisionsView: View {
                                 Text("Yes").frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(Color(red: 0.02, green: 0.34, blue: 0.25))
+                            .tint(HealthMesVisualStyle.capacity)
                         }
                         .disabled(model.busyProposalIDs.contains(decision.id))
                         if let url = decision.exactWebURL {
@@ -271,7 +271,7 @@ struct DecisionsView: View {
                 ForEach(model.records.prefix(20)) { record in
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: decisionIcon(record.kind))
-                            .foregroundStyle(Color(red: 0.02, green: 0.34, blue: 0.25))
+                            .foregroundStyle(HealthMesVisualStyle.capacity)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(verbatim: record.summary)
                                 .font(.body.weight(.medium))

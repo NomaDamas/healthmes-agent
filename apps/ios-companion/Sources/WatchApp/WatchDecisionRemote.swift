@@ -65,7 +65,7 @@ enum WatchDecisionResult: Equatable {
     var tint: Color {
         switch self {
         case .approved, .applied, .alreadyApproved:
-            return .green
+            return Color(red: 0.35, green: 0.55, blue: 0.95)
         case .declined, .alreadyDeclined:
             return .secondary
         case .expired, .offline:
@@ -460,6 +460,8 @@ struct WatchDecisionRemoteView: View {
     @State private var isSpeaking = false
     @State private var spokenDraft: String?
     @State private var speakStatus: String?
+    private let brand = Color(red: 1.0, green: 0.38, blue: 0.22)
+    private let decisionBlue = Color(red: 0.35, green: 0.55, blue: 0.95)
 
     var body: some View {
         Group {
@@ -485,7 +487,7 @@ struct WatchDecisionRemoteView: View {
                 HStack {
                     Label("CHANGE", systemImage: "calendar.badge.clock")
                         .font(.caption2.weight(.bold))
-                        .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
+                        .foregroundStyle(brand)
                     Spacer()
                     if let score = model.energyScore {
                         Text(verbatim: "\(score)%")
@@ -556,7 +558,7 @@ struct WatchDecisionRemoteView: View {
                 if let speakStatus {
                     Label(speakStatus, systemImage: "checkmark.circle.fill")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
+                        .foregroundStyle(brand)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
@@ -595,7 +597,7 @@ struct WatchDecisionRemoteView: View {
                             .frame(maxWidth: .infinity, minHeight: 28)
                         }
                         .buttonStyle(.bordered)
-                        .tint(Color(red: 0.42, green: 0.88, blue: 0.76))
+                        .tint(brand)
                         .disabled(model.applyingAction != nil || isSpeaking)
                         .accessibilityHint(
                             Text("Dictate a different instruction to HealthMes")
@@ -635,7 +637,7 @@ struct WatchDecisionRemoteView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .tint(Color(red: 0.03, green: 0.55, blue: 0.46))
+            .tint(brand)
 
             Button {
                 presentSpeakInput(for: decision)
@@ -707,7 +709,7 @@ struct WatchDecisionRemoteView: View {
                     accessibilityLabel: accessibilityLabel
                 )
                     .buttonStyle(.borderedProminent)
-                    .tint(Color(red: 0.03, green: 0.55, blue: 0.46))
+                    .tint(decisionBlue)
             } else {
                 decisionButtonContent(
                     title: title,
@@ -787,7 +789,7 @@ struct WatchDecisionRemoteView: View {
                 if model.availability == .unpaired {
                     Label("CONNECT", systemImage: "iphone.gen2")
                         .font(.caption2.weight(.bold))
-                        .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
+                        .foregroundStyle(brand)
                     Text("Open HealthMes on iPhone")
                         .font(.headline)
                         .fixedSize(horizontal: false, vertical: true)
@@ -802,7 +804,7 @@ struct WatchDecisionRemoteView: View {
                         Task { await model.refresh() }
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(Color(red: 0.03, green: 0.55, blue: 0.46))
+                    .tint(brand)
                     .frame(maxWidth: .infinity)
                 } else {
                     HStack(alignment: .firstTextBaseline) {

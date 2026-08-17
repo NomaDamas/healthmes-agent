@@ -212,7 +212,7 @@ private struct WorkspaceDrawer: View {
             HStack(spacing: 12) {
                 Image(systemName: "waveform.path.ecg.rectangle.fill")
                     .font(.title2)
-                    .foregroundStyle(Color(red: 0.44, green: 0.91, blue: 0.79))
+                    .foregroundStyle(HealthMesVisualStyle.brand)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("HealthMes")
                         .font(.headline)
@@ -2199,7 +2199,7 @@ private struct WorkspaceThreadSheet: View {
                     .font(.body.bold())
                     .foregroundStyle(.white)
                     .frame(width: 36, height: 36)
-                    .background(HealthMesVisualStyle.capacity, in: Circle())
+                    .background(HealthMesVisualStyle.brand, in: Circle())
             }
             .buttonStyle(.plain)
             .disabled(thread.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)

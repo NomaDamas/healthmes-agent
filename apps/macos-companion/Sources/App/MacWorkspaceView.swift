@@ -140,7 +140,7 @@ struct MacWorkspaceView: View {
             workspaceStore.addCategory(
                 title: title,
                 symbolName: "folder",
-                colorHex: "#466A56"
+                colorHex: "#E34A26"
             )
         case .createChannel(let categoryID):
             workspaceStore.addChannel(
@@ -201,7 +201,7 @@ private struct MacWorkspaceSidebar: View {
                     .fill(Color.white.opacity(0.13))
                     .frame(width: 36, height: 36)
                 Image(systemName: "bolt.heart.fill")
-                    .foregroundStyle(Color(red: 0.44, green: 0.91, blue: 0.79))
+                    .foregroundStyle(MacHealthMesStyle.brand)
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text("HealthMes")

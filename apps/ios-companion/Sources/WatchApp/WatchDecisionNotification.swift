@@ -69,7 +69,7 @@ final class WatchDecisionNotificationController:
 
     override class var isInteractive: Bool { true }
     override class var sashColor: Color? {
-        Color(red: 0.08, green: 0.58, blue: 0.47)
+        Color(red: 0.89, green: 0.29, blue: 0.15)
     }
     override class var titleColor: Color? { .white }
     override class var subtitleColor: Color? { .white.opacity(0.72) }
@@ -112,14 +112,15 @@ struct WatchDecisionNotificationView: View {
     let model: WatchDecisionNotificationModel
     @State private var showsWhy = false
 
-    private let healthGreen = Color(red: 0.42, green: 0.88, blue: 0.76)
+    private let brand = Color(red: 1.0, green: 0.38, blue: 0.22)
+    private let decisionBlue = Color(red: 0.47, green: 0.66, blue: 1.0)
     private let reasonAmber = Color(red: 1.0, green: 0.73, blue: 0.34)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Label("HEALTHMES DECISION", systemImage: "waveform.path.ecg")
+            Label("HEALTHMES WELLNESS", systemImage: "sun.max.fill")
                 .font(.system(size: 10, weight: .bold, design: .rounded))
-                .foregroundStyle(healthGreen)
+                .foregroundStyle(brand)
 
             Text(verbatim: model.heading)
                 .font(.system(.headline, design: .rounded).weight(.bold))
@@ -142,7 +143,7 @@ struct WatchDecisionNotificationView: View {
                             label: String(localized: "TO"),
                             date: after,
                             end: model.endsAt,
-                            tint: healthGreen
+                            tint: decisionBlue
                         )
                     }
                 }
@@ -174,7 +175,7 @@ struct WatchDecisionNotificationView: View {
                     .font(.caption2.weight(.semibold))
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(healthGreen)
+                .foregroundStyle(brand)
 
                 if showsWhy {
                     VStack(alignment: .leading, spacing: 5) {

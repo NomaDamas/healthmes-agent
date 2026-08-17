@@ -1,15 +1,19 @@
 import SwiftUI
 
 enum MacHealthMesStyle {
-    static let canvas = Color(red: 0.955, green: 0.955, blue: 0.935)
-    static let graphite = Color(red: 0.10, green: 0.13, blue: 0.13)
-    static let moss = Color(red: 0.02, green: 0.45, blue: 0.39)
-    static let mossDeep = Color(red: 0.02, green: 0.27, blue: 0.25)
-    static let calendar = Color(red: 0.16, green: 0.42, blue: 0.78)
-    static let amber = Color(red: 0.59, green: 0.31, blue: 0.04)
-    static let line = Color.black.opacity(0.09)
-    static let sidebarTop = Color(red: 0.045, green: 0.105, blue: 0.10)
-    static let sidebarBottom = Color(red: 0.07, green: 0.17, blue: 0.15)
+    static let canvas = Color(red: 0.98, green: 0.96, blue: 0.93)
+    static let graphite = Color(red: 0.12, green: 0.14, blue: 0.17)
+    static let brand = Color(red: 0.89, green: 0.29, blue: 0.15)
+    static let brandDeep = Color(red: 0.72, green: 0.20, blue: 0.10)
+    static let data = Color(red: 0.24, green: 0.44, blue: 0.84)
+    static let dataDeep = Color(red: 0.16, green: 0.31, blue: 0.67)
+    static let moss = data
+    static let mossDeep = dataDeep
+    static let calendar = Color(red: 0.20, green: 0.40, blue: 0.82)
+    static let amber = Color(red: 0.72, green: 0.32, blue: 0.06)
+    static let line = Color(red: 0.31, green: 0.27, blue: 0.22).opacity(0.12)
+    static let sidebarTop = Color(red: 0.11, green: 0.125, blue: 0.16)
+    static let sidebarBottom = Color(red: 0.16, green: 0.18, blue: 0.23)
 }
 
 struct MacPageHeader: View {
@@ -23,7 +27,7 @@ struct MacPageHeader: View {
                 .font(.caption.weight(.semibold))
                 .textCase(.uppercase)
                 .tracking(1.4)
-                .foregroundStyle(MacHealthMesStyle.moss)
+                .foregroundStyle(MacHealthMesStyle.brand)
             Text(title)
                 .font(.system(size: 30, weight: .semibold, design: .rounded))
                 .foregroundStyle(MacHealthMesStyle.graphite)
@@ -67,7 +71,7 @@ struct MacSurfaceCard<Content: View>: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(MacHealthMesStyle.line)
         }
-        .shadow(color: MacHealthMesStyle.mossDeep.opacity(0.055), radius: 18, y: 8)
+        .shadow(color: MacHealthMesStyle.graphite.opacity(0.06), radius: 14, y: 6)
     }
 }
 
