@@ -53,6 +53,7 @@ EXPECTED_TABLES = {
     "app_usage_sample",
     "cognitive_energy_estimate",
     "decision_record",
+    "decision_request_receipt",
     "decision_domain_policy",
     "insight",
     "medical_record",
@@ -510,6 +511,139 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    def test_decision_request_receipt_migration_round_trip(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'decision-receipt.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e9f0a1b2c3d4")
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert not sa.inspect(engine).has_table(
+                "decision_request_receipt"
+            )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert inspector.has_table("decision_request_receipt")
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                "ck_decision_request_receipt_state_payload_consistent"
+            }
+            assert {
+                item["name"]
+                for item in inspector.get_unique_constraints(
+                    "decision_request_receipt"
+                )
+            } == {"uq_decision_request_receipt_request_id"}
+            assert {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "decision_request_receipt"
+                )
+            } == {
+                "ix_decision_request_receipt_expires_at",
+                "ix_decision_request_receipt_lease_expires_at",
+                "ix_decision_request_receipt_owner_token",
+                "ix_decision_request_receipt_request_id",
+                "ix_decision_request_receipt_state",
+            }
+
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            now = datetime(2026, 8, 16, 9, tzinfo=UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=uuid.uuid4().hex,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="a" * 64,
+                        state="pending",
+                        owner_token=uuid.uuid4().hex,
+                        lease_expires_at=now + timedelta(minutes=5),
+                        expires_at=now + timedelta(days=30),
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=uuid.uuid4().hex,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="b" * 64,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"status": "completed"},
+                        },
+                        expires_at=now + timedelta(days=30),
+                    )
+                )
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(receipt)
+                ) == 2
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade decision_request_receipt without "
+                "losing durable idempotency results"
+            ),
+        ):
+            command.downgrade(config, "e9f0a1b2c3d4")
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert sa.inspect(engine).has_table(
+                "decision_request_receipt"
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(receipt)
+                ) == 2
+                connection.execute(receipt.delete())
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "e9f0a1b2c3d4")
+        engine = sa.create_engine(database_url)
+        try:
+            assert not sa.inspect(engine).has_table(
+                "decision_request_receipt"
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e9f0a1b2c3d4"
+        finally:
+            engine.dispose()
+
     def test_decision_retention_removes_malformed_payload_before_sqlite_ddl(
         self,
         tmp_path,
@@ -573,7 +707,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.text(
                         "SELECT COUNT(*) FROM decision_record "
@@ -1635,7 +1769,7 @@ class TestSqliteUpgrade:
                     )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
         finally:
             engine.dispose()
 
@@ -2512,7 +2646,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
         finally:
             engine.dispose()
 
@@ -2854,7 +2988,7 @@ def test_postgres_wearable_retention_migration_round_trip() -> None:
                 assert migrated.expires_at == original_expiry
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
         finally:
             scoped_engine.dispose()
 
@@ -3097,7 +3231,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.select(proposal.c.status).where(
                         proposal.c.id == active_id
@@ -3121,7 +3255,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 connection.execute(
                     proposal.update()
                     .where(proposal.c.id == active_id)
@@ -3167,7 +3301,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.select(proposal.c.status).where(
                         proposal.c.id == raced_id
@@ -3375,7 +3509,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(preserved)
@@ -3440,7 +3574,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(migrated)
@@ -3546,7 +3680,7 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.select(policy.c.enabled).where(
                         policy.c.id == policy_id
@@ -3586,7 +3720,7 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e9f0a1b2c3d4"
+                ) == "f0a1b2c3d4e5"
                 assert connection.scalar(
                     sa.select(policy.c.enabled).where(
                         policy.c.id == policy_id
@@ -3626,6 +3760,118 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
                 assert connection.scalar(
                     sa.select(sa.func.count()).select_from(policy)
                 ) == 0
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_receipt_downgrade_is_lossless() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        receipt_id = uuid.uuid4()
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="a" * 64,
+                        state="completed",
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"status": "completed"},
+                        },
+                        expires_at=datetime(
+                            2026,
+                            9,
+                            15,
+                            tzinfo=UTC,
+                        ),
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade decision_request_receipt without "
+                "losing durable idempotency results"
+            ),
+        ):
+            command.downgrade(config, "e9f0a1b2c3d4")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(receipt)
+                    .where(receipt.c.id == receipt_id)
+                ) == 1
+                connection.execute(
+                    receipt.delete().where(
+                        receipt.c.id == receipt_id
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "e9f0a1b2c3d4")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            assert (
+                "decision_request_receipt"
+                not in sa.inspect(scoped_engine).get_table_names()
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e9f0a1b2c3d4"
         finally:
             scoped_engine.dispose()
     finally:

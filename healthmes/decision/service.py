@@ -9,7 +9,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from threading import Lock
 from typing import Protocol
@@ -23,6 +23,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.config import Settings, resolve_timezone
 from healthmes.decision.composition import (
@@ -34,13 +35,22 @@ from healthmes.decision.contracts import (
     DecisionContextHints,
     DecisionRequest,
     DecisionResult,
+    DecisionStatus,
+    PersistenceStatus,
     PrivacyLevel,
+)
+from healthmes.store.decision_receipts import (
+    DecisionReceiptClaimState,
+    DecisionReceiptConflictError,
+    DecisionReceiptStore,
 )
 
 _CHANNEL_REQUEST_NAMESPACE = uuid.UUID(
     "ed5fcd43-39c0-4fb4-b968-57455f1fc9bf"
 )
 _MAX_COMPLETED_IDEMPOTENT_REQUESTS = 256
+_DECISION_RECEIPT_RETENTION = timedelta(days=30)
+_DECISION_RECEIPT_SCHEMA = "healthmes.decision-receipt.v1"
 
 
 class DecisionRuntimeNotConfiguredError(RuntimeError):
@@ -115,12 +125,16 @@ class DecisionChannelRequest(BaseModel):
         default_factory=DecisionContextHints
     )
 
-    @field_validator("idempotency_key")
+    @field_validator("idempotency_key", "source")
     @classmethod
-    def validate_idempotency_key(cls, value: str) -> str:
+    def validate_identity_component(cls, value: str, info) -> str:
         if value != value.strip():
             raise ValueError(
-                "idempotency_key must not contain surrounding whitespace"
+                f"{info.field_name} must not contain surrounding whitespace"
+            )
+        if not value.isprintable():
+            raise ValueError(
+                f"{info.field_name} must not contain control characters"
             )
         return value
 
@@ -146,13 +160,20 @@ class DecisionService(Protocol):
 @dataclass(frozen=True, slots=True)
 class _ActiveDecision:
     fingerprint: str
-    task: asyncio.Task[DecisionResult]
+    task: asyncio.Task[_IdempotentExecution]
 
 
 @dataclass(frozen=True, slots=True)
 class _CompletedDecision:
     fingerprint: str
     result: DecisionResult
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _IdempotentExecution:
+    result: DecisionResult
+    cache_expires_at: datetime | None
 
 
 class HealthMesDecisionService:
@@ -163,16 +184,23 @@ class HealthMesDecisionService:
         *,
         settings: Settings,
         engine_provider: Callable[[], DecisionEngine | None],
+        session_factory_provider: Callable[
+            [], sessionmaker[Session]
+        ],
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not callable(engine_provider):
             raise TypeError("engine_provider must be callable")
+        if not callable(session_factory_provider):
+            raise TypeError("session_factory_provider must be callable")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
         self._settings = settings
         self._engine_provider = engine_provider
+        self._session_factory_provider = session_factory_provider
         self._clock = clock or (lambda: datetime.now(UTC))
         self._idempotency_lock = Lock()
+        self._receipt_store: DecisionReceiptStore | None = None
         self._active_idempotent_requests: dict[
             uuid.UUID,
             _ActiveDecision,
@@ -242,6 +270,13 @@ class HealthMesDecisionService:
                 request_id
             )
             if completed is not None:
+                if completed.expires_at <= _as_utc(self._clock()):
+                    self._completed_idempotent_requests.pop(
+                        request_id,
+                        None,
+                    )
+                    completed = None
+            if completed is not None:
                 _require_matching_idempotency_fingerprint(
                     completed.fingerprint,
                     fingerprint,
@@ -264,7 +299,10 @@ class HealthMesDecisionService:
                     )
                 task = active.task
             else:
-                coroutine = self._execute(submission)
+                coroutine = self._execute_idempotently(
+                    submission,
+                    fingerprint=fingerprint,
+                )
                 try:
                     task = loop.create_task(
                         coroutine,
@@ -286,7 +324,8 @@ class HealthMesDecisionService:
                         done,
                     )
                 )
-        return await asyncio.shield(task)
+        execution = await asyncio.shield(task)
+        return execution.result
 
     async def _execute(
         self,
@@ -298,16 +337,105 @@ class HealthMesDecisionService:
             raise DecisionRuntimeNotConfiguredError(
                 "HealthMes decision runtime is not configured"
             )
-        return await engine.ask_wellness(request)
+        result = await engine.ask_wellness(request)
+        if not isinstance(result, DecisionResult):
+            raise TypeError("decision engine must return DecisionResult")
+        return result
+
+    async def _execute_idempotently(
+        self,
+        submission: DecisionServiceRequest,
+        *,
+        fingerprint: str,
+    ) -> _IdempotentExecution:
+        request_id = submission.request_id
+        assert request_id is not None
+        owner_token = uuid.uuid4()
+        store = self._get_receipt_store()
+
+        while True:
+            try:
+                claim = await asyncio.to_thread(
+                    store.claim,
+                    request_id=request_id,
+                    fingerprint=fingerprint,
+                    owner_token=owner_token,
+                    now=self._clock(),
+                )
+            except DecisionReceiptConflictError as exc:
+                raise DecisionIdempotencyConflictError(str(exc)) from exc
+            if claim.state is DecisionReceiptClaimState.COMPLETED:
+                assert claim.result_payload is not None
+                assert claim.expires_at is not None
+                return _IdempotentExecution(
+                    result=_result_from_receipt(claim.result_payload),
+                    cache_expires_at=_as_utc(claim.expires_at),
+                )
+            if claim.state is DecisionReceiptClaimState.ACQUIRED:
+                break
+            await asyncio.sleep(claim.retry_after_seconds)
+
+        try:
+            result = await self._execute(submission)
+            if not _is_terminal_non_retryable(result):
+                await _run_receipt_cleanup(
+                    store.release,
+                    request_id=request_id,
+                    fingerprint=fingerprint,
+                    owner_token=owner_token,
+                )
+                return _IdempotentExecution(
+                    result=result,
+                    cache_expires_at=None,
+                )
+            payload = _result_receipt_payload(result)
+            completion = await asyncio.to_thread(
+                store.complete,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                owner_token=owner_token,
+                result_payload=payload,
+                now=self._clock(),
+            )
+            return _IdempotentExecution(
+                result=_result_from_receipt(
+                    completion.result_payload
+                ),
+                cache_expires_at=_as_utc(completion.expires_at),
+            )
+        except BaseException:
+            await _run_receipt_cleanup(
+                store.release,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                owner_token=owner_token,
+            )
+            raise
+
+    def _get_receipt_store(self) -> DecisionReceiptStore:
+        with self._idempotency_lock:
+            if self._receipt_store is None:
+                lease_seconds = max(
+                    30.0,
+                    self._settings.decision_timeout_seconds
+                    + self._settings.decision_finalization_timeout_seconds
+                    + 30.0,
+                )
+                self._receipt_store = DecisionReceiptStore(
+                    session_factory=self._session_factory_provider(),
+                    lease_duration=timedelta(seconds=lease_seconds),
+                    retention=_DECISION_RECEIPT_RETENTION,
+                )
+            return self._receipt_store
 
     def _finish_idempotent_request(
         self,
         request_id: uuid.UUID,
         fingerprint: str,
-        task: asyncio.Task[DecisionResult],
+        task: asyncio.Task[_IdempotentExecution],
     ) -> None:
         try:
-            result = task.result()
+            execution = task.result()
         except BaseException:
             with self._idempotency_lock:
                 active = self._active_idempotent_requests.get(
@@ -325,10 +453,17 @@ class HealthMesDecisionService:
             if active is None or active.task is not task:
                 return
             self._active_idempotent_requests.pop(request_id, None)
+            result = execution.result
+            if not _is_terminal_non_retryable(result):
+                return
+            expires_at = execution.cache_expires_at
+            if expires_at is None:
+                return
             self._completed_idempotent_requests[request_id] = (
                 _CompletedDecision(
                     fingerprint=fingerprint,
                     result=result,
+                    expires_at=expires_at,
                 )
             )
             self._completed_idempotent_requests.move_to_end(request_id)
@@ -382,9 +517,15 @@ class DecisionChannelAdapter:
 def _channel_request_id(
     submission: DecisionChannelRequest,
 ) -> uuid.UUID:
+    identity = json.dumps(
+        [submission.source, submission.idempotency_key],
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     return uuid.uuid5(
         _CHANNEL_REQUEST_NAMESPACE,
-        f"{submission.source}\0{submission.idempotency_key}",
+        identity,
     )
 
 
@@ -421,3 +562,66 @@ def _caller_channel(submission: DecisionServiceRequest) -> str:
         return DecisionIngress.REST.value
     assert submission.source is not None
     return f"{submission.ingress.value}:{submission.source}"
+
+
+def _is_terminal_non_retryable(result: DecisionResult) -> bool:
+    return (
+        result.status
+        in {
+            DecisionStatus.COMPLETED,
+            DecisionStatus.NEEDS_CLARIFICATION,
+        }
+        and result.persistence_status
+        in {
+            PersistenceStatus.NOT_REQUIRED,
+            PersistenceStatus.PERSISTED,
+        }
+    )
+
+
+def _result_receipt_payload(result: DecisionResult) -> dict:
+    return {
+        "schema": _DECISION_RECEIPT_SCHEMA,
+        "result": result.model_dump(
+            mode="json",
+            round_trip=True,
+            exclude={"tool_trace"},
+        ),
+    }
+
+
+def _result_from_receipt(payload: dict) -> DecisionResult:
+    if payload.get("schema") != _DECISION_RECEIPT_SCHEMA:
+        raise RuntimeError("unsupported decision receipt schema")
+    raw_result = payload.get("result")
+    if not isinstance(raw_result, dict):
+        raise RuntimeError("decision receipt result is invalid")
+    return DecisionResult.model_validate(
+        {**raw_result, "tool_trace": []}
+    )
+
+
+async def _run_receipt_cleanup(
+    operation: Callable[..., None],
+    **kwargs,
+) -> None:
+    task = asyncio.create_task(asyncio.to_thread(operation, **kwargs))
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            if task.done():
+                break
+    if task.done():
+        task.result()
+    if cancelled is not None:
+        raise cancelled
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

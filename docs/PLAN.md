@@ -57,7 +57,7 @@ HealthMes 서비스
 **핵심 연결 결정 (PR #138 canonical 구현):**
 - **단일 runtime:** production composition은 HealthMes
   `POST /v1/wellness-decisions`에서 Hermes `/v1/responses`를 정확히 한 번
-  호출한다. 폐기된 `/v1/model/iterations` adapter와 공개 builder는 제거했다.
+  호출한다. 폐기된 split-runtime adapter와 공개 builder는 제거했다.
 - **제품 질문 경로는 하나:** Client → HealthMes
   `POST /v1/wellness-decisions` → Hermes `/v1/responses` → HealthMes MCP.
   Hermes가 autonomous LLM/tool loop를 소유하고 HealthMes는 제품 ingress,
@@ -226,7 +226,7 @@ Telegram을 포함한 messaging channel은 future bounded adapter이며 별도 w
 
 2026-08-16 현재 시간 구동 입력과 proactive trigger는
 `DecisionAlertSender`를 통해 같은 internal DecisionRequest service에 연결된다.
-legacy generic Hermes webhook reasoning 구현과 설정은 제거됐다. bootstrap
+legacy parallel Hermes reasoning 구현과 설정은 제거됐다. bootstrap
 migration은 HealthMes 소유권을 증명할 수 있는 과거 cron만 제거하고 사용자 또는
 소유권 불명 cron은 보존한다. 실제 Telegram/UI inbound와 outbound channel
 integration은 아직 없으며, 디바이스/채널 팀은 UI-neutral channel adapter 계약을

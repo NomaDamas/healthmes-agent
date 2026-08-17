@@ -260,9 +260,9 @@ build_configured_decision_engine(...)
   -> HermesResponsesDecisionAgent
 ```
 
-폐기된 split-runtime의 public adapter, builder와
-`/v1/model/iterations` 계약은 제품 코드에서 제거한다. 테스트가 해당 endpoint의
-404를 확인하는 것은 재등장을 막기 위한 negative invariant다.
+폐기된 split-runtime의 public adapter, builder와 iteration 계약은 제품 코드에서
+제거한다. 테스트가 legacy endpoint의 404를 확인하는 것은 재등장을 막기 위한
+negative invariant다.
 
 `HealthMesDecisionService`가 REST, channel, proactive와 scheduled 요청의 공통
 진입점이다. bounded command가 별도 endpoint를 가지더라도 자유 형식 LLM 판단을

@@ -44,7 +44,7 @@ Data sources and honesty rules:
   pushed proposals already appear via the mirror, so including them twice
   would double-count). ``energy_demand`` comes from the linked task when one
   exists.
-- **alerts** are recent pushed trigger events (``alert_sent`` within
+- **alerts** are recent delivered or app-available trigger events within
   :data:`ALERT_RECENT_HOURS`). The store has no resolution tracking yet, so
   "unresolved" == "recent" — a documented placeholder policy for the domain
   expert to refine. ``top.decision_url`` links the earliest alert-kind
@@ -90,6 +90,11 @@ from healthmes.calendars.visibility import (
     read_visible_calendar,
 )
 from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.alert_visibility import (
+    AlertDeliveryState,
+    alert_delivery_state,
+    is_user_visible_alert,
+)
 from healthmes.store import (
     CalendarEventMirror,
     CognitiveEnergyEstimate,
@@ -161,11 +166,12 @@ class GlanceBlockOut(BaseModel):
 
 
 class GlanceAlertOut(BaseModel):
-    """The most recent unresolved alert, notification-grammar shaped."""
+    """The most recent visible alert, notification-grammar shaped."""
 
     id: uuid.UUID
     rule_id: str
     summary: str
+    delivery_state: AlertDeliveryState
     decision_url: str | None
 
 
@@ -341,21 +347,24 @@ def _next_blocks(
 
 
 def _alerts_block(session: Session, settings: Settings, now: datetime) -> GlanceAlertsOut:
-    """Recent pushed alerts, newest first (recency stands in for resolution)."""
+    """Recent visible alerts, newest first (recency stands in for resolution)."""
     cutoff = now - timedelta(hours=ALERT_RECENT_HOURS)
     events = [
         event
         for event in session.scalars(
             select(TriggerEvent)
-            .where(TriggerEvent.alert_sent.is_(True), TriggerEvent.fired_at >= cutoff)
+            .where(TriggerEvent.fired_at >= cutoff)
             .order_by(TriggerEvent.fired_at.desc(), TriggerEvent.created_at.desc())
         ).all()
-        if ensure_utc(event.fired_at) >= cutoff  # sqlite reads are naive; re-verify
+        if ensure_utc(event.fired_at) >= cutoff
+        and is_user_visible_alert(event)
     ]
     if not events:
         return GlanceAlertsOut(unresolved_count=0, top=None)
 
     top = events[0]
+    delivery_state = alert_delivery_state(top)
+    assert delivery_state is not None
     payload: dict[str, Any] = top.payload or {}
     summary = payload.get("message") or payload.get("summary")
     decision = session.scalar(
@@ -371,6 +380,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
         top=GlanceAlertOut(
             id=top.id,
             rule_id=top.rule_id,
+            delivery_state=delivery_state,
             # The observation line of the notification grammar; the rule id is
             # the honest fallback when a legacy row has no payload.
             summary=str(summary) if summary else top.rule_id,

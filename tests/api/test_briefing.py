@@ -357,6 +357,7 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
                 "id": str(TRIGGER_ALERT_TOP_ID),
                 "rule_id": "stress_spike_vs_baseline",
                 "summary": "Stress 82 vs baseline 55",
+                "delivery_state": "delivered",
                 "decision_url": f"{BASE_URL}/decisions/{DECISION_ALERT_TOP_ID}",
             },
         },

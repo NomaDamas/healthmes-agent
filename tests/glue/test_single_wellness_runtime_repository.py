@@ -13,17 +13,35 @@ CANONICAL_DOCS = (
     REPO_ROOT / "docs" / "HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md",
     REPO_ROOT / "docs" / "HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md",
 )
-PRODUCTION_TEXT_SURFACES = (
-    REPO_ROOT / ".env.example",
-    REPO_ROOT / "docker-compose.yml",
-    REPO_ROOT / "config" / "hermes-decision-config.yaml.tmpl",
-    REPO_ROOT / "healthmes" / "config.py",
-    REPO_ROOT / "healthmes" / "decision",
-    REPO_ROOT / "healthmes" / "engine",
-    REPO_ROOT / "healthmes" / "mcp_server",
-    REPO_ROOT / "scripts" / "healthmes_local.sh",
-    REPO_ROOT / "skills",
-)
+PRODUCTION_TEXT_SUFFIXES = {
+    ".env",
+    ".example",
+    ".ini",
+    ".json",
+    ".md",
+    ".py",
+    ".sh",
+    ".tmpl",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+EXCLUDED_PRODUCTION_PARTS = {
+    ".agents",
+    ".codex",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "tests",
+    "vendor",
+}
 
 
 def _text_files(path: Path) -> Iterator[Path]:
@@ -31,11 +49,14 @@ def _text_files(path: Path) -> Iterator[Path]:
         yield path
         return
     for candidate in sorted(path.rglob("*")):
+        relative_parts = candidate.relative_to(REPO_ROOT).parts
         if (
             candidate.is_file()
-            and candidate.suffix
-            in {".md", ".py", ".tmpl", ".yaml", ".yml"}
-            and "__pycache__" not in candidate.parts
+            and candidate.suffix in PRODUCTION_TEXT_SUFFIXES
+            and not (
+                set(relative_parts)
+                & EXCLUDED_PRODUCTION_PARTS
+            )
         ):
             yield candidate
 
@@ -90,7 +111,7 @@ def test_bootstrap_and_env_do_not_offer_direct_ow_mcp_controls() -> None:
 
 
 def test_production_surfaces_have_no_retired_reasoning_entrypoints() -> None:
-    text = _combined_text(PRODUCTION_TEXT_SURFACES)
+    text = _combined_text((REPO_ROOT,))
 
     for forbidden in (
         "/v1/model/iterations",

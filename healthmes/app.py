@@ -288,6 +288,7 @@ def create_app(
     app.state.decision_service = HealthMesDecisionService(
         settings=settings,
         engine_provider=lambda: app.state.decision_engine,
+        session_factory_provider=get_session_factory,
         clock=decision_clock,
     )
     app.state.scheduler = None

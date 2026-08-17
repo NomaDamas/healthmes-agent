@@ -37,7 +37,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
@@ -48,6 +48,11 @@ from healthmes.calendars.visibility import (
     require_calendar_visibility_current,
 )
 from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.alert_visibility import (
+    APP_AVAILABLE_STATE,
+    APP_POLL_CHANNEL,
+    is_user_visible_alert,
+)
 from healthmes.engine.decision_dispatch import DecisionDispatchResult
 from healthmes.engine.rules import (
     ALL_RULES,
@@ -744,7 +749,7 @@ class FireOutcome:
     """What happened to one fire in one sweep."""
 
     fire: TriggerFire
-    status: str  # "pushed" | "deduplicated" | "suppressed" | "push_failed"
+    status: str  # pushed | available | deduplicated | suppressed | push_failed
     reason: str | None = None
 
 
@@ -930,10 +935,11 @@ class TriggerEvaluator:
         )
         if outcomes:
             logger.info(
-                "Trigger sweep: %d fire(s) — pushed=%d deduplicated=%d "
-                "suppressed=%d push_failed=%d",
+                "Trigger sweep: %d fire(s) — pushed=%d available=%d "
+                "deduplicated=%d suppressed=%d push_failed=%d",
                 len(outcomes),
                 report.count("pushed"),
+                report.count("available"),
                 report.count("deduplicated"),
                 report.count("suppressed"),
                 report.count("push_failed"),
@@ -1222,6 +1228,21 @@ class TriggerEvaluator:
             session.commit()
             return outcome
 
+        if ready_for_native:
+            event.payload = {
+                **delivery_payload,
+                "push": {
+                    "sent": False,
+                    "state": APP_AVAILABLE_STATE,
+                    "channel": APP_POLL_CHANNEL,
+                    "status_code": result.status_code,
+                    "detail": result.detail,
+                },
+            }
+            outcome = FireOutcome(fire=fire, status="available")
+            session.commit()
+            return outcome
+
         if result.retryable:
             event.payload = {
                 **delivery_payload,
@@ -1337,27 +1358,32 @@ class TriggerEvaluator:
             cooldown_cutoff = _ensure_utc(
                 now - timedelta(minutes=settings.alert_cooldown_minutes)
             )
-            recent_push = session.scalar(
-                select(TriggerEvent.id)
+            recent_events = session.scalars(
+                select(TriggerEvent)
                 .where(
                     TriggerEvent.rule_id == fire.rule_id,
-                    TriggerEvent.alert_sent.is_(True),
                     TriggerEvent.fired_at > cooldown_cutoff,
                 )
-                .limit(1)
-            )
-            if recent_push is not None:
+            ).all()
+            if any(
+                is_user_visible_alert(event)
+                for event in recent_events
+            ):
                 return _SUPPRESS_COOLDOWN
 
         day_start_utc = _ensure_utc(
             datetime.combine(now.date(), time(0, 0), tzinfo=now.tzinfo)
         )
-        pushed_today = session.scalar(
-            select(func.count())
-            .select_from(TriggerEvent)
-            .where(TriggerEvent.alert_sent.is_(True), TriggerEvent.fired_at >= day_start_utc)
+        visible_today = sum(
+            1
+            for event in session.scalars(
+                select(TriggerEvent).where(
+                    TriggerEvent.fired_at >= day_start_utc
+                )
+            )
+            if is_user_visible_alert(event)
         )
-        if (pushed_today or 0) >= self._settings.alert_daily_budget:
+        if visible_today >= self._settings.alert_daily_budget:
             return _SUPPRESS_DAILY_BUDGET
         return None
 

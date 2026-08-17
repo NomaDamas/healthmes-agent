@@ -15,7 +15,7 @@ dependencies = [
     "psycopg[binary]",
     # MCP server mounted at /mcp (Streamable HTTP)
     "fastmcp",
-    # REST client for open-wearables + webhook push to Hermes
+    # REST clients for open-wearables and model-provider integrations
     "httpx",
     # In-service scheduler (triggers / cognitive-energy persist)
     "apscheduler>=3.10,<4",

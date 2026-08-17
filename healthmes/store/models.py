@@ -69,6 +69,7 @@ __all__ = [
     "AppUsageSample",
     "CognitiveEnergyEstimate",
     "DecisionRecord",
+    "DecisionRequestReceipt",
     "DecisionDomainPolicy",
     "Insight",
     "MedicalRecord",
@@ -430,6 +431,40 @@ class DecisionRecord(Base):
     )
     retention_basis_at: Mapped[datetime | None] = mapped_column(index=True)
     expires_at: Mapped[datetime | None] = mapped_column(index=True)
+
+
+class DecisionRequestReceipt(Base):
+    """Bounded, content-minimized idempotency state for one decision request."""
+
+    __tablename__ = "decision_request_receipt"
+    __table_args__ = (
+        UniqueConstraint(
+            "request_id",
+            name="uq_decision_request_receipt_request_id",
+        ),
+        CheckConstraint(
+            "("
+            "state = 'pending' "
+            "AND owner_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL "
+            "AND result_payload IS NULL"
+            ") OR ("
+            "state = 'completed' "
+            "AND owner_token IS NULL "
+            "AND lease_expires_at IS NULL "
+            "AND result_payload IS NOT NULL"
+            ")",
+            name="state_payload_consistent",
+        ),
+    )
+
+    request_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    request_fingerprint: Mapped[str_64]
+    state: Mapped[str_32] = mapped_column(index=True)
+    owner_token: Mapped[uuid.UUID | None] = mapped_column(index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    result_payload: Mapped[JSONDict | None]
+    expires_at: Mapped[datetime] = mapped_column(index=True)
 
 
 class DecisionDomainPolicy(Base):

@@ -97,6 +97,21 @@ class RetryThenCompleteSender:
         )
 
 
+class AppAvailableDecisionSender:
+    requires_reasoning = True
+
+    def send(self, fire, *, fired_at, trigger_event_id):
+        del fire, fired_at, trigger_event_id
+        return DecisionDispatchResult(
+            ok=False,
+            status_code=204,
+            detail="native alert delivery is disabled",
+            retryable=False,
+            ready_for_native=True,
+            message="Which coffee size are you considering?",
+        )
+
+
 def _evaluator(settings, session_factory, *, sender=None) -> TriggerEvaluator:
     return TriggerEvaluator(
         settings,
@@ -215,3 +230,35 @@ def test_retry_reuses_original_trigger_not_previous_llm_answer(
         serialized = json.dumps(event.payload)
         assert "Intermediate LLM answer" not in serialized
         assert event.payload["message"] == "Final verified answer."
+
+
+def test_native_disabled_decision_is_app_available_not_delivered(
+    settings,
+    session_factory,
+) -> None:
+    configured = settings.model_copy(
+        update={"native_alert_delivery": False}
+    )
+
+    report = _evaluator(
+        configured,
+        session_factory,
+        sender=AppAvailableDecisionSender(),
+    ).evaluate_once()
+
+    assert report.count("available") == 1
+    assert report.count("pushed") == 0
+    with session_factory() as session:
+        event = session.scalar(select(TriggerEvent))
+        assert event is not None
+        assert event.alert_sent is False
+        assert event.payload["message"] == (
+            "Which coffee size are you considering?"
+        )
+        assert event.payload["push"] == {
+            "sent": False,
+            "state": "available",
+            "channel": "app_poll",
+            "status_code": 204,
+            "detail": "native alert delivery is disabled",
+        }

@@ -14,6 +14,7 @@ from healthmes.storage import (
 from healthmes.store import (
     DecisionKind,
     DecisionRecord,
+    DecisionRequestReceipt,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -200,6 +201,62 @@ def test_maintenance_deletes_exact_cutoff_and_preserves_related_rows(
     assert session.scalar(
         sa.select(sa.func.count()).select_from(Task)
     ) == 1
+
+
+def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
+    session,
+    settings,
+) -> None:
+    current = datetime(2026, 8, 16, 12, tzinfo=UTC)
+    expired = DecisionRequestReceipt(
+        request_id=uuid.uuid4(),
+        request_fingerprint="a" * 64,
+        state="completed",
+        result_payload={
+            "schema": "healthmes.decision-receipt.v1",
+            "result": {"status": "completed"},
+        },
+        expires_at=current,
+    )
+    future = DecisionRequestReceipt(
+        request_id=uuid.uuid4(),
+        request_fingerprint="b" * 64,
+        state="completed",
+        result_payload={
+            "schema": "healthmes.decision-receipt.v1",
+            "result": {"status": "completed"},
+        },
+        expires_at=current + timedelta(microseconds=1),
+    )
+    session.add_all((expired, future))
+    session.commit()
+    expired_id = expired.id
+    future_id = future.id
+
+    preview = run_storage_maintenance(
+        session,
+        settings,
+        dry_run=True,
+        now=current,
+    )
+    session.commit()
+
+    assert preview.decision_receipt_candidates == 1
+    assert preview.decision_receipts_deleted == 0
+    assert session.get(DecisionRequestReceipt, expired_id) is not None
+
+    report = run_storage_maintenance(
+        session,
+        settings,
+        now=current,
+    )
+    session.commit()
+    session.expire_all()
+
+    assert report.decision_receipt_candidates == 1
+    assert report.decision_receipts_deleted == 1
+    assert session.get(DecisionRequestReceipt, expired_id) is None
+    assert session.get(DecisionRequestReceipt, future_id) is not None
 
 
 def test_retention_shrink_purges_recalculated_exact_cutoff(session) -> None:

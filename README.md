@@ -72,8 +72,8 @@ Apple prerequisites, and verification criteria are tracked in
   sweep (stress spike vs baseline, low recovery + heavy afternoon, external
   schedule changes, deadline risk) routes wellness reasoning through the same
   internal `HealthMesDecisionService` ingress as interactive questions.
-  Completed results are placed in the durable alert/native-delivery path; no
-  generic Hermes webhook reasoning route remains.
+  Completed results are placed in the durable alert/native-delivery path; the
+  retired parallel reasoning route is no longer shipped.
   Alert hygiene is already built in: per-rule cooldown, daily budget, quiet
   hours, dedup keys, and per-rule crash isolation.
 - Hermes decision bootstrap (`scripts/bootstrap.py`): renders and attests an
@@ -159,8 +159,8 @@ Apple prerequisites, and verification criteria are tracked in
   read-only decision tools exposed by the unified HealthMes MCP server.
   HealthMes validates the canonical tool trace and returned source
   references, then persists a compact DecisionRecord only for actions,
-  actionable risks, or explicit tracking. The split-runtime
-  `/v1/model/iterations` adapter and public builder have been removed.
+  actionable risks, or explicit tracking. The retired split-runtime adapter
+  and public builder have been removed.
   See `docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`. The authenticated
   REST boundary exposes
   per-domain `activity` / `nutrition` / `wearable` / `calendar` consent,

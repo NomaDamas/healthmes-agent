@@ -150,6 +150,7 @@ def test_lists_recent_pushed_alerts_newest_first(client, seeded, parse_utc):
     assert top["summary"] == "Recovery 38 today."
     assert top["proposal"] == "Move the 14:00 block to tomorrow."
     assert top["evidence"] == {"hrv_delta_pct": -18, "baseline_days": 14}
+    assert top["delivery_state"] == "delivered"
     assert parse_utc(top["fired_at"]) == _utc(9, 13, 50)
     assert uuid.UUID(top["id"])  # a real trigger_event id the app can key on
 
@@ -167,6 +168,11 @@ def test_decision_links_use_exact_trigger_correlation(client, seeded):
     assert glance_alerts["top"]["id"] == alerts[0]["id"]
     assert glance_alerts["top"]["rule_id"] == alerts[0]["rule_id"]
     assert glance_alerts["top"]["summary"] == alerts[0]["summary"]
+    assert glance_alerts["top"]["delivery_state"] == "delivered"
+    assert (
+        glance_alerts["top"]["delivery_state"]
+        == alerts[0]["delivery_state"]
+    )
     assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
 
 
@@ -194,6 +200,41 @@ def test_llm_message_is_the_shared_alert_and_glance_display_contract(
     )
     assert glance["top"]["id"] == alert["id"]
     assert glance["top"]["summary"] == alert["summary"]
+
+
+def test_app_available_result_is_visible_without_claiming_delivery(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "scheduled_briefing.morning",
+        sent=False,
+        payload={
+            **_payload("Deterministic briefing trigger."),
+            "message": "Which coffee size are you considering?",
+            "push": {
+                "sent": False,
+                "state": "available",
+                "channel": "app_poll",
+                "status_code": 204,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert event.alert_sent is False
+    assert alert["summary"] == "Which coffee size are you considering?"
+    assert alert["delivery_state"] == "app_available"
+    assert glance["unresolved_count"] == 1
+    assert glance["top"]["id"] == alert["id"]
+    assert glance["top"]["summary"] == alert["summary"]
+    assert glance["top"]["delivery_state"] == "app_available"
 
 
 def test_alert_link_hides_decision_at_exact_expiry(

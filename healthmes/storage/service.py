@@ -34,6 +34,9 @@ from healthmes.store import (
     StorageUsageDaily,
     WellnessEvent,
 )
+from healthmes.store.decision_receipts import (
+    purge_expired_decision_receipts,
+)
 from healthmes.store.session import session_scope
 
 RETENTION_PRESETS: dict[str, int | None] = {
@@ -72,6 +75,8 @@ class StorageMaintenanceReport:
     bytes_reclaimed: int
     decision_candidates: int
     decisions_deleted: int
+    decision_receipt_candidates: int
+    decision_receipts_deleted: int
     errors: tuple[str, ...]
 
 
@@ -885,6 +890,11 @@ def _run_storage_maintenance(
         now=current,
         dry_run=dry_run,
     )
+    decision_receipt_candidates = purge_expired_decision_receipts(
+        session,
+        now=current,
+        dry_run=dry_run,
+    )
     for obj in candidates:
         path = _safe_path(settings, obj.relative_path)
         if path is None:
@@ -943,6 +953,12 @@ def _run_storage_maintenance(
         "decisions_deleted": (
             0 if dry_run else decision_candidates
         ),
+        "decision_receipt_candidates": (
+            decision_receipt_candidates
+        ),
+        "decision_receipts_deleted": (
+            0 if dry_run else decision_receipt_candidates
+        ),
     }
     session.flush()
     return StorageMaintenanceReport(
@@ -954,6 +970,10 @@ def _run_storage_maintenance(
         decision_candidates=decision_candidates,
         decisions_deleted=(
             0 if dry_run else decision_candidates
+        ),
+        decision_receipt_candidates=decision_receipt_candidates,
+        decision_receipts_deleted=(
+            0 if dry_run else decision_receipt_candidates
         ),
         errors=tuple(errors),
     )

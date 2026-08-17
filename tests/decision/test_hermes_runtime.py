@@ -655,7 +655,6 @@ def test_child_environment_is_exact_and_scrubs_general_reasoning(
         **PROVIDER_ENV,
         "PATH": "/unsafe/path",
         "TELEGRAM_BOT_TOKEN": "telegram-secret",
-        "HEALTHMES_HERMES_WEBHOOK_SECRET": "webhook-secret",
         "HERMES_HOME": "/wrong/home",
     }
 
@@ -667,7 +666,6 @@ def test_child_environment_is_exact_and_scrubs_general_reasoning(
     assert child["OPENAI_API_KEY"] == PROVIDER_ENV["OPENAI_API_KEY"]
     assert child["HERMES_HOME"] == str(runtime_bundle.home)
     assert "TELEGRAM_BOT_TOKEN" not in child
-    assert "HEALTHMES_HERMES_WEBHOOK_SECRET" not in child
     assert "PATH" not in child
     assert set(child) - HERMES_RUNTIME_PROVIDER_ENV_NAMES == {
         item.name

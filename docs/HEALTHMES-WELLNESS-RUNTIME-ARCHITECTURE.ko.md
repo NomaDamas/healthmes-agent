@@ -52,7 +52,7 @@ REST / Future Channel Wrapper / Proactive / Scheduled
   최종 종합을 소유한다.
 - HealthMes가 Hermes에게 한 번씩 생각을 요청하고 직접 tool loop를 돌리는
   split-runtime은 사용하지 않는다.
-- 폐기된 `/v1/model/iterations` adapter, 공개 builder와 계약 문서는 제거한다.
+- 폐기된 split-runtime adapter, 공개 builder와 계약 문서는 제거한다.
 - MVP는 subagent를 spawn하지 않는다. 하나의 Hermes turn이 필요한 HealthMes
   도구를 직접 선택한다. 향후 위임을 추가해도 외부 ingress와 데이터 접근 계약은
   그대로 유지해야 한다.
