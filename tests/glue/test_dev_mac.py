@@ -62,6 +62,31 @@ def _write_process_identity(
     return pid_file
 
 
+def _write_decision_stop_budget(
+    runtime_dir: Path,
+    *,
+    drain_timeout_seconds: int,
+    pid: str = "4242",
+    start_time: str = "Mon Aug  3 12:00:00 2026",
+    nonce: str = "abc123",
+) -> Path:
+    path = runtime_dir / "hermes-decision-stop-budget"
+    path.write_text(
+        "\n".join(
+            (
+                "version\t1",
+                f"drain_timeout_seconds\t{drain_timeout_seconds}",
+                f"supervisor_pid\t{pid}",
+                f"supervisor_start_token\tps:{start_time}",
+                f"service_nonce\t{nonce}",
+                "",
+            )
+        ),
+        encoding="ascii",
+    )
+    return path
+
+
 def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
@@ -485,9 +510,9 @@ def test_decision_stop_uses_full_bound_and_never_orphans_child_group(
         runtime,
         process_name="hermes-decision",
     )
-    (runtime / "hermes-decision-stop-budget").write_text(
-        "3\n",
-        encoding="utf-8",
+    _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=3,
     )
     result = _run_local_runtime(
         harness,
@@ -521,8 +546,10 @@ def test_decision_stop_uses_saved_startup_budget_not_mutable_env(
         runtime,
         process_name="hermes-decision",
     )
-    budget = runtime / "hermes-decision-stop-budget"
-    budget.write_text("2\n", encoding="utf-8")
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
 
     _run_local_runtime(
         harness,
@@ -540,6 +567,35 @@ def test_decision_stop_uses_saved_startup_budget_not_mutable_env(
     assert "kill -s TERM -4242" in events
     assert events.count("sleep 1") == 0
     assert not budget.exists()
+
+
+def test_decision_stop_ignores_budget_from_another_service_identity(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+        nonce="different-service",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "ignoring stale or invalid decision runtime stop budget" in (
+        result.stdout
+    )
+    assert _event_lines(harness).count("sleep 1") == 315
+    assert budget.exists()
 
 
 def test_generic_stop_bounds_term_and_post_kill_wait(

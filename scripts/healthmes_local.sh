@@ -161,11 +161,17 @@ new_service_nonce() {
 }
 
 run_service_runner() {
-    local nonce=$1 command=$2 child status
+    local nonce=$1 command=$2 child status service_pid service_start_token
     [ -n "$nonce" ] && [ "${HEALTHMES_SERVICE_NONCE:-}" = "$nonce" ] \
         || die "invalid service runner nonce"
+    service_pid=$$
+    service_start_token="ps:$(ps_value "$service_pid" lstart)" \
+        || die "failed to capture service runner start token"
     trap ':' INT TERM
-    "$BASH_BIN" -lc "$command" &
+    env \
+        HEALTHMES_SERVICE_PID="$service_pid" \
+        HEALTHMES_SERVICE_START_TOKEN="$service_start_token" \
+        "$BASH_BIN" -lc "$command" &
     child=$!
     while true; do
         wait "$child" && return 0
@@ -213,24 +219,79 @@ signal_process_group() {
 }
 
 load_decision_runtime_stop_bounds() {
-    local saved_budget extra
+    local key value extra
+    local version= drain_timeout= supervisor_pid=
+    local supervisor_start_token= service_nonce=
+    local seen_version= seen_drain_timeout= seen_supervisor_pid=
+    local seen_supervisor_start_token= seen_service_nonce=
     DECISION_RUNTIME_TERM_WAIT_SECONDS=$MAX_DECISION_RUNTIME_DRAIN_SECONDS
     DECISION_RUNTIME_KILL_WAIT_SECONDS=1
     if [ ! -f "$HERMES_DECISION_STOP_BUDGET" ]; then
         return 0
     fi
-    {
-        IFS= read -r saved_budget \
-            || die "saved decision runtime stop budget is unreadable"
-        if IFS= read -r extra; then
-            die "saved decision runtime stop budget has trailing data"
-        fi
-    } <"$HERMES_DECISION_STOP_BUDGET"
-    [[ "$saved_budget" =~ ^[1-9][0-9]*$ ]] \
-        || die "saved decision runtime stop budget is invalid"
-    [ "$saved_budget" -le "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ] \
-        || die "saved decision runtime stop budget exceeds 315 seconds"
-    DECISION_RUNTIME_TERM_WAIT_SECONDS=$saved_budget
+    process_identity_matches "$HERMES_DECISION_PID" || return 0
+    while IFS=$'\t' read -r key value extra; do
+        [ -z "$extra" ] || {
+            info "ignoring malformed decision runtime stop budget"
+            return 0
+        }
+        case "$key" in
+        version)
+            [ -z "$seen_version" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                return 0
+            }
+            version=$value
+            seen_version=1
+            ;;
+        drain_timeout_seconds)
+            [ -z "$seen_drain_timeout" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                return 0
+            }
+            drain_timeout=$value
+            seen_drain_timeout=1
+            ;;
+        supervisor_pid)
+            [ -z "$seen_supervisor_pid" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                return 0
+            }
+            supervisor_pid=$value
+            seen_supervisor_pid=1
+            ;;
+        supervisor_start_token)
+            [ -z "$seen_supervisor_start_token" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                return 0
+            }
+            supervisor_start_token=$value
+            seen_supervisor_start_token=1
+            ;;
+        service_nonce)
+            [ -z "$seen_service_nonce" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                return 0
+            }
+            service_nonce=$value
+            seen_service_nonce=1
+            ;;
+        *)
+            info "ignoring malformed decision runtime stop budget"
+            return 0
+            ;;
+        esac
+    done <"$HERMES_DECISION_STOP_BUDGET"
+    if [ "$version" != 1 ] \
+        || ! [[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] \
+        || [ "$drain_timeout" -gt "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ] \
+        || [ "$supervisor_pid" != "$PROCESS_PID" ] \
+        || [ "$supervisor_start_token" != "ps:$PROCESS_START_TIME" ] \
+        || [ "$service_nonce" != "$PROCESS_NONCE" ]; then
+        info "ignoring stale or invalid decision runtime stop budget"
+        return 0
+    fi
+    DECISION_RUNTIME_TERM_WAIT_SECONDS=$drain_timeout
 }
 
 wait_for_process_exit() {

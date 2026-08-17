@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import hashlib
 import hmac
 import json
 import math
 import os
+import secrets
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,7 +23,7 @@ from collections.abc import (
     Callable,
     Mapping,
 )
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -81,6 +84,8 @@ _MAX_CHILD_TERM_TIMEOUT_SECONDS = 10.0
 _MAX_CHILD_KILL_TIMEOUT_SECONDS = 5.0
 _MAX_DECISION_TIMEOUT_SECONDS = 300.0
 _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
+_RUNTIME_SHUTDOWN_BUDGET_VERSION = 1
+_MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES = 1024
 _PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
 _PROXY_CONNECT_TIMEOUT_SECONDS = 5.0
@@ -109,6 +114,79 @@ class HermesRuntimeShutdownBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class HermesRuntimeSupervisorIdentity:
+    """Immutable launcher identity bound to one published stop budget."""
+
+    pid: int
+    start_token: str
+    service_nonce: str
+
+    def __post_init__(self) -> None:
+        if self.pid < 1:
+            raise ValueError("runtime supervisor PID must be positive")
+        if (
+            not self.start_token
+            or len(self.start_token) > 256
+            or not self.start_token.isascii()
+            or not self.start_token.startswith(("linux:", "ps:"))
+            or "\t" in self.start_token
+            or "\n" in self.start_token
+            or "\r" in self.start_token
+        ):
+            raise ValueError("runtime supervisor start token is invalid")
+        if (
+            not self.service_nonce
+            or len(self.service_nonce) > 128
+            or not self.service_nonce.isascii()
+            or not all(
+                character.isalnum() or character == "-"
+                for character in self.service_nonce
+            )
+        ):
+            raise ValueError("runtime supervisor service nonce is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class HermesRuntimeShutdownBudgetRecord:
+    """Identity-bound, canonical stop budget published by a live server."""
+
+    drain_timeout_seconds: int
+    supervisor_pid: int
+    supervisor_start_token: str
+    service_nonce: str
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.drain_timeout_seconds <= (
+            _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "runtime drain timeout is outside the supported bound"
+            )
+        HermesRuntimeSupervisorIdentity(
+            pid=self.supervisor_pid,
+            start_token=self.supervisor_start_token,
+            service_nonce=self.service_nonce,
+        )
+
+    @property
+    def supervisor_identity(self) -> HermesRuntimeSupervisorIdentity:
+        return HermesRuntimeSupervisorIdentity(
+            pid=self.supervisor_pid,
+            start_token=self.supervisor_start_token,
+            service_nonce=self.service_nonce,
+        )
+
+    def to_bytes(self) -> bytes:
+        return (
+            f"version\t{_RUNTIME_SHUTDOWN_BUDGET_VERSION}\n"
+            f"drain_timeout_seconds\t{self.drain_timeout_seconds}\n"
+            f"supervisor_pid\t{self.supervisor_pid}\n"
+            f"supervisor_start_token\t{self.supervisor_start_token}\n"
+            f"service_nonce\t{self.service_nonce}\n"
+        ).encode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
 class _ProcessGroupMember:
     """Stable OS identity used to avoid signaling a reused process group."""
 
@@ -120,6 +198,157 @@ ProcessGroupProbe = Callable[
     [int, float],
     frozenset[_ProcessGroupMember],
 ]
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    target = path.expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        _lock_path(target),
+        os.O_CREAT | os.O_RDWR,
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _fsync_parent(path: Path) -> None:
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _probe_process_start_token(
+    pid: int,
+    *,
+    expected_style: str | None = None,
+) -> str | None:
+    if (
+        expected_style != "ps"
+        and sys.platform.startswith("linux")
+        and Path(f"/proc/{pid}/stat").exists()
+    ):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            closing_parenthesis = stat.rfind(")")
+            fields = stat[closing_parenthesis + 1 :].split()
+            return f"linux:{fields[19]}"
+        except (IndexError, OSError):
+            return None
+    environment = dict(os.environ)
+    environment["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "lstart="],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=_PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    start_time = result.stdout.strip()
+    return f"ps:{start_time}" if start_time else None
+
+
+def capture_runtime_supervisor_identity(
+    environment: Mapping[str, str],
+) -> HermesRuntimeSupervisorIdentity:
+    """Capture the launcher identity inherited by this serving process."""
+
+    pid_value = environment.get("HEALTHMES_SERVICE_PID", "").strip()
+    start_token = environment.get(
+        "HEALTHMES_SERVICE_START_TOKEN",
+        "",
+    ).strip()
+    service_nonce = environment.get("HEALTHMES_SERVICE_NONCE", "").strip()
+    inherited = (pid_value, start_token, service_nonce)
+    if any(inherited):
+        if not all(inherited):
+            raise ValueError(
+                "runtime supervisor launcher identity is incomplete"
+            )
+        try:
+            pid = int(pid_value)
+        except ValueError as exc:
+            raise ValueError(
+                "runtime supervisor launcher PID is invalid"
+            ) from exc
+        identity = HermesRuntimeSupervisorIdentity(
+            pid=pid,
+            start_token=start_token,
+            service_nonce=service_nonce,
+        )
+    else:
+        pid = os.getpid()
+        token = _probe_process_start_token(pid)
+        if token is None:
+            raise ValueError(
+                "runtime supervisor start token is unavailable"
+            )
+        identity = HermesRuntimeSupervisorIdentity(
+            pid=pid,
+            start_token=token,
+            service_nonce=secrets.token_hex(16),
+        )
+    if not runtime_supervisor_identity_is_live(identity):
+        raise ValueError("runtime supervisor launcher identity is stale")
+    return identity
+
+
+def runtime_supervisor_identity_is_live(
+    identity: HermesRuntimeSupervisorIdentity,
+) -> bool:
+    style = identity.start_token.partition(":")[0]
+    return hmac.compare_digest(
+        _probe_process_start_token(
+            identity.pid,
+            expected_style=style,
+        )
+        or "",
+        identity.start_token,
+    )
+
+
+@dataclass(slots=True)
+class _RuntimeShutdownBudgetPublication:
+    path: Path
+    record: HermesRuntimeShutdownBudgetRecord
+
+    def publish(self) -> None:
+        if not runtime_supervisor_identity_is_live(
+            self.record.supervisor_identity
+        ):
+            raise RuntimeError(
+                "runtime shutdown budget owner is not running"
+            )
+        with _exclusive_file_lock(self.path):
+            persist_runtime_shutdown_budget(self.path, self.record)
+
+    def remove_if_owned(self) -> None:
+        target = self.path.expanduser()
+        with _exclusive_file_lock(target):
+            try:
+                current = load_runtime_shutdown_budget(target)
+            except ValueError:
+                return
+            if current != self.record:
+                return
+            target.unlink(missing_ok=True)
+            _fsync_parent(target)
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,13 +612,48 @@ class _HermesRuntimeUvicornServer(uvicorn.Server):
         config: uvicorn.Config,
         *,
         shutdown_coordinator: _RuntimeShutdownCoordinator,
+        shutdown_budget_publication: (
+            _RuntimeShutdownBudgetPublication | None
+        ) = None,
     ) -> None:
         super().__init__(config)
         self._shutdown_coordinator = shutdown_coordinator
+        self._shutdown_budget_publication = (
+            shutdown_budget_publication
+        )
 
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         self._shutdown_coordinator.request_close()
         super().handle_exit(sig, frame)
+
+    async def startup(
+        self,
+        sockets: list[socket.socket] | None = None,
+    ) -> None:
+        await super().startup(sockets=sockets)
+        publication = self._shutdown_budget_publication
+        if publication is None or not self.started:
+            return
+        try:
+            publication.publish()
+        except BaseException:
+            self.should_exit = True
+            try:
+                await super().shutdown(sockets=sockets)
+            finally:
+                publication.remove_if_owned()
+            raise
+
+    async def shutdown(
+        self,
+        sockets: list[socket.socket] | None = None,
+    ) -> None:
+        try:
+            await super().shutdown(sockets=sockets)
+        finally:
+            publication = self._shutdown_budget_publication
+            if publication is not None:
+                publication.remove_if_owned()
 
 
 class HermesRuntimeProcess:
@@ -998,17 +1262,17 @@ class HermesRuntimeProcess:
         self._known_child_group_members = known | current
         return current
 
-    def _owned_child_group_is_running(
+    def _owned_child_group_members(
         self,
         *,
         timeout_seconds: float,
-    ) -> bool:
+    ) -> frozenset[_ProcessGroupMember]:
         pgid = self._child_pgid
         if pgid is None:
-            return False
+            return frozenset()
         current = self._process_group_probe(pgid, timeout_seconds)
         if not current:
-            return False
+            return frozenset()
         known = self._known_child_group_members
         if not known:
             raise HermesRuntimeIdentityError(
@@ -1021,36 +1285,53 @@ class HermesRuntimeProcess:
                 "hermes_runtime_child_group_identity_changed"
             )
         self._known_child_group_members = known | current
-        return True
+        return current
 
-    def _signal_owned_child_group(
+    def _signal_owned_child_group_members(
         self,
         sent: signal.Signals,
         *,
         deadline: float,
     ) -> bool:
-        pgid = self._child_pgid
-        if pgid is None:
+        if self._child_pgid is None:
             return False
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             return False
-        if not self._owned_child_group_is_running(
+        current = self._owned_child_group_members(
             timeout_seconds=min(
                 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
                 remaining,
             )
-        ):
+        )
+        if not current:
             return False
-        try:
-            os.killpg(pgid, sent)
-        except ProcessLookupError:
-            return False
-        except PermissionError as exc:
-            raise RuntimeError(
-                "hermes_runtime_child_group_signal_denied"
-            ) from exc
-        return True
+        signaled = False
+        for member in sorted(current, key=lambda item: item.pid):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            revalidated = self._owned_child_group_members(
+                timeout_seconds=min(
+                    _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                    remaining,
+                )
+            )
+            if member not in revalidated:
+                continue
+            try:
+                # Never signal the numeric PGID directly. A dead leader can
+                # free that number while verified descendants still need
+                # cleanup, so each exact PID/start-token member is signaled.
+                os.kill(member.pid, sent)
+            except ProcessLookupError:
+                continue
+            except PermissionError as exc:
+                raise RuntimeError(
+                    "hermes_runtime_child_group_signal_denied"
+                ) from exc
+            signaled = True
+        return signaled
 
     async def _wait_for_child_group_exit(self, *, deadline: float) -> bool:
         loop = asyncio.get_running_loop()
@@ -1058,7 +1339,7 @@ class HermesRuntimeProcess:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
-            if not self._owned_child_group_is_running(
+            if not self._owned_child_group_members(
                 timeout_seconds=min(
                     _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
                     remaining,
@@ -1103,7 +1384,11 @@ class HermesRuntimeProcess:
         term_deadline = (
             loop.time() + self._config.child_term_timeout_seconds
         )
-        if process.returncode is None:
+        if not self._known_child_group_members:
+            if process.returncode is not None:
+                self._child_pgid = None
+                self._process = None
+                return
             remaining = term_deadline - loop.time()
             if remaining <= 0:
                 raise RuntimeError(
@@ -1116,8 +1401,7 @@ class HermesRuntimeProcess:
                     remaining,
                 ),
             )
-
-        self._signal_owned_child_group(
+        self._signal_owned_child_group_members(
             signal.SIGTERM,
             deadline=term_deadline,
         )
@@ -1128,7 +1412,7 @@ class HermesRuntimeProcess:
             loop.time() + self._config.child_kill_timeout_seconds
         )
         if not group_gone:
-            self._signal_owned_child_group(
+            self._signal_owned_child_group_members(
                 signal.SIGKILL,
                 deadline=kill_deadline,
             )
@@ -1777,13 +2061,13 @@ def _parse_pydantic_float(value: object, *, label: str) -> float:
 
 def persist_runtime_shutdown_budget(
     path: Path,
-    budget: HermesRuntimeShutdownBudget,
+    record: HermesRuntimeShutdownBudgetRecord,
 ) -> None:
-    """Atomically save the exact integer budget used by this supervisor."""
+    """Atomically save the exact identity-bound budget used at startup."""
 
-    drain_timeout = budget.drain_timeout_seconds
-    if not 1 <= drain_timeout <= _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS:
-        raise ValueError("runtime drain timeout is outside the supported bound")
+    payload = record.to_bytes()
+    if len(payload) > _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES:
+        raise ValueError("runtime shutdown budget record is too large")
     target = path.expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -1794,11 +2078,12 @@ def persist_runtime_shutdown_budget(
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(f"{drain_timeout}\n".encode("ascii"))
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(target)
         target.chmod(0o600)
+        _fsync_parent(target)
     except BaseException:
         try:
             os.close(descriptor)
@@ -1808,29 +2093,60 @@ def persist_runtime_shutdown_budget(
         raise
 
 
-def load_runtime_shutdown_budget(path: Path) -> int:
-    """Read a canonical saved drain bound without consulting mutable env."""
+def load_runtime_shutdown_budget(
+    path: Path,
+) -> HermesRuntimeShutdownBudgetRecord:
+    """Read a canonical identity-bound drain record."""
 
     try:
         payload = path.expanduser().read_bytes()
     except OSError as exc:
         raise ValueError("runtime shutdown budget is unavailable") from exc
     if (
-        len(payload) > 8
+        not payload
+        or len(payload) > _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES
         or not payload.endswith(b"\n")
-        or not payload[:-1].isdigit()
-        or payload[:1] == b"0"
     ):
         raise ValueError("runtime shutdown budget is invalid")
-    value = int(payload)
-    if not 1 <= value <= _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS:
-        raise ValueError("runtime shutdown budget is outside the supported bound")
-    return value
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("runtime shutdown budget is invalid") from exc
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("\t")
+        if not separator or key in fields:
+            raise ValueError("runtime shutdown budget is invalid")
+        fields[key] = value
+    expected = {
+        "version",
+        "drain_timeout_seconds",
+        "supervisor_pid",
+        "supervisor_start_token",
+        "service_nonce",
+    }
+    if set(fields) != expected or fields["version"] != str(
+        _RUNTIME_SHUTDOWN_BUDGET_VERSION
+    ):
+        raise ValueError("runtime shutdown budget is invalid")
+    try:
+        return HermesRuntimeShutdownBudgetRecord(
+            drain_timeout_seconds=int(fields["drain_timeout_seconds"]),
+            supervisor_pid=int(fields["supervisor_pid"]),
+            supervisor_start_token=fields["supervisor_start_token"],
+            service_nonce=fields["service_nonce"],
+        )
+    except ValueError as exc:
+        raise ValueError("runtime shutdown budget is invalid") from exc
 
 
 def _build_supervisor_server(
     controller: RuntimeController,
     config: HermesRuntimeSupervisorConfig,
+    *,
+    shutdown_budget_publication: (
+        _RuntimeShutdownBudgetPublication | None
+    ) = None,
 ) -> _HermesRuntimeUvicornServer:
     coordinator = _RuntimeShutdownCoordinator(controller)
     app = create_supervisor_app(
@@ -1851,6 +2167,7 @@ def _build_supervisor_server(
     return _HermesRuntimeUvicornServer(
         server_config,
         shutdown_coordinator=coordinator,
+        shutdown_budget_publication=shutdown_budget_publication,
     )
 
 
@@ -2038,12 +2355,33 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     controller = HermesRuntimeProcess(config)
+    publication: _RuntimeShutdownBudgetPublication | None = None
     if config.shutdown_budget_path is not None:
-        persist_runtime_shutdown_budget(
-            config.shutdown_budget_path,
-            config.shutdown_budget,
+        try:
+            identity = capture_runtime_supervisor_identity(os.environ)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        publication = _RuntimeShutdownBudgetPublication(
+            path=config.shutdown_budget_path,
+            record=HermesRuntimeShutdownBudgetRecord(
+                drain_timeout_seconds=(
+                    config.shutdown_budget.drain_timeout_seconds
+                ),
+                supervisor_pid=identity.pid,
+                supervisor_start_token=identity.start_token,
+                service_nonce=identity.service_nonce,
+            ),
         )
-    _build_supervisor_server(controller, config).run()
+    server = _build_supervisor_server(
+        controller,
+        config,
+        shutdown_budget_publication=publication,
+    )
+    try:
+        server.run()
+    finally:
+        if publication is not None:
+            publication.remove_if_owned()
 
 
 if __name__ == "__main__":

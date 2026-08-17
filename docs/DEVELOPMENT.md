@@ -232,17 +232,26 @@ supported 300-second overall decision wall clock plus the supervisor's bounded
 10-second child TERM wait and 5-second post-SIGKILL wait.
 
 The canonical native launcher also drains the old decision supervisor before
-running the dedicated Hermes `uv sync` or bootstrap. At supervisor startup,
-the validated `HEALTHMES_DECISION_TIMEOUT_SECONDS` wall clock plus the child
-TERM and KILL waits is rounded up once and atomically saved in
-`data/runtime/hermes-decision-stop-budget`. Stop and update consume that saved
-value rather than reparsing mutable environment files; a legacy runtime with
-no saved value receives the conservative 315-second maximum. The decision
-supervisor owns a separate child process group, so the launcher refuses to
-SIGKILL only the outer service group if that complete drain fails; it retains
-the process identity and exits non-zero instead of orphaning the child or
-reporting a false stop. The login LaunchAgent's 360-second `ExitTimeOut` is
-longer than every valid saved drain budget.
+running the dedicated Hermes `uv sync` or bootstrap. The validated
+`HEALTHMES_DECISION_TIMEOUT_SECONDS` wall clock plus the child TERM and KILL
+waits is rounded up once, but it is not published until Uvicorn has completed
+owned serving startup. The atomic
+`data/runtime/hermes-decision-stop-budget` record binds that exact value to the
+running launcher PID, OS start token, and service nonce. Stop and update use it
+only when all three fields still match the managed PID identity; stale,
+malformed, or missing records receive the conservative 315-second maximum
+instead of shortening a live drain from mutable environment state. A failed
+competing startup therefore cannot overwrite the ready runtime's budget.
+
+The decision supervisor owns a separate child process group. It tracks
+PID/start-token identities for the leader and descendants, then signals only
+the currently revalidated member PIDs. This still cleans up descendants when
+the leader exits first without signaling a later unrelated process group that
+reuses the numeric PGID. The launcher refuses to SIGKILL only the outer
+service group if that complete drain fails; it retains the process identity
+and exits non-zero instead of orphaning the child or reporting a false stop.
+The login LaunchAgent's 360-second `ExitTimeOut` is longer than every valid
+saved drain budget.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general

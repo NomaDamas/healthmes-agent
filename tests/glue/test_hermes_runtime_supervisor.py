@@ -10,15 +10,21 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from healthmes.hermes_runtime_identity import HermesRuntimeIdentityError
 from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeProcess,
+    HermesRuntimeShutdownBudgetRecord,
     HermesRuntimeSupervisorConfig,
+    HermesRuntimeSupervisorIdentity,
+    _build_supervisor_server,
     _next_restart_backoff,
     _parse_pydantic_float,
     _ProcessGroupMember,
+    _RuntimeShutdownBudgetPublication,
+    capture_runtime_supervisor_identity,
     create_supervisor_app,
     load_runtime_shutdown_budget,
 )
@@ -687,14 +693,14 @@ async def test_child_kill_wait_is_bounded_and_close_reports_failure(
     process._lifecycle_state = "running"
     signals: list[tuple[int, signal.Signals]] = []
 
-    def kill_group(pid: int, sent: signal.Signals) -> None:
+    def kill_member(pid: int, sent: signal.Signals) -> None:
         signals.append((pid, sent))
         if sent == signal.SIGKILL:
             group.clear()
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.killpg",
-        kill_group,
+        "healthmes.hermes_runtime_supervisor.os.kill",
+        kill_member,
     )
 
     with pytest.raises(
@@ -750,24 +756,28 @@ async def test_sigterm_checks_descendants_and_sigkills_the_remaining_group(
     process._launch_argv = ("fake-hermes",)
     process._healthy = True
     process._lifecycle_state = "running"
-    signals: list[signal.Signals] = []
+    signals: list[tuple[int, signal.Signals]] = []
 
-    def kill_group(_pid: int, sent: signal.Signals) -> None:
-        signals.append(sent)
-        if sent == signal.SIGTERM:
+    def kill_member(pid: int, sent: signal.Signals) -> None:
+        signals.append((pid, sent))
+        if pid == leader.pid and sent == signal.SIGTERM:
             child.returncode = 0
             group.discard(leader)
-        else:
+        elif sent == signal.SIGKILL:
             group.clear()
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.killpg",
-        kill_group,
+        "healthmes.hermes_runtime_supervisor.os.kill",
+        kill_member,
     )
 
     await process.aclose()
 
-    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert signals == [
+        (leader.pid, signal.SIGTERM),
+        (descendant.pid, signal.SIGTERM),
+        (descendant.pid, signal.SIGKILL),
+    ]
     assert group == set()
     assert process._process is None
     assert process._lifecycle_state == "closed"
@@ -809,7 +819,7 @@ async def test_reused_process_group_is_never_signaled_or_reported_drained(
             group.add(_group_member(4242, "reused"))
 
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.killpg",
+        "healthmes.hermes_runtime_supervisor.os.kill",
         replace_after_term,
     )
 
@@ -853,7 +863,7 @@ async def test_post_sigkill_group_verification_is_bounded(
     process._lifecycle_state = "running"
     signals: list[signal.Signals] = []
     monkeypatch.setattr(
-        "healthmes.hermes_runtime_supervisor.os.killpg",
+        "healthmes.hermes_runtime_supervisor.os.kill",
         lambda _pid, sent: signals.append(sent),
     )
 
@@ -865,6 +875,123 @@ async def test_post_sigkill_group_verification_is_bounded(
 
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert process._process is child
+    assert process._lifecycle_state == "close_failed"
+
+
+@pytest.mark.asyncio
+async def test_verified_descendant_is_stopped_after_leader_exits_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = _group_member(4242, "leader")
+    descendant = _group_member(4243, "descendant")
+    group = {descendant}
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        return frozenset(group)
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.01,
+            child_kill_timeout_seconds=0.01,
+        ),
+        process_group_probe=probe,
+    )
+
+    class ExitedLeader:
+        returncode = 0
+        pid = leader.pid
+
+        async def wait(self) -> int:
+            return 0
+
+    child = ExitedLeader()
+    process._process = child  # type: ignore[assignment]
+    process._child_pgid = leader.pid
+    process._known_child_group_members = frozenset(
+        {leader, descendant}
+    )
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[tuple[int, signal.Signals]] = []
+
+    def kill_member(pid: int, sent: signal.Signals) -> None:
+        signals.append((pid, sent))
+        group.discard(descendant)
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.kill",
+        kill_member,
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        lambda *_args: pytest.fail("numeric PGID must never be signaled"),
+    )
+
+    await process.aclose()
+
+    assert signals == [(descendant.pid, signal.SIGTERM)]
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_group_reuse_between_probe_and_signal_is_not_signaled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = _group_member(4242, "leader")
+    probes = 0
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            return frozenset({leader})
+        return frozenset({_group_member(4242, "reused")})
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.01,
+            child_kill_timeout_seconds=0.01,
+        ),
+        process_group_probe=probe,
+    )
+    child = SimpleNamespace(returncode=None, pid=leader.pid)
+    process._process = child
+    process._child_pgid = leader.pid
+    process._known_child_group_members = frozenset({leader})
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.kill",
+        lambda pid, sent: signals.append((pid, sent)),
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        lambda *_args: pytest.fail("numeric PGID must never be signaled"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_group_identity_changed",
+    ):
+        await process.aclose()
+
+    assert signals == []
     assert process._lifecycle_state == "close_failed"
 
 
@@ -1163,17 +1290,31 @@ def test_supervisor_persists_the_validated_startup_budget(
 ) -> None:
     budget_path = tmp_path / "runtime" / "stop-budget"
     captured: list[HermesRuntimeSupervisorConfig] = []
+    published: list[HermesRuntimeShutdownBudgetRecord] = []
 
     class FakeServer:
+        def __init__(
+            self,
+            publication: _RuntimeShutdownBudgetPublication,
+        ) -> None:
+            self.publication = publication
+
         def run(self) -> None:
-            return None
+            assert not budget_path.exists()
+            self.publication.publish()
+            published.append(load_runtime_shutdown_budget(budget_path))
 
     def build_server(
         _controller: HermesRuntimeProcess,
         config: HermesRuntimeSupervisorConfig,
+        *,
+        shutdown_budget_publication: (
+            _RuntimeShutdownBudgetPublication | None
+        ) = None,
     ) -> FakeServer:
         captured.append(config)
-        return FakeServer()
+        assert shutdown_budget_publication is not None
+        return FakeServer(shutdown_budget_publication)
 
     monkeypatch.setattr(
         "healthmes.hermes_runtime_supervisor._build_supervisor_server",
@@ -1201,8 +1342,103 @@ def test_supervisor_persists_the_validated_startup_budget(
     assert len(captured) == 1
     assert captured[0].decision_timeout_seconds == 60
     assert captured[0].shutdown_budget.drain_timeout_seconds == 75
-    assert load_runtime_shutdown_budget(budget_path) == 75
-    assert budget_path.read_bytes() == b"75\n"
+    assert len(published) == 1
+    assert published[0].drain_timeout_seconds == 75
+    assert not budget_path.exists()
+
+
+def test_inherited_supervisor_identity_must_match_live_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = HermesRuntimeSupervisorIdentity(
+        pid=4242,
+        start_token="ps:Mon Aug 17 12:00:00 2026",
+        service_nonce="service-nonce",
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_start_token",
+        lambda pid, expected_style=None: (
+            identity.start_token if pid == identity.pid else None
+        ),
+    )
+
+    captured = capture_runtime_supervisor_identity(
+        {
+            "HEALTHMES_SERVICE_PID": str(identity.pid),
+            "HEALTHMES_SERVICE_START_TOKEN": identity.start_token,
+            "HEALTHMES_SERVICE_NONCE": identity.service_nonce,
+        }
+    )
+
+    assert captured == identity
+
+
+@pytest.mark.asyncio
+async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    identity = capture_runtime_supervisor_identity({})
+    ready_record = HermesRuntimeShutdownBudgetRecord(
+        drain_timeout_seconds=75,
+        supervisor_pid=identity.pid,
+        supervisor_start_token=identity.start_token,
+        service_nonce=identity.service_nonce,
+    )
+    competing_record = HermesRuntimeShutdownBudgetRecord(
+        drain_timeout_seconds=2,
+        supervisor_pid=identity.pid,
+        supervisor_start_token=identity.start_token,
+        service_nonce="competing-startup",
+    )
+    ready_publication = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=ready_record,
+    )
+    competing_publication = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=competing_record,
+    )
+    controller = SimpleNamespace()
+    config = _supervisor_config(tmp_path)
+
+    async def ready_startup(
+        server: uvicorn.Server,
+        sockets: list[Any] | None = None,
+    ) -> None:
+        del sockets
+        server.started = True
+
+    monkeypatch.setattr(uvicorn.Server, "startup", ready_startup)
+    ready_server = _build_supervisor_server(
+        controller,  # type: ignore[arg-type]
+        config,
+        shutdown_budget_publication=ready_publication,
+    )
+    await ready_server.startup()
+    assert load_runtime_shutdown_budget(path) == ready_record
+
+    async def failed_startup(
+        _server: uvicorn.Server,
+        sockets: list[Any] | None = None,
+    ) -> None:
+        del sockets
+        raise OSError("port already owned")
+
+    monkeypatch.setattr(uvicorn.Server, "startup", failed_startup)
+    competing_server = _build_supervisor_server(
+        controller,  # type: ignore[arg-type]
+        config,
+        shutdown_budget_publication=competing_publication,
+    )
+    with pytest.raises(OSError, match="port already owned"):
+        await competing_server.startup()
+    competing_publication.remove_if_owned()
+
+    assert load_runtime_shutdown_budget(path) == ready_record
+    ready_publication.remove_if_owned()
+    assert not path.exists()
 
 
 def test_parent_health_remains_observable_while_runtime_recovers() -> None:

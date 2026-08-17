@@ -53,7 +53,7 @@ from healthmes.hermes_runtime_identity import (
 from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeProcess,
     HermesRuntimeResponseLease,
-    HermesRuntimeShutdownBudget,
+    HermesRuntimeShutdownBudgetRecord,
     HermesRuntimeState,
     HermesRuntimeSupervisorConfig,
     _build_supervisor_server,
@@ -1267,16 +1267,17 @@ def test_shutdown_budget_is_persisted_atomically_and_exactly(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "runtime" / "stop-budget"
-    budget = HermesRuntimeShutdownBudget(
-        decision_timeout_seconds=60.25,
-        child_term_timeout_seconds=9.5,
-        child_kill_timeout_seconds=4.5,
+    record = HermesRuntimeShutdownBudgetRecord(
+        drain_timeout_seconds=75,
+        supervisor_pid=4242,
+        supervisor_start_token="ps:Mon Aug 17 12:00:00 2026",
+        service_nonce="service-nonce",
     )
 
-    persist_runtime_shutdown_budget(path, budget)
+    persist_runtime_shutdown_budget(path, record)
 
-    assert path.read_bytes() == b"75\n"
-    assert load_runtime_shutdown_budget(path) == 75
+    assert path.read_bytes() == record.to_bytes()
+    assert load_runtime_shutdown_budget(path) == record
     assert path.stat().st_mode & 0o777 == 0o600
     assert list(path.parent.iterdir()) == [path]
 

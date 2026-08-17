@@ -318,15 +318,21 @@ docker compose up -d --build --force-recreate hermes-decision
 
 `360`초는 `HEALTHMES_DECISION_TIMEOUT_SECONDS`의 최대 전체 판단 시간 300초,
 child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5초를
-모두 포함하는 315초 상한보다 길다. Supervisor는 시작할 때 검증한 이 값을
-`data/runtime/hermes-decision-stop-budget`에 저장한다. Native stop/update는
-변경될 수 있는 현재 환경 변수를 다시 계산하지 않고 실행 중 runtime이 저장한
-값을 사용하며, 파일이 없는 구버전 runtime에는 안전한 최대 315초를 적용한다.
+모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하지만
+Uvicorn이 실제 serving startup을 완료한 뒤에만
+`data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain
+시간뿐 아니라 실행 중 launcher의 PID, OS start token, service nonce가 함께
+들어간다. Native stop/update는 세 identity가 현재 관리 중인 PID와 모두 맞을
+때만 그 값을 사용한다. 파일이 없거나, 형식이 잘못됐거나, 이전/경쟁 process의
+identity이면 짧은 값을 믿지 않고 안전한 최대 315초를 적용한다. 따라서 port
+충돌로 실패한 두 번째 startup이 기존 runtime의 종료 시간을 덮어쓸 수 없다.
 LaunchAgent의 `ExitTimeOut`은 360초다.
 
 SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
-lease만 drain한다. 종료 시 leader process만 기다리지 않고 전체 child process
-group을 확인하며 남은 descendant는 제한 시간 안에 SIGKILL한다. Hermes SSE
+lease만 drain한다. 종료 시 leader process만 기다리지 않고 child group의 각
+PID/start-token identity를 확인한다. Leader가 먼저 끝나도 이미 검증된
+descendant는 TERM/KILL 대상이지만, 숫자 PGID 자체에는 신호하지 않으므로 나중에
+같은 PGID를 재사용한 무관한 process group은 건드리지 않는다. Hermes SSE
 proxy는 connect/write/pool에는 각각 명시적인 5초 제한을 두되 read timeout은
 없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만 전체 decision wall-clock
 deadline은 그대로 적용된다.
