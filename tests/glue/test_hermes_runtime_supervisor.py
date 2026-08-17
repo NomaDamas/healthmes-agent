@@ -1135,6 +1135,62 @@ async def test_leader_exit_before_first_snapshot_probes_empty_group(
 
 
 @pytest.mark.asyncio
+async def test_empty_pre_reap_snapshot_never_adopts_reused_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unrelated = _group_member(5252, "unrelated-reused-group")
+    probes = 0
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            return frozenset()
+        return frozenset({unrelated})
+
+    process = HermesRuntimeProcess(
+        _supervisor_config(tmp_path),
+        process_group_probe=probe,
+    )
+    child = SimpleNamespace(returncode=0, pid=4242)
+    process._process = child
+    process._child_pgid = child.pid
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        lambda member, sent: (
+            signals.append((member.pid, sent)) is None
+        ),
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        lambda *_args: pytest.fail("numeric PGID must never be signaled"),
+    )
+
+    for _ in range(2):
+        with pytest.raises(
+            HermesRuntimeIdentityError,
+            match="hermes_runtime_child_group_identity_changed",
+        ):
+            await process.aclose()
+
+    assert probes == 2
+    assert signals == []
+    assert process._known_child_group_members == frozenset()
+    assert process._child_group_identity_lost is True
+    assert process._process is child
+    assert process._lifecycle_state == "close_failed"
+
+
+@pytest.mark.asyncio
 async def test_group_reuse_between_probe_and_signal_is_not_signaled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -592,6 +592,26 @@ rewrite_loaded_decision_runtime_lifecycle_phase() {
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256"
 }
 
+rewrite_loaded_decision_runtime_lifecycle_script_generation() {
+    local expected_generation=$1 phase=$2 script_sha256=$3 now
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    now="$(current_epoch)" || return 1
+    write_decision_runtime_lifecycle_lock \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" \
+        "$phase" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
+        "$now" \
+        "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" \
+        "$script_sha256"
+}
+
 set_decision_runtime_lifecycle_phase() {
     local phase=$1 expected_generation
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] || return 1
@@ -815,6 +835,16 @@ finish_decision_runtime_post_release_cleanup() {
     DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA=false
 }
 
+run_owned_decision_runtime_lifecycle_command() {
+    "$@"
+    set_decision_runtime_lifecycle_phase complete \
+        || die "decision runtime lifecycle completion could not be journaled; preserving the lock"
+    release_decision_runtime_lifecycle_lock \
+        || die "decision runtime lifecycle lock ownership changed before release; preserving the lock"
+    trap - EXIT
+    finish_decision_runtime_post_release_cleanup
+}
+
 with_decision_runtime_lifecycle_lock() {
     local operation=$1
     shift
@@ -832,13 +862,7 @@ with_decision_runtime_lifecycle_lock() {
     # hide a failed pull, setup, service stop, or cleanup behind later success.
     # The EXIT trap releases non-mutating failures and journals interrupted
     # durable mutations as repair_required.
-    "$@"
-    set_decision_runtime_lifecycle_phase complete \
-        || die "decision runtime lifecycle completion could not be journaled; preserving the lock"
-    release_decision_runtime_lifecycle_lock \
-        || die "decision runtime lifecycle lock ownership changed before release; preserving the lock"
-    trap - EXIT
-    finish_decision_runtime_post_release_cleanup
+    run_owned_decision_runtime_lifecycle_command "$@"
 }
 
 decision_runtime_startup_lease_record() {
@@ -2443,8 +2467,143 @@ cmd_install() {
     info "installed and configured to start at login"
 }
 
+loaded_decision_runtime_update_handoff_matches() {
+    local expected_version=$1 expected_owner_pid=$2
+    local expected_owner_start_token=$3 expected_owner_nonce=$4
+    local expected_acquired_at=$5 expected_updated_at=$6
+    local expected_contract_version=$7 expected_script_sha256=$8
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$expected_version" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" = update ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" = pulling ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" = "$expected_owner_pid" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" = "$expected_owner_start_token" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" = "$expected_owner_nonce" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" = "$expected_acquired_at" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT" = "$expected_updated_at" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION" = "$expected_contract_version" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256" = "$expected_script_sha256" ]
+}
+
+reexec_updated_local_script_if_needed() {
+    [ "$#" -eq 9 ] \
+        || die "invalid decision runtime update handoff arguments"
+    local restart_launch_agent=$1 expected_version=$2
+    local expected_owner_pid=$3 expected_owner_start_token=$4
+    local expected_owner_nonce=$5 expected_acquired_at=$6
+    local expected_updated_at=$7 expected_contract_version=$8
+    local expected_old_script_sha256=$9 current_script_sha256
+
+    current_script_sha256="$(current_lifecycle_script_sha256)" \
+        || die "updated healthmes_local.sh identity is unreadable; preserving the lifecycle journal"
+    [ "$current_script_sha256" != "$expected_old_script_sha256" ] \
+        || return 0
+    [ "${HEALTHMES_INTERNAL_UPDATE_HANDOFF_DEPTH:-0}" = 0 ] \
+        || die "recursive decision runtime update handoff refused; preserving the lifecycle journal"
+    export HEALTHMES_INTERNAL_UPDATE_HANDOFF_DEPTH=1
+    if ! exec "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
+        __resume_update_after_pull \
+        "$restart_launch_agent" \
+        "$expected_version" \
+        "$expected_owner_pid" \
+        "$expected_owner_start_token" \
+        "$expected_owner_nonce" \
+        "$expected_acquired_at" \
+        "$expected_updated_at" \
+        "$expected_contract_version" \
+        "$expected_old_script_sha256" \
+        "$current_script_sha256"; then
+        die "failed to execute updated healthmes_local.sh; preserving the lifecycle journal"
+    fi
+}
+
+cmd_update_after_pull() {
+    local restart_launch_agent=$1
+    [ "$restart_launch_agent" = true ] \
+        || [ "$restart_launch_agent" = false ] \
+        || die "invalid update restart state"
+    bash "$DEV_MAC_SCRIPT" setup
+    if [ "$restart_launch_agent" = true ]; then
+        set_decision_runtime_lifecycle_phase restarting \
+            || die "failed to journal update restart"
+        start_launch_agent
+    fi
+    info "updated"
+}
+
+resume_decision_runtime_update_after_pull() {
+    [ "$#" -eq 10 ] \
+        || die "invalid decision runtime update handoff arguments"
+    local restart_launch_agent=$1 expected_version=$2
+    local expected_owner_pid=$3 expected_owner_start_token=$4
+    local expected_owner_nonce=$5 expected_acquired_at=$6
+    local expected_updated_at=$7 expected_contract_version=$8
+    local expected_old_script_sha256=$9
+    local expected_new_script_sha256=${10}
+    local current_script_sha256 expected_generation
+
+    [ "${HEALTHMES_INTERNAL_UPDATE_HANDOFF_DEPTH:-0}" = 1 ] \
+        || die "decision runtime update handoff was not started by the update holder"
+    [ "$restart_launch_agent" = true ] \
+        || [ "$restart_launch_agent" = false ] \
+        || die "invalid update restart state"
+    [ "$expected_version" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        || die "decision runtime update handoff record version is incompatible; preserving the lifecycle journal"
+    [ "$expected_contract_version" = "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" ] \
+        || die "decision runtime update handoff contract version is incompatible; preserving the lifecycle journal"
+    [[ "$expected_old_script_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        && [[ "$expected_new_script_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        && [ "$expected_old_script_sha256" != "$expected_new_script_sha256" ] \
+        || die "decision runtime update handoff script identities are invalid; preserving the lifecycle journal"
+    [ "$expected_owner_pid" = "$$" ] \
+        || die "decision runtime update handoff changed process identity; preserving the lifecycle journal"
+    capture_native_process_start_token "$$" \
+        || die "decision runtime update handoff owner identity is unreadable; preserving the lifecycle journal"
+    [ "$NATIVE_PROCESS_START_TOKEN" = "$expected_owner_start_token" ] \
+        || die "decision runtime update handoff owner identity changed; preserving the lifecycle journal"
+    current_script_sha256="$(current_lifecycle_script_sha256)" \
+        || die "updated healthmes_local.sh identity is unreadable; preserving the lifecycle journal"
+    [ "$current_script_sha256" = "$expected_new_script_sha256" ] \
+        || die "updated healthmes_local.sh changed during handoff; preserving the lifecycle journal"
+
+    load_decision_runtime_lifecycle_lock
+    loaded_decision_runtime_update_handoff_matches \
+        "$expected_version" \
+        "$expected_owner_pid" \
+        "$expected_owner_start_token" \
+        "$expected_owner_nonce" \
+        "$expected_acquired_at" \
+        "$expected_updated_at" \
+        "$expected_contract_version" \
+        "$expected_old_script_sha256" \
+        || die "decision runtime update lifecycle generation changed during handoff; preserving the lifecycle journal"
+    expected_generation="$(decision_runtime_lifecycle_lock_generation)"
+
+    DECISION_RUNTIME_LIFECYCLE_LOCK_HELD=true
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID=$expected_owner_pid
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN=$expected_owner_start_token
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE=$expected_owner_nonce
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION=update
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PHASE=pulling
+    DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256=$current_script_sha256
+    DECISION_RUNTIME_DURABLE_MUTATION_STARTED=true
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_RUNTIME=false
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA=false
+    trap release_decision_runtime_lifecycle_lock_on_exit EXIT
+    rewrite_loaded_decision_runtime_lifecycle_script_generation \
+        "$expected_generation" setup "$current_script_sha256" \
+        || die "failed to hand off the decision runtime update lifecycle journal"
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PHASE=setup
+    unset HEALTHMES_INTERNAL_UPDATE_HANDOFF_DEPTH
+    run_owned_decision_runtime_lifecycle_command \
+        cmd_update_after_pull "$restart_launch_agent"
+}
+
 cmd_update() {
     local restart_launch_agent=false
+    local handoff_version handoff_owner_pid handoff_owner_start_token
+    local handoff_owner_nonce handoff_acquired_at handoff_updated_at
+    local handoff_contract_version handoff_script_sha256
     set_decision_runtime_lifecycle_phase preflight \
         || die "failed to journal update preflight"
     git -C "$REPO_ROOT" diff --quiet || die "working tree has changes; commit or stash first"
@@ -2460,16 +2619,47 @@ cmd_update() {
     stop_decision_runtime
     set_decision_runtime_lifecycle_phase pulling \
         || die "failed to journal update source replacement"
+    load_decision_runtime_lifecycle_lock
+    loaded_lifecycle_lock_is_owned_by_current_process \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" = pulling ] \
+        || die "decision runtime update lifecycle journal changed before pull"
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256" = "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256" ] \
+        || die "decision runtime update lifecycle script generation changed before pull"
+    assert_lifecycle_script_generation_unchanged
+    handoff_version=$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION
+    handoff_owner_pid=$DECISION_RUNTIME_LIFECYCLE_LOCK_PID
+    handoff_owner_start_token=$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN
+    handoff_owner_nonce=$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE
+    handoff_acquired_at=$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT
+    handoff_updated_at=$DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT
+    handoff_contract_version=$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION
+    handoff_script_sha256=$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256
     git -C "$REPO_ROOT" pull --ff-only
+    reexec_updated_local_script_if_needed \
+        "$restart_launch_agent" \
+        "$handoff_version" \
+        "$handoff_owner_pid" \
+        "$handoff_owner_start_token" \
+        "$handoff_owner_nonce" \
+        "$handoff_acquired_at" \
+        "$handoff_updated_at" \
+        "$handoff_contract_version" \
+        "$handoff_script_sha256"
+    load_decision_runtime_lifecycle_lock
+    loaded_decision_runtime_update_handoff_matches \
+        "$handoff_version" \
+        "$handoff_owner_pid" \
+        "$handoff_owner_start_token" \
+        "$handoff_owner_nonce" \
+        "$handoff_acquired_at" \
+        "$handoff_updated_at" \
+        "$handoff_contract_version" \
+        "$handoff_script_sha256" \
+        || die "decision runtime update lifecycle generation changed during pull"
     set_decision_runtime_lifecycle_phase setup \
         || die "failed to journal update setup"
-    bash "$DEV_MAC_SCRIPT" setup
-    if [ "$restart_launch_agent" = true ]; then
-        set_decision_runtime_lifecycle_phase restarting \
-            || die "failed to journal update restart"
-        start_launch_agent
-    fi
-    info "updated"
+    cmd_update_after_pull "$restart_launch_agent"
 }
 
 start_apps() {
@@ -2917,5 +3107,11 @@ open) cmd_open ;;
 daemon) cmd_daemon ;;
 uninstall) with_decision_runtime_lifecycle_lock uninstall cmd_uninstall "${2:-}" ;;
 __service_runner) run_service_runner "${2:-}" "${3:-}" ;;
+__resume_update_after_pull)
+    [ "$#" -eq 11 ] \
+        || die "invalid decision runtime update handoff invocation"
+    resume_decision_runtime_update_after_pull \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
+    ;;
 *) usage ;;
 esac

@@ -4,6 +4,7 @@ Shell scripts get no import-time checking, so the invariants that protect
 the read-only vendor tree are pinned here as text/syntax assertions.
 """
 
+import hashlib
 import os
 import plistlib
 import re
@@ -769,6 +770,10 @@ def test_native_mutation_paths_drain_decision_runtime_first() -> None:
     text = LOCAL_SCRIPT.read_text(encoding="utf-8")
     install_body = _function_body(text, "cmd_install")
     update_body = _function_body(text, "cmd_update")
+    update_after_pull_body = _function_body(
+        text,
+        "cmd_update_after_pull",
+    )
     start_body = _function_body(text, "start_apps")
 
     assert install_body.index("stop_decision_runtime") < install_body.index(
@@ -778,8 +783,9 @@ def test_native_mutation_paths_drain_decision_runtime_first() -> None:
         'git -C "$REPO_ROOT" pull --ff-only'
     )
     assert update_body.index("stop_decision_runtime") < update_body.index(
-        '"$DEV_MAC_SCRIPT" setup'
+        'cmd_update_after_pull "$restart_launch_agent"'
     )
+    assert '"$DEV_MAC_SCRIPT" setup' in update_after_pull_body
     assert start_body.index("stop_decision_runtime") < start_body.index(
         "uv sync --frozen --no-dev"
     )
@@ -928,8 +934,14 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         in development
     )
     assert (
-        "If an update replaced it, that old shell exits and requires "
-        "the user to rerun the command"
+        "If the digest changed, it replaces itself with the newly "
+        "pulled script by `exec` without changing its PID or releasing "
+        "the lifecycle lock"
+    ) in development
+    assert (
+        "validates the native owner start token, nonce, exact "
+        "`pulling` journal generation, prior digest, and compatible "
+        "lifecycle contract"
     ) in development
     assert (
         "A dead non-complete `update`, `install`, or `uninstall` "
@@ -2218,85 +2230,204 @@ def test_durable_lifecycle_does_not_mask_internal_command_failure(
     ).read_text(encoding="ascii")
 
 
-def test_waiting_old_shell_refuses_to_run_after_update_changes_script(
+def test_update_reexecutes_new_script_with_same_lifecycle_owner(
     tmp_path: Path,
 ) -> None:
     harness = _local_runtime_harness(tmp_path)
     local_script = Path(harness["local_script"])
-    marker_dir = tmp_path / "script-drift-markers"
+    marker_dir = tmp_path / "update-handoff-markers"
     marker_dir.mkdir()
-    release = marker_dir / "release"
+    updated_script = tmp_path / "updated-healthmes_local.sh"
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
     script = local_script.read_text(encoding="utf-8")
-    overrides = textwrap.dedent(
+    old_overrides = textwrap.dedent(
         """
-        cmd_update() {
-            : >"$FAKE_MARKER_DIR/update-entered"
-            while [ ! -f "$FAKE_MARKER_DIR/release" ]; do
-                /bin/sleep 0.05
-            done
+        stop_launch_agent() {
+            : >"$FAKE_MARKER_DIR/launch-agent-stopped"
         }
-        cmd_start() {
-            : >"$FAKE_MARKER_DIR/stale-start-entered"
+        load_runtime_env() {
+            :
+        }
+        stop_decision_runtime() {
+            printf '%s\\n' "$$" >"$FAKE_MARKER_DIR/pre-pull-pid"
+        }
+        cmd_update_after_pull() {
+            : >"$FAKE_MARKER_DIR/stale-post-pull-code-ran"
         }
         """
     ).lstrip()
     local_script.write_text(
         script.replace(
             'case "${1:-}" in\n',
-            f"{overrides}\ncase \"${{1:-}}\" in\n",
+            f"{old_overrides}\ncase \"${{1:-}}\" in\n",
             1,
         ),
         encoding="utf-8",
     )
+    new_overrides = textwrap.dedent(
+        """
+        cmd_update_after_pull() {
+            [ "$1" = true ] || exit 71
+            [ "${FAKE_HANDOFF_ENV:-}" = preserved ] || exit 72
+            [ -z "${HEALTHMES_INTERNAL_UPDATE_HANDOFF_DEPTH+x}" ] \
+                || exit 73
+            printf '%s\\n' "$$" >"$FAKE_MARKER_DIR/post-pull-pid"
+            cp "$(decision_runtime_lifecycle_lock_record)" \
+                "$FAKE_MARKER_DIR/handoff-record"
+            : >"$FAKE_MARKER_DIR/new-post-pull-code-ran"
+        }
+        """
+    ).lstrip()
+    updated_script.write_text(
+        script.replace(
+            'case "${1:-}" in\n',
+            f"{new_overrides}\ncase \"${{1:-}}\" in\n",
+            1,
+        )
+        + "\n# pulled update generation\n",
+        encoding="utf-8",
+    )
+    updated_script.chmod(0o755)
+    _write_executable(
+        fake_bin / "git",
+        """
+        #!/usr/bin/env bash
+        printf 'git %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        case " $* " in
+        *" pull --ff-only "*)
+            cp "$FAKE_UPDATED_LOCAL_SCRIPT" "$FAKE_LOCAL_SCRIPT"
+            ;;
+        esac
+        """,
+    )
+    launch_agent = (
+        Path(harness["env"]["HOME"])
+        / "Library"
+        / "LaunchAgents"
+        / "com.healthmes.local.plist"
+    )
+    launch_agent.touch()
     environment = {
         **harness["env"],
         "FAKE_MARKER_DIR": str(marker_dir),
-        "HEALTHMES_SLEEP_BIN": "/bin/sleep",
+        "FAKE_UPDATED_LOCAL_SCRIPT": str(updated_script),
+        "FAKE_LOCAL_SCRIPT": str(local_script),
+        "FAKE_HANDOFF_ENV": "preserved",
+        "HEALTHMES_BASH_BIN": shutil.which("bash") or "/bin/bash",
     }
-    holder = subprocess.Popen(
+
+    result = subprocess.run(
         ["bash", str(local_script), "update"],
         env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        check=False,
+        capture_output=True,
         text=True,
     )
-    contender: subprocess.Popen[str] | None = None
-    try:
-        for _ in range(100):
-            if (marker_dir / "update-entered").exists():
-                break
-            time.sleep(0.01)
-        assert (marker_dir / "update-entered").exists()
-        contender = subprocess.Popen(
-            ["bash", str(local_script), "start"],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        time.sleep(0.2)
-        local_script.write_text(
-            local_script.read_text(encoding="utf-8")
-            + "\n# simulated update replacement\n",
-            encoding="utf-8",
-        )
-        release.touch()
 
-        holder_stdout, holder_stderr = holder.communicate(timeout=5)
-        contender_stdout, contender_stderr = contender.communicate(timeout=5)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (marker_dir / "new-post-pull-code-ran").exists()
+    assert not (marker_dir / "stale-post-pull-code-ran").exists()
+    assert (marker_dir / "launch-agent-stopped").exists()
+    assert (marker_dir / "pre-pull-pid").read_text(
+        encoding="ascii"
+    ) == (marker_dir / "post-pull-pid").read_text(encoding="ascii")
+    handoff_record = (marker_dir / "handoff-record").read_text(
+        encoding="ascii"
+    )
+    expected_digest = hashlib.sha256(
+        updated_script.read_bytes()
+    ).hexdigest()
+    assert "operation\tupdate\n" in handoff_record
+    assert "phase\tsetup\n" in handoff_record
+    assert "script_contract_version\t2\n" in handoff_record
+    assert f"script_sha256\t{expected_digest}\n" in handoff_record
+    assert not (
+        Path(harness["runtime"])
+        / "hermes-decision-lifecycle-lock"
+    ).exists()
+    assert sum(
+        line.startswith("git ") and " pull --ff-only" in line
+        for line in _event_lines(harness)
+    ) == 1
 
-        assert holder.returncode == 0, (holder_stdout, holder_stderr)
-        assert contender.returncode != 0
-        assert "changed while this command waited" in contender_stderr
-        assert not (marker_dir / "stale-start-entered").exists()
-    finally:
-        release.touch(exist_ok=True)
-        if holder.poll() is None:
-            holder.terminate()
-            holder.wait(timeout=5)
-        if contender is not None and contender.poll() is None:
-            contender.terminate()
-            contender.wait(timeout=5)
+
+def test_update_reexec_contract_mismatch_preserves_journal(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    local_script = Path(harness["local_script"])
+    updated_script = tmp_path / "incompatible-healthmes_local.sh"
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    script = local_script.read_text(encoding="utf-8")
+    old_overrides = textwrap.dedent(
+        """
+        load_runtime_env() {
+            :
+        }
+        stop_decision_runtime() {
+            :
+        }
+        """
+    ).lstrip()
+    initial_script = script.replace(
+        'case "${1:-}" in\n',
+        f"{old_overrides}\ncase \"${{1:-}}\" in\n",
+        1,
+    )
+    local_script.write_text(initial_script, encoding="utf-8")
+    initial_digest = hashlib.sha256(
+        initial_script.encode("utf-8")
+    ).hexdigest()
+    updated_script.write_text(
+        script.replace(
+            "DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION=2",
+            "DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION=3",
+            1,
+        )
+        + "\n# incompatible pulled lifecycle contract\n",
+        encoding="utf-8",
+    )
+    updated_script.chmod(0o755)
+    _write_executable(
+        fake_bin / "git",
+        """
+        #!/usr/bin/env bash
+        printf 'git %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        case " $* " in
+        *" pull --ff-only "*)
+            cp "$FAKE_UPDATED_LOCAL_SCRIPT" "$FAKE_LOCAL_SCRIPT"
+            ;;
+        esac
+        """,
+    )
+    environment = {
+        **harness["env"],
+        "FAKE_UPDATED_LOCAL_SCRIPT": str(updated_script),
+        "FAKE_LOCAL_SCRIPT": str(local_script),
+        "HEALTHMES_BASH_BIN": shutil.which("bash") or "/bin/bash",
+    }
+
+    result = subprocess.run(
+        ["bash", str(local_script), "update"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    lock = (
+        Path(harness["runtime"])
+        / "hermes-decision-lifecycle-lock"
+    )
+    assert result.returncode != 0
+    assert "handoff contract version is incompatible" in result.stderr
+    assert lock.exists()
+    record = (lock / "record").read_text(encoding="ascii")
+    assert "operation\tupdate\n" in record
+    assert "phase\tpulling\n" in record
+    assert "script_contract_version\t2\n" in record
+    assert f"script_sha256\t{initial_digest}\n" in record
+    assert "dev_mac setup" not in _event_lines(harness)
 
 
 def test_uninstall_runs_launch_service_and_cleanup_under_one_lock(

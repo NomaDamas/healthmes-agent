@@ -336,11 +336,17 @@ PID, native OS start token(Linux `/proc` start ticks 또는 macOS `libproc`
 
 살아 있는 owner는 최대 10초만 기다리고 identity가 unreadable이거나 record가
 malformed이면 fail closed한다. 기다리는 shell은 매 시도마다 현재 script
-digest를 다시 계산한다. Update가 파일을 교체했으면 오래된 shell은 메모리에
-로드된 구버전 함수를 실행하지 않고 종료하며, 현재 script로 명령을 다시
-실행하도록 요구한다. 정확한 `start`/`stop` owner가 죽고 2초 stale grace도
-지났을 때만 숫자 PID를 signal하지 않고 orphan lock을 회수한다. 반면 완료되지
-않은 `update`/`install`/`uninstall` owner가 죽으면 record를
+digest를 다시 계산한다. `git pull` 뒤 digest가 바뀌었으면 update holder는
+lifecycle lock을 놓거나 PID를 바꾸지 않고 새 script를 `exec`한다. 새 script는
+native owner start token, nonce, 정확한 `pulling` journal generation, 이전
+digest, 호환되는 lifecycle contract를 모두 검증한 뒤 journal을 새 digest와
+`setup` phase로 원자적으로 인계한다. LaunchAgent 재시작 여부는 명시적으로
+전달되고 기존 환경은 상속되며, one-shot 내부 marker가 재귀 re-exec을 막는다.
+Identity, generation, digest, contract 중 하나라도 맞지 않으면 구버전 메모리
+함수를 계속 실행하지 않고 durable journal을 보존한 채 fail closed한다. 정확한
+`start`/`stop` owner가 죽고 2초 stale grace도 지났을 때만 숫자 PID를 signal하지
+않고 orphan lock을 회수한다. 반면 완료되지 않은
+`update`/`install`/`uninstall` owner가 죽으면 record를
 `repair_required`로 원자적으로 전환해 보존하고, 명시적으로 검증된 repair 전에는
 다른 lifecycle 명령을 실행하지 않는다. 완료 phase를 기록한 직후 lock 삭제 전에
 죽은 경우만 동일 identity/age 검증 후 정리할 수 있다.
@@ -433,7 +439,10 @@ snapshot 전에 leader가 끝났고 asyncio `returncode` 반영이 늦는 경우
 정확한 subprocess handle을 먼저 reap한 뒤, reap 전후 descendant snapshot의
 identity 연속성이 있을 때만 각 member를 adopt해 종료한다. 숫자 PGID 자체에는
 신호하지 않으므로 나중에 같은 PGID를 재사용한 무관한 process group은 건드리지
-않는다. Hermes SSE proxy는 connect/write/pool에는 각각 명시적인 5초 제한을
+않는다. 특히 reap 전 snapshot이 비었는데 reap 뒤에만 member가 나타나면 PGID
+재사용으로 보아 그 generation을 이후 close 재시도에서도 fail closed 상태로
+유지하고 새 member에는 신호하지 않는다. Hermes SSE proxy는
+connect/write/pool에는 각각 명시적인 5초 제한을
 두되 read timeout은 없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만 전체
 decision wall-clock deadline은 그대로 적용된다.
 

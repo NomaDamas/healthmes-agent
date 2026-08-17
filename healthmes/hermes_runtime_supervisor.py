@@ -1050,6 +1050,7 @@ class HermesRuntimeProcess:
         self._known_child_group_members: frozenset[_ProcessGroupMember] = (
             frozenset()
         )
+        self._child_group_identity_lost = False
         self._launch_argv: tuple[str, ...] | None = None
         self._child_generation = 0
         self._healthy = False
@@ -1346,6 +1347,7 @@ class HermesRuntimeProcess:
         self._process = process
         self._child_pgid = process.pid
         self._known_child_group_members = frozenset()
+        self._child_group_identity_lost = False
         self._launch_argv = launch_manifest.launch_argv
         try:
             self._refresh_child_group_identity(require_leader=True)
@@ -1631,6 +1633,10 @@ class HermesRuntimeProcess:
     ) -> frozenset[_ProcessGroupMember]:
         """Bind the first group snapshot even when the leader exits first."""
 
+        if self._child_group_identity_lost:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_changed"
+            )
         pgid = self._child_pgid
         if pgid is None:
             raise HermesRuntimeIdentityError(
@@ -1649,6 +1655,7 @@ class HermesRuntimeProcess:
         )
         if leader_in_before:
             if process.returncode is not None:
+                self._child_group_identity_lost = True
                 raise HermesRuntimeIdentityError(
                     "hermes_runtime_child_group_leader_changed"
                 )
@@ -1683,14 +1690,23 @@ class HermesRuntimeProcess:
             min(_PROCESS_GROUP_PROBE_TIMEOUT_SECONDS, remaining),
         )
         if any(member.pid == process.pid for member in after_reap):
+            self._child_group_identity_lost = True
             raise HermesRuntimeIdentityError(
                 "hermes_runtime_child_group_leader_changed"
+            )
+        if not before_reap and after_reap:
+            # Once the leader has been reaped, a newly non-empty numeric PGID
+            # has no identity continuity with the managed generation.
+            self._child_group_identity_lost = True
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_changed"
             )
         if (
             before_reap
             and after_reap
             and before_reap.isdisjoint(after_reap)
         ):
+            self._child_group_identity_lost = True
             raise HermesRuntimeIdentityError(
                 "hermes_runtime_child_group_identity_changed"
             )
@@ -1815,6 +1831,7 @@ class HermesRuntimeProcess:
         if process is None:
             self._child_pgid = None
             self._known_child_group_members = frozenset()
+            self._child_group_identity_lost = False
             return
         if self._child_pgid is None:
             self._child_pgid = process.pid
@@ -1860,6 +1877,7 @@ class HermesRuntimeProcess:
             self._process = None
         self._child_pgid = None
         self._known_child_group_members = frozenset()
+        self._child_group_identity_lost = False
 
     async def aclose(self) -> None:
         self.begin_closing()

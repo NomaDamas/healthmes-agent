@@ -243,8 +243,16 @@ timezone and locale. Version-1 `ps` records remain readable, but a live PID
 whose formatted token differs is unknown and is never treated as a dead owner.
 A live owner is waited for for at most 10 seconds; unreadable or malformed
 identity fails closed. A waiting shell re-hashes the on-disk script on every
-attempt. If an update replaced it, that old shell exits and requires the user
-to rerun the command instead of executing stale in-memory functions.
+attempt. After `git pull`, the update holder re-hashes the script. If the
+digest changed, it replaces itself with the newly pulled script by `exec`
+without changing its PID or releasing the lifecycle lock. The new script
+validates the native owner start token, nonce, exact `pulling` journal
+generation, prior digest, and compatible lifecycle contract before atomically
+moving the journal to its own digest and continuing setup/restart. The restart
+decision is passed explicitly, the caller environment is inherited, and a
+one-shot internal handoff marker prevents recursive re-exec. Any identity,
+generation, digest, or contract mismatch fails closed and preserves the
+durable journal instead of running stale in-memory functions.
 
 A verified dead `start` or `stop` owner may be recovered only after the
 two-second stale grace, and recovery never signals its numeric PID. A dead
@@ -354,7 +362,10 @@ a later unrelated process group that reuses the numeric PGID. If the leader is
 already absent from the first OS snapshot while asyncio has not yet published
 its return code, the supervisor first reaps that exact subprocess handle and
 then requires continuity between the pre/post-reap descendant snapshots before
-adopting and signalling individual members. The launcher
+adopting and signalling individual members. An empty pre-reap snapshot followed
+by a non-empty snapshot is treated as reused-PGID identity loss; that generation
+remains fail-closed on later close retries and the newly observed members are
+never signalled. The launcher
 refuses to SIGKILL only the outer service group if that complete drain fails;
 it exits non-zero instead of orphaning the child or reporting a false stop.
 On any unproven cleanup, available launcher PID/identity metadata and the v3
