@@ -613,15 +613,24 @@ def _parse_shutdown_budget_payload(
         raise _IdentityUnavailable(
             "native_identity_shutdown_budget_invalid"
         )
+
+    def parse_ascii_decimal(field: str) -> int:
+        value = fields[field]
+        if not value or not value.isascii() or not value.isdigit():
+            raise _IdentityUnavailable(
+                "native_identity_shutdown_budget_invalid"
+            )
+        return int(value, 10)
+
     try:
-        drain_timeout = int(fields["drain_timeout_seconds"])
-        supervisor_pid = int(fields["supervisor_pid"])
+        drain_timeout = parse_ascii_decimal("drain_timeout_seconds")
+        supervisor_pid = parse_ascii_decimal("supervisor_pid")
         launcher_pid = (
-            int(fields["launcher_pid"])
+            parse_ascii_decimal("launcher_pid")
             if version == "3"
             else supervisor_pid
         )
-    except ValueError as exc:
+    except (KeyError, ValueError) as exc:
         raise _IdentityUnavailable(
             "native_identity_shutdown_budget_invalid"
         ) from exc

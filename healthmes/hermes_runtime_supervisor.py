@@ -3236,6 +3236,13 @@ def _parse_runtime_shutdown_budget(
         if not separator or key in fields:
             raise ValueError("runtime shutdown budget is invalid")
         fields[key] = value
+
+    def parse_ascii_decimal(field: str) -> int:
+        value = fields[field]
+        if not value or not value.isascii() or not value.isdigit():
+            raise ValueError
+        return int(value, 10)
+
     version = fields.get("version")
     try:
         if version == str(_RUNTIME_SHUTDOWN_BUDGET_VERSION):
@@ -3252,15 +3259,15 @@ def _parse_runtime_shutdown_budget(
             if set(fields) != expected:
                 raise ValueError
             return HermesRuntimeShutdownBudgetRecord(
-                drain_timeout_seconds=int(
-                    fields["drain_timeout_seconds"]
+                drain_timeout_seconds=parse_ascii_decimal(
+                    "drain_timeout_seconds"
                 ),
-                launcher_pid=int(fields["launcher_pid"]),
+                launcher_pid=parse_ascii_decimal("launcher_pid"),
                 launcher_start_token=fields["launcher_start_token"],
                 launcher_service_nonce=fields[
                     "launcher_service_nonce"
                 ],
-                supervisor_pid=int(fields["supervisor_pid"]),
+                supervisor_pid=parse_ascii_decimal("supervisor_pid"),
                 supervisor_start_token=fields[
                     "supervisor_start_token"
                 ],
@@ -3281,10 +3288,10 @@ def _parse_runtime_shutdown_budget(
             if set(fields) != expected:
                 raise ValueError
             record = _LegacyRuntimeShutdownBudgetRecord(
-                drain_timeout_seconds=int(
-                    fields["drain_timeout_seconds"]
+                drain_timeout_seconds=parse_ascii_decimal(
+                    "drain_timeout_seconds"
                 ),
-                supervisor_pid=int(fields["supervisor_pid"]),
+                supervisor_pid=parse_ascii_decimal("supervisor_pid"),
                 supervisor_start_token=fields[
                     "supervisor_start_token"
                 ],

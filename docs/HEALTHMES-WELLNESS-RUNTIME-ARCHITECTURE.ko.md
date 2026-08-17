@@ -414,9 +414,12 @@ token, service nonce, 예상 service name을 원자적으로 기록한다. 최�
 snapshot이 실패해도 이후 start/stop은 native token이 그대로이고 bounded
 snapshot의 PID/PGID, Bash wrapper command marker, nonce, service가 모두
 일치할 때만 완전한 identity를 복구한다. Process 부재나 PID reuse가 증명되면
-그 recovery generation만 정리하고, malformed·충돌·timeout·unreadable 상태는
-metadata를 보존한 채 fail closed한다. Shutdown budget을 포함한 모든 managed
-runtime PID의 canonical 규칙은 shell, native helper, Python 모두 `PID >= 2`다.
+그 recovery generation만 정리한다. Native token이 같은 live process를 가리키는
+동안 command/PGID marker가 불일치하면 stale로 간주하지 않고 metadata를 보존해
+중복 실행을 막는다. Malformed·충돌·timeout·unreadable 상태도 fail closed한다.
+Shutdown budget 정수는 세 parser 모두 부호 없는 ASCII 10진 숫자만 허용하며,
+managed runtime PID는 `PID >= 2`여야 한다. Compose는 init shim을 사용하므로
+Python supervisor가 container PID 1이 되지 않는다.
 
 Python supervisor는 Uvicorn의 일반 startup 구현을 호출하기 직전에
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain

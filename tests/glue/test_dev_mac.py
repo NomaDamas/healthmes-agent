@@ -1837,6 +1837,34 @@ def test_status_rejects_unsafe_shutdown_budget_paths(
             ),
             id="supervisor-pid-one",
         ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"drain_timeout_seconds\t2\n",
+                b"drain_timeout_seconds\t+2\n",
+            ),
+            id="drain-leading-plus",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+                f"launcher_pid\t+{FAKE_MANAGED_PID}\n".encode(),
+            ),
+            id="launcher-leading-plus",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"supervisor_pid\t4343\n",
+                b"supervisor_pid\t4_343\n",
+            ),
+            id="supervisor-underscore",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"supervisor_pid\t4343\n",
+                b"supervisor_pid\t 4343\n",
+            ),
+            id="supervisor-leading-space",
+        ),
     ),
 )
 def test_shutdown_budget_malformed_corpus_has_python_shell_parity(
@@ -3766,7 +3794,7 @@ def test_generic_start_recovers_live_identity_after_ps_is_unknown(
                 pass
 
 
-@pytest.mark.parametrize("identity_state", ("absent", "reused"))
+@pytest.mark.parametrize("identity_state", ("absent", "live-marker-mismatch"))
 def test_generic_start_clears_only_reliably_stale_pid_tombstones(
     tmp_path: Path,
     identity_state: str,
@@ -3828,6 +3856,7 @@ def test_generic_start_clears_only_reliably_stale_pid_tombstones(
     )
     pid_file = runtime / "healthmes.pid"
     identity_file = pid_file.with_suffix(".pid.identity")
+    recovery_record = runtime / "healthmes.pid.recovery" / "record"
     captured_pid = tmp_path / "captured-generic-start-pid"
     launcher_pid: int | None = None
     env_overrides = {
@@ -3850,11 +3879,46 @@ def test_generic_start_clears_only_reliably_stale_pid_tombstones(
         assert result.returncode != 0
         if identity_state == "absent":
             assert "exited before identity verification" in result.stderr
+            assert not pid_file.exists()
+            assert not identity_file.exists()
+            assert recovery_record.exists()
+
+            stopped = _run_local_runtime(
+                harness,
+                "__test_stop_generic",
+                env_overrides=env_overrides,
+                timeout=10,
+            )
+
+            assert stopped.returncode == 0
+            assert "HealthMes stopped" in stopped.stdout
+            assert not pid_file.exists()
+            assert not identity_file.exists()
+            assert not recovery_record.exists()
         else:
             assert "PID was reused before identity verification" in result.stderr
             launcher_pid = int(captured_pid.read_text(encoding="ascii"))
-        assert not pid_file.exists()
-        assert not identity_file.exists()
+            recovery_generation = recovery_record.read_bytes()
+            second = _run_local_runtime(
+                harness,
+                "__test_start_generic",
+                check=False,
+                env_overrides=env_overrides,
+                timeout=10,
+            )
+
+            assert second.returncode != 0
+            assert "process identity is unknown; preserving metadata" in (
+                second.stderr
+            )
+            assert recovery_record.read_bytes() == recovery_generation
+            assert int(captured_pid.read_text(encoding="ascii")) == launcher_pid
+            os.kill(launcher_pid, 0)
+            assert not pid_file.exists()
+            assert not identity_file.exists()
+            assert not any(
+                event.startswith("kill ") for event in _event_lines(harness)
+            )
     finally:
         if launcher_pid is not None:
             try:

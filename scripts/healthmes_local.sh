@@ -498,7 +498,18 @@ recover_generic_process_identity() {
         && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]; then
         :
     else
-        return 4
+        # A command/PGID mismatch is not proof of PID reuse when the native
+        # start token still identifies the same live process. Recheck the
+        # native identity so only proven absence/reuse can retire metadata.
+        if native_process_start_token_status \
+            "$GENERIC_PROCESS_RECOVERY_PID" \
+            "$GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN"; then
+            return 5
+        else
+            status=$?
+            [ "$status" -eq 3 ] && return 4
+            return 5
+        fi
     fi
     native_process_start_token_status \
         "$GENERIC_PROCESS_RECOVERY_PID" \

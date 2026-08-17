@@ -81,6 +81,7 @@ def test_compose_launches_only_healthmes_owned_supervisor_surface() -> None:
         "-m",
         "healthmes.hermes_runtime_supervisor",
     ]
+    assert runtime["init"] is True
     assert runtime["command"] == [
         "--hermes-home",
         "/opt/data",

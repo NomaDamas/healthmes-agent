@@ -192,6 +192,9 @@ services:
     image: hermes-agent
     profiles: ["decision"]
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    # Keep the managed Python supervisor away from container PID 1. The
+    # runtime identity contract deliberately reserves PID 1 as unmanaged.
+    init: true
     restart: unless-stopped
     # The supported decision timeout is at most 300 seconds. Child shutdown
     # then has at most 10 seconds for TERM and 5 seconds after KILL. Keep

@@ -332,9 +332,12 @@ name. If the initial `ps` snapshot fails, a later start or stop may reconstruct
 the full identity only when the native token still matches and a bounded
 snapshot proves the same PID/PGID, Bash wrapper command marker, nonce, and
 service. Absence or proven PID reuse retires only that exact recovery
-generation; malformed, conflicting, timed-out, or unreadable evidence remains
-fail closed. All managed runtime PIDs, including shutdown-budget launcher and
-supervisor PIDs, must be at least 2 in the shell, helper, and Python parsers.
+generation. A marker mismatch while the native token still identifies the same
+live process remains unknown and cannot trigger cleanup or a duplicate launch.
+Malformed, conflicting, timed-out, or unreadable evidence also remains fail
+closed. Shutdown-budget integers use unsigned ASCII decimal digits in every
+parser, and all managed runtime PIDs must be at least 2. Compose enables its
+init shim so the managed Python supervisor never occupies container PID 1.
 
 Immediately before Uvicorn calls its normal startup implementation, the
 Python supervisor publishes an atomic
