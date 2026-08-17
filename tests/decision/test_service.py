@@ -11,12 +11,15 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+import healthmes.decision.service as decision_service_module
+import healthmes.store.decision_receipts as decision_receipts_module
 from healthmes.decision import (
     DecisionBudget,
     DecisionChannelAdapter,
     DecisionChannelRequest,
     DecisionContextHints,
     DecisionIdempotencyConflictError,
+    DecisionIdempotencyExpiredError,
     DecisionIngress,
     DecisionResult,
     DecisionRuntimeNotConfiguredError,
@@ -28,6 +31,7 @@ from healthmes.decision import (
     PrivacyLevel,
     RuntimeMetadata,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
     DecisionRequestReceipt,
@@ -35,6 +39,7 @@ from healthmes.store import (
 )
 from healthmes.store.decision_receipts import (
     DecisionReceiptClaimState,
+    DecisionReceiptOwnershipError,
     DecisionReceiptStore,
 )
 
@@ -116,6 +121,87 @@ class ClaimObservingReceiptStore(DecisionReceiptStore):
         if claim.state is DecisionReceiptClaimState.WAIT:
             self.wait_reached.set()
         return claim
+
+
+class ClaimReturnBlockingReceiptStore(DecisionReceiptStore):
+    """Pause the first acquired claim before its worker returns it."""
+
+    def __init__(
+        self,
+        *,
+        acquired: threading.Event,
+        release_claim: threading.Event,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.acquired = acquired
+        self.release_claim = release_claim
+        self._blocked = False
+
+    def claim(self, **kwargs):
+        claim = super().claim(**kwargs)
+        if (
+            not self._blocked
+            and claim.state is DecisionReceiptClaimState.ACQUIRED
+        ):
+            self._blocked = True
+            self.acquired.set()
+            if not self.release_claim.wait(timeout=5):
+                raise TimeoutError("test did not release acquired claim")
+        return claim
+
+
+class CompletionBlockingReceiptStore(DecisionReceiptStore):
+    """Pause completion so cancellation can revoke its lease generation."""
+
+    def __init__(
+        self,
+        *,
+        complete_entered: threading.Event,
+        release_complete: threading.Event,
+        complete_finished: threading.Event,
+        lease_released: threading.Event,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.complete_entered = complete_entered
+        self.release_complete = release_complete
+        self.complete_finished = complete_finished
+        self.lease_released = lease_released
+        self.completion_error: BaseException | None = None
+
+    def complete(self, **kwargs):
+        self.complete_entered.set()
+        if not self.release_complete.wait(timeout=5):
+            raise TimeoutError("test did not release blocked completion")
+        try:
+            return super().complete(**kwargs)
+        except BaseException as exc:
+            self.completion_error = exc
+            raise
+        finally:
+            self.complete_finished.set()
+
+    def release(self, **kwargs):
+        try:
+            return super().release(**kwargs)
+        finally:
+            self.lease_released.set()
+
+
+class FirstBlockedThenFreshEngine(RecordingEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            self.started.set()
+            await self.release.wait()
+            return _completed_result(request, answer="Lost-generation answer.")
+        return _completed_result(request, answer="Fresh recovery answer.")
 
 
 @pytest.mark.asyncio
@@ -368,7 +454,8 @@ async def test_identical_channel_retries_execute_the_engine_once(
     first_result, retry_result = await asyncio.gather(first, retry)
     cached_result = await adapter.ask_wellness(submission)
 
-    assert first_result is retry_result is cached_result
+    assert first_result is retry_result
+    assert cached_result == first_result
     assert len(engine.requests) == 1
 
 
@@ -412,6 +499,132 @@ async def test_cancelling_one_waiter_preserves_shared_execution(
 
     assert result.status is DecisionStatus.COMPLETED
     assert len(engine.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_last_waiter_cancellation_removes_active_entry_and_releases_claim(
+    settings,
+    service_session_factory,
+) -> None:
+    acquired = threading.Event()
+    release_claim = threading.Event()
+    engine = RecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    service._receipt_store = ClaimReturnBlockingReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(minutes=5),
+        retention=timedelta(days=30),
+        acquired=acquired,
+        release_claim=release_claim,
+    )
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    cancelled = asyncio.create_task(service.ask_wellness(submission))
+    assert await asyncio.to_thread(acquired.wait, 1)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert request_id not in service._active_idempotent_requests
+
+    retry = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.sleep(0)
+    release_claim.set()
+    result = await asyncio.wait_for(retry, timeout=2)
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert len(engine.requests) == 1
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "completed"
+        assert receipt.lease_generation == 3
+
+
+@pytest.mark.asyncio
+async def test_cancelled_completion_cannot_publish_revoked_generation(
+    settings,
+    service_session_factory,
+) -> None:
+    complete_entered = threading.Event()
+    release_complete = threading.Event()
+    complete_finished = threading.Event()
+    lease_released = threading.Event()
+    engine = RecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    store = CompletionBlockingReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(minutes=5),
+        retention=timedelta(days=30),
+        complete_entered=complete_entered,
+        release_complete=release_complete,
+        complete_finished=complete_finished,
+        lease_released=lease_released,
+    )
+    service._receipt_store = store
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    cancelled = asyncio.create_task(service.ask_wellness(submission))
+    assert await asyncio.to_thread(complete_entered.wait, 1)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert await asyncio.to_thread(lease_released.wait, 1)
+
+    release_complete.set()
+    assert await asyncio.to_thread(complete_finished.wait, 1)
+    assert isinstance(
+        store.completion_error,
+        DecisionReceiptOwnershipError,
+    )
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "pending"
+        assert receipt.lease_generation == 2
+
+    recovered = await service.ask_wellness(submission)
+
+    assert recovered.status is DecisionStatus.COMPLETED
+    assert len(engine.requests) == 2
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "completed"
+        assert receipt.lease_generation == 3
 
 
 @pytest.mark.asyncio
@@ -535,12 +748,15 @@ def test_sqlite_expired_lease_preserves_first_committed_result(
     )
     assert first_claim.state is DecisionReceiptClaimState.ACQUIRED
     assert takeover_claim.state is DecisionReceiptClaimState.ACQUIRED
+    assert first_claim.lease_generation is not None
+    assert takeover_claim.lease_generation is not None
 
     canonical = {"schema": "test", "winner": "takeover"}
     store.complete(
         request_id=request_id,
         fingerprint=fingerprint,
         owner_token=takeover_owner,
+        lease_generation=takeover_claim.lease_generation,
         result_payload=canonical,
         now=NOW + timedelta(seconds=2),
     )
@@ -548,11 +764,73 @@ def test_sqlite_expired_lease_preserves_first_committed_result(
         request_id=request_id,
         fingerprint=fingerprint,
         owner_token=first_owner,
+        lease_generation=first_claim.lease_generation,
         result_payload={"schema": "test", "winner": "expired-owner"},
         now=NOW + timedelta(seconds=3),
     )
 
     assert delayed_completion.result_payload == canonical
+
+
+def test_sqlite_stale_generation_cannot_publish_or_release_takeover(
+    service_session_factory,
+) -> None:
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(seconds=1),
+        retention=timedelta(days=30),
+    )
+    request_id = uuid.uuid4()
+    fingerprint = "a" * 64
+    first_owner = uuid.uuid4()
+    takeover_owner = uuid.uuid4()
+    first = store.claim(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=first_owner,
+        now=NOW,
+    )
+    takeover = store.claim(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=takeover_owner,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert first.lease_generation == 1
+    assert takeover.lease_generation == 2
+
+    with pytest.raises(DecisionReceiptOwnershipError):
+        store.complete(
+            request_id=request_id,
+            fingerprint=fingerprint,
+            owner_token=first_owner,
+            lease_generation=1,
+            result_payload={"schema": "test", "winner": "stale"},
+            now=NOW + timedelta(seconds=2),
+        )
+    store.release(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=first_owner,
+        lease_generation=1,
+        now=NOW + timedelta(seconds=2),
+    )
+    waiting = store.observe(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert waiting.state is DecisionReceiptClaimState.WAIT
+    assert waiting.lease_generation == 2
+    canonical = store.complete(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=takeover_owner,
+        lease_generation=2,
+        result_payload={"schema": "test", "winner": "takeover"},
+        now=NOW + timedelta(seconds=2),
+    )
+    assert canonical.result_payload["winner"] == "takeover"
 
 
 @pytest.mark.asyncio
@@ -659,6 +937,156 @@ async def test_stale_owner_waits_for_inflight_canonical_receipt(
     )
     assert canonical_result.answer == "Canonical answer."
     assert stale_result == canonical_result
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_reruns_after_takeover_worker_is_cancelled(
+    settings,
+    service_session_factory,
+) -> None:
+    clock = MutableClock(NOW)
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(seconds=1),
+        retention=timedelta(days=30),
+    )
+    recovering_engine = FirstBlockedThenFreshEngine()
+    takeover_engine = BlockingRecordingEngine(answer="Cancelled takeover.")
+    recovering_service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: recovering_engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    takeover_service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: takeover_engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    recovering_service._receipt_store = store
+    takeover_service._receipt_store = store
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    recovering_call = asyncio.create_task(
+        recovering_service.ask_wellness(submission)
+    )
+    await asyncio.wait_for(recovering_engine.started.wait(), timeout=1)
+    clock.advance(timedelta(seconds=2))
+    takeover_call = asyncio.create_task(
+        takeover_service.ask_wellness(submission)
+    )
+    await asyncio.wait_for(takeover_engine.started.wait(), timeout=1)
+
+    recovering_engine.release.set()
+    await asyncio.sleep(0.05)
+    assert not recovering_call.done()
+    takeover_call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await takeover_call
+
+    recovered = await asyncio.wait_for(recovering_call, timeout=2)
+
+    assert recovered.answer == "Fresh recovery answer."
+    assert len(recovering_engine.requests) == 2
+    assert len(takeover_engine.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_retention_shrink_serializes_with_receipt_completion(
+    settings,
+    service_session_factory,
+    monkeypatch,
+) -> None:
+    with service_session_factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "30d",
+            now=NOW,
+        )
+        session.commit()
+
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(minutes=5),
+        retention=timedelta(days=30),
+    )
+    request_id = uuid.uuid4()
+    owner_token = uuid.uuid4()
+    fingerprint = "a" * 64
+    claim = store.claim(
+        request_id=request_id,
+        fingerprint=fingerprint,
+        owner_token=owner_token,
+        now=NOW,
+        requested_at=NOW - timedelta(days=2),
+    )
+    assert claim.lease_generation is not None
+
+    policy_read = threading.Event()
+    finish_completion = threading.Event()
+    original_result_expiry = decision_receipts_module._result_expiry
+
+    def blocking_result_expiry(session, *, receipt):
+        deadline = original_result_expiry(session, receipt=receipt)
+        policy_read.set()
+        if not finish_completion.wait(timeout=5):
+            raise TimeoutError("test did not release retention calculation")
+        return deadline
+
+    monkeypatch.setattr(
+        decision_receipts_module,
+        "_result_expiry",
+        blocking_result_expiry,
+    )
+
+    completion = asyncio.create_task(
+        asyncio.to_thread(
+            store.complete,
+            request_id=request_id,
+            fingerprint=fingerprint,
+            owner_token=owner_token,
+            lease_generation=claim.lease_generation,
+            result_payload={"schema": "test", "answer": "sensitive"},
+            now=NOW,
+        )
+    )
+    assert await asyncio.to_thread(policy_read.wait, 1)
+
+    def shorten_retention() -> None:
+        with service_session_factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "1d",
+                now=NOW,
+            )
+            session.commit()
+
+    retention_update = asyncio.create_task(
+        asyncio.to_thread(shorten_retention)
+    )
+    await asyncio.sleep(0.05)
+    assert not retention_update.done()
+    finish_completion.set()
+    await asyncio.gather(completion, retention_update)
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "tombstone"
+        assert receipt.result_payload is None
+        assert receipt.result_expires_at is None
 
 
 @pytest.mark.asyncio
@@ -800,6 +1228,135 @@ async def test_unknown_retry_reuses_first_requested_at(
                 tzinfo=UTC
             )
         assert stored_requested_at.astimezone(UTC) == NOW
+
+
+@pytest.mark.asyncio
+async def test_keyed_fingerprint_preserves_legacy_sha_receipt_replay(
+    settings,
+    service_session_factory,
+) -> None:
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+    engine = RecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    first = await service.ask_wellness(submission)
+    legacy = (
+        decision_service_module._legacy_service_request_fingerprint(
+            submission
+        )
+    )
+    expected_hmac = decision_service_module._service_request_fingerprint(
+        submission,
+        key=(
+            settings.decision_correlation_secret
+            .get_secret_value()
+            .encode("utf-8")
+        ),
+    )
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.request_fingerprint == expected_hmac
+        assert expected_hmac != legacy
+        receipt.request_fingerprint = legacy
+        session.commit()
+
+    restarted_engine = RecordingEngine()
+    restarted = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: restarted_engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    replay = await restarted.ask_wellness(submission)
+
+    assert replay == first
+    assert restarted_engine.requests == []
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.request_fingerprint == expected_hmac
+
+
+@pytest.mark.asyncio
+async def test_decision_retention_tombstone_blocks_sensitive_replay(
+    settings,
+    service_session_factory,
+) -> None:
+    with service_session_factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "1d",
+            now=NOW,
+        )
+        session.commit()
+
+    clock = MutableClock(NOW)
+    engine = RecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+    await service.ask_wellness(submission)
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "completed"
+        assert receipt.result_expires_at == (
+            NOW + timedelta(days=1)
+        ).replace(tzinfo=None)
+        assert receipt.expires_at == (
+            NOW + timedelta(days=30)
+        ).replace(tzinfo=None)
+
+    clock.advance(timedelta(days=1))
+    with pytest.raises(DecisionIdempotencyExpiredError):
+        await service.ask_wellness(submission)
+
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "tombstone"
+        assert receipt.result_payload is None
+        assert receipt.expires_at > receipt.requested_at
 
 
 @pytest.mark.asyncio

@@ -217,6 +217,7 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
             "schema": "healthmes.decision-receipt.v1",
             "result": {"status": "completed"},
         },
+        result_expires_at=current,
         expires_at=current,
     )
     future = DecisionRequestReceipt(
@@ -228,6 +229,7 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
             "schema": "healthmes.decision-receipt.v1",
             "result": {"status": "completed"},
         },
+        result_expires_at=current + timedelta(microseconds=1),
         expires_at=current + timedelta(microseconds=1),
     )
     session.add_all((expired, future))
@@ -408,3 +410,88 @@ def test_retention_shrink_purges_recalculated_exact_cutoff(session) -> None:
     session.commit()
 
     assert session.get(DecisionRecord, row_id) is None
+
+
+def test_retention_shrink_scrubs_trigger_and_receipt_but_keeps_identity(
+    session,
+) -> None:
+    current = datetime(2026, 8, 16, 12, tzinfo=UTC)
+    basis = current - timedelta(days=1)
+    update_retention_policy(
+        session,
+        "decision",
+        "forever",
+        now=basis,
+    )
+    trigger = TriggerEvent(
+        fired_at=basis,
+        rule_id="scheduled_briefing.morning",
+        payload={
+            "summary": "Morning briefing trigger.",
+            "message": "Sensitive generated wellness answer.",
+            "decision": {"record_id": str(uuid.uuid4())},
+            "push": {
+                "sent": False,
+                "state": "app_available",
+                "channel": "app_poll",
+            },
+        },
+        alert_sent=False,
+    )
+    session.add(trigger)
+    session.flush()
+    decision = _wellness_decision(
+        created_at=basis,
+        trigger_event_id=trigger.id,
+    )
+    apply_decision_retention(session, decision, basis_at=basis)
+    session.add(decision)
+    session.flush()
+    trigger.payload = {
+        **trigger.payload,
+        "decision": {"record_id": str(decision.id)},
+        "decision_record_id": str(decision.id),
+    }
+    request_id = uuid.uuid4()
+    fingerprint = "e" * 64
+    identity_expires_at = basis + timedelta(days=30)
+    receipt = DecisionRequestReceipt(
+        request_id=request_id,
+        request_fingerprint=fingerprint,
+        requested_at=basis,
+        state="completed",
+        result_payload={
+            "schema": "healthmes.decision-receipt.v1",
+            "result": {"answer": "Sensitive generated wellness answer."},
+        },
+        result_expires_at=identity_expires_at,
+        expires_at=identity_expires_at,
+    )
+    session.add(receipt)
+    session.commit()
+    trigger_id = trigger.id
+    receipt_id = receipt.id
+
+    update_retention_policy(
+        session,
+        "decision",
+        "1d",
+        now=current,
+    )
+    session.commit()
+    session.expire_all()
+
+    stored_trigger = session.get(TriggerEvent, trigger_id)
+    stored_receipt = session.get(DecisionRequestReceipt, receipt_id)
+    assert stored_trigger is not None
+    assert "message" not in stored_trigger.payload
+    assert "decision" not in stored_trigger.payload
+    assert "decision_record_id" not in stored_trigger.payload
+    assert stored_trigger.payload["push"]["state"] == "expired"
+    assert stored_receipt is not None
+    assert stored_receipt.state == "tombstone"
+    assert stored_receipt.result_payload is None
+    assert stored_receipt.result_expires_at is None
+    assert stored_receipt.request_id == request_id
+    assert stored_receipt.request_fingerprint == fingerprint
+    assert _as_utc(stored_receipt.expires_at) == identity_expires_at

@@ -39,6 +39,7 @@ from healthmes.store import (
 )
 from healthmes.store.decision_receipts import (
     purge_expired_decision_receipts,
+    scrub_decision_receipt_results,
 )
 from healthmes.store.session import session_scope
 
@@ -198,9 +199,18 @@ def _update_retention_policy(
         )
     if data_class == "decision":
         # Sessions disable autoflush. Persist recalculated expiry timestamps
-        # before the SQL purge so an exact-cutoff row cannot survive until the
-        # outer commit as an already-expired DecisionRecord.
+        # before scrubbing copied answers and receipts. This must happen before
+        # deleting DecisionRecords because legacy trigger rows may only be
+        # linked through DecisionRecord.trigger_event_id.
         session.flush()
+        expire_trigger_event_answers(
+            session,
+            now=current,
+        )
+        scrub_decision_receipt_results(
+            session,
+            now=current,
+        )
         purge_expired_decision_records(
             session,
             now=current,

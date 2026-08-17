@@ -6,6 +6,7 @@ cutoff from the same frozen local clock. All persisted datetimes are
 normalized to UTC by the engine.
 """
 
+import threading
 import uuid
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
@@ -15,6 +16,7 @@ from freezegun import freeze_time
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+import healthmes.engine.triggers as trigger_module
 from healthmes.calendars import creds
 from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
@@ -38,6 +40,7 @@ from healthmes.engine.triggers import (
     default_now_provider,
     is_in_quiet_hours,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import Base, create_db_engine
 from healthmes.store.enums import (
     CalendarMutationOperation,
@@ -163,6 +166,64 @@ class RaisingAlertSender:
     ) -> DecisionDispatchResult:
         self.calls += 1
         raise self.exc
+
+
+class RetentionChangingSender:
+    """Shrink retention while reasoning is in flight, then return an answer."""
+
+    requires_reasoning = True
+
+    def __init__(self, session_factory, *, now: datetime) -> None:
+        self._session_factory = session_factory
+        self._now = now
+        self.calls = 0
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> DecisionDispatchResult:
+        del fire, fired_at, trigger_event_id
+        self.calls += 1
+        with self._session_factory() as session:
+            update_retention_policy(
+                session,
+                "alert",
+                "1d",
+                now=self._now,
+            )
+            session.commit()
+        return DecisionDispatchResult(
+            ok=False,
+            status_code=204,
+            ready_for_native=True,
+            channel="app_poll",
+            message="This answer completed after its alert expired.",
+        )
+
+
+class AppAvailableAlertSender:
+    """Return one generated answer for the finalization-race tests."""
+
+    requires_reasoning = True
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> DecisionDispatchResult:
+        del fire, fired_at, trigger_event_id
+        return DecisionDispatchResult(
+            ok=False,
+            status_code=204,
+            ready_for_native=True,
+            channel="app_poll",
+            message="Generated answer awaiting app display.",
+        )
 
 
 class FakeHealthReader:
@@ -350,6 +411,225 @@ def test_dispatching_event_retries_with_same_correlation_id(
     [stored] = all_events(session_factory)
     assert stored.id == event_id
     assert stored.alert_sent is True
+
+
+def test_retention_expired_dispatch_never_invokes_sender(
+    settings,
+    session_factory,
+) -> None:
+    sender = FakeAlertSender()
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        event = TriggerEvent(
+            fired_at=utc(now - timedelta(days=1)),
+            rule_id="scheduled_briefing.morning",
+            dedup_key="scheduled_briefing.morning:2026-07-08",
+            alert_sent=False,
+            payload={
+                "summary": "Expired morning trigger.",
+                "proposal": "Generate an expired briefing.",
+                "evidence": {},
+                "message": "Stale answer must not survive.",
+                "push": {
+                    "state": "dispatching",
+                    "channel": "decision",
+                },
+            },
+        )
+        with session_factory() as session:
+            update_retention_policy(
+                session,
+                "alert",
+                "1d",
+                now=now,
+            )
+            session.add(event)
+            session.commit()
+            event_id = event.id
+
+        report = make_evaluator(
+            settings,
+            session_factory,
+            sender,
+            rules=(),
+        ).evaluate_once()
+
+    assert report.outcomes == ()
+    assert sender.sent == []
+    with session_factory() as session:
+        stored = session.get(TriggerEvent, event_id)
+        assert stored is not None
+        assert stored.alert_sent is False
+        assert "message" not in stored.payload
+        assert stored.payload["push"]["state"] == "expired"
+
+
+def test_retention_shrink_during_reasoning_never_persists_answer(
+    settings,
+    tmp_path,
+) -> None:
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'trigger-retention-race.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    try:
+        with freeze_time("2026-07-09 14:00:00"):
+            now = local_now()
+            event = TriggerEvent(
+                fired_at=utc(now - timedelta(days=2)),
+                rule_id="scheduled_briefing.morning",
+                dedup_key="scheduled_briefing.morning:2026-07-07",
+                alert_sent=False,
+                payload={
+                    "summary": "A retained scheduled prompt.",
+                    "proposal": "Generate a briefing.",
+                    "evidence": {},
+                    "push": {
+                        "state": "dispatching",
+                        "channel": "decision",
+                    },
+                },
+            )
+            with factory() as session:
+                update_retention_policy(
+                    session,
+                    "alert",
+                    "7d",
+                    now=now,
+                )
+                session.add(event)
+                session.commit()
+                event_id = event.id
+
+            sender = RetentionChangingSender(factory, now=now)
+            report = make_evaluator(
+                settings,
+                factory,
+                sender,
+                rules=(),
+            ).evaluate_once()
+
+        assert sender.calls == 1
+        assert report.count("suppressed") == 1
+        assert report.outcomes[0].reason == "retention_expired"
+        with factory() as session:
+            stored = session.get(TriggerEvent, event_id)
+            assert stored is not None
+            assert stored.alert_sent is False
+            assert "message" not in stored.payload
+            assert stored.payload["push"]["state"] == "expired"
+    finally:
+        engine.dispose()
+
+
+def test_retention_shrink_after_final_check_scrubs_committed_answer(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 7, 9, 14, tzinfo=UTC)
+    fired_at = now - timedelta(days=2)
+    with session_factory() as session:
+        update_retention_policy(
+            session,
+            "alert",
+            "7d",
+            now=now,
+        )
+        session.commit()
+
+    original_check = trigger_module.alert_retention_is_expired
+    post_reasoning_check = threading.Event()
+    release_finalization = threading.Event()
+    check_lock = threading.Lock()
+    check_count = 0
+
+    def block_after_final_check(session, event, *, now):
+        nonlocal check_count
+        expired = original_check(session, event, now=now)
+        with check_lock:
+            check_count += 1
+            should_block = check_count == 2
+        if should_block:
+            post_reasoning_check.set()
+            if not release_finalization.wait(timeout=5):
+                raise TimeoutError("test did not release alert finalization")
+        return expired
+
+    monkeypatch.setattr(
+        trigger_module,
+        "alert_retention_is_expired",
+        block_after_final_check,
+    )
+    evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=AppAvailableAlertSender(),
+        rules=(),
+        now_provider=lambda: now,
+    )
+    report_box: list[Any] = []
+    errors: list[BaseException] = []
+
+    def evaluate() -> None:
+        try:
+            report_box.append(
+                evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="retention_race",
+                        dedup_key="retention_race:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=fired_at,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    retention_done = threading.Event()
+
+    def shorten_retention() -> None:
+        try:
+            with session_factory() as session:
+                update_retention_policy(
+                    session,
+                    "alert",
+                    "1d",
+                    now=now,
+                )
+                session.commit()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            retention_done.set()
+
+    evaluation_thread = threading.Thread(target=evaluate)
+    evaluation_thread.start()
+    assert post_reasoning_check.wait(timeout=2)
+
+    retention_thread = threading.Thread(target=shorten_retention)
+    retention_thread.start()
+    assert not retention_done.wait(timeout=0.05)
+    release_finalization.set()
+    evaluation_thread.join(timeout=5)
+    retention_thread.join(timeout=5)
+
+    assert not evaluation_thread.is_alive()
+    assert not retention_thread.is_alive()
+    assert errors == []
+    assert report_box[0].status == "available"
+    [stored] = all_events(session_factory)
+    assert stored.alert_sent is False
+    assert "message" not in stored.payload
+    assert stored.payload["push"]["state"] == "expired"
 
 
 def test_retryable_result_is_recovered_without_rule_refiring(

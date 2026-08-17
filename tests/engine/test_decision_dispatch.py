@@ -214,6 +214,34 @@ def test_proactive_action_without_confirmed_record_is_retried(
     assert result.detail == "decision persistence is not confirmed"
 
 
+def test_native_delivery_disabled_suppresses_generated_message(
+    settings,
+) -> None:
+    configured = settings.model_copy(
+        update={"native_alert_delivery": False}
+    )
+    sender = DecisionAlertSender(
+        configured,
+        bridge=RecordingBridge(),
+    )
+
+    result = sender.send(
+        _fire(),
+        fired_at=NOW,
+        trigger_event_id=TRIGGER_ID,
+    )
+
+    assert result.ok is False
+    assert result.retryable is False
+    assert result.ready_for_native is False
+    assert result.channel is None
+    assert result.message is None
+    assert result.suppressed_reason == (
+        "native_alert_delivery_disabled"
+    )
+    assert result.detail == "native alert delivery is disabled"
+
+
 @pytest.mark.asyncio
 async def test_thread_bridge_runs_service_on_application_loop() -> None:
     class AsyncService:

@@ -11,6 +11,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+import healthmes.store.decision_receipts as decision_receipts_module
 from healthmes.decision import (
     DecisionChannelAdapter,
     DecisionChannelRequest,
@@ -21,6 +22,7 @@ from healthmes.decision import (
     PersistenceStatus,
     RuntimeMetadata,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import Base, DecisionRequestReceipt, create_db_engine
 from healthmes.store.decision_receipts import (
     DecisionReceiptClaimState,
@@ -301,29 +303,28 @@ async def test_postgres_concurrency_restart_and_failed_retry(
         takeover_fingerprint = "a" * 64
         first_owner = uuid.uuid4()
         takeover_owner = uuid.uuid4()
-        assert (
-            store.claim(
-                request_id=takeover_request_id,
-                fingerprint=takeover_fingerprint,
-                owner_token=first_owner,
-                now=NOW,
-            ).state
-            is DecisionReceiptClaimState.ACQUIRED
+        first_claim = store.claim(
+            request_id=takeover_request_id,
+            fingerprint=takeover_fingerprint,
+            owner_token=first_owner,
+            now=NOW,
         )
-        assert (
-            store.claim(
-                request_id=takeover_request_id,
-                fingerprint=takeover_fingerprint,
-                owner_token=takeover_owner,
-                now=NOW + timedelta(seconds=2),
-            ).state
-            is DecisionReceiptClaimState.ACQUIRED
+        takeover_claim = store.claim(
+            request_id=takeover_request_id,
+            fingerprint=takeover_fingerprint,
+            owner_token=takeover_owner,
+            now=NOW + timedelta(seconds=2),
         )
+        assert first_claim.state is DecisionReceiptClaimState.ACQUIRED
+        assert takeover_claim.state is DecisionReceiptClaimState.ACQUIRED
+        assert first_claim.lease_generation is not None
+        assert takeover_claim.lease_generation is not None
         canonical = {"schema": "test", "winner": "takeover"}
         store.complete(
             request_id=takeover_request_id,
             fingerprint=takeover_fingerprint,
             owner_token=takeover_owner,
+            lease_generation=takeover_claim.lease_generation,
             result_payload=canonical,
             now=NOW + timedelta(seconds=2),
         )
@@ -332,6 +333,7 @@ async def test_postgres_concurrency_restart_and_failed_retry(
                 request_id=takeover_request_id,
                 fingerprint=takeover_fingerprint,
                 owner_token=first_owner,
+                lease_generation=first_claim.lease_generation,
                 result_payload={
                     "schema": "test",
                     "winner": "expired-owner",
@@ -352,29 +354,33 @@ async def test_postgres_concurrency_restart_and_failed_retry(
         future_owner = uuid.uuid4()
         expired_request_id = uuid.uuid4()
         expired_owner = uuid.uuid4()
-        store.claim(
+        future_claim = store.claim(
             request_id=future_request_id,
             fingerprint="c" * 64,
             owner_token=future_owner,
             now=NOW,
         )
+        assert future_claim.lease_generation is not None
         store.complete(
             request_id=future_request_id,
             fingerprint="c" * 64,
             owner_token=future_owner,
+            lease_generation=future_claim.lease_generation,
             result_payload={"schema": "test", "state": "future"},
             now=NOW,
         )
-        store.claim(
+        expired_claim = store.claim(
             request_id=expired_request_id,
             fingerprint="d" * 64,
             owner_token=expired_owner,
             now=NOW - timedelta(days=30),
         )
+        assert expired_claim.lease_generation is not None
         store.complete(
             request_id=expired_request_id,
             fingerprint="d" * 64,
             owner_token=expired_owner,
+            lease_generation=expired_claim.lease_generation,
             result_payload={"schema": "test", "state": "expired"},
             now=NOW - timedelta(days=30),
         )
@@ -522,3 +528,102 @@ async def test_postgres_stale_owner_waits_for_canonical_result(
         )
         assert canonical_result.answer == "Canonical answer."
         assert stale_result == canonical_result
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires HEALTHMES_TEST_POSTGRES_URL",
+)
+@pytest.mark.asyncio
+async def test_postgres_retention_shrink_serializes_with_receipt_completion(
+    monkeypatch,
+) -> None:
+    with _isolated_postgres_factory() as factory:
+        with factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "30d",
+                now=NOW,
+            )
+            session.commit()
+
+        store = DecisionReceiptStore(
+            session_factory=factory,
+            lease_duration=timedelta(minutes=5),
+            retention=timedelta(days=30),
+        )
+        request_id = uuid.uuid4()
+        owner_token = uuid.uuid4()
+        fingerprint = "a" * 64
+        claim = store.claim(
+            request_id=request_id,
+            fingerprint=fingerprint,
+            owner_token=owner_token,
+            now=NOW,
+            requested_at=NOW - timedelta(days=2),
+        )
+        assert claim.lease_generation is not None
+
+        policy_read = threading.Event()
+        finish_completion = threading.Event()
+        original_result_expiry = decision_receipts_module._result_expiry
+
+        def blocking_result_expiry(session, *, receipt):
+            deadline = original_result_expiry(session, receipt=receipt)
+            policy_read.set()
+            if not finish_completion.wait(timeout=5):
+                raise TimeoutError(
+                    "test did not release retention calculation"
+                )
+            return deadline
+
+        monkeypatch.setattr(
+            decision_receipts_module,
+            "_result_expiry",
+            blocking_result_expiry,
+        )
+        completion = asyncio.create_task(
+            asyncio.to_thread(
+                store.complete,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                owner_token=owner_token,
+                lease_generation=claim.lease_generation,
+                result_payload={
+                    "schema": "test",
+                    "answer": "sensitive",
+                },
+                now=NOW,
+            )
+        )
+        assert await asyncio.to_thread(policy_read.wait, 2)
+
+        def shorten_retention() -> None:
+            with factory() as session:
+                update_retention_policy(
+                    session,
+                    "decision",
+                    "1d",
+                    now=NOW,
+                )
+                session.commit()
+
+        retention_update = asyncio.create_task(
+            asyncio.to_thread(shorten_retention)
+        )
+        await asyncio.sleep(0.05)
+        assert not retention_update.done()
+        finish_completion.set()
+        await asyncio.gather(completion, retention_update)
+
+        with factory() as session:
+            receipt = session.scalar(
+                sa.select(DecisionRequestReceipt).where(
+                    DecisionRequestReceipt.request_id == request_id
+                )
+            )
+            assert receipt is not None
+            assert receipt.state == "tombstone"
+            assert receipt.result_payload is None
+            assert receipt.result_expires_at is None

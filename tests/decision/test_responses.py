@@ -2490,6 +2490,9 @@ def test_production_rest_path_probes_then_uses_one_responses_turn(
 
         response = client.post(
             "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": "production-responses-turn-1"
+            },
             json={"question": "Should I take a break now?"},
         )
 

@@ -32,6 +32,8 @@ from healthmes.decision import (
     DecisionEngineBusyError,
     DecisionEngineClosedError,
     DecisionIdempotencyConflictError,
+    DecisionIdempotencyExpiredError,
+    DecisionIdempotencyUnavailableError,
     DecisionIngress,
     DecisionResult,
     DecisionRuntimeNotConfiguredError,
@@ -351,7 +353,17 @@ def get_wellness_decision_result(
     return WellnessDecisionOutput.from_result(result)
 
 
-@router.post("", response_model=WellnessDecisionOutput)
+@router.post(
+    "",
+    response_model=WellnessDecisionOutput,
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": (
+                "Invalid request body or Idempotency-Key syntax."
+            )
+        }
+    },
+)
 async def create_wellness_decision(
     body: WellnessDecisionInput,
     request: Request,
@@ -368,13 +380,22 @@ async def create_wellness_decision(
     """Run one server-owned, aggregate-only local decision turn."""
 
     try:
-        service_request = DecisionServiceRequest(
-            request_id=decision_rest_request_id(
-                owner_principal_id=(
-                    request.app.state.settings.decision_owner_principal_id
-                ),
-                idempotency_key=idempotency_key,
+        request_id = decision_rest_request_id(
+            owner_principal_id=(
+                request.app.state.settings.decision_owner_principal_id
             ),
+            idempotency_key=idempotency_key,
+        )
+    except ValueError as exc:
+        raise APIError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "invalid_idempotency_key",
+            "Idempotency-Key is invalid.",
+        ) from exc
+
+    try:
+        service_request = DecisionServiceRequest(
+            request_id=request_id,
             question=body.question,
             ingress=DecisionIngress.REST,
             persistence_requested=body.persistence_requested,
@@ -432,6 +453,20 @@ async def create_wellness_decision(
             status.HTTP_409_CONFLICT,
             "decision_idempotency_conflict",
             "Idempotency-Key was already used for different input.",
+        ) from exc
+    except DecisionIdempotencyExpiredError as exc:
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "decision_idempotency_expired",
+            "The retained result expired; submit a new Idempotency-Key.",
+        ) from exc
+    except DecisionIdempotencyUnavailableError as exc:
+        raise APIError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "decision_idempotency_temporarily_unavailable",
+            "The durable decision result is temporarily unavailable; retry "
+            "the same Idempotency-Key.",
+            detail={"retryable": True},
         ) from exc
 
     if result.persistence_status is PersistenceStatus.UNKNOWN:

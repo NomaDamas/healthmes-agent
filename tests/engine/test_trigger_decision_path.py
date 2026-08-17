@@ -105,10 +105,11 @@ class AppAvailableDecisionSender:
         return DecisionDispatchResult(
             ok=False,
             status_code=204,
-            detail="native alert delivery is disabled",
+            detail="decision completed; available for app polling",
             retryable=False,
             ready_for_native=True,
-            message="Which coffee size are you considering?",
+            channel="app_poll",
+            message="This sender ignored the native-delivery setting.",
         )
 
 
@@ -232,7 +233,7 @@ def test_retry_reuses_original_trigger_not_previous_llm_answer(
         assert event.payload["message"] == "Final verified answer."
 
 
-def test_native_disabled_decision_is_app_available_not_delivered(
+def test_native_disabled_decision_is_suppressed_without_app_visible_copy(
     settings,
     session_factory,
 ) -> None:
@@ -246,19 +247,16 @@ def test_native_disabled_decision_is_app_available_not_delivered(
         sender=AppAvailableDecisionSender(),
     ).evaluate_once()
 
-    assert report.count("available") == 1
+    assert report.count("available") == 0
     assert report.count("pushed") == 0
+    assert report.count("suppressed") == 1
     with session_factory() as session:
         event = session.scalar(select(TriggerEvent))
         assert event is not None
         assert event.alert_sent is False
-        assert event.payload["message"] == (
-            "Which coffee size are you considering?"
-        )
+        assert "message" not in event.payload
         assert event.payload["push"] == {
-            "sent": False,
-            "state": "app_available",
-            "channel": "app_poll",
+            "suppressed_reason": "native_alert_delivery_disabled",
             "status_code": 204,
             "detail": "native alert delivery is disabled",
         }

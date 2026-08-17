@@ -34,6 +34,7 @@ from healthmes.decision import (
     DecisionEngineBusyError,
     DecisionEngineClosedError,
     DecisionFinalizer,
+    DecisionIdempotencyUnavailableError,
     DecisionPersistenceIntent,
     DecisionRequest,
     DecisionResult,
@@ -57,7 +58,9 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     create_db_engine,
+    dispose_engine,
     get_session_factory,
+    init_engine,
     session_scope,
 )
 from tests.decision.test_e2e import (
@@ -148,6 +151,13 @@ class BusyDecisionEngine:
     async def ask_wellness(self, _request):
         raise DecisionEngineBusyError(
             "HealthMes decision engine is at capacity"
+        )
+
+
+class UnavailableDecisionService:
+    async def ask_wellness(self, _submission):
+        raise DecisionIdempotencyUnavailableError(
+            "canonical lease disappeared"
         )
 
 
@@ -387,18 +397,15 @@ async def test_rest_disconnect_cancels_hermes_responses_stream(
         agent=agent,
         finalizer=_UnusedFinalizer(),  # type: ignore[arg-type]
     )
-    app = create_app(
-        _secured_settings(
-            settings,
-            database_url=(
-                f"sqlite+pysqlite:///{tmp_path / 'disconnect.db'}"
-            ),
-        )
+    configured = _secured_settings(
+        settings,
+        database_url=(
+            f"sqlite+pysqlite:///{tmp_path / 'disconnect.db'}"
+        ),
     )
-    receipt_factory = (
-        app.state.decision_service._session_factory_provider()
-    )
-    Base.metadata.create_all(receipt_factory.kw["bind"])
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
+    app = create_app(configured)
     app.state.decision_engine = engine
 
     try:
@@ -422,6 +429,7 @@ async def test_rest_disconnect_cancels_hermes_responses_stream(
         await asyncio.wait_for(search_service.aborted.wait(), timeout=1)
     finally:
         await engine.aclose()
+        dispose_engine()
 
 
 @pytest.mark.asyncio
@@ -435,11 +443,9 @@ async def test_actual_asgi_disconnect_cancels_decision_reasoning(
             f"sqlite+pysqlite:///{tmp_path / 'asgi-disconnect.db'}"
         ),
     )
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
     app = create_app(configured)
-    receipt_factory = (
-        app.state.decision_service._session_factory_provider()
-    )
-    Base.metadata.create_all(receipt_factory.kw["bind"])
     engine = DisconnectAwareDecisionEngine()
     app.state.decision_engine = engine
     request_body = json.dumps(
@@ -480,31 +486,34 @@ async def test_actual_asgi_disconnect_cancels_decision_reasoning(
         "client": ("127.0.0.1", 43123),
         "server": ("127.0.0.1", 8100),
     }
-    request_task = asyncio.create_task(
-        app(scope, receive, send)  # type: ignore[arg-type]
-    )
-    started_task = asyncio.create_task(engine.started.wait())
-    done, _pending = await asyncio.wait(
-        (request_task, started_task),
-        timeout=1,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if request_task in done:
-        request_task.result()
-    assert started_task in done, {
-        "sent": sent,
-        "request_stack": [
-            f"{frame.f_code.co_filename}:{frame.f_lineno}"
-            for frame in request_task.get_stack()
-        ],
-    }
+    try:
+        request_task = asyncio.create_task(
+            app(scope, receive, send)  # type: ignore[arg-type]
+        )
+        started_task = asyncio.create_task(engine.started.wait())
+        done, _pending = await asyncio.wait(
+            (request_task, started_task),
+            timeout=1,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request_task in done:
+            request_task.result()
+        assert started_task in done, {
+            "sent": sent,
+            "request_stack": [
+                f"{frame.f_code.co_filename}:{frame.f_lineno}"
+                for frame in request_task.get_stack()
+            ],
+        }
 
-    await receive_queue.put({"type": "http.disconnect"})
+        await receive_queue.put({"type": "http.disconnect"})
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(request_task, timeout=1)
-    await asyncio.wait_for(engine.cancelled.wait(), timeout=1)
-    assert sent == []
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=1)
+        await asyncio.wait_for(engine.cancelled.wait(), timeout=1)
+        assert sent == []
+    finally:
+        dispose_engine()
 
 
 def test_rest_contract_is_server_owned_and_hides_internal_trace(
@@ -842,6 +851,42 @@ def test_request_contract_errors_are_422_before_runtime_lookup(
     assert overlong_range.json()["error"]["code"] == "validation_error"
 
 
+@pytest.mark.parametrize(
+    "idempotency_key",
+    (
+        " invalid-surrounding-whitespace ",
+        "invalid\x7fcontrol-character",
+    ),
+)
+def test_invalid_idempotency_key_returns_documented_422(
+    settings,
+    idempotency_key: str,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": idempotency_key},
+            json={"question": "Should I take a break?"},
+        )
+        openapi = client.get("/openapi.json").json()
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == (
+        "invalid_idempotency_key"
+    )
+    documented = openapi["paths"]["/v1/wellness-decisions"][
+        "post"
+    ]["responses"]["422"]
+    assert documented["description"] == (
+        "Invalid request body or Idempotency-Key syntax."
+    )
+
+
 def test_closing_engine_returns_503(settings) -> None:
     app = create_app(settings)
     with TestClient(
@@ -876,6 +921,33 @@ def test_busy_engine_returns_429(settings) -> None:
 
     assert response.status_code == 429
     assert response.json()["error"]["code"] == "decision_engine_busy"
+
+
+def test_unavailable_idempotency_convergence_returns_retryable_503(
+    settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_service = UnavailableDecisionService()
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "unavailable-convergence-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_idempotency_temporarily_unavailable",
+        "message": (
+            "The durable decision result is temporarily unavailable; retry "
+            "the same Idempotency-Key."
+        ),
+        "detail": {"retryable": True},
+    }
 
 
 @pytest.mark.parametrize(

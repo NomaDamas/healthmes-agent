@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import uuid
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -42,6 +42,7 @@ from healthmes.decision.contracts import (
 from healthmes.store.decision_receipts import (
     DecisionReceiptClaimState,
     DecisionReceiptConflictError,
+    DecisionReceiptExpiredError,
     DecisionReceiptOwnershipError,
     DecisionReceiptStore,
 )
@@ -52,9 +53,12 @@ _CHANNEL_REQUEST_NAMESPACE = uuid.UUID(
 _REST_REQUEST_NAMESPACE = uuid.UUID(
     "d8fcb625-cade-45a4-b27f-63a6c06c9719"
 )
-_MAX_COMPLETED_IDEMPOTENT_REQUESTS = 256
 _DECISION_RECEIPT_RETENTION = timedelta(days=30)
 _DECISION_RECEIPT_SCHEMA = "healthmes.decision-receipt.v1"
+_DECISION_SERVICE_FINGERPRINT_CONTEXT = (
+    b"healthmes-decision-service-request-fingerprint-v1\x00"
+)
+_MIN_FINGERPRINT_KEY_BYTES = 32
 
 
 class DecisionRuntimeNotConfiguredError(RuntimeError):
@@ -63,6 +67,14 @@ class DecisionRuntimeNotConfiguredError(RuntimeError):
 
 class DecisionIdempotencyConflictError(RuntimeError):
     """Raised when one request ID is reused for different decision input."""
+
+
+class DecisionIdempotencyExpiredError(RuntimeError):
+    """Raised when a retained identity no longer has a replayable result."""
+
+
+class DecisionIdempotencyUnavailableError(RuntimeError):
+    """Raised when a durable request cannot safely converge yet."""
 
 
 class DecisionIngress(StrEnum):
@@ -169,13 +181,6 @@ class _ActiveDecision:
 
 
 @dataclass(frozen=True, slots=True)
-class _CompletedDecision:
-    fingerprint: str
-    result: DecisionResult
-    expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
 class _IdempotentExecution:
     result: DecisionResult
     cache_expires_at: datetime | None
@@ -210,10 +215,6 @@ class HealthMesDecisionService:
             uuid.UUID,
             _ActiveDecision,
         ] = {}
-        self._completed_idempotent_requests: OrderedDict[
-            uuid.UUID,
-            _CompletedDecision,
-        ] = OrderedDict()
 
     def build_request(
         self,
@@ -268,29 +269,15 @@ class HealthMesDecisionService:
             return await self._execute(submission)
 
         request_id = submission.request_id
-        fingerprint = _service_request_fingerprint(submission)
+        fingerprint = _service_request_fingerprint(
+            submission,
+            key=_service_fingerprint_key(self._settings),
+        )
+        legacy_fingerprint = _legacy_service_request_fingerprint(
+            submission
+        )
         loop = asyncio.get_running_loop()
         with self._idempotency_lock:
-            completed = self._completed_idempotent_requests.get(
-                request_id
-            )
-            if completed is not None:
-                if completed.expires_at <= _as_utc(self._clock()):
-                    self._completed_idempotent_requests.pop(
-                        request_id,
-                        None,
-                    )
-                    completed = None
-            if completed is not None:
-                _require_matching_idempotency_fingerprint(
-                    completed.fingerprint,
-                    fingerprint,
-                )
-                self._completed_idempotent_requests.move_to_end(
-                    request_id
-                )
-                return completed.result
-
             active = self._active_idempotent_requests.get(request_id)
             if active is not None:
                 _require_matching_idempotency_fingerprint(
@@ -307,6 +294,7 @@ class HealthMesDecisionService:
                 coroutine = self._execute_idempotently(
                     submission,
                     fingerprint=fingerprint,
+                    legacy_fingerprint=legacy_fingerprint,
                 )
                 try:
                     task = loop.create_task(
@@ -352,6 +340,11 @@ class HealthMesDecisionService:
                         and active.waiters == 0
                         and not task.done()
                     )
+                    if cancel_orphaned_task:
+                        self._active_idempotent_requests.pop(
+                            request_id,
+                            None,
+                        )
             if cancel_orphaned_task:
                 task.cancel()
 
@@ -375,6 +368,7 @@ class HealthMesDecisionService:
         submission: DecisionServiceRequest,
         *,
         fingerprint: str,
+        legacy_fingerprint: str,
     ) -> _IdempotentExecution:
         request_id = submission.request_id
         assert request_id is not None
@@ -385,80 +379,106 @@ class HealthMesDecisionService:
         )
 
         while True:
-            try:
-                claim = await asyncio.to_thread(
-                    store.claim,
-                    request_id=request_id,
-                    fingerprint=fingerprint,
-                    owner_token=owner_token,
-                    now=self._clock(),
-                    requested_at=requested_at,
-                )
-            except DecisionReceiptConflictError as exc:
-                raise DecisionIdempotencyConflictError(str(exc)) from exc
-            if claim.state is DecisionReceiptClaimState.COMPLETED:
-                assert claim.result_payload is not None
-                assert claim.expires_at is not None
-                return _IdempotentExecution(
-                    result=_result_from_receipt(claim.result_payload),
-                    cache_expires_at=_as_utc(claim.expires_at),
-                )
-            if claim.state is DecisionReceiptClaimState.ACQUIRED:
-                assert claim.requested_at is not None
-                requested_at = _as_utc(claim.requested_at)
-                break
-            await asyncio.sleep(claim.retry_after_seconds)
+            lease_generation: int | None = None
+            while True:
+                try:
+                    claim = await _claim_with_cancellation_cleanup(
+                        store,
+                        request_id=request_id,
+                        fingerprint=fingerprint,
+                        legacy_fingerprint=legacy_fingerprint,
+                        owner_token=owner_token,
+                        now=self._clock(),
+                        requested_at=requested_at,
+                    )
+                except DecisionReceiptConflictError as exc:
+                    raise DecisionIdempotencyConflictError(str(exc)) from exc
+                except DecisionReceiptExpiredError as exc:
+                    raise DecisionIdempotencyExpiredError(str(exc)) from exc
+                if claim.state is DecisionReceiptClaimState.COMPLETED:
+                    assert claim.result_payload is not None
+                    assert claim.expires_at is not None
+                    return _IdempotentExecution(
+                        result=_result_from_receipt(claim.result_payload),
+                        cache_expires_at=_as_utc(claim.expires_at),
+                    )
+                if claim.state is DecisionReceiptClaimState.ACQUIRED:
+                    assert claim.requested_at is not None
+                    assert claim.lease_generation is not None
+                    requested_at = _as_utc(claim.requested_at)
+                    lease_generation = claim.lease_generation
+                    break
+                await asyncio.sleep(claim.retry_after_seconds)
 
-        frozen_submission = submission.model_copy(
-            update={"requested_at": requested_at}
-        )
-        try:
-            result = await self._execute(frozen_submission)
-            if not _is_terminal_non_retryable(result):
+            assert lease_generation is not None
+            frozen_submission = submission.model_copy(
+                update={"requested_at": requested_at}
+            )
+            try:
+                result = await self._execute(frozen_submission)
+                if not _is_terminal_non_retryable(result):
+                    await _run_receipt_cleanup(
+                        store.release,
+                        request_id=request_id,
+                        fingerprint=fingerprint,
+                        legacy_fingerprint=legacy_fingerprint,
+                        owner_token=owner_token,
+                        lease_generation=lease_generation,
+                        now=self._clock(),
+                    )
+                    return _IdempotentExecution(
+                        result=result,
+                        cache_expires_at=None,
+                    )
+                payload = _result_receipt_payload(result)
+                try:
+                    completion = await asyncio.to_thread(
+                        store.complete,
+                        request_id=request_id,
+                        fingerprint=fingerprint,
+                        legacy_fingerprint=legacy_fingerprint,
+                        owner_token=owner_token,
+                        lease_generation=lease_generation,
+                        result_payload=payload,
+                        now=self._clock(),
+                    )
+                except DecisionReceiptOwnershipError:
+                    canonical = await self._converge_after_lease_loss(
+                        store,
+                        request_id=request_id,
+                        fingerprint=fingerprint,
+                        legacy_fingerprint=legacy_fingerprint,
+                    )
+                    if canonical is not None:
+                        return canonical
+                    # The replacement worker also disappeared. Claim a fresh
+                    # generation and rerun the engine; never publish the stale
+                    # result produced under the lost generation.
+                    owner_token = uuid.uuid4()
+                    continue
+                except DecisionReceiptExpiredError as exc:
+                    raise DecisionIdempotencyExpiredError(str(exc)) from exc
+                return _IdempotentExecution(
+                    result=_result_from_receipt(
+                        completion.result_payload
+                    ),
+                    cache_expires_at=(
+                        _as_utc(completion.expires_at)
+                        if completion.expires_at is not None
+                        else None
+                    ),
+                )
+            except BaseException:
                 await _run_receipt_cleanup(
                     store.release,
                     request_id=request_id,
                     fingerprint=fingerprint,
+                    legacy_fingerprint=legacy_fingerprint,
                     owner_token=owner_token,
+                    lease_generation=lease_generation,
                     now=self._clock(),
                 )
-                return _IdempotentExecution(
-                    result=result,
-                    cache_expires_at=None,
-                )
-            payload = _result_receipt_payload(result)
-            try:
-                completion = await asyncio.to_thread(
-                    store.complete,
-                    request_id=request_id,
-                    fingerprint=fingerprint,
-                    owner_token=owner_token,
-                    result_payload=payload,
-                    now=self._clock(),
-                )
-            except DecisionReceiptOwnershipError:
-                return await self._converge_after_lease_loss(
-                    store,
-                    request_id=request_id,
-                    fingerprint=fingerprint,
-                    requested_at=requested_at,
-                    result_payload=payload,
-                )
-            return _IdempotentExecution(
-                result=_result_from_receipt(
-                    completion.result_payload
-                ),
-                cache_expires_at=_as_utc(completion.expires_at),
-            )
-        except BaseException:
-            await _run_receipt_cleanup(
-                store.release,
-                request_id=request_id,
-                fingerprint=fingerprint,
-                owner_token=owner_token,
-                now=self._clock(),
-            )
-            raise
+                raise
 
     async def _converge_after_lease_loss(
         self,
@@ -466,19 +486,26 @@ class HealthMesDecisionService:
         *,
         request_id: uuid.UUID,
         fingerprint: str,
-        requested_at: datetime,
-        result_payload: dict,
-    ) -> _IdempotentExecution:
+        legacy_fingerprint: str,
+    ) -> _IdempotentExecution | None:
         """Return only the durable winner after this worker loses its lease."""
 
-        convergence_owner = uuid.uuid4()
         while True:
-            observation = await asyncio.to_thread(
-                store.observe,
-                request_id=request_id,
-                fingerprint=fingerprint,
-                now=self._clock(),
-            )
+            try:
+                observation = await asyncio.to_thread(
+                    store.observe,
+                    request_id=request_id,
+                    fingerprint=fingerprint,
+                    legacy_fingerprint=legacy_fingerprint,
+                    now=self._clock(),
+                )
+            except DecisionReceiptExpiredError as exc:
+                raise DecisionIdempotencyExpiredError(str(exc)) from exc
+            except DecisionReceiptOwnershipError as exc:
+                raise DecisionIdempotencyUnavailableError(
+                    "durable decision receipt disappeared while converging; "
+                    "retry the same Idempotency-Key"
+                ) from exc
             if (
                 observation.state
                 is DecisionReceiptClaimState.COMPLETED
@@ -493,49 +520,9 @@ class HealthMesDecisionService:
                         observation.expires_at
                     ),
                 )
-            if observation.retry_after_seconds > 0.01:
-                await asyncio.sleep(
-                    observation.retry_after_seconds
-                )
-                continue
-
-            claim = await asyncio.to_thread(
-                store.claim,
-                request_id=request_id,
-                fingerprint=fingerprint,
-                owner_token=convergence_owner,
-                now=self._clock(),
-                requested_at=requested_at,
-            )
-            if claim.state is DecisionReceiptClaimState.WAIT:
-                await asyncio.sleep(claim.retry_after_seconds)
-                continue
-            if claim.state is DecisionReceiptClaimState.COMPLETED:
-                assert claim.result_payload is not None
-                assert claim.expires_at is not None
-                return _IdempotentExecution(
-                    result=_result_from_receipt(
-                        claim.result_payload
-                    ),
-                    cache_expires_at=_as_utc(claim.expires_at),
-                )
-            try:
-                completion = await asyncio.to_thread(
-                    store.complete,
-                    request_id=request_id,
-                    fingerprint=fingerprint,
-                    owner_token=convergence_owner,
-                    result_payload=result_payload,
-                    now=self._clock(),
-                )
-            except DecisionReceiptOwnershipError:
-                continue
-            return _IdempotentExecution(
-                result=_result_from_receipt(
-                    completion.result_payload
-                ),
-                cache_expires_at=_as_utc(completion.expires_at),
-            )
+            if observation.lease_expired:
+                return None
+            await asyncio.sleep(observation.retry_after_seconds)
 
     def _get_receipt_store(self) -> DecisionReceiptStore:
         with self._idempotency_lock:
@@ -578,25 +565,7 @@ class HealthMesDecisionService:
             if active is None or active.task is not task:
                 return
             self._active_idempotent_requests.pop(request_id, None)
-            result = execution.result
-            if not _is_terminal_non_retryable(result):
-                return
-            expires_at = execution.cache_expires_at
-            if expires_at is None:
-                return
-            self._completed_idempotent_requests[request_id] = (
-                _CompletedDecision(
-                    fingerprint=fingerprint,
-                    result=result,
-                    expires_at=expires_at,
-                )
-            )
-            self._completed_idempotent_requests.move_to_end(request_id)
-            while (
-                len(self._completed_idempotent_requests)
-                > _MAX_COMPLETED_IDEMPOTENT_REQUESTS
-            ):
-                self._completed_idempotent_requests.popitem(last=False)
+            del execution, fingerprint
 
 
 class DecisionChannelAdapter:
@@ -688,7 +657,32 @@ def decision_rest_request_id(
 
 def _service_request_fingerprint(
     submission: DecisionServiceRequest,
+    *,
+    key: bytes,
 ) -> str:
+    if len(key) < _MIN_FINGERPRINT_KEY_BYTES:
+        raise DecisionRuntimeNotConfiguredError(
+            "decision_correlation_secret must contain at least 32 bytes"
+        )
+    encoded = _service_request_fingerprint_payload(submission)
+    return hmac.new(
+        key,
+        _DECISION_SERVICE_FINGERPRINT_CONTEXT + encoded,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _legacy_service_request_fingerprint(
+    submission: DecisionServiceRequest,
+) -> str:
+    return hashlib.sha256(
+        _service_request_fingerprint_payload(submission)
+    ).hexdigest()
+
+
+def _service_request_fingerprint_payload(
+    submission: DecisionServiceRequest,
+) -> bytes:
     payload = submission.model_dump(
         mode="json",
         round_trip=True,
@@ -701,14 +695,20 @@ def _service_request_fingerprint(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return encoded
+
+
+def _service_fingerprint_key(settings: Settings) -> bytes:
+    return settings.decision_correlation_secret.get_secret_value().encode(
+        "utf-8"
+    )
 
 
 def _require_matching_idempotency_fingerprint(
     stored: str,
     received: str,
 ) -> None:
-    if stored != received:
+    if not hmac.compare_digest(stored, received):
         raise DecisionIdempotencyConflictError(
             "decision request id was reused with different input"
         )
@@ -756,6 +756,51 @@ def _result_from_receipt(payload: dict) -> DecisionResult:
     return DecisionResult.model_validate(
         {**raw_result, "tool_trace": []}
     )
+
+
+async def _claim_with_cancellation_cleanup(
+    store: DecisionReceiptStore,
+    **kwargs,
+):
+    """Finish a threaded claim and release its exact generation on cancel."""
+
+    task = asyncio.create_task(
+        asyncio.to_thread(store.claim, **kwargs)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        try:
+            claim = task.result()
+        except BaseException:
+            claim = None
+        if (
+            claim is not None
+            and claim.state is DecisionReceiptClaimState.ACQUIRED
+            and claim.lease_generation is not None
+        ):
+            cleanup_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"requested_at"}
+            }
+            cleanup_kwargs["lease_generation"] = (
+                claim.lease_generation
+            )
+            try:
+                await _run_receipt_cleanup(
+                    store.release,
+                    **cleanup_kwargs,
+                )
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        raise cancellation
 
 
 async def _run_receipt_cleanup(

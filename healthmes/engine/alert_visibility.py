@@ -38,22 +38,54 @@ def alert_delivery_state(
             and push.get("state") == EXPIRED_STATE
         ):
             return None
-    if event.alert_sent:
-        return DELIVERED_STATE
     if not isinstance(payload, dict):
-        return None
+        return DELIVERED_STATE if event.alert_sent else None
     message = payload.get("message")
     push = payload.get("push")
-    if (
-        isinstance(message, str)
-        and bool(message.strip())
-        and isinstance(push, dict)
-        and push.get("sent") is False
-        and push.get("state") == APP_AVAILABLE_STATE
-        and push.get("channel") == APP_POLL_CHANNEL
-    ):
-        return APP_AVAILABLE_DELIVERY_STATE
+    has_message = isinstance(message, str) and bool(message.strip())
+    if isinstance(push, dict):
+        upstream_failed = (
+            push.get("upstream_ok") is False
+            or push.get("webhook_ok") is False
+        )
+        if upstream_failed:
+            if has_message and push.get("channel") == "native":
+                return APP_AVAILABLE_DELIVERY_STATE
+            return None
+        if (
+            event.alert_sent
+            and push.get("sent") is True
+            and not upstream_failed
+        ):
+            return DELIVERED_STATE
+        if push.get("sent") is False:
+            if (
+                has_message
+                and push.get("state") == APP_AVAILABLE_STATE
+                and push.get("channel") == APP_POLL_CHANNEL
+            ):
+                return APP_AVAILABLE_DELIVERY_STATE
+            return None
+    if event.alert_sent:
+        # Payload-less and pre-transport-metadata rows retain their historical
+        # meaning. Explicit failed-upstream metadata above always wins.
+        return DELIVERED_STATE
     return None
+
+
+def alert_retention_is_expired(
+    session: Session,
+    event: TriggerEvent,
+    *,
+    now: datetime,
+) -> bool:
+    """Return whether the alert itself is beyond its visibility window."""
+
+    deadline = _alert_retention_deadline(session, event)
+    return (
+        deadline is not None
+        and deadline <= _as_utc(now)
+    )
 
 
 def is_user_visible_alert(
@@ -67,8 +99,11 @@ def is_user_visible_alert(
     if alert_delivery_state(event) is None:
         return False
     current = _as_utc(now)
-    alert_deadline = _alert_retention_deadline(session, event)
-    if alert_deadline is not None and alert_deadline <= current:
+    if alert_retention_is_expired(
+        session,
+        event,
+        now=current,
+    ):
         return False
     payload = event.payload
     return not (
@@ -91,9 +126,16 @@ def expire_trigger_event_answers(
     """Remove retained LLM answers once alert or decision retention expires."""
 
     current = _as_utc(now)
+    statement = select(TriggerEvent)
+    if session.get_bind().dialect.name == "postgresql" and not dry_run:
+        # Dispatch owns its TriggerEvent row while reasoning. Retention must
+        # lock even rows that do not contain a message yet, so it cannot commit
+        # a shorter policy between the dispatcher's final check and answer
+        # publication.
+        statement = statement.with_for_update()
     candidates = [
         event
-        for event in session.scalars(select(TriggerEvent))
+        for event in session.scalars(statement)
         if isinstance(event.payload, dict)
         and isinstance(event.payload.get("message"), str)
         and trigger_answer_is_expired(
@@ -125,11 +167,11 @@ def trigger_answer_is_expired(
     now: datetime,
 ) -> bool:
     current = _as_utc(now)
-    alert_deadline = _alert_retention_deadline(
+    if alert_retention_is_expired(
         session,
         event,
-    )
-    if alert_deadline is not None and alert_deadline <= current:
+        now=current,
+    ):
         return True
 
     return _linked_decision_is_expired(

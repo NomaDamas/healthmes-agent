@@ -171,7 +171,7 @@ class GlanceAlertOut(BaseModel):
     id: uuid.UUID
     rule_id: str
     summary: str
-    delivery_state: AlertDeliveryState
+    delivery_state: AlertDeliveryState = "delivered"
     decision_url: str | None
 
 

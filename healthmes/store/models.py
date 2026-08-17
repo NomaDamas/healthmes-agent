@@ -447,14 +447,26 @@ class DecisionRequestReceipt(Base):
             "state = 'pending' "
             "AND owner_token IS NOT NULL "
             "AND lease_expires_at IS NOT NULL "
-            "AND result_payload IS NULL"
+            "AND result_payload IS NULL "
+            "AND result_expires_at IS NULL"
             ") OR ("
             "state = 'completed' "
             "AND owner_token IS NULL "
             "AND lease_expires_at IS NULL "
-            "AND result_payload IS NOT NULL"
+            "AND result_payload IS NOT NULL "
+            "AND result_expires_at IS NOT NULL"
+            ") OR ("
+            "state = 'tombstone' "
+            "AND owner_token IS NULL "
+            "AND lease_expires_at IS NULL "
+            "AND result_payload IS NULL "
+            "AND result_expires_at IS NULL"
             ")",
             name="state_payload_consistent",
+        ),
+        CheckConstraint(
+            "lease_generation >= 1",
+            name="lease_generation_positive",
         ),
     )
 
@@ -463,8 +475,13 @@ class DecisionRequestReceipt(Base):
     requested_at: Mapped[datetime]
     state: Mapped[str_32] = mapped_column(index=True)
     owner_token: Mapped[uuid.UUID | None] = mapped_column(index=True)
+    lease_generation: Mapped[int] = mapped_column(
+        default=1,
+        server_default="1",
+    )
     lease_expires_at: Mapped[datetime | None] = mapped_column(index=True)
     result_payload: Mapped[JSONDict | None]
+    result_expires_at: Mapped[datetime | None] = mapped_column(index=True)
     expires_at: Mapped[datetime] = mapped_column(index=True)
 
 

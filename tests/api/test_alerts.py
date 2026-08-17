@@ -237,6 +237,97 @@ def test_app_available_result_is_visible_without_claiming_delivery(
     assert glance["top"]["delivery_state"] == "app_available"
 
 
+def test_legacy_native_failure_is_app_available_not_delivered(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "legacy_native_failure",
+        sent=True,
+        payload={
+            **_payload("Legacy native delivery failed."),
+            "message": "Open HealthMes to read this answer.",
+            "push": {
+                "sent": True,
+                "channel": "native",
+                "upstream_ok": False,
+                "status_code": 502,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alert["delivery_state"] == "app_available"
+    assert glance["top"]["delivery_state"] == "app_available"
+
+
+def test_confirmed_native_transport_is_delivered(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "confirmed_native_delivery",
+        sent=True,
+        payload={
+            **_payload("Confirmed native delivery."),
+            "message": "This message reached the native transport.",
+            "push": {
+                "sent": True,
+                "channel": "native",
+                "upstream_ok": True,
+                "status_code": 200,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alert["delivery_state"] == "delivered"
+    assert glance["top"]["delivery_state"] == "delivered"
+
+
+def test_failed_native_transport_without_message_is_not_delivered(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "failed_native_without_message",
+        sent=True,
+        payload={
+            **_payload("Native transport failed before app fallback."),
+            "push": {
+                "sent": True,
+                "channel": "native",
+                "upstream_ok": False,
+                "status_code": 502,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        alerts = client.get(ALERTS).json()
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alerts["pagination"]["total_count"] == 0
+    assert alerts["data"] == []
+    assert glance["unresolved_count"] == 0
+    assert glance["top"] is None
+
+
 def test_alert_link_hides_decision_at_exact_expiry(
     client,
     session,

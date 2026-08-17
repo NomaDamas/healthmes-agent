@@ -40,6 +40,10 @@ from typing import Any, Protocol
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
 from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.visibility import (
@@ -51,6 +55,7 @@ from healthmes.config import Settings, resolve_timezone
 from healthmes.engine.alert_visibility import (
     APP_AVAILABLE_STATE,
     APP_POLL_CHANNEL,
+    alert_retention_is_expired,
     is_user_visible_alert,
 )
 from healthmes.engine.decision_dispatch import DecisionDispatchResult
@@ -111,6 +116,7 @@ _SUPPRESS_QUIET_HOURS = "quiet_hours"
 _SUPPRESS_COOLDOWN = "cooldown"
 _SUPPRESS_DAILY_BUDGET = "daily_budget"
 _SUPPRESS_PUSH_FAILED = "push_failed"
+_SUPPRESS_RETENTION_EXPIRED = "retention_expired"
 _CALENDAR_DERIVED_RULE_IDS = frozenset(
     {
         "calendar_task_intake",
@@ -834,6 +840,22 @@ def _merge_decision_result(
     return merged
 
 
+def _expired_alert_payload(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    expired = dict(payload)
+    expired.pop("message", None)
+    expired.pop("decision", None)
+    expired.pop("decision_record_id", None)
+    expired["push"] = {
+        "state": "expired",
+        "expired_at": _ensure_utc(now).isoformat(),
+    }
+    return expired
+
+
 def default_now_provider(settings: Settings) -> Callable[[], datetime]:
     """Wall-clock provider in the *user's* timezone (Settings.timezone).
 
@@ -897,7 +919,10 @@ class TriggerEvaluator:
 
         outcomes: list[FireOutcome] = []
         with session_scope(self._session_factory) as session:
-            retried, pending_keys = self._retry_pending_dispatches(session)
+            retried, pending_keys = self._retry_pending_dispatches(
+                session,
+                now=now,
+            )
             outcomes.extend(retried)
             signals = self._health_reader.read(now)
             context, calendar_visibility = self._build_context(
@@ -975,6 +1000,8 @@ class TriggerEvaluator:
     def _retry_pending_dispatches(
         self,
         session: Session,
+        *,
+        now: datetime,
     ) -> tuple[list[FireOutcome], set[str]]:
         """Deliver committed outbox rows independently of rule conditions."""
         events = session.scalars(
@@ -999,6 +1026,17 @@ class TriggerEvaluator:
             if event.dedup_key is not None:
                 pending_keys.add(event.dedup_key)
             payload = event.payload or {}
+            if alert_retention_is_expired(
+                session,
+                event,
+                now=_ensure_utc(now),
+            ):
+                event.payload = _expired_alert_payload(
+                    payload,
+                    now=_ensure_utc(now),
+                )
+                session.commit()
+                continue
             trigger_payload = payload.get("trigger")
             if not isinstance(trigger_payload, dict):
                 trigger_payload = payload
@@ -1132,6 +1170,21 @@ class TriggerEvaluator:
         # (pinned by tests/hardening/test_trigger_flood.py).
         session.flush()
 
+        if alert_retention_is_expired(
+            session,
+            event,
+            now=_ensure_utc(now),
+        ):
+            event.payload = _expired_alert_payload(
+                payload,
+                now=_ensure_utc(now),
+            )
+            return FireOutcome(
+                fire=fire,
+                status="suppressed",
+                reason=_SUPPRESS_RETENTION_EXPIRED,
+            )
+
         reason = self._push_suppression_reason(session, now, fire)
         if reason is not None:
             event.payload = {**payload, "push": {"suppressed_reason": reason}}
@@ -1185,12 +1238,80 @@ class TriggerEvaluator:
                 fired_at=fired_at,
                 trigger_event_id=event.id,
             )
-            self._link_decision_record(session, event, result)
         except Exception as exc:
             outcome = self._handle_send_exception(session, fire, event, payload, exc)
             session.commit()
             return outcome
 
+        try:
+            if session.get_bind().dialect.name == "sqlite":
+                # SQLite has no row-level FOR UPDATE. Use the same file-backed
+                # write fence as retention changes for the final recheck and
+                # commit, without blocking the sender/LLM call itself.
+                with activity_write_lock():
+                    lock_activity_write_plane(session)
+                    return self._finalize_delivery_result(
+                        session,
+                        fire,
+                        event,
+                        payload,
+                        result,
+                    )
+            # PostgreSQL retention updates lock every TriggerEvent before they
+            # can commit. This event is already row-locked by the dispatch
+            # claim, so the later transaction either observes this answer and
+            # scrubs it or commits first and is observed by this recheck.
+            return self._finalize_delivery_result(
+                session,
+                fire,
+                event,
+                payload,
+                result,
+            )
+        except Exception as exc:
+            outcome = self._handle_send_exception(session, fire, event, payload, exc)
+            session.commit()
+            return outcome
+
+    def _finalize_delivery_result(
+        self,
+        session: Session,
+        fire: TriggerFire,
+        event: TriggerEvent,
+        payload: dict[str, Any],
+        result: DecisionDispatchResult,
+    ) -> FireOutcome:
+        completed_at = _ensure_utc(self._now())
+        if alert_retention_is_expired(
+            session,
+            event,
+            now=completed_at,
+        ):
+            event.payload = _expired_alert_payload(
+                payload,
+                now=completed_at,
+            )
+            outcome = FireOutcome(
+                fire=fire,
+                status="suppressed",
+                reason=_SUPPRESS_RETENTION_EXPIRED,
+            )
+            session.commit()
+            return outcome
+        self._link_decision_record(session, event, result)
+
+        if (
+            not result.ok
+            and result.ready_for_native
+            and not self._settings.native_alert_delivery
+        ):
+            result = replace(
+                result,
+                detail="native alert delivery is disabled",
+                ready_for_native=False,
+                message=None,
+                suppressed_reason="native_alert_delivery_disabled",
+            )
         delivery_payload = _merge_decision_result(payload, result)
         if result.ok:
             event.alert_sent = True
@@ -1222,6 +1343,23 @@ class TriggerEvaluator:
                 },
             }
             outcome = FireOutcome(fire=fire, status="available")
+            session.commit()
+            return outcome
+
+        if result.suppressed_reason is not None:
+            event.payload = {
+                **delivery_payload,
+                "push": {
+                    "suppressed_reason": result.suppressed_reason,
+                    "status_code": result.status_code,
+                    "detail": result.detail,
+                },
+            }
+            outcome = FireOutcome(
+                fire=fire,
+                status="suppressed",
+                reason=result.suppressed_reason,
+            )
             session.commit()
             return outcome
 

@@ -73,7 +73,7 @@ class AlertOut(BaseModel):
     id: uuid.UUID
     rule_id: str
     fired_at: datetime
-    delivery_state: AlertDeliveryState
+    delivery_state: AlertDeliveryState = "delivered"
     summary: str  # observation line (falls back to rule_id for legacy rows)
     proposal: str | None  # proposal line
     evidence: dict[str, Any] | None  # evidence facts (client renders the line)

@@ -60,6 +60,7 @@ class DecisionDispatchResult:
     limitations: tuple[str, ...] = ()
     confidence: float | None = None
     proposed_action: bool = False
+    suppressed_reason: str | None = None
 
 
 class DecisionServiceThreadBridge:
@@ -194,16 +195,21 @@ class DecisionAlertSender:
                 confidence=result.confidence,
                 proposed_action=result.proposed_action,
             )
+        native_enabled = self._settings.native_alert_delivery
         return DecisionDispatchResult(
             # This component performs reasoning only. A separate transport
             # must report ok=True before HealthMes may claim delivery.
             ok=False,
             status_code=204,
-            detail="decision completed; available for app polling",
+            detail=(
+                "decision completed; available for app polling"
+                if native_enabled
+                else "native alert delivery is disabled"
+            ),
             retryable=False,
-            ready_for_native=True,
-            channel="app_poll",
-            message=message,
+            ready_for_native=native_enabled,
+            channel="app_poll" if native_enabled else None,
+            message=message if native_enabled else None,
             decision_record_id=result.decision_record_id,
             decision_request_id=result.request_id,
             decision_turn_id=result.turn_id,
@@ -211,6 +217,11 @@ class DecisionAlertSender:
             limitations=tuple(result.limitations),
             confidence=result.confidence,
             proposed_action=result.proposed_action,
+            suppressed_reason=(
+                None
+                if native_enabled
+                else "native_alert_delivery_disabled"
+            ),
         )
 
 
