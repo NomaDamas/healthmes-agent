@@ -108,6 +108,31 @@ def test_process_activity_write_lock_timeout_is_bounded() -> None:
     assert not holder.is_alive()
 
 
+def test_process_activity_write_lock_releases_when_cancelled_after_acquire(
+) -> None:
+    class ReplayCancelled(RuntimeError):
+        pass
+
+    checks = 0
+
+    def cancel_after_acquire() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise ReplayCancelled
+
+    with pytest.raises(ReplayCancelled):
+        with activity_write_lock(
+            timeout_seconds=1,
+            cancellation_check=cancel_after_acquire,
+            poll_seconds=0.01,
+        ):
+            pytest.fail("cancelled lock acquisition entered its body")
+
+    with activity_write_lock(timeout_seconds=0.1):
+        pass
+
+
 def test_file_sqlite_activity_lock_timeout_is_bounded(tmp_path) -> None:
     engine = create_db_engine(f"sqlite:///{tmp_path / 'bounded.db'}")
     first = Session(engine)

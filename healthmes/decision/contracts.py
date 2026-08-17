@@ -272,6 +272,85 @@ class DecisionPersistenceIntent(StrEnum):
     EXPLICIT_TRACKING = "explicit_tracking"
 
 
+class DecisionRecordSummaryCode(StrEnum):
+    """Allowlisted conclusion categories safe for compact persistence."""
+
+    PAUSE_AND_REASSESS = "pause_and_reassess"
+    TAKE_RESTORATIVE_BREAK = "take_restorative_break"
+    DELAY_AND_REASSESS = "delay_and_reassess"
+    REDUCE_OR_AVOID = "reduce_or_avoid"
+    PROCEED_WITH_CAUTION = "proceed_with_caution"
+    SEEK_PROFESSIONAL_SUPPORT = "seek_professional_support"
+    TRACK_FOR_REVIEW = "track_for_review"
+
+
+_DECISION_RECORD_SUMMARIES = {
+    DecisionRecordSummaryCode.PAUSE_AND_REASSESS: (
+        "Pause and reassess before continuing."
+    ),
+    DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK: (
+        "Take a restorative break before continuing."
+    ),
+    DecisionRecordSummaryCode.DELAY_AND_REASSESS: (
+        "Delay this choice and reassess later."
+    ),
+    DecisionRecordSummaryCode.REDUCE_OR_AVOID: (
+        "Reduce or avoid this choice for now."
+    ),
+    DecisionRecordSummaryCode.PROCEED_WITH_CAUTION: (
+        "Proceed cautiously and monitor how you feel."
+    ),
+    DecisionRecordSummaryCode.SEEK_PROFESSIONAL_SUPPORT: (
+        "Seek qualified professional support before acting."
+    ),
+    DecisionRecordSummaryCode.TRACK_FOR_REVIEW: (
+        "Keep this wellness item tracked for later review."
+    ),
+}
+_DECISION_RECORD_CODES_BY_INTENT = {
+    DecisionPersistenceIntent.ACTION: frozenset(
+        {
+            DecisionRecordSummaryCode.PAUSE_AND_REASSESS,
+            DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK,
+            DecisionRecordSummaryCode.DELAY_AND_REASSESS,
+            DecisionRecordSummaryCode.REDUCE_OR_AVOID,
+            DecisionRecordSummaryCode.PROCEED_WITH_CAUTION,
+            DecisionRecordSummaryCode.SEEK_PROFESSIONAL_SUPPORT,
+        }
+    ),
+    DecisionPersistenceIntent.RISK: frozenset(
+        {
+            DecisionRecordSummaryCode.PAUSE_AND_REASSESS,
+            DecisionRecordSummaryCode.DELAY_AND_REASSESS,
+            DecisionRecordSummaryCode.REDUCE_OR_AVOID,
+            DecisionRecordSummaryCode.SEEK_PROFESSIONAL_SUPPORT,
+        }
+    ),
+    DecisionPersistenceIntent.EXPLICIT_TRACKING: frozenset(
+        {DecisionRecordSummaryCode.TRACK_FOR_REVIEW}
+    ),
+}
+
+
+def decision_record_summary(
+    code: DecisionRecordSummaryCode,
+) -> str:
+    """Render one privacy-safe compact conclusion owned by HealthMes."""
+
+    return _DECISION_RECORD_SUMMARIES[DecisionRecordSummaryCode(code)]
+
+
+def decision_record_summary_code_is_allowed(
+    *,
+    persistence_intent: DecisionPersistenceIntent,
+    code: DecisionRecordSummaryCode,
+) -> bool:
+    return code in _DECISION_RECORD_CODES_BY_INTENT.get(
+        persistence_intent,
+        (),
+    )
+
+
 class CompatibilityPreset(StrEnum):
     """Legacy resolver presets; never required by the decision core."""
 
@@ -1006,6 +1085,7 @@ class DecisionDraft(BaseModel):
         default=None,
         max_length=MAX_RECORD_SUMMARY_LENGTH,
     )
+    record_summary_code: DecisionRecordSummaryCode | None = None
     proposed_action: bool = False
     persistence_intent: DecisionPersistenceIntent = (
         DecisionPersistenceIntent.NONE
@@ -1104,10 +1184,13 @@ class DecisionDraft(BaseModel):
             )
         if (
             self.status is not DecisionStatus.COMPLETED
-            and self.record_summary is not None
+            and (
+                self.record_summary is not None
+                or self.record_summary_code is not None
+            )
         ):
             raise ValueError(
-                "only completed decisions may include record_summary"
+                "only completed decisions may include compact record metadata"
             )
         if self.status is DecisionStatus.NEEDS_CLARIFICATION:
             if self.clarification_question is None:
@@ -1136,6 +1219,28 @@ class DecisionDraft(BaseModel):
         }:
             raise ValueError(
                 "proposed actions require action or risk persistence"
+            )
+        if (
+            self.persistence_intent
+            in {
+                DecisionPersistenceIntent.ACTION,
+                DecisionPersistenceIntent.RISK,
+                DecisionPersistenceIntent.EXPLICIT_TRACKING,
+            }
+            and self.record_summary_code is None
+        ):
+            raise ValueError(
+                "persisted decisions require a record_summary_code"
+            )
+        if self.record_summary_code is not None and (
+            not decision_record_summary_code_is_allowed(
+                persistence_intent=self.persistence_intent,
+                code=self.record_summary_code,
+            )
+        ):
+            raise ValueError(
+                "record_summary_code is incompatible with "
+                "persistence_intent"
             )
         if self.persistence_intent in {
             DecisionPersistenceIntent.ACTION,

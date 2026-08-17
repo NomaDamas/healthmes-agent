@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from errno import EACCES, EAGAIN, EDEADLK
 from pathlib import Path
@@ -36,19 +36,48 @@ else:
 def activity_write_lock(
     *,
     timeout_seconds: float | None = None,
+    cancellation_check: Callable[[], None] | None = None,
+    poll_seconds: float = _SQLITE_FILE_LOCK_POLL_SECONDS,
 ) -> Iterator[None]:
     """Serialize activity ingest, retention, deletion, and summary writes."""
-    if timeout_seconds is None:
-        acquired = _ACTIVITY_WRITE_LOCK.acquire()
+    if cancellation_check is None:
+        if timeout_seconds is None:
+            acquired = _ACTIVITY_WRITE_LOCK.acquire()
+        else:
+            if timeout_seconds <= 0:
+                raise ValueError(
+                    "activity write lock timeout must be positive"
+                )
+            acquired = _ACTIVITY_WRITE_LOCK.acquire(
+                timeout=timeout_seconds
+            )
     else:
-        if timeout_seconds <= 0:
-            raise ValueError("activity write lock timeout must be positive")
-        acquired = _ACTIVITY_WRITE_LOCK.acquire(timeout=timeout_seconds)
+        if poll_seconds <= 0:
+            raise ValueError("activity write lock poll must be positive")
+        deadline = (
+            None
+            if timeout_seconds is None
+            else steady_time() + timeout_seconds
+        )
+        acquired = False
+        while not acquired:
+            cancellation_check()
+            wait_seconds = poll_seconds
+            if deadline is not None:
+                remaining = deadline - steady_time()
+                if remaining <= 0:
+                    break
+                wait_seconds = min(wait_seconds, remaining)
+            acquired = _ACTIVITY_WRITE_LOCK.acquire(
+                timeout=wait_seconds
+            )
     if not acquired:
         raise TimeoutError(
             "timed out waiting for the process activity write lock"
         )
     try:
+        if cancellation_check is not None:
+            cancellation_check()
         yield
     finally:
         _ACTIVITY_WRITE_LOCK.release()
@@ -69,6 +98,7 @@ def _lock_file(
     *,
     timeout_seconds: float | None,
     poll_seconds: float,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     if os.name == "nt":  # pragma: no cover - exercised on Windows runners
         handle.seek(0)
@@ -94,6 +124,8 @@ def _lock_file(
 
     deadline = steady_time() + timeout_seconds
     while True:
+        if cancellation_check is not None:
+            cancellation_check()
         try:
             if os.name == "nt":  # pragma: no cover - Windows runners
                 handle.seek(0)
@@ -138,6 +170,7 @@ def _lock_sqlite_write_plane(
     *,
     timeout_seconds: float | None,
     poll_seconds: float,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     if _SQLITE_FILE_LOCK_INFO_KEY in session.info:
         return
@@ -152,6 +185,7 @@ def _lock_sqlite_write_plane(
             handle,
             timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
+            cancellation_check=cancellation_check,
         )
     except BaseException:
         handle.close()
@@ -175,6 +209,7 @@ def lock_activity_write_plane(
     *,
     timeout_seconds: float | None = None,
     poll_seconds: float = _SQLITE_FILE_LOCK_POLL_SECONDS,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     """Serialize PostgreSQL activity writes across processes and devices."""
     dialect = session.get_bind().dialect.name
@@ -183,6 +218,7 @@ def lock_activity_write_plane(
             session,
             timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
+            cancellation_check=cancellation_check,
         )
         return
     if dialect != "postgresql":
@@ -194,6 +230,8 @@ def lock_activity_write_plane(
             )
         deadline = steady_time() + timeout_seconds
         while True:
+            if cancellation_check is not None:
+                cancellation_check()
             acquired = bool(
                 session.scalar(
                     text(
@@ -228,6 +266,7 @@ def postgres_activity_write_plane_guard(
     *,
     timeout_seconds: float = _POSTGRES_GUARD_TIMEOUT_SECONDS,
     poll_seconds: float = _POSTGRES_GUARD_POLL_SECONDS,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> Iterator[Connection | None]:
     """Hold the activity write plane before opening a serializable snapshot.
 
@@ -254,6 +293,8 @@ def postgres_activity_write_plane_guard(
             deadline = steady_time() + timeout_seconds
             acquired = False
             while steady_time() < deadline:
+                if cancellation_check is not None:
+                    cancellation_check()
                 # Cleanup starts before PostgreSQL can grant the lock. A driver
                 # or result-processing failure after server-side acquisition
                 # must not return a lock-holding connection to the pool.
@@ -276,6 +317,8 @@ def postgres_activity_write_plane_guard(
                         max(0.0, deadline - steady_time()),
                     )
                 )
+            if cancellation_check is not None:
+                cancellation_check()
             if not acquired:
                 raise TimeoutError(
                     "timed out waiting for the activity write plane"

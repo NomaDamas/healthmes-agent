@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from healthmes.decision import (
     DecisionDraft,
     DecisionFinalizer,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
@@ -260,6 +262,7 @@ def _run(
     runtime: RuntimeMetadata | None = None,
     answer: str | None = None,
     record_summary: str | None = None,
+    record_summary_code: DecisionRecordSummaryCode | None = None,
     context_status: ContextStatus = ContextStatus.OK,
     result_limitations: list[str] | None = None,
     draft_limitations: list[str] | None = None,
@@ -321,12 +324,31 @@ def _run(
             }
         )
         if (
-            selected_intent is not DecisionPersistenceIntent.NONE
+            selected_intent
+            in {
+                DecisionPersistenceIntent.ACTION,
+                DecisionPersistenceIntent.RISK,
+                DecisionPersistenceIntent.EXPLICIT_TRACKING,
+            }
             or request.persistence_requested
         ):
             draft_kwargs["record_summary"] = (
                 record_summary
                 or "Pause before choosing more caffeine."
+            )
+            draft_kwargs["record_summary_code"] = (
+                record_summary_code
+                or (
+                    DecisionRecordSummaryCode.TRACK_FOR_REVIEW
+                    if selected_intent
+                    is DecisionPersistenceIntent.EXPLICIT_TRACKING
+                    else DecisionRecordSummaryCode.REDUCE_OR_AVOID
+                    if selected_intent
+                    is DecisionPersistenceIntent.RISK
+                    else (
+                        DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+                    )
+                )
             )
     elif status is DecisionStatus.NEEDS_CLARIFICATION:
         draft_kwargs["clarification_question"] = (
@@ -1214,12 +1236,10 @@ def test_public_record_redacts_internal_source_reference_ids(
         assert ref.reference_id not in str(row.tree)
         assert row.decision_payload is not None
         assert "result" not in row.decision_payload
-        assert row.decision_payload["outcome"]["record_summary"] == (
-            "A wellness action recommendation was recorded."
+        assert row.decision_payload["outcome"]["summary_code"] == (
+            "pause_and_reassess"
         )
-        assert row.summary == (
-            "A wellness action recommendation was recorded."
-        )
+        assert row.summary == "Pause and reassess before continuing."
         assert answer not in json.dumps(row.decision_payload)
         assert "question" not in row.decision_payload["request"]
         assert "caller" not in row.decision_payload["request"]
@@ -1284,18 +1304,16 @@ def test_long_sensitive_answer_is_returned_but_never_persisted(
         ):
             assert secret not in persisted
         outcome = row.decision_payload["outcome"]
-        assert outcome["record_summary"] == (
-            "A wellness action recommendation was recorded."
-        )
+        assert outcome["summary_code"] == "pause_and_reassess"
         assert outcome["limitation_codes"] == ["context_stale"]
 
         recovered = decision_result_from_record(row)
-        assert recovered.answer == outcome["record_summary"]
+        assert recovered.answer == "Pause and reassess before continuing."
         assert sensitive_marker not in recovered.answer
         assert "decision_response_compacted" in recovered.limitations
 
 
-def test_persisted_decision_derives_compact_record_summary(
+def test_persisted_decision_requires_compact_record_summary_code(
     persistence,
 ):
     _engine, factory = persistence
@@ -1306,7 +1324,7 @@ def test_persisted_decision_derives_compact_record_summary(
     run = run.model_copy(
         update={
             "draft": run.draft.model_copy(
-                update={"record_summary": None}
+                update={"record_summary_code": None}
             )
         },
         deep=True,
@@ -1314,16 +1332,15 @@ def test_persisted_decision_derives_compact_record_summary(
 
     result = _finalizer(factory).finalize(request, run)
 
-    assert result.status is DecisionStatus.COMPLETED
-    assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert result.limitations == [
+        "invalid_decision_finalization_input"
+    ]
     with factory() as session:
-        row = session.scalars(sa.select(DecisionRecord)).one()
-        assert row.summary == (
-            "A wellness action recommendation was recorded."
-        )
-        assert row.decision_payload["outcome"]["record_summary"] == (
-            "A wellness action recommendation was recorded."
-        )
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
 
 
 @pytest.mark.parametrize(
@@ -2781,8 +2798,16 @@ def test_retry_reads_and_revalidates_legacy_v2_v3_v4_payloads(
             legacy_payload = {
                 **common,
                 "outcome": {
-                    **current["outcome"],
+                    "status": first.status.value,
                     "record_summary": historical_v4_summary,
+                    "proposed_action": first.proposed_action,
+                    "limitation_codes": current["outcome"][
+                        "limitation_codes"
+                    ],
+                    "confidence": first.confidence,
+                    "decision_record_id": str(
+                        first.decision_record_id
+                    ),
                 },
             }
         row.decision_request_fingerprint = legacy_fingerprint
@@ -3649,3 +3674,71 @@ async def test_engine_finalization_does_not_block_event_loop(persistence):
     result = await asyncio.wait_for(decision_task, timeout=2)
 
     assert result.persistence_status is PersistenceStatus.PERSISTED
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sqlite_replay_releases_lock_and_worker_capacity(
+    persistence,
+    monkeypatch,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    finalizer = _finalizer(factory, max_workers=1)
+    first = finalizer.finalize(request, _run(request, [ref]))
+    assert first.decision_record_id is not None
+
+    acquired = threading.Event()
+    release = threading.Event()
+    replay_waiting = threading.Event()
+    original_lock = finalizer_module.activity_write_lock
+
+    def hold_lock() -> None:
+        with original_lock():
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    @contextmanager
+    def observed_lock(**kwargs):
+        replay_waiting.set()
+        with original_lock(**kwargs):
+            yield
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        monkeypatch.setattr(
+            finalizer_module,
+            "activity_write_lock",
+            observed_lock,
+        )
+        replay = asyncio.create_task(
+            finalizer.arevalidate_persisted(
+                request,
+                first.decision_record_id,
+            )
+        )
+        assert await asyncio.to_thread(replay_waiting.wait, 1)
+
+        replay.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(replay, timeout=1)
+
+        release.set()
+        holder.join(timeout=5)
+        assert not holder.is_alive()
+
+        retry = await asyncio.wait_for(
+            finalizer.arevalidate_persisted(
+                request,
+                first.decision_record_id,
+            ),
+            timeout=1,
+        )
+        assert retry.status is DecisionStatus.COMPLETED
+        assert retry.decision_record_id == first.decision_record_id
+    finally:
+        release.set()
+        holder.join(timeout=5)

@@ -214,10 +214,17 @@ def _final_response(
             "persistence_intent",
             "action" if decision.get("proposed_action") is True else "none",
         )
-    if decision.get("persistence_intent") != "none":
+    intent = decision.get("persistence_intent")
+    if intent is not None and intent != "none":
         decision.setdefault(
-            "record_summary",
-            "Take a short break before choosing more caffeine.",
+            "record_summary_code",
+            (
+                "track_for_review"
+                if intent == "explicit_tracking"
+                else "reduce_or_avoid"
+                if intent == "risk"
+                else "pause_and_reassess"
+            ),
         )
     envelope = {
         "schema": HERMES_DECISION_DRAFT_SCHEMA,
@@ -1033,6 +1040,14 @@ def test_final_envelope_uses_typed_persistence_intent_contract(
             "used_source_ref_ids": used_source_ref_ids,
         },
     }
+    if intent in {"action", "risk", "explicit_tracking"}:
+        envelope["decision"]["record_summary_code"] = (
+            "track_for_review"
+            if intent == "explicit_tracking"
+            else "reduce_or_avoid"
+            if intent == "risk"
+            else "pause_and_reassess"
+        )
 
     parsed = _parse_final_draft(json.dumps(envelope))
 

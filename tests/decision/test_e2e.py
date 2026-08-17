@@ -29,6 +29,7 @@ from healthmes.decision import (
     DecisionDraft,
     DecisionFinalizer,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionStatus,
     DomainAccessGrant,
@@ -498,6 +499,9 @@ class AdaptiveCrossDomainRuntime:
                     "현재 컨텍스트에서는 추가 카페인보다 휴식을 먼저 "
                     "선택합니다."
                 ),
+                record_summary_code=(
+                    DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+                ),
                 proposed_action=True,
                 persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=used_source_ref_ids,
@@ -547,6 +551,9 @@ class CalendarRevocationRuntime:
                 record_summary=(
                     "Calendar access changed before the recommendation "
                     "could be retained."
+                ),
+                record_summary_code=(
+                    DecisionRecordSummaryCode.PAUSE_AND_REASSESS
                 ),
                 proposed_action=True,
                 persistence_intent=DecisionPersistenceIntent.ACTION,
@@ -599,6 +606,9 @@ class ActivityConsentRevocationRuntime:
                 record_summary=(
                     "Activity access changed before the recommendation "
                     "could be retained."
+                ),
+                record_summary_code=(
+                    DecisionRecordSummaryCode.PAUSE_AND_REASSESS
                 ),
                 proposed_action=True,
                 persistence_intent=DecisionPersistenceIntent.ACTION,

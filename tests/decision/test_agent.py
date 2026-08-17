@@ -33,6 +33,7 @@ from healthmes.decision import (
     DecisionContextHints,
     DecisionDraft,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionRuntimeContractError,
     DecisionRuntimeTurn,
@@ -1896,12 +1897,18 @@ async def test_agent_collects_only_gateway_returned_source_refs(
                 turn.history[0].results[0].source_ref_ids[0]
             )
             return RuntimeStepOutput(
-                draft=DecisionDraft(
-                    status=DecisionStatus.COMPLETED,
-                    answer="The recorded intake is available.",
-                    proposed_action=True,
-                    persistence_intent=(
-                        DecisionPersistenceIntent.ACTION
+                    draft=DecisionDraft(
+                        status=DecisionStatus.COMPLETED,
+                        answer="The recorded intake is available.",
+                        record_summary=(
+                            "Pause briefly before the next wellness choice."
+                        ),
+                        record_summary_code=(
+                            DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+                        ),
+                        proposed_action=True,
+                        persistence_intent=(
+                            DecisionPersistenceIntent.ACTION
                     ),
                     used_source_ref_ids=[reference_id],
                 ),
@@ -2474,12 +2481,18 @@ async def test_runtime_cannot_invent_source_reference_ids(
                     metadata=self.metadata,
                 )
             return RuntimeStepOutput(
-                draft=DecisionDraft(
-                    status=DecisionStatus.COMPLETED,
-                    answer="This action cites a forged reference.",
-                    proposed_action=True,
-                    persistence_intent=(
-                        DecisionPersistenceIntent.ACTION
+                    draft=DecisionDraft(
+                        status=DecisionStatus.COMPLETED,
+                        answer="This action cites a forged reference.",
+                        record_summary=(
+                            "Pause briefly before the next wellness choice."
+                        ),
+                        record_summary_code=(
+                            DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+                        ),
+                        proposed_action=True,
+                        persistence_intent=(
+                            DecisionPersistenceIntent.ACTION
                     ),
                     used_source_ref_ids=[forged_id],
                 ),

@@ -48,6 +48,7 @@ from healthmes.decision.contracts import (
     ContextQuery,
     ContextStatus,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
@@ -57,6 +58,8 @@ from healthmes.decision.contracts import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    decision_record_summary,
+    decision_record_summary_code_is_allowed,
     validate_record_summary_for_storage,
 )
 from healthmes.decision.validation import (
@@ -72,11 +75,12 @@ from healthmes.store import DecisionKind, DecisionRecord
 from healthmes.timing import steady_time
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
-DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v5"
+DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v6"
 _LEGACY_DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V2 = "healthmes.decision-private.v2"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V3 = "healthmes.decision-private.v3"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V4 = "healthmes.decision-private.v4"
+_LEGACY_DECISION_PAYLOAD_SCHEMA_V5 = "healthmes.decision-private.v5"
 _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
 _FINGERPRINT_CONTEXT = b"healthmes-decision-request-fingerprint-v1\x00"
 _MIN_FINGERPRINT_KEY_BYTES = 32
@@ -447,6 +451,41 @@ class _StoredDecisionOutcome(BaseModel):
         return self
 
 
+class _StoredDecisionOutcomeV6(BaseModel):
+    """Current outcome stores only an allowlisted conclusion code."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: DecisionStatus
+    summary_code: DecisionRecordSummaryCode
+    proposed_action: bool
+    limitation_codes: tuple[str, ...] = Field(
+        default=(),
+        max_length=_MAX_STORED_LIMITATION_CODES,
+    )
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    decision_record_id: uuid.UUID
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> _StoredDecisionOutcomeV6:
+        if self.status is not DecisionStatus.COMPLETED:
+            raise ValueError("stored outcomes must be completed")
+        if any(
+            _SAFE_LIMITATION_CODE.fullmatch(value) is None
+            for value in self.limitation_codes
+        ):
+            raise ValueError(
+                "stored outcome limitations must be safe codes"
+            )
+        if len(self.limitation_codes) != len(
+            set(self.limitation_codes)
+        ):
+            raise ValueError(
+                "stored outcome limitation codes must be unique"
+            )
+        return self
+
+
 class _StoredDecisionPayloadV4(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -541,12 +580,67 @@ class _StoredDecisionPayloadV5(BaseModel):
         return self
 
 
+class _StoredDecisionPayloadV6(BaseModel):
+    """Current payload retaining only an allowlisted safe conclusion code."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["healthmes.decision-private.v6"] = Field(
+        alias="schema"
+    )
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request: _StoredDecisionRequestMetadata
+    persistence_intent: DecisionPersistenceIntent
+    outcome: _StoredDecisionOutcomeV6
+    run: _StoredRun
+    source_refs: tuple[SourceRef, ...]
+    source_attestations: tuple[_StoredSourceAttestationV5, ...]
+    access_trace: tuple[AccessAuditEntry, ...]
+
+    @model_validator(mode="after")
+    def validate_persistence_contract(
+        self,
+    ) -> _StoredDecisionPayloadV6:
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.NONE,
+            DecisionPersistenceIntent.MUTATION,
+        }:
+            raise ValueError(
+                "stored decisions require a read-only persistence intent"
+            )
+        action_or_risk = self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        }
+        if self.outcome.proposed_action is not action_or_risk:
+            raise ValueError(
+                "stored persistence intent conflicts with proposed_action"
+            )
+        if action_or_risk and not self.source_refs:
+            raise ValueError(
+                "stored action and risk outcomes require source refs"
+            )
+        if not decision_record_summary_code_is_allowed(
+            persistence_intent=self.persistence_intent,
+            code=self.outcome.summary_code,
+        ):
+            raise ValueError(
+                "stored summary code conflicts with persistence intent"
+            )
+        return self
+
+
 StoredDecisionPayload = (
     _StoredDecisionPayloadV1
     | _StoredDecisionPayloadV2
     | _StoredDecisionPayloadV3
     | _StoredDecisionPayloadV4
     | _StoredDecisionPayloadV5
+    | _StoredDecisionPayloadV6
 )
 
 
@@ -555,6 +649,10 @@ class _FinalizationRejected(RuntimeError):
         super().__init__(code)
         self.code = code
         self.limitations = limitations
+
+
+class _RevalidationCancelled(RuntimeError):
+    """Internal cooperative stop signal for read-only replay workers."""
 
 
 class _FinalizationPhase(Enum):
@@ -576,6 +674,28 @@ class _FinalizationControl:
         self._phase = _FinalizationPhase.PRE_COMMIT
         self._result: DecisionResult | None = None
         self._published_at: float | None = None
+        self._cancellation_requested = threading.Event()
+        self._async_waiters: set[
+            tuple[
+                asyncio.AbstractEventLoop,
+                asyncio.Future[None],
+            ]
+        ] = set()
+
+    def request_cancellation(self) -> None:
+        """Ask a read-only replay worker to stop before its next DB stage."""
+
+        self._cancellation_requested.set()
+
+    def ensure_revalidation_active(self) -> None:
+        """Fail a replay promptly after caller or shutdown cancellation."""
+
+        if self._cancellation_requested.is_set():
+            raise _RevalidationCancelled
+        with self._lock:
+            if self._phase is _FinalizationPhase.ABORTED:
+                raise _RevalidationCancelled
+        _ensure_finalization_deadline(self.deadline)
 
     def enter_commit(self) -> None:
         """Enter the irreversible phase only at SQLAlchemy before_commit."""
@@ -674,10 +794,45 @@ class _FinalizationControl:
     def signal_done(self) -> None:
         """Expose a prepared outcome after worker resources are reusable."""
 
+        waiters: tuple[
+            tuple[
+                asyncio.AbstractEventLoop,
+                asyncio.Future[None],
+            ],
+            ...,
+        ] = ()
         with self._lock:
             if self._published_at is None:
                 self._published_at = steady_time()
                 self.done.set()
+                waiters = tuple(self._async_waiters)
+                self._async_waiters.clear()
+        for loop, future in waiters:
+            _notify_async_waiter(loop, future)
+
+    def add_async_waiter(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        future: asyncio.Future[None],
+    ) -> None:
+        """Wake an event-loop waiter when the worker releases its slot."""
+
+        notify_now = False
+        with self._lock:
+            if self.done.is_set():
+                notify_now = True
+            else:
+                self._async_waiters.add((loop, future))
+        if notify_now:
+            _notify_async_waiter(loop, future)
+
+    def remove_async_waiter(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        future: asyncio.Future[None],
+    ) -> None:
+        with self._lock:
+            self._async_waiters.discard((loop, future))
 
     def snapshot(
         self,
@@ -697,6 +852,67 @@ class _FinalizationControl:
                 self._published_at is not None
                 and self._published_at < self.deadline,
             )
+
+
+def _resolve_async_waiter(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+def _notify_async_waiter(
+    loop: asyncio.AbstractEventLoop,
+    future: asyncio.Future[None],
+) -> None:
+    if loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(_resolve_async_waiter, future)
+    except RuntimeError:
+        # The owning loop may close between is_closed() and notification.
+        pass
+
+
+async def _await_control(
+    control: _FinalizationControl,
+    *,
+    wake_at_deadline: bool,
+) -> None:
+    """Wait without event-loop timer polling or executor-thread leakage."""
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    control.add_async_waiter(loop, future)
+    deadline_timer: threading.Timer | None = None
+    if wake_at_deadline and not control.done.is_set():
+        remaining = max(0.0, control.deadline - steady_time())
+        if remaining == 0:
+            future.set_result(None)
+        else:
+            deadline_timer = threading.Timer(
+                remaining,
+                _notify_async_waiter,
+                args=(loop, future),
+            )
+            deadline_timer.daemon = True
+            deadline_timer.start()
+    try:
+        await asyncio.shield(future)
+    finally:
+        control.remove_async_waiter(loop, future)
+        if deadline_timer is not None:
+            deadline_timer.cancel()
+        if not future.done():
+            future.cancel()
+
+
+async def _await_control_until_deadline(
+    control: _FinalizationControl,
+) -> None:
+    await _await_control(control, wake_at_deadline=True)
+
+
+async def _await_control_done(control: _FinalizationControl) -> None:
+    await _await_control(control, wake_at_deadline=False)
 
 
 def decision_request_fingerprint(
@@ -825,11 +1041,7 @@ class DecisionFinalizer:
         """Finalize without occupying asyncio's non-daemon thread pool."""
 
         control = self._start_supervised_finalization(request, run)
-        while not control.done.is_set():
-            remaining = control.deadline - steady_time()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(0.01, remaining))
+        await _await_control_until_deadline(control)
         return self._supervised_result(request, run, control)
 
     def revalidate_persisted(
@@ -859,11 +1071,20 @@ class DecisionFinalizer:
             request,
             decision_record_id,
         )
-        while not control.done.is_set():
-            remaining = control.deadline - steady_time()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(0.01, remaining))
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            await _await_control_until_deadline(control)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            control.request_cancellation()
+            while not control.done.is_set():
+                try:
+                    await _await_control_done(control)
+                except asyncio.CancelledError as repeated:
+                    cancellation = repeated
+                    control.request_cancellation()
+        if cancellation is not None:
+            raise cancellation
         return self._supervised_revalidation_result(request, control)
 
     def _start_supervised_finalization(
@@ -980,7 +1201,12 @@ class DecisionFinalizer:
                 result = self._revalidate_persisted_inline(
                     request,
                     decision_record_id,
-                    deadline=control.deadline,
+                    control=control,
+                )
+            except _RevalidationCancelled:
+                result = _revalidation_failure_result(
+                    request,
+                    code=_FINALIZATION_TIMEOUT,
                 )
             except BaseException:
                 result = _revalidation_failure_result(
@@ -1160,8 +1386,9 @@ class DecisionFinalizer:
         request: DecisionRequest,
         decision_record_id: uuid.UUID,
         *,
-        deadline: float,
+        control: _FinalizationControl,
     ) -> DecisionResult:
+        deadline = control.deadline
         try:
             canonical_request = strict_model_validate(
                 DecisionRequest,
@@ -1175,15 +1402,19 @@ class DecisionFinalizer:
             )
 
         try:
-            with activity_write_lock(
-                timeout_seconds=_remaining_seconds(deadline)
-            ):
+            control.ensure_revalidation_active()
+            with _cooperative_activity_write_lock(control):
+                control.ensure_revalidation_active()
                 with self._session_factory() as session:
                     original_bind = session.bind
                     with _finalization_connection_guard(
                         session.get_bind(),
                         timeout_seconds=_remaining_seconds(deadline),
+                        cancellation_check=(
+                            control.ensure_revalidation_active
+                        ),
                     ) as guarded_connection:
+                        control.ensure_revalidation_active()
                         if guarded_connection is not None:
                             session.bind = guarded_connection
                         try:
@@ -1192,7 +1423,11 @@ class DecisionFinalizer:
                                 timeout_seconds=_remaining_seconds(
                                     deadline
                                 ),
+                                cancellation_check=(
+                                    control.ensure_revalidation_active
+                                ),
                             )
+                            control.ensure_revalidation_active()
                             statement = select(DecisionRecord).where(
                                 DecisionRecord.id
                                 == canonical_record_id,
@@ -1205,7 +1440,7 @@ class DecisionFinalizer:
                             ):
                                 statement = statement.with_for_update()
                             row = session.scalar(statement)
-                            _ensure_finalization_deadline(deadline)
+                            control.ensure_revalidation_active()
                             if (
                                 row is None
                                 or (
@@ -1228,6 +1463,7 @@ class DecisionFinalizer:
                                 row,
                                 fingerprint=fingerprint,
                             )
+                            control.ensure_revalidation_active()
                             if isinstance(stored, str):
                                 raise _FinalizationRejected(stored)
                             policy = self._resolve_policy(
@@ -1235,14 +1471,17 @@ class DecisionFinalizer:
                                 session=session,
                                 lock=True,
                             )
-                            _ensure_finalization_deadline(deadline)
+                            control.ensure_revalidation_active()
                             result = self._revalidate_stored_decision(
                                 session,
                                 canonical_request,
                                 policy=policy,
                                 stored=stored,
+                                cancellation_check=(
+                                    control.ensure_revalidation_active
+                                ),
                             )
-                            _ensure_finalization_deadline(deadline)
+                            control.ensure_revalidation_active()
                             session.rollback()
                             return result
                         finally:
@@ -1256,6 +1495,8 @@ class DecisionFinalizer:
                 code=exc.code,
                 extra_limitations=exc.limitations,
             )
+        except _RevalidationCancelled:
+            raise
         except TimeoutError:
             return _revalidation_failure_result(
                 canonical_request,
@@ -1630,11 +1871,23 @@ class DecisionFinalizer:
                                     record_id=record_id,
                                     extra_limitations=source_limitations,
                                 )
+                                (
+                                    record_summary_code,
+                                    record_summary,
+                                ) = (
+                                    _record_summary_for_storage(
+                                        run,
+                                        persistence_intent,
+                                    )
+                                )
                                 _ensure_finalization_deadline(deadline)
                                 payload = _decision_payload(
                                     request,
                                     run,
                                     result,
+                                    record_summary_code=(
+                                        record_summary_code
+                                    ),
                                     request_fingerprint=fingerprint,
                                     persistence_intent=persistence_intent,
                                     source_limitations=source_limitations,
@@ -1644,9 +1897,7 @@ class DecisionFinalizer:
                                     id=record_id,
                                     kind=DecisionKind.INSIGHT,
                                     tree=_decision_tree(result),
-                                    summary=_stored_outcome_summary(
-                                        persistence_intent
-                                    ),
+                                    summary=record_summary,
                                     llm_model=(
                                         run.runtime.model[:64]
                                         if run.runtime.model
@@ -1733,7 +1984,10 @@ class DecisionFinalizer:
         *,
         policy: ContextAccessPolicy,
         stored: _StoredDecision,
+        cancellation_check: Callable[[], None] | None = None,
     ) -> DecisionResult:
+        if cancellation_check is not None:
+            cancellation_check()
         used_ids = tuple(
             source_ref.reference_id
             for source_ref in stored.source_refs
@@ -1743,6 +1997,8 @@ class DecisionFinalizer:
             used_ids=used_ids,
             candidates=stored.candidates,
         )
+        if cancellation_check is not None:
+            cancellation_check()
         source_validation_now = _as_utc(self._clock())
         self._lock_used_ref_sources(
             session,
@@ -1752,7 +2008,10 @@ class DecisionFinalizer:
             candidates=stored.candidates,
             now=source_validation_now,
             calendar_visibility_snapshot=calendar_snapshot,
+            cancellation_check=cancellation_check,
         )
+        if cancellation_check is not None:
+            cancellation_check()
         validated_refs, source_limitations = self._revalidate_used_refs(
             session,
             request,
@@ -1763,7 +2022,10 @@ class DecisionFinalizer:
             lock_sources=False,
             now=source_validation_now,
             calendar_visibility_snapshot=calendar_snapshot,
+            cancellation_check=cancellation_check,
         )
+        if cancellation_check is not None:
+            cancellation_check()
         self._require_calendar_visibility_current(calendar_snapshot)
         if tuple(validated_refs) != stored.source_refs:
             raise _FinalizationRejected(
@@ -1847,9 +2109,14 @@ class DecisionFinalizer:
         candidates: SourceCandidates,
         now: datetime,
         calendar_visibility_snapshot: CalendarVisibility | None,
+        cancellation_check: Callable[[], None] | None = None,
     ) -> None:
+        if cancellation_check is not None:
+            cancellation_check()
         lock_refs: dict[str, SourceRef] = {}
         for reference_id in used_ids:
+            if cancellation_check is not None:
+                cancellation_check()
             for attempt in candidates.get(
                 reference_id,
                 (),
@@ -1865,6 +2132,8 @@ class DecisionFinalizer:
             now=now,
             calendar_visibility_snapshot=calendar_visibility_snapshot,
         )
+        if cancellation_check is not None:
+            cancellation_check()
 
     def _revalidate_used_refs(
         self,
@@ -1878,7 +2147,10 @@ class DecisionFinalizer:
         lock_sources: bool,
         now: datetime | None = None,
         calendar_visibility_snapshot: CalendarVisibility | None,
+        cancellation_check: Callable[[], None] | None = None,
     ) -> tuple[tuple[SourceRef, ...], tuple[str, ...]]:
+        if cancellation_check is not None:
+            cancellation_check()
         if not used_ids:
             return (), ()
 
@@ -1907,10 +2179,14 @@ class DecisionFinalizer:
             entry.query_id: entry for entry in access_trace
         }
         for reference_id in used_ids:
+            if cancellation_check is not None:
+                cancellation_check()
             attempts = candidates.get(reference_id, ())
             accepted: SourceRef | None = None
             rejected_reasons: set[str] = set()
             for attempt in attempts:
+                if cancellation_check is not None:
+                    cancellation_check()
                 candidate = next(
                     (
                         source_ref
@@ -1938,6 +2214,8 @@ class DecisionFinalizer:
                         calendar_visibility_snapshot
                     ),
                 )
+                if cancellation_check is not None:
+                    cancellation_check()
                 rejected_reasons.update(reasons)
                 if checked is not None:
                     accepted = checked
@@ -2187,7 +2465,8 @@ def _stored_decision(
                 payload,
                 _StoredDecisionPayloadV3
                 | _StoredDecisionPayloadV4
-                | _StoredDecisionPayloadV5,
+                | _StoredDecisionPayloadV5
+                | _StoredDecisionPayloadV6,
             )
             and row.retention_basis_at is None
         )
@@ -2241,8 +2520,12 @@ def _validate_stored_payload(
         payload = _StoredDecisionPayloadV4.model_validate(
             normalized.value
         )
-    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+    elif schema_name == _LEGACY_DECISION_PAYLOAD_SCHEMA_V5:
         payload = _StoredDecisionPayloadV5.model_validate(
+            normalized.value
+        )
+    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+        payload = _StoredDecisionPayloadV6.model_validate(
             normalized.value
         )
     else:
@@ -2319,14 +2602,16 @@ def _result_from_stored_outcome(
         _StoredDecisionPayloadV3
         | _StoredDecisionPayloadV4
         | _StoredDecisionPayloadV5
+        | _StoredDecisionPayloadV6
     ),
 ) -> DecisionResult:
     outcome = payload.outcome
-    answer = (
-        outcome.record_summary
-        if isinstance(outcome, _StoredDecisionOutcome)
-        else outcome.summary
-    )
+    if isinstance(outcome, _StoredDecisionOutcomeV6):
+        answer = decision_record_summary(outcome.summary_code)
+    elif isinstance(outcome, _StoredDecisionOutcome):
+        answer = outcome.record_summary
+    else:
+        answer = outcome.summary
     return DecisionResult(
         request_id=payload.request.request_id,
         turn_id=payload.request.turn_id,
@@ -2350,9 +2635,12 @@ def _stored_row_summary(
     payload: StoredDecisionPayload,
     result: DecisionResult,
 ) -> str:
+    if isinstance(payload, _StoredDecisionPayloadV6):
+        return decision_record_summary(payload.outcome.summary_code)
     if isinstance(
         payload,
-        _StoredDecisionPayloadV4 | _StoredDecisionPayloadV5,
+        _StoredDecisionPayloadV4
+        | _StoredDecisionPayloadV5,
     ):
         return payload.outcome.record_summary
     return _public_summary(result)
@@ -2613,15 +2901,14 @@ def _decision_payload(
     run: DecisionAgentRun,
     result: DecisionResult,
     *,
+    record_summary_code: DecisionRecordSummaryCode,
     request_fingerprint: str,
     persistence_intent: DecisionPersistenceIntent,
     source_limitations: Sequence[str],
 ) -> dict[str, Any]:
-    stored_outcome = _StoredDecisionOutcome(
+    stored_outcome = _StoredDecisionOutcomeV6(
         status=result.status,
-        record_summary=_stored_outcome_summary(
-            persistence_intent
-        ),
+        summary_code=record_summary_code,
         proposed_action=result.proposed_action,
         limitation_codes=_sanitized_limitation_codes(
             _tool_trace_limitations(run.tool_trace),
@@ -2645,7 +2932,7 @@ def _decision_payload(
         attestation.query.query_id
         for attestation in source_attestations
     }
-    payload_model = _StoredDecisionPayloadV5(
+    payload_model = _StoredDecisionPayloadV6(
         schema_name=DECISION_PAYLOAD_SCHEMA,
         request_fingerprint=request_fingerprint,
         request=_StoredDecisionRequestMetadata(
@@ -2695,6 +2982,27 @@ def _stored_outcome_summary(
     ):
         return "A wellness decision was explicitly tracked."
     raise ValueError("unsupported stored decision persistence intent")
+
+
+def _record_summary_for_storage(
+    run: DecisionAgentRun,
+    persistence_intent: DecisionPersistenceIntent,
+) -> tuple[DecisionRecordSummaryCode, str]:
+    """Return a validated code and its deterministic compact conclusion."""
+
+    code = run.draft.record_summary_code
+    if code is None:
+        raise _FinalizationRejected(
+            "decision_record_summary_code_required"
+        )
+    if not decision_record_summary_code_is_allowed(
+        persistence_intent=persistence_intent,
+        code=code,
+    ):
+        raise _FinalizationRejected(
+            "invalid_decision_finalization_input"
+        )
+    return code, decision_record_summary(code)
 
 
 def _sanitized_limitation_codes(
@@ -2900,6 +3208,7 @@ def _begin_finalization_transaction(
     session: Session,
     *,
     timeout_seconds: float,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     if timeout_seconds <= 0:
         raise TimeoutError("decision finalization deadline expired")
@@ -2910,7 +3219,10 @@ def _begin_finalization_transaction(
         lock_activity_write_plane(
             session,
             timeout_seconds=timeout_seconds,
+            cancellation_check=cancellation_check,
         )
+        if cancellation_check is not None:
+            cancellation_check()
         _begin_sqlite_immediate(
             session,
             timeout_seconds=timeout_seconds,
@@ -2931,6 +3243,7 @@ def _finalization_connection_guard(
     bind: Engine | Connection,
     *,
     timeout_seconds: float,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> Iterator[Connection | None]:
     """Keep SQLite checkouts alive through connection-local timeout cleanup."""
 
@@ -2944,8 +3257,23 @@ def _finalization_connection_guard(
     with postgres_activity_write_plane_guard(
         bind,
         timeout_seconds=timeout_seconds,
+        cancellation_check=cancellation_check,
     ) as connection:
         yield connection
+
+
+@contextmanager
+def _cooperative_activity_write_lock(
+    control: _FinalizationControl,
+) -> Iterator[None]:
+    """Poll the process lock so replay cancellation releases capacity quickly."""
+
+    with activity_write_lock(
+        timeout_seconds=_remaining_seconds(control.deadline),
+        cancellation_check=control.ensure_revalidation_active,
+    ):
+        control.ensure_revalidation_active()
+        yield
 
 
 def _begin_sqlite_immediate(

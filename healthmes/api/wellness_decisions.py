@@ -18,13 +18,11 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
-from sqlalchemy import select
 
 from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
 )
-from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError
 from healthmes.decision import (
     DECISION_DOMAINS,
@@ -35,6 +33,7 @@ from healthmes.decision import (
     DecisionIdempotencyExpiredError,
     DecisionIdempotencyUnavailableError,
     DecisionIngress,
+    DecisionRecoveryNotFoundError,
     DecisionResult,
     DecisionRuntimeNotConfiguredError,
     DecisionServiceRequest,
@@ -44,14 +43,9 @@ from healthmes.decision import (
     RuntimeMetadata,
     SourceRef,
     decision_rest_request_id,
-    decision_result_from_record,
     list_decision_domain_policies,
     resolve_decision_execution_scope,
     update_decision_domain_policy,
-)
-from healthmes.store import DecisionRecord
-from healthmes.store.decision_records import (
-    decision_record_is_available_at,
 )
 from healthmes.store.session import SessionDep
 
@@ -67,6 +61,7 @@ _SERVICE_UNAVAILABLE_REASON_CODES = frozenset(
         "decision_finalization_capacity_exhausted",
         "decision_finalization_timeout",
         "decision_record_persistence_failed",
+        "decision_record_summary_code_required",
         "invalid_decision_revalidation_input",
         "decision_request_id_conflict",
         "decision_run_request_mismatch",
@@ -221,6 +216,9 @@ async def _wait_for_http_disconnect(request: Request) -> None:
         message = await request.receive()
         if message["type"] == "http.disconnect":
             return
+        # Some transports repeatedly expose the consumed http.request
+        # message. Yield explicitly so cancellation cannot become a busy-loop.
+        await asyncio.sleep(0)
 
 
 async def _run_until_http_disconnect[T](
@@ -325,33 +323,69 @@ def put_wellness_decision_setting(
     "/{request_id}",
     response_model=WellnessDecisionOutput,
 )
-def get_wellness_decision_result(
+async def get_wellness_decision_result(
     request_id: uuid.UUID,
-    session: SessionDep,
+    request: Request,
 ) -> WellnessDecisionOutput:
     """Recover a committed result after a 202 outcome-unknown response."""
 
-    now = utc_now()
-    record = session.scalar(
-        select(DecisionRecord).where(
-            DecisionRecord.decision_request_id == request_id,
-            decision_record_is_available_at(now),
+    decision_service = request.app.state.decision_service
+    recover = getattr(decision_service, "recover_wellness", None)
+    if not callable(recover):
+        raise APIError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "decision_runtime_not_configured",
+            "The HealthMes decision runtime is not configured.",
         )
-    )
-    if record is None:
+    try:
+        result = await _run_until_http_disconnect(
+            request,
+            recover(request_id),
+        )
+    except DecisionRecoveryNotFoundError as exc:
+        raise APIError(
+            status.HTTP_404_NOT_FOUND,
+            "wellness_decision_not_found",
+            "Wellness decision is not available.",
+        ) from exc
+    except DecisionRuntimeNotConfiguredError as exc:
+        raise APIError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "decision_runtime_not_configured",
+            "The HealthMes decision runtime is not configured.",
+        ) from exc
+    except DecisionEngineBusyError as exc:
+        raise APIError(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "decision_engine_busy",
+            "The HealthMes decision engine is at capacity.",
+        ) from exc
+    except DecisionEngineClosedError as exc:
+        raise APIError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "decision_engine_closing",
+            "The HealthMes decision engine is shutting down.",
+        ) from exc
+
+    if (
+        result.status in {DecisionStatus.BLOCKED, DecisionStatus.FAILED}
+        and "decision_record_not_available" in result.limitations
+    ):
         raise APIError(
             status.HTTP_404_NOT_FOUND,
             "wellness_decision_not_found",
             "Wellness decision is not available.",
         )
-    try:
-        result = decision_result_from_record(record, now=now)
-    except ValueError as exc:
+    if result.status in {
+        DecisionStatus.BLOCKED,
+        DecisionStatus.FAILED,
+    }:
         raise APIError(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "decision_record_contract_invalid",
-            "The stored wellness decision could not be verified.",
-        ) from exc
+            "decision_service_unavailable",
+            "The stored wellness decision could not be revalidated.",
+            detail={"reason_codes": list(result.limitations)},
+        )
     return WellnessDecisionOutput.from_result(result)
 
 

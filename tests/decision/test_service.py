@@ -781,7 +781,11 @@ def test_sqlite_expired_lease_preserves_first_committed_result(
     assert first_claim.lease_generation is not None
     assert takeover_claim.lease_generation is not None
 
-    canonical = {"schema": "test", "winner": "takeover"}
+    canonical = {
+        "schema": "healthmes.decision-receipt.v2",
+        "kind": "transient_result",
+        "result": {"winner": "takeover"},
+    }
     store.complete(
         request_id=request_id,
         fingerprint=fingerprint,
@@ -795,7 +799,11 @@ def test_sqlite_expired_lease_preserves_first_committed_result(
         fingerprint=fingerprint,
         owner_token=first_owner,
         lease_generation=first_claim.lease_generation,
-        result_payload={"schema": "test", "winner": "expired-owner"},
+        result_payload={
+            "schema": "healthmes.decision-receipt.v2",
+            "kind": "transient_result",
+            "result": {"winner": "expired-owner"},
+        },
         now=NOW + timedelta(seconds=3),
     )
 

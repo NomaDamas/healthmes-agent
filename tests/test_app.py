@@ -8,16 +8,24 @@ gated on ``Settings.scheduler_enabled``.
 """
 
 import asyncio
+import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from healthmes import __version__
 from healthmes.activity.maintenance import ACTIVITY_MAINTENANCE_JOB_ID
-from healthmes.app import create_app
+from healthmes.app import (
+    _run_mandatory_decision_receipt_maintenance,
+    create_app,
+)
 from healthmes.config import Settings
 from healthmes.engine.scheduler import (
     ACTIVITYWATCH_JOB_ID,
@@ -29,7 +37,14 @@ from healthmes.engine.scheduler import (
     TRIGGER_JOB_ID,
 )
 from healthmes.mcp_server import server as mcp_server
-from healthmes.store import Base, get_engine
+from healthmes.store import (
+    Base,
+    DecisionRequestReceipt,
+    create_db_engine,
+    dispose_engine,
+    get_engine,
+    init_engine,
+)
 from healthmes.store import session as store_session
 
 _MCP_INITIALIZE = {
@@ -43,6 +58,28 @@ _MCP_INITIALIZE = {
     },
 }
 _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
+
+
+def _completed_receipt(
+    *,
+    now: datetime,
+    payload: dict,
+    retention_basis_at: datetime | None = None,
+    result_expires_at: datetime | None = None,
+) -> DecisionRequestReceipt:
+    basis = retention_basis_at or now
+    return DecisionRequestReceipt(
+        request_id=uuid.uuid4(),
+        request_fingerprint=uuid.uuid4().hex * 2,
+        requested_at=now,
+        state="completed",
+        result_payload=payload,
+        result_expires_at=(
+            result_expires_at or now + timedelta(days=30)
+        ),
+        retention_basis_at=basis,
+        expires_at=now + timedelta(days=30),
+    )
 
 
 def test_create_app_returns_fastapi_with_settings_on_state(settings: Settings) -> None:
@@ -488,6 +525,256 @@ class TestStoreWiring:
         assert mcp_server._settings_override is None
         assert store_session._engine is None
         assert store_session._session_factory is None
+
+
+def test_startup_compacts_legacy_and_scrubs_expired_transient_receipts(
+    settings,
+) -> None:
+    now = datetime.now(UTC)
+    database_url = (
+        f"sqlite+pysqlite:///{settings.data_dir / 'receipt-startup.db'}"
+    )
+    database = create_db_engine(database_url)
+    Base.metadata.create_all(database)
+    record_id = uuid.uuid4()
+    legacy = _completed_receipt(
+        now=now,
+        payload={
+            "schema": "healthmes.decision-receipt.v1",
+            "result": {
+                "answer": "legacy sensitive answer",
+                "persistence_status": "persisted",
+                "decision_record_id": str(record_id),
+            },
+        },
+    )
+    expired = _completed_receipt(
+        now=now,
+        retention_basis_at=now - timedelta(minutes=15),
+        payload={
+            "schema": "healthmes.decision-receipt.v2",
+            "kind": "transient_result",
+            "result": {"answer": "expired transient answer"},
+        },
+    )
+    malformed = DecisionRequestReceipt(
+        request_id=uuid.uuid4(),
+        request_fingerprint=uuid.uuid4().hex * 2,
+        requested_at=now,
+        state="completed",
+        result_payload=["malformed sensitive answer"],
+        result_expires_at=now + timedelta(days=30),
+        retention_basis_at=now - timedelta(minutes=15),
+        expires_at=now + timedelta(days=30),
+    )
+    forged_pointer = _completed_receipt(
+        now=now,
+        retention_basis_at=now - timedelta(minutes=15),
+        payload={
+            "schema": "healthmes.decision-receipt.v2",
+            "kind": "decision_record",
+            "decision_record_id": "not-a-uuid",
+            "result": {"answer": "forged pointer sensitive answer"},
+        },
+    )
+    with Session(database) as session:
+        session.add_all(
+            (legacy, expired, malformed, forged_pointer)
+        )
+        session.commit()
+        legacy_id = legacy.id
+        expired_id = expired.id
+        malformed_id = malformed.id
+        forged_pointer_id = forged_pointer.id
+    database.dispose()
+
+    configured = settings.model_copy(
+        update={"database_url": database_url}
+    )
+    app = create_app(configured)
+    with TestClient(app):
+        assert app.state.scheduler is None
+        with store_session.session_scope() as session:
+            compacted = session.get(
+                DecisionRequestReceipt,
+                legacy_id,
+            )
+            scrubbed = session.get(
+                DecisionRequestReceipt,
+                expired_id,
+            )
+            rejected = session.get(
+                DecisionRequestReceipt,
+                malformed_id,
+            )
+            forged = session.get(
+                DecisionRequestReceipt,
+                forged_pointer_id,
+            )
+            assert compacted is not None
+            assert compacted.result_payload == {
+                "schema": "healthmes.decision-receipt.v2",
+                "kind": "decision_record",
+                "decision_record_id": str(record_id),
+            }
+            assert "legacy sensitive answer" not in str(
+                compacted.result_payload
+            )
+            assert scrubbed is not None
+            assert scrubbed.state == "tombstone"
+            assert scrubbed.result_payload is None
+            assert scrubbed.result_expires_at is None
+            assert rejected is not None
+            assert rejected.state == "tombstone"
+            assert rejected.result_payload is None
+            assert rejected.result_expires_at is None
+            assert forged is not None
+            assert forged.state == "tombstone"
+            assert forged.result_payload is None
+            assert forged.result_expires_at is None
+
+
+def test_recurring_receipt_scrub_runs_with_scheduler_disabled(
+    settings,
+    monkeypatch,
+) -> None:
+    import healthmes.app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "_DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS",
+        0.01,
+    )
+    configured = settings.model_copy(
+        update={
+            "database_url": (
+                f"sqlite+pysqlite:///"
+                f"{settings.data_dir / 'receipt-recurring.db'}"
+            )
+        }
+    )
+    app = create_app(configured)
+    with TestClient(app):
+        assert app.state.scheduler is None
+        assert app.state.decision_receipt_maintenance_task is not None
+        now = datetime.now(UTC)
+        receipt = _completed_receipt(
+            now=now,
+            payload={
+                "schema": "healthmes.decision-receipt.v1",
+                "result": {
+                    "answer": "recurring sensitive answer",
+                    "persistence_status": "persisted",
+                    "decision_record_id": str(uuid.uuid4()),
+                },
+            },
+        )
+        with store_session.session_scope() as session:
+            session.add(receipt)
+            session.flush()
+            receipt_id = receipt.id
+
+        deadline = time.monotonic() + 2
+        stored_payload = None
+        while time.monotonic() < deadline:
+            with store_session.session_scope() as session:
+                stored = session.get(
+                    DecisionRequestReceipt,
+                    receipt_id,
+                )
+                assert stored is not None
+                if (
+                    isinstance(stored.result_payload, dict)
+                    and stored.result_payload.get("schema")
+                    == "healthmes.decision-receipt.v2"
+                ):
+                    stored_payload = dict(stored.result_payload)
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("recurring receipt maintenance did not run")
+
+        assert "recurring sensitive answer" not in str(
+            stored_payload
+        )
+
+
+def test_mandatory_receipt_maintenance_commits_bounded_progress(
+    settings,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "database_url": (
+                f"sqlite+pysqlite:///"
+                f"{settings.data_dir / 'receipt-bounded.db'}"
+            )
+        }
+    )
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
+    now = datetime.now(UTC)
+    try:
+        with store_session.session_scope() as session:
+            session.add_all(
+                _completed_receipt(
+                    now=now,
+                    payload={
+                        "schema": "healthmes.decision-receipt.v1",
+                        "result": {
+                            "answer": f"sensitive answer {index}",
+                            "persistence_status": "persisted",
+                            "decision_record_id": str(uuid.uuid4()),
+                        },
+                    },
+                )
+                for index in range(3)
+            )
+
+        processed, cursor = (
+            _run_mandatory_decision_receipt_maintenance(
+                now=now,
+                batch_size=1,
+                max_rows=2,
+            )
+        )
+        assert processed == 2
+        assert cursor is not None
+        with store_session.session_scope() as session:
+            remaining = session.scalar(
+                select(DecisionRequestReceipt)
+                .where(
+                    DecisionRequestReceipt.result_payload[
+                        "schema"
+                    ].as_string()
+                    == "healthmes.decision-receipt.v1"
+                )
+                .limit(1)
+            )
+            assert remaining is not None
+
+        processed, cursor = (
+            _run_mandatory_decision_receipt_maintenance(
+                now=now,
+                batch_size=1,
+                max_rows=2,
+                after_id=cursor,
+            )
+        )
+        assert processed == 1
+        assert cursor is None
+        with store_session.session_scope() as session:
+            assert session.scalar(
+                select(DecisionRequestReceipt)
+                .where(
+                    DecisionRequestReceipt.result_payload[
+                        "schema"
+                    ].as_string()
+                    == "healthmes.decision-receipt.v1"
+                )
+                .limit(1)
+            ) is None
+    finally:
+        dispose_engine()
 
 
 class TestMcpWiring:

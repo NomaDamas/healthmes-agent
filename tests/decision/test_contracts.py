@@ -20,6 +20,7 @@ from healthmes.decision import (
     DecisionContextHints,
     DecisionDraft,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
@@ -484,6 +485,9 @@ def test_action_draft_requires_valid_source_reference():
         status=DecisionStatus.COMPLETED,
         answer="Take a short break before deciding.",
         record_summary="Pause briefly before making the next choice.",
+        record_summary_code=(
+            DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+        ),
         proposed_action=True,
         persistence_intent=DecisionPersistenceIntent.ACTION,
         used_source_ref_ids=[reference_id],
@@ -495,6 +499,9 @@ def test_action_draft_requires_valid_source_reference():
             status=DecisionStatus.COMPLETED,
             answer="Take a break.",
             record_summary="Pause before continuing.",
+            record_summary_code=(
+                DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+            ),
             proposed_action=True,
             persistence_intent=DecisionPersistenceIntent.ACTION,
         )
@@ -540,6 +547,35 @@ def test_record_summary_is_bounded_and_completed_only():
             status=DecisionStatus.NEEDS_CLARIFICATION,
             clarification_question="Which drink?",
             record_summary=summary,
+        )
+
+
+def test_persisted_draft_requires_compatible_record_summary_code():
+    reference_id = _source_ref().reference_id
+    with pytest.raises(
+        ValidationError,
+        match="record_summary_code",
+    ):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="Take a break.",
+            proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=[reference_id],
+        )
+    with pytest.raises(
+        ValidationError,
+        match="incompatible",
+    ):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="Take a break.",
+            record_summary_code=(
+                DecisionRecordSummaryCode.TRACK_FOR_REVIEW
+            ),
+            proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=[reference_id],
         )
 
 

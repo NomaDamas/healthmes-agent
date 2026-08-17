@@ -22,11 +22,14 @@ from healthmes.decision import (
     ContextAccessLayer,
     ContextAccessPolicy,
     ContextCapability,
+    ContextCoverage,
+    ContextFreshness,
     ContextProviderMetadata,
     ContextProviderRegistry,
     ContextQuery,
     ContextResult,
     ContextStatus,
+    CoverageStatus,
     DecisionAgentRun,
     DecisionBudget,
     DecisionCaller,
@@ -36,11 +39,13 @@ from healthmes.decision import (
     DecisionFinalizer,
     DecisionIdempotencyUnavailableError,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
     DomainAccessGrant,
     ExecutionScope,
+    FreshnessStatus,
     HealthMesDecisionEngine,
     HermesHttpResponsesTransport,
     HermesResponsesDecisionAgent,
@@ -49,14 +54,17 @@ from healthmes.decision import (
     PrivacyLevel,
     RuntimeMetadata,
     RuntimeStepOutput,
+    SourceRef,
     ToolCallRecord,
     ToolCallStatus,
 )
+from healthmes.decision.access import _current_source_content_digest
 from healthmes.decision.agent import HealthMesDecisionAgent
 from healthmes.store import (
     Base,
     DecisionKind,
     DecisionRecord,
+    WellnessEvent,
     create_db_engine,
     dispose_engine,
     get_session_factory,
@@ -208,6 +216,179 @@ class UnknownPersistenceDecisionEngine:
             persistence_status=PersistenceStatus.UNKNOWN,
             runtime=RuntimeMetadata(runtime="healthmes-finalizer"),
         )
+
+
+class StoredRecoveryNutritionProvider:
+    metadata = ContextProviderMetadata(
+        provider_id="nutrition",
+        domain="nutrition",
+        description="Stored nutrition context for GET recovery tests.",
+        capabilities=(
+            ContextCapability(
+                capability="nutrition.summary",
+                description="Read a retained nutrition summary.",
+                granularities=("summary",),
+                query_fields=("start", "end", "timezone"),
+                output_fields=("caffeine_mg",),
+                max_lookback_days=7,
+                sensitivity="nutrition",
+                freshness_expectation="Stored event timestamp.",
+            ),
+        ),
+    )
+
+    async def query(self, _session, _query, *, now):
+        del now
+        raise AssertionError("GET recovery must not rerun providers")
+
+
+def _persist_source_backed_recovery_decision(
+    *,
+    now: datetime,
+    policy_resolver,
+) -> tuple[
+    DecisionRequest,
+    DecisionResult,
+    DecisionFinalizer,
+    ContextProviderRegistry,
+    uuid.UUID,
+]:
+    observed_at = now - timedelta(hours=1)
+    observed_end = now - timedelta(minutes=30)
+    with session_scope() as session:
+        event = WellnessEvent(
+            event_type="nutrition.observation.v1",
+            schema_version=1,
+            observed_at=observed_at,
+            recorded_at=observed_at + timedelta(minutes=1),
+            timezone="UTC",
+            source_provider="healthmes-intake",
+            source_device=None,
+            source_record_id=uuid.uuid4().hex,
+            capture_method="text",
+            quality_flags={},
+            confidence=0.9,
+            coverage=1.0,
+            sensitivity="nutrition",
+            consent_scope="personal",
+            payload={
+                "window": {
+                    "start": observed_at.isoformat(),
+                    "end": observed_end.isoformat(),
+                },
+                "caffeine_mg": 80,
+            },
+            derived_from=None,
+        )
+        session.add(event)
+        session.flush()
+        source_ref = SourceRef(
+            domain="nutrition",
+            resource_type=event.event_type,
+            record_id=str(event.id),
+            source_provider=event.source_provider,
+            observed_start=event.observed_at,
+            observed_end=observed_end,
+            schema_version=event.schema_version,
+            derived_by="nutrition.summary.v1",
+            freshness=FreshnessStatus.CURRENT,
+            coverage=event.coverage,
+            sensitivity=event.sensitivity,
+        )
+        digest = _current_source_content_digest(session, source_ref)
+        assert digest is not None
+        source_ref = source_ref.model_copy(
+            update={"content_digest": digest},
+            deep=True,
+        )
+        event_id = event.id
+
+    request = DecisionRequest(
+        question="Should I pause before having more caffeine?",
+        requested_at=now,
+        timezone="UTC",
+        caller=DecisionCaller(
+            principal_id="rest-owner",
+            authenticated=True,
+            execution_scope=ExecutionScope.LOCAL,
+            channel="rest",
+        ),
+    )
+    query = ContextQuery(
+        provider_id="nutrition",
+        capability="nutrition.summary",
+        start=now - timedelta(hours=2),
+        end=now,
+        timezone="UTC",
+    )
+    result = ContextResult(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        status=ContextStatus.OK,
+        payload={"caffeine_mg": 80},
+        source_refs=(source_ref,),
+        freshness=ContextFreshness(
+            status=FreshnessStatus.CURRENT,
+            as_of=now,
+            age_seconds=0,
+        ),
+        coverage=ContextCoverage(
+            status=CoverageStatus.COMPLETE,
+            ratio=1,
+        ),
+    )
+    run = DecisionAgentRun(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        draft=DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="Delay the next coffee and reassess after a short pause.",
+            record_summary="Take a short restorative break first.",
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=(source_ref.reference_id,),
+            confidence=0.8,
+        ),
+        source_refs=(source_ref,),
+        runtime=RuntimeMetadata(
+            runtime="scripted",
+            model="api-source-recovery-v1",
+        ),
+        steps_used=1,
+        tool_trace=(
+            ToolCallRecord(
+                query=query,
+                status=ToolCallStatus.COMPLETED,
+                started_at=now,
+                finished_at=now,
+                result=result,
+            ),
+        ),
+        system_policy_version="healthmes-decision-policy.api-recovery-test",
+        started_at=now,
+        finished_at=now,
+    )
+    registry = ContextProviderRegistry(
+        (StoredRecoveryNutritionProvider(),)
+    )
+    finalizer = DecisionFinalizer(
+        access_layer=ContextAccessLayer(
+            registry,
+            clock=lambda: now,
+        ),
+        session_factory=get_session_factory(),
+        policy_resolver=policy_resolver,
+        fingerprint_key=FINGERPRINT_KEY,
+        clock=lambda: now,
+    )
+    persisted = finalizer.finalize(request, run)
+    assert persisted.persistence_status is PersistenceStatus.PERSISTED
+    assert persisted.decision_record_id is not None
+    return request, persisted, finalizer, registry, event_id
 
 
 class MissingResponsesTransport:
@@ -1106,114 +1287,125 @@ def test_unknown_commit_outcome_returns_202_and_recovery_location(
 def test_decision_recovery_returns_compact_persisted_result(
     settings,
 ) -> None:
+    settings = settings.model_copy(
+        update={"decision_owner_principal_id": "rest-owner"}
+    )
     app = create_app(settings)
     sensitive_answer = "Private recovery marker: take a short break."
+    writer_finalizer = None
 
-    with TestClient(
-        app,
-        base_url="http://127.0.0.1:8100",
-        client=("127.0.0.1", 43123),
-    ) as client:
-        assert client.get(
-            f"/v1/wellness-decisions/{uuid.uuid4()}"
-        ).status_code == 404
-        with freeze_time("2026-08-16 12:00:00"):
-            current = datetime.now(UTC)
-            decision_request = DecisionRequest(
-                question="Track this private recovery-marker check-in.",
-                requested_at=current,
-                timezone="UTC",
-                persistence_requested=True,
-                caller=DecisionCaller(
-                    principal_id="rest-owner",
-                    authenticated=True,
-                    execution_scope=ExecutionScope.LOCAL,
-                    channel="rest",
-                ),
-            )
-            run = DecisionAgentRun(
-                request_id=decision_request.request_id,
-                turn_id=decision_request.turn_id,
-                draft=DecisionDraft(
-                    status=DecisionStatus.COMPLETED,
-                    answer=sensitive_answer,
-                    persistence_intent=(
-                        DecisionPersistenceIntent.EXPLICIT_TRACKING
+    try:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            assert client.get(
+                f"/v1/wellness-decisions/{uuid.uuid4()}"
+            ).status_code == 404
+            with freeze_time("2026-08-16 12:00:00"):
+                current = datetime.now(UTC)
+                decision_request = DecisionRequest(
+                    question="Track this private recovery-marker check-in.",
+                    requested_at=current,
+                    timezone="UTC",
+                    persistence_requested=True,
+                    caller=DecisionCaller(
+                        principal_id="rest-owner",
+                        authenticated=True,
+                        execution_scope=ExecutionScope.LOCAL,
+                        channel="rest",
                     ),
-                    confidence=0.75,
-                ),
-                runtime=RuntimeMetadata(
-                    runtime="scripted",
-                    model="api-replay-v1",
-                    input_tokens=3,
-                    output_tokens=2,
-                ),
-                steps_used=1,
-                system_policy_version=(
-                    "healthmes-decision-policy.api-replay-test"
-                ),
-                started_at=current,
-                finished_at=current,
-            )
-            policy = ContextAccessPolicy(
-                owner_principal_id="rest-owner",
-                grants=(),
-            )
-            finalizer = DecisionFinalizer(
-                access_layer=ContextAccessLayer(
-                    ContextProviderRegistry(),
+                )
+                run = DecisionAgentRun(
+                    request_id=decision_request.request_id,
+                    turn_id=decision_request.turn_id,
+                    draft=DecisionDraft(
+                        status=DecisionStatus.COMPLETED,
+                        answer=sensitive_answer,
+                        record_summary=(
+                            "Take a short restorative break now."
+                        ),
+                        record_summary_code=(
+                            DecisionRecordSummaryCode.TRACK_FOR_REVIEW
+                        ),
+                        persistence_intent=(
+                            DecisionPersistenceIntent.EXPLICIT_TRACKING
+                        ),
+                        confidence=0.75,
+                    ),
+                    runtime=RuntimeMetadata(
+                        runtime="scripted",
+                        model="api-replay-v1",
+                        input_tokens=3,
+                        output_tokens=2,
+                    ),
+                    steps_used=1,
+                    system_policy_version=(
+                        "healthmes-decision-policy.api-replay-test"
+                    ),
+                    started_at=current,
+                    finished_at=current,
+                )
+                policy = ContextAccessPolicy(
+                    owner_principal_id="rest-owner",
+                    grants=(),
+                )
+                writer_finalizer = DecisionFinalizer(
+                    access_layer=ContextAccessLayer(
+                        ContextProviderRegistry(),
+                        clock=lambda: current,
+                    ),
+                    session_factory=get_session_factory(),
+                    policy_resolver=lambda _request: policy,
+                    fingerprint_key=FINGERPRINT_KEY,
                     clock=lambda: current,
-                ),
-                session_factory=get_session_factory(),
-                policy_resolver=lambda _request: policy,
-                fingerprint_key=FINGERPRINT_KEY,
-                clock=lambda: current,
-            )
-            try:
-                persisted = finalizer.finalize(
+                )
+                persisted = writer_finalizer.finalize(
                     decision_request,
                     run,
                 )
-            finally:
-                finalizer.close()
 
-            assert persisted.status is DecisionStatus.COMPLETED
-            assert (
-                persisted.persistence_status
-                is PersistenceStatus.PERSISTED
-            )
-            assert persisted.decision_record_id is not None
-            with session_scope() as session:
-                row = session.scalar(
-                    select(DecisionRecord).where(
-                        DecisionRecord.decision_request_id
-                        == decision_request.request_id
-                    )
-                )
-                assert row is not None
-                assert row.decision_payload is not None
+                assert persisted.status is DecisionStatus.COMPLETED
                 assert (
-                    row.decision_payload["schema"]
-                    == DECISION_PAYLOAD_SCHEMA
+                    persisted.persistence_status
+                    is PersistenceStatus.PERSISTED
                 )
-                serialized = json.dumps(
-                    row.decision_payload,
-                    sort_keys=True,
-                )
-                assert sensitive_answer not in serialized
-                assert decision_request.question not in serialized
-                assert "tool_trace" not in row.decision_payload
+                assert persisted.decision_record_id is not None
+                with session_scope() as session:
+                    row = session.scalar(
+                        select(DecisionRecord).where(
+                            DecisionRecord.decision_request_id
+                            == decision_request.request_id
+                        )
+                    )
+                    assert row is not None
+                    assert row.decision_payload is not None
+                    assert (
+                        row.decision_payload["schema"]
+                        == DECISION_PAYLOAD_SCHEMA
+                    )
+                    serialized = json.dumps(
+                        row.decision_payload,
+                        sort_keys=True,
+                    )
+                    assert sensitive_answer not in serialized
+                    assert decision_request.question not in serialized
+                    assert "tool_trace" not in row.decision_payload
 
-            response = client.get(
-                f"/v1/wellness-decisions/{decision_request.request_id}"
-            )
+                response = client.get(
+                    f"/v1/wellness-decisions/{decision_request.request_id}"
+                )
+    finally:
+        if writer_finalizer is not None:
+            writer_finalizer.close()
 
     assert response.status_code == 200
     assert response.json() == {
         "request_id": str(decision_request.request_id),
         "turn_id": str(decision_request.turn_id),
         "status": "completed",
-        "answer": "A wellness decision was explicitly tracked.",
+        "answer": "Keep this wellness item tracked for later review.",
         "proposed_action": False,
         "source_refs": [],
         "limitations": ["decision_response_compacted"],
@@ -1231,6 +1423,86 @@ def test_decision_recovery_returns_compact_persisted_result(
             "output_tokens": 2,
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_limitation"),
+    (
+        ("delete_source", "source_ref_record_missing"),
+        ("expire_source", "source_ref_expired"),
+        ("revoke_consent", "domain_consent_denied"),
+        ("disable_provider", "provider_disabled"),
+    ),
+)
+def test_get_recovery_revalidates_current_source_access(
+    settings,
+    mutation,
+    expected_limitation,
+) -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    policy_state = {"enabled": True}
+
+    def resolve_policy(_request):
+        return ContextAccessPolicy(
+            owner_principal_id="rest-owner",
+            grants=(
+                DomainAccessGrant(
+                    domain="nutrition",
+                    enabled=policy_state["enabled"],
+                ),
+            ),
+        )
+
+    configured = settings.model_copy(
+        update={"decision_owner_principal_id": "rest-owner"}
+    )
+    app = create_app(configured, decision_clock=lambda: now)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        (
+            request,
+            persisted,
+            finalizer,
+            registry,
+            event_id,
+        ) = _persist_source_backed_recovery_decision(
+            now=now,
+            policy_resolver=resolve_policy,
+        )
+        app.state.decision_recovery_finalizer = finalizer
+
+        try:
+            if mutation in {"delete_source", "expire_source"}:
+                with session_scope() as session:
+                    event = session.get(WellnessEvent, event_id)
+                    assert event is not None
+                    if mutation == "delete_source":
+                        session.delete(event)
+                    else:
+                        event.expires_at = now
+            elif mutation == "revoke_consent":
+                policy_state["enabled"] = False
+            else:
+                registry.set_enabled("nutrition", enabled=False)
+
+            response = client.get(
+                f"/v1/wellness-decisions/{request.request_id}"
+            )
+        finally:
+            finalizer.close()
+            app.state.decision_recovery_finalizer = None
+
+    assert persisted.decision_record_id is not None
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == (
+        "decision_service_unavailable"
+    )
+    reason_codes = response.json()["error"]["detail"]["reason_codes"]
+    assert "decision_source_ref_revalidation_failed" in reason_codes
+    assert expected_limitation in reason_codes
 
 
 def test_decision_recovery_returns_404_for_unknown_request(
@@ -1318,16 +1590,22 @@ def test_decision_recovery_rejects_corrupt_persisted_payload(
                     decision_payload={"schema": "invalid"},
                     decision_payload_digest="0" * 64,
                 )
-            )
+                )
 
         response = client.get(
             f"/v1/wellness-decisions/{request_id}"
         )
 
     assert response.status_code == 503
-    assert response.json()["error"]["code"] == (
-        "decision_record_contract_invalid"
-    )
+    assert response.json()["error"] == {
+        "code": "decision_service_unavailable",
+        "message": (
+            "The stored wellness decision could not be revalidated."
+        ),
+        "detail": {
+            "reason_codes": ["decision_record_contract_invalid"],
+        },
+    }
 
 
 def test_real_provider_failure_reaches_rest_as_503(settings) -> None:

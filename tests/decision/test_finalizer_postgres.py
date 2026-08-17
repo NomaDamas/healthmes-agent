@@ -47,6 +47,7 @@ from healthmes.decision import (
     DecisionDraft,
     DecisionFinalizer,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionStatus,
     DomainAccessGrant,
@@ -317,6 +318,9 @@ def _run(
             answer="Take a short break before choosing more caffeine.",
             proposed_action=True,
             persistence_intent=DecisionPersistenceIntent.ACTION,
+            record_summary_code=(
+                DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+            ),
             used_source_ref_ids=[
                 source_ref.reference_id for source_ref in source_refs
             ],
@@ -586,11 +590,13 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
             bind,
             *,
             timeout_seconds: float,
+            cancellation_check=None,
         ):
             finalizer_waiting_for_write_plane.set()
             with original_guard(
                 bind,
                 timeout_seconds=timeout_seconds,
+                cancellation_check=cancellation_check,
             ) as connection:
                 yield connection
 
@@ -818,6 +824,37 @@ def test_postgres_activity_write_plane_guard_timeout_is_bounded() -> None:
             elapsed = time.monotonic() - started
             assert 0.15 <= elapsed < 2
             blocker.rollback()
+
+        with postgres_activity_write_plane_guard(
+            store.engine,
+            timeout_seconds=1,
+            poll_seconds=0.02,
+        ) as connection:
+            assert connection is not None
+
+
+def test_postgres_guard_releases_advisory_lock_when_cancelled_after_acquire(
+) -> None:
+    class ReplayCancelled(RuntimeError):
+        pass
+
+    with _postgres_store(pool_size=1) as store:
+        checks = 0
+
+        def cancel_after_acquire() -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise ReplayCancelled
+
+        with pytest.raises(ReplayCancelled):
+            with postgres_activity_write_plane_guard(
+                store.engine,
+                timeout_seconds=1,
+                poll_seconds=0.02,
+                cancellation_check=cancel_after_acquire,
+            ):
+                pytest.fail("cancelled guard entered its body")
 
         with postgres_activity_write_plane_guard(
             store.engine,

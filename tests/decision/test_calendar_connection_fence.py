@@ -29,6 +29,7 @@ from healthmes.decision import (
     DecisionDraft,
     DecisionFinalizer,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionStatus,
     DomainAccessGrant,
@@ -179,6 +180,9 @@ def _decision_fixture(
             status=DecisionStatus.COMPLETED,
             answer="Take a short break before the next meeting.",
             record_summary="Pause briefly before the next meeting.",
+            record_summary_code=(
+                DecisionRecordSummaryCode.PAUSE_AND_REASSESS
+            ),
             proposed_action=True,
             persistence_intent=DecisionPersistenceIntent.ACTION,
             used_source_ref_ids=[

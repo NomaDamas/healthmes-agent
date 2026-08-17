@@ -318,9 +318,20 @@ class HealthMesDecisionEngine:
             task.add_done_callback(self._request_finished)
         try:
             done, _pending = await asyncio.wait((task,))
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            cancellation = exc
             task.cancel()
-            raise
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as repeated:
+                    cancellation = repeated
+                    if not task.done():
+                        task.cancel()
+            with self._state_lock:
+                self._active.discard(task)
+            _consume_task_result(task)
+            raise cancellation
         assert task in done
         return task.result()
 

@@ -104,10 +104,11 @@ persistence. For this one model iteration you must:
     a mutation, and `explicit_tracking` is only advisory: HealthMes verifies a
     trusted request flag. Never persist merely because source data was
     consulted.
-11. `record_summary` is an optional backward-compatible transient hint. Never
-    put raw identifiers or sensitive detail in it. HealthMes does not trust or
-    store this model-authored text; it derives a fixed category-only summary
-    from the verified persistence intent.
+11. `record_summary_code` is required whenever `persistence_intent` is
+    `action`, `risk`, or `explicit_tracking`. Select only an enum value allowed
+    by the runtime schema. HealthMes renders the stored conclusion from that
+    code; never put sensitive facts into a compact record. `record_summary` is
+    a legacy transient hint and should be omitted.
 12. Keep the final answer concise. Return structured data matching the
     supplied runtime contract. HealthMes validates source references and
     conditionally persists a compact record after this loop.

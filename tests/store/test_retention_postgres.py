@@ -34,6 +34,9 @@ from healthmes.store import (
     WellnessEvent,
     create_db_engine,
 )
+from healthmes.store.decision_receipts import (
+    maintain_decision_receipt_results,
+)
 from healthmes.wearables import provenance as wearable_provenance
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
@@ -304,6 +307,131 @@ def test_postgres_retention_extension_cannot_revive_expired_receipt() -> None:
             assert stored.result_payload is None
             assert stored.result_expires_at is None
             assert stored.expires_at == identity_expires_at
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_receipt_maintenance_advances_in_bounded_json_batches(
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_receipt_batch_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    record_id = uuid.uuid4()
+    try:
+        with factory() as session:
+            legacy = DecisionRequestReceipt(
+                request_id=uuid.uuid4(),
+                request_fingerprint="a" * 64,
+                requested_at=now,
+                state="completed",
+                result_payload={
+                    "schema": "healthmes.decision-receipt.v1",
+                    "result": {
+                        "answer": "legacy sensitive answer",
+                        "persistence_status": "persisted",
+                        "decision_record_id": str(record_id),
+                    },
+                },
+                result_expires_at=now + timedelta(days=30),
+                retention_basis_at=now,
+                expires_at=now + timedelta(days=30),
+            )
+            expired = DecisionRequestReceipt(
+                request_id=uuid.uuid4(),
+                request_fingerprint="b" * 64,
+                requested_at=now,
+                state="completed",
+                result_payload={
+                    "schema": "healthmes.decision-receipt.v2",
+                    "kind": "transient_result",
+                    "result": {"answer": "expired transient answer"},
+                },
+                result_expires_at=now + timedelta(days=30),
+                retention_basis_at=now - timedelta(minutes=15),
+                expires_at=now + timedelta(days=30),
+            )
+            fresh_pointer = DecisionRequestReceipt(
+                request_id=uuid.uuid4(),
+                request_fingerprint="c" * 64,
+                requested_at=now,
+                state="completed",
+                result_payload={
+                    "schema": "healthmes.decision-receipt.v2",
+                    "kind": "decision_record",
+                    "decision_record_id": str(uuid.uuid4()),
+                },
+                result_expires_at=now + timedelta(days=30),
+                retention_basis_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=30),
+            )
+            session.add_all((legacy, expired, fresh_pointer))
+            session.commit()
+            legacy_id = legacy.id
+            expired_id = expired.id
+            pointer_id = fresh_pointer.id
+
+        processed = []
+        cursor = None
+        for _index in range(4):
+            with factory() as session:
+                batch = maintain_decision_receipt_results(
+                    session,
+                    now=now,
+                    batch_size=1,
+                    after_id=cursor,
+                )
+                processed.append(batch.scanned)
+                cursor = batch.next_cursor
+                session.commit()
+        assert processed == [1, 1, 1, 0]
+
+        with factory() as session:
+            compacted = session.get(
+                DecisionRequestReceipt,
+                legacy_id,
+            )
+            scrubbed = session.get(
+                DecisionRequestReceipt,
+                expired_id,
+            )
+            retained = session.get(
+                DecisionRequestReceipt,
+                pointer_id,
+            )
+            assert compacted is not None
+            assert compacted.result_payload == {
+                "schema": "healthmes.decision-receipt.v2",
+                "kind": "decision_record",
+                "decision_record_id": str(record_id),
+            }
+            assert scrubbed is not None
+            assert scrubbed.state == "tombstone"
+            assert scrubbed.result_payload is None
+            assert retained is not None
+            assert retained.state == "completed"
     finally:
         engine.dispose()
         with admin_engine.begin() as connection:

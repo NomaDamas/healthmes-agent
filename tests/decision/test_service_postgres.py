@@ -319,7 +319,11 @@ async def test_postgres_concurrency_restart_and_failed_retry(
         assert takeover_claim.state is DecisionReceiptClaimState.ACQUIRED
         assert first_claim.lease_generation is not None
         assert takeover_claim.lease_generation is not None
-        canonical = {"schema": "test", "winner": "takeover"}
+        canonical = {
+            "schema": "healthmes.decision-receipt.v2",
+            "kind": "transient_result",
+            "result": {"winner": "takeover"},
+        }
         store.complete(
             request_id=takeover_request_id,
             fingerprint=takeover_fingerprint,
@@ -335,8 +339,9 @@ async def test_postgres_concurrency_restart_and_failed_retry(
                 owner_token=first_owner,
                 lease_generation=first_claim.lease_generation,
                 result_payload={
-                    "schema": "test",
-                    "winner": "expired-owner",
+                    "schema": "healthmes.decision-receipt.v2",
+                    "kind": "transient_result",
+                    "result": {"winner": "expired-owner"},
                 },
                 now=NOW + timedelta(seconds=3),
             ).result_payload

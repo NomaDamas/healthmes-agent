@@ -249,6 +249,40 @@ async def test_aclose_drains_an_accepted_persisted_replay() -> None:
     assert agent.closed is True
 
 
+async def test_cancelled_replay_releases_engine_capacity_before_return(
+) -> None:
+    agent = _StubAgent()
+    finalizer = _BlockingReplayFinalizer()
+    engine = HealthMesDecisionEngine(
+        agent=agent,  # type: ignore[arg-type]
+        finalizer=finalizer,  # type: ignore[arg-type]
+        max_pending_requests=1,
+    )
+    replay = asyncio.create_task(
+        engine.replay_persisted_decision(
+            _request(),
+            uuid.uuid4(),
+        )
+    )
+    await asyncio.wait_for(finalizer.started.wait(), timeout=1)
+
+    replay.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(replay, timeout=1)
+
+    finalizer.release.set()
+    retry = await asyncio.wait_for(
+        engine.replay_persisted_decision(
+            _request(),
+            uuid.uuid4(),
+        ),
+        timeout=1,
+    )
+
+    assert retry.status is DecisionStatus.COMPLETED
+    await engine.aclose()
+
+
 async def test_aclose_drains_commit_worker_after_unknown_response() -> None:
     agent = _StubAgent()
     finalizer = _UnknownCommitFinalizer()

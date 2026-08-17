@@ -23,6 +23,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.config import Settings, resolve_timezone
@@ -46,6 +47,10 @@ from healthmes.store.decision_receipts import (
     DecisionReceiptOwnershipError,
     DecisionReceiptStore,
 )
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
+from healthmes.store.models import DecisionRecord
 
 _CHANNEL_REQUEST_NAMESPACE = uuid.UUID(
     "ed5fcd43-39c0-4fb4-b968-57455f1fc9bf"
@@ -76,6 +81,10 @@ class DecisionIdempotencyExpiredError(RuntimeError):
 
 class DecisionIdempotencyUnavailableError(RuntimeError):
     """Raised when a durable request cannot safely converge yet."""
+
+
+class DecisionRecoveryNotFoundError(RuntimeError):
+    """Raised when request-ID recovery has no currently retained record."""
 
 
 class DecisionIngress(StrEnum):
@@ -171,12 +180,27 @@ class DecisionEngine(Protocol):
     ) -> DecisionResult: ...
 
 
+class PersistedDecisionRecovery(Protocol):
+    """Hermes-independent surface for revalidating committed decisions."""
+
+    async def arevalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult: ...
+
+
 class DecisionService(Protocol):
     """Canonical service surface allowed behind product ingress adapters."""
 
     async def ask_wellness(
         self,
         submission: DecisionServiceRequest,
+    ) -> DecisionResult: ...
+
+    async def recover_wellness(
+        self,
+        request_id: uuid.UUID,
     ) -> DecisionResult: ...
 
 
@@ -224,17 +248,26 @@ class HealthMesDecisionService:
         session_factory_provider: Callable[
             [], sessionmaker[Session]
         ],
+        recovery_provider: Callable[
+            [], PersistedDecisionRecovery | None
+        ]
+        | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not callable(engine_provider):
             raise TypeError("engine_provider must be callable")
         if not callable(session_factory_provider):
             raise TypeError("session_factory_provider must be callable")
+        if recovery_provider is not None and not callable(
+            recovery_provider
+        ):
+            raise TypeError("recovery_provider must be callable")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
         self._settings = settings
         self._engine_provider = engine_provider
         self._session_factory_provider = session_factory_provider
+        self._recovery_provider = recovery_provider or (lambda: None)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._idempotency_lock = Lock()
         self._receipt_store: DecisionReceiptStore | None = None
@@ -374,6 +407,67 @@ class HealthMesDecisionService:
                         )
             if cancel_orphaned_task:
                 task.cancel()
+
+    async def recover_wellness(
+        self,
+        request_id: uuid.UUID,
+    ) -> DecisionResult:
+        """Revalidate a retained result without invoking model reasoning."""
+
+        if not isinstance(request_id, uuid.UUID):
+            raise TypeError("request_id must be a UUID")
+        current = _as_utc(self._clock())
+        with self._session_factory_provider()() as session:
+            identity = session.execute(
+                select(
+                    DecisionRecord.id,
+                    DecisionRecord.decision_turn_id,
+                ).where(
+                    DecisionRecord.decision_request_id == request_id,
+                    decision_record_is_available_at(current),
+                )
+            ).one_or_none()
+        if identity is None or identity.decision_turn_id is None:
+            raise DecisionRecoveryNotFoundError(
+                "wellness decision is not available"
+            )
+
+        request = DecisionRequest(
+            request_id=request_id,
+            turn_id=identity.decision_turn_id,
+            question="Recover the previously committed wellness decision.",
+            requested_at=current,
+            timezone=str(resolve_timezone(self._settings)),
+            caller=DecisionCaller(
+                principal_id=(
+                    self._settings.decision_owner_principal_id
+                ),
+                authenticated=True,
+                execution_scope=resolve_decision_execution_scope(
+                    self._settings
+                ),
+                channel=DecisionIngress.REST.value,
+            ),
+            requested_privacy_level=PrivacyLevel.AGGREGATE,
+        )
+        result = await self._revalidate_persisted(
+            request,
+            identity.id,
+        )
+        if not isinstance(result, DecisionResult):
+            raise TypeError("decision replay must return DecisionResult")
+        if result.request_id != request_id:
+            raise RuntimeError(
+                "decision replay returned a different request identity"
+            )
+        if result.status is DecisionStatus.COMPLETED and (
+            result.persistence_status is not PersistenceStatus.PERSISTED
+            or result.decision_record_id != identity.id
+        ):
+            raise RuntimeError(
+                "completed decision recovery did not return its stored record"
+            )
+        return result
 
     async def _execute(
         self,
@@ -579,16 +673,6 @@ class HealthMesDecisionService:
         pointer = _decision_record_id_from_receipt(payload)
         if pointer is None:
             raise RuntimeError("decision receipt payload is invalid")
-        engine = self._engine_provider()
-        if engine is None:
-            raise DecisionRuntimeNotConfiguredError(
-                "HealthMes decision runtime is not configured"
-            )
-        replay = getattr(engine, "replay_persisted_decision", None)
-        if not callable(replay):
-            raise DecisionRuntimeNotConfiguredError(
-                "HealthMes decision runtime cannot revalidate stored results"
-            )
         frozen_submission = submission.model_copy(
             update={
                 "requested_at": _as_utc(
@@ -597,7 +681,7 @@ class HealthMesDecisionService:
             }
         )
         request = self.build_request(frozen_submission)
-        result = await replay(request, pointer)
+        result = await self._revalidate_persisted(request, pointer)
         if not isinstance(result, DecisionResult):
             raise TypeError(
                 "decision replay must return DecisionResult"
@@ -614,6 +698,42 @@ class HealthMesDecisionService:
                 "completed decision replay did not return its stored record"
             )
         return result
+
+    async def _revalidate_persisted(
+        self,
+        request: DecisionRequest,
+        decision_record_id: uuid.UUID,
+    ) -> DecisionResult:
+        """Prefer the live engine, then use the standalone recovery finalizer."""
+
+        engine = self._engine_provider()
+        if engine is not None:
+            replay = getattr(engine, "replay_persisted_decision", None)
+            if callable(replay):
+                return await replay(request, decision_record_id)
+
+        recovery = self._recovery_provider()
+        if recovery is None:
+            raise DecisionRuntimeNotConfiguredError(
+                "HealthMes decision recovery is not configured"
+            )
+        async_revalidate = getattr(
+            recovery,
+            "arevalidate_persisted",
+            None,
+        )
+        if callable(async_revalidate):
+            return await async_revalidate(request, decision_record_id)
+        revalidate = getattr(recovery, "revalidate_persisted", None)
+        if callable(revalidate):
+            return await asyncio.to_thread(
+                revalidate,
+                request,
+                decision_record_id,
+            )
+        raise DecisionRuntimeNotConfiguredError(
+            "HealthMes decision recovery cannot revalidate stored results"
+        )
 
     def _get_receipt_store(self) -> DecisionReceiptStore:
         with self._idempotency_lock:

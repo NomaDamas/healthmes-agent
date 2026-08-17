@@ -322,6 +322,36 @@ def build_decision_context_search_session_service(
     )
 
 
+def build_decision_recovery_finalizer(
+    *,
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    search_service: DecisionContextSearchSessionService,
+    clock: Callable[[], datetime] | None = None,
+) -> DecisionFinalizer | None:
+    """Build persisted-decision recovery without requiring Hermes."""
+
+    correlation_secret = (
+        settings.decision_correlation_secret.get_secret_value().strip()
+    ).encode("utf-8")
+    if len(correlation_secret) < 32:
+        return None
+    policy_resolver = DatabaseDecisionPolicyResolver(
+        session_factory=session_factory,
+        owner_principal_id=settings.decision_owner_principal_id,
+        execution_scope=resolve_decision_execution_scope(settings),
+    )
+    return DecisionFinalizer(
+        access_layer=search_service.access_layer,
+        session_factory=session_factory,
+        policy_resolver=policy_resolver,
+        fingerprint_key=correlation_secret,
+        timeout_seconds=settings.decision_finalization_timeout_seconds,
+        max_workers=settings.decision_max_pending_requests,
+        clock=clock,
+    )
+
+
 def build_configured_decision_engine(
     *,
     settings: Settings,

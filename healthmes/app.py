@@ -7,9 +7,11 @@ mcp_tool.py), and the in-process APScheduler loops.
 """
 
 import asyncio
+import logging
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import FastAPI
 from sqlalchemy.orm import Session
@@ -42,6 +44,7 @@ from healthmes.decision import (
     HealthMesDecisionService,
     build_configured_decision_engine,
     build_decision_context_search_session_service,
+    build_decision_recovery_finalizer,
     ensure_decision_domain_policies,
 )
 from healthmes.decision.domain_providers import WearableReader
@@ -73,6 +76,15 @@ from healthmes.store import (
     init_engine,
     session_scope,
 )
+from healthmes.store.decision_receipts import (
+    DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+    DEFAULT_RECEIPT_MAINTENANCE_MAX_ROWS,
+    DecisionReceiptMaintenanceBatch,
+    maintain_decision_receipt_results,
+)
+
+_LOGGER = logging.getLogger(__name__)
+_DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS = 30.0
 
 
 async def _close_decision_engine_durably(decision_engine) -> None:
@@ -118,6 +130,141 @@ def _initialize_activity_storage(
         )
 
 
+def _run_mandatory_decision_receipt_maintenance(
+    *,
+    now: datetime | None = None,
+    batch_size: int = DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+    max_rows: int = DEFAULT_RECEIPT_MAINTENANCE_MAX_ROWS,
+    after_id: uuid.UUID | None = None,
+) -> tuple[int, uuid.UUID | None]:
+    """Commit bounded cleanup batches independently from optional scheduling."""
+
+    if batch_size < 1:
+        raise ValueError("decision receipt batch_size must be positive")
+    if max_rows < 1:
+        raise ValueError("decision receipt max_rows must be positive")
+    current = now or datetime.now(UTC)
+    processed = 0
+    cursor = after_id
+    while processed < max_rows:
+        current_batch_size = min(batch_size, max_rows - processed)
+        with activity_write_lock():
+            with session_scope() as session:
+                lock_activity_write_plane(session)
+                batch = maintain_decision_receipt_results(
+                    session,
+                    now=current,
+                    batch_size=current_batch_size,
+                    after_id=cursor,
+                )
+        processed += batch.scanned
+        cursor = batch.next_cursor
+        if cursor is None:
+            break
+    return processed, cursor
+
+
+def _run_one_decision_receipt_maintenance_batch(
+    *,
+    now: datetime | None = None,
+    after_id: uuid.UUID | None = None,
+) -> DecisionReceiptMaintenanceBatch:
+    """Run one short recurring transaction so normal writes regain the lock."""
+
+    with activity_write_lock():
+        with session_scope() as session:
+            lock_activity_write_plane(session)
+            return maintain_decision_receipt_results(
+                session,
+                now=now or datetime.now(UTC),
+                batch_size=(
+                    DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE
+                ),
+                after_id=after_id,
+            )
+
+
+async def _run_receipt_maintenance_durably(
+    *,
+    after_id: uuid.UUID | None = None,
+) -> DecisionReceiptMaintenanceBatch:
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _run_one_decision_receipt_maintenance_batch,
+            after_id=after_id,
+        )
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _decision_receipt_maintenance_loop(
+    stop: asyncio.Event,
+    *,
+    initial_cursor: uuid.UUID | None = None,
+) -> None:
+    cursor = initial_cursor
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=(
+                    _DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS
+                ),
+            )
+        except TimeoutError:
+            try:
+                batch = await _run_receipt_maintenance_durably(
+                    after_id=cursor,
+                )
+                cursor = batch.next_cursor
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception(
+                    "mandatory decision receipt maintenance failed"
+                )
+
+
+async def _stop_decision_receipt_maintenance(
+    task: asyncio.Task[None],
+    stop: asyncio.Event,
+) -> None:
+    """Stop the loop, drain any DB worker, and perform one final scrub."""
+
+    stop.set()
+    cancellation: asyncio.CancelledError | None = None
+    current = asyncio.current_task()
+    while not task.done():
+        cancelling_before = (
+            current.cancelling() if current is not None else 0
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelling_after = (
+                current.cancelling() if current is not None else 0
+            )
+            if current is None or cancelling_after <= cancelling_before:
+                raise
+            cancellation = exc
+    task.result()
+    try:
+        await _run_receipt_maintenance_durably()
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+    if cancellation is not None:
+        raise cancellation
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -143,6 +290,8 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.scheduler = None
         app.state.decision_engine = None
+        app.state.decision_recovery_finalizer = None
+        app.state.decision_receipt_maintenance_task = None
         async with AsyncExitStack() as cleanup:
             # Register each cleanup immediately after ownership is acquired.
             # LIFO then guarantees scheduler -> decisions -> MCP -> DB even
@@ -159,6 +308,34 @@ def create_app(
                         settings.decision_owner_principal_id
                     ),
                 )
+            _, receipt_maintenance_cursor = (
+                _run_mandatory_decision_receipt_maintenance()
+            )
+
+            receipt_maintenance_stop = asyncio.Event()
+            receipt_maintenance_task = asyncio.create_task(
+                _decision_receipt_maintenance_loop(
+                    receipt_maintenance_stop,
+                    initial_cursor=receipt_maintenance_cursor,
+                ),
+                name="healthmes-decision-receipt-maintenance",
+            )
+            app.state.decision_receipt_maintenance_task = (
+                receipt_maintenance_task
+            )
+
+            async def stop_receipt_maintenance() -> None:
+                try:
+                    await _stop_decision_receipt_maintenance(
+                        receipt_maintenance_task,
+                        receipt_maintenance_stop,
+                    )
+                finally:
+                    app.state.decision_receipt_maintenance_task = (
+                        None
+                    )
+
+            cleanup.push_async_callback(stop_receipt_maintenance)
 
             mcp_server.set_settings(settings)
             cleanup.callback(mcp_server.set_settings, None)
@@ -182,6 +359,28 @@ def create_app(
             mcp_server.set_decision_search_session_service(
                 decision_search_service
             )
+            decision_recovery_finalizer = (
+                build_decision_recovery_finalizer(
+                    settings=settings,
+                    session_factory=get_session_factory(),
+                    search_service=decision_search_service,
+                    clock=decision_clock,
+                )
+            )
+            app.state.decision_recovery_finalizer = (
+                decision_recovery_finalizer
+            )
+            if decision_recovery_finalizer is not None:
+
+                async def close_decision_recovery_finalizer() -> None:
+                    try:
+                        await decision_recovery_finalizer.aclose()
+                    finally:
+                        app.state.decision_recovery_finalizer = None
+
+                cleanup.push_async_callback(
+                    close_decision_recovery_finalizer
+                )
             decision_engine = build_configured_decision_engine(
                 settings=settings,
                 session_factory=get_session_factory(),
@@ -285,13 +484,18 @@ def create_app(
     app.state.settings = settings
     app.state.decision_clock = decision_clock
     app.state.decision_engine = None
+    app.state.decision_recovery_finalizer = None
     app.state.decision_service = HealthMesDecisionService(
         settings=settings,
         engine_provider=lambda: app.state.decision_engine,
         session_factory_provider=get_session_factory,
+        recovery_provider=lambda: (
+            app.state.decision_recovery_finalizer
+        ),
         clock=decision_clock,
     )
     app.state.scheduler = None
+    app.state.decision_receipt_maintenance_task = None
     install_local_sessions(app)
     install_google_oauth(app)
 

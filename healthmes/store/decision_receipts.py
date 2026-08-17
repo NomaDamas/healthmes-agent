@@ -27,6 +27,8 @@ from healthmes.store.session import session_scope
 _DECISION_RECEIPT_SCHEMA_V1 = "healthmes.decision-receipt.v1"
 _DECISION_RECEIPT_SCHEMA_V2 = "healthmes.decision-receipt.v2"
 _TRANSIENT_RESULT_MAX_AGE = timedelta(minutes=15)
+DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE = 256
+DEFAULT_RECEIPT_MAINTENANCE_MAX_ROWS = 10_000
 
 
 class DecisionReceiptConflictError(RuntimeError):
@@ -62,6 +64,14 @@ class DecisionReceiptClaim:
 class DecisionReceiptCompletion:
     result_payload: dict[str, Any]
     expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionReceiptMaintenanceBatch:
+    """One bounded scan position for startup and recurring receipt cleanup."""
+
+    scanned: int
+    next_cursor: uuid.UUID | None
 
 
 class DecisionReceiptStore:
@@ -419,55 +429,107 @@ def scrub_decision_receipt_results(
     *,
     now: datetime,
     dry_run: bool = False,
+    batch_size: int = DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
 ) -> int:
-    """Drop sensitive cached results at the effective decision cutoff."""
+    """Apply current retention to every completed receipt."""
 
     current = _as_utc(now)
-    statement = select(DecisionRequestReceipt).where(
-        DecisionRequestReceipt.state == "completed"
-    )
-    if session.get_bind().dialect.name == "postgresql" and not dry_run:
-        statement = statement.with_for_update()
+    if batch_size < 1:
+        raise ValueError("decision receipt batch_size must be positive")
+
     candidates = 0
-    for receipt in session.scalars(statement):
-        payload = _compact_receipt_payload(receipt.result_payload)
-        policy_deadline = _result_expiry(
-            session,
-            receipt=receipt,
-            result_payload=payload,
+    last_id: uuid.UUID | None = None
+    while True:
+        statement = (
+            select(DecisionRequestReceipt)
+            .where(DecisionRequestReceipt.state == "completed")
+            .order_by(DecisionRequestReceipt.id)
+            .limit(batch_size)
         )
-        stored_deadline = (
-            _as_utc(receipt.result_expires_at)
-            if receipt.result_expires_at is not None
-            else None
-        )
-        # Sensitive replay payloads have monotonic expiry. Extending a policy
-        # may retain future results longer, but it cannot revive a payload
-        # whose previously committed deadline already passed.
-        deadline = (
-            policy_deadline
-            if stored_deadline is None
-            else min(stored_deadline, policy_deadline)
-        )
-        if deadline <= current:
-            candidates += 1
-            if not dry_run:
-                receipt.state = "tombstone"
-                receipt.owner_token = None
-                receipt.lease_expires_at = None
-                receipt.result_payload = null()
-                receipt.result_expires_at = None
-        elif not dry_run:
-            if payload != receipt.result_payload:
-                receipt.result_payload = payload
-            if (
-                receipt.result_expires_at is None
-                or _as_utc(receipt.result_expires_at) != deadline
-            ):
-                receipt.result_expires_at = deadline
+        if last_id is not None:
+            statement = statement.where(
+                DecisionRequestReceipt.id > last_id
+            )
+        if (
+            session.get_bind().dialect.name == "postgresql"
+            and not dry_run
+        ):
+            statement = statement.with_for_update()
+        rows = tuple(session.scalars(statement))
+        if not rows:
+            break
+        for receipt in rows:
+            try:
+                expired = _normalize_completed_receipt(
+                    session,
+                    receipt,
+                    now=current,
+                )
+            except RuntimeError:
+                expired = True
+                if not dry_run:
+                    _tombstone_receipt_result(receipt)
+            if expired:
+                candidates += 1
+            if dry_run:
+                session.expire(receipt)
+        last_id = rows[-1].id
+        if not dry_run:
+            session.flush()
+        if len(rows) < batch_size:
+            break
+
     if not dry_run:
         session.flush()
     return candidates
+
+
+def maintain_decision_receipt_results(
+    session: Session,
+    *,
+    now: datetime,
+    batch_size: int = DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+    after_id: uuid.UUID | None = None,
+) -> DecisionReceiptMaintenanceBatch:
+    """Scan and normalize one bounded page of completed receipts."""
+
+    current = _as_utc(now)
+    if batch_size < 1:
+        raise ValueError("decision receipt batch_size must be positive")
+    statement = (
+        select(DecisionRequestReceipt)
+        .where(DecisionRequestReceipt.state == "completed")
+        .order_by(DecisionRequestReceipt.id)
+        .limit(batch_size)
+    )
+    if after_id is not None:
+        statement = statement.where(
+            DecisionRequestReceipt.id > after_id
+        )
+    if session.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update()
+    rows = tuple(session.scalars(statement))
+    for receipt in rows:
+        try:
+            _normalize_completed_receipt(
+                session,
+                receipt,
+                now=current,
+            )
+        except RuntimeError:
+            # A corrupt completed envelope must not poison every startup and
+            # recurring maintenance transaction. Its cached body is already
+            # unusable, so fail closed and continue cleaning the batch.
+            _tombstone_receipt_result(receipt)
+    session.flush()
+    return DecisionReceiptMaintenanceBatch(
+        scanned=len(rows),
+        next_cursor=(
+            rows[-1].id
+            if len(rows) == batch_size
+            else None
+        ),
+    )
 
 
 def purge_expired_decision_receipts(
@@ -525,9 +587,36 @@ def _normalize_completed_receipt(
     receipt: DecisionRequestReceipt,
     *,
     now: datetime,
-) -> None:
+) -> bool:
     if receipt.state != "completed":
-        return
+        return False
+    payload, deadline = _completed_receipt_normalization(
+        session,
+        receipt,
+    )
+    if deadline <= _as_utc(now):
+        _tombstone_receipt_result(receipt)
+        return True
+    if payload != receipt.result_payload:
+        receipt.result_payload = payload
+    receipt.result_expires_at = deadline
+    return False
+
+
+def _tombstone_receipt_result(
+    receipt: DecisionRequestReceipt,
+) -> None:
+    receipt.state = "tombstone"
+    receipt.owner_token = None
+    receipt.lease_expires_at = None
+    receipt.result_payload = null()
+    receipt.result_expires_at = None
+
+
+def _completed_receipt_normalization(
+    session: Session,
+    receipt: DecisionRequestReceipt,
+) -> tuple[dict[str, Any], datetime]:
     if not isinstance(receipt.result_payload, dict):
         raise RuntimeError("completed decision receipt has no result payload")
     if receipt.result_expires_at is None:
@@ -535,6 +624,8 @@ def _normalize_completed_receipt(
             "completed decision receipt has no result expiry"
         )
     payload = _compact_receipt_payload(receipt.result_payload)
+    # Sensitive replay payloads have monotonic expiry. Extending a policy may
+    # retain future results longer, but it cannot revive a committed deadline.
     deadline = min(
         _as_utc(receipt.result_expires_at),
         _result_expiry(
@@ -543,16 +634,7 @@ def _normalize_completed_receipt(
             result_payload=payload,
         ),
     )
-    if deadline <= _as_utc(now):
-        receipt.state = "tombstone"
-        receipt.owner_token = None
-        receipt.lease_expires_at = None
-        receipt.result_payload = null()
-        receipt.result_expires_at = None
-        return
-    if payload != receipt.result_payload:
-        receipt.result_payload = payload
-    receipt.result_expires_at = deadline
+    return payload, deadline
 
 
 def _result_expiry(
@@ -591,19 +673,40 @@ def _compact_receipt_payload(
     if not isinstance(payload, dict):
         raise RuntimeError("completed decision receipt has no result payload")
     normalized = dict(payload)
-    if normalized.get("schema") != _DECISION_RECEIPT_SCHEMA_V1:
-        return normalized
+    schema_name = normalized.get("schema")
+    if schema_name == _DECISION_RECEIPT_SCHEMA_V2:
+        kind = normalized.get("kind")
+        if kind == "decision_record":
+            pointer = _canonical_decision_record_pointer(normalized)
+            if pointer is None:
+                raise RuntimeError(
+                    "persisted decision receipt is invalid"
+                )
+            return pointer
+        if (
+            kind == "transient_result"
+            and set(normalized) == {"schema", "kind", "result"}
+            and isinstance(normalized.get("result"), dict)
+        ):
+            return normalized
+        raise RuntimeError("decision receipt result is invalid")
+    if schema_name != _DECISION_RECEIPT_SCHEMA_V1:
+        raise RuntimeError("unsupported decision receipt schema")
+    if set(normalized) != {"schema", "result"}:
+        raise RuntimeError("legacy decision receipt is invalid")
     raw_result = normalized.get("result")
     if not isinstance(raw_result, dict):
-        return normalized
+        raise RuntimeError("legacy decision receipt result is invalid")
     if (
         raw_result.get("persistence_status") == "persisted"
         and raw_result.get("decision_record_id") is not None
     ):
         try:
             record_id = uuid.UUID(str(raw_result["decision_record_id"]))
-        except (TypeError, ValueError):
-            return normalized
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "legacy persisted decision receipt is invalid"
+            ) from exc
         return {
             "schema": _DECISION_RECEIPT_SCHEMA_V2,
             "kind": "decision_record",
@@ -616,13 +719,39 @@ def _compact_receipt_payload(
     }
 
 
+def _canonical_decision_record_pointer(
+    payload: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "kind",
+        "decision_record_id",
+    }:
+        return None
+    if (
+        payload.get("schema") != _DECISION_RECEIPT_SCHEMA_V2
+        or payload.get("kind") != "decision_record"
+    ):
+        return None
+    raw_record_id = payload.get("decision_record_id")
+    if not isinstance(raw_record_id, str):
+        return None
+    try:
+        record_id = uuid.UUID(raw_record_id)
+    except ValueError:
+        return None
+    canonical_id = str(record_id)
+    if raw_record_id != canonical_id:
+        return None
+    return {
+        "schema": _DECISION_RECEIPT_SCHEMA_V2,
+        "kind": "decision_record",
+        "decision_record_id": canonical_id,
+    }
+
+
 def _receipt_payload_is_transient(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return True
-    return not (
-        payload.get("schema") == _DECISION_RECEIPT_SCHEMA_V2
-        and payload.get("kind") == "decision_record"
-    )
+    return _canonical_decision_record_pointer(payload) is None
 
 
 def _require_fingerprint(
