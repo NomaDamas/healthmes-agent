@@ -67,6 +67,24 @@ keeping the archive self-contained and extraction safe under `tarfile`'s
   "schema_version": 2,              // v2 adds raw_ingest
   "created_at": "2026-07-09T03:30:00+00:00",  // injected by the caller, tz-aware
   "healthmes_version": "0.1.0",
+  "recovery": {
+    "scope": "partial_component_snapshot",
+    "full_node_recovery": false,
+    "components": {
+      "healthmes_db": {"status": "included"},
+      "media": {"status": "included" | "source_not_present" | "not_configured"},
+      "raw_ingest": {"status": "included" | "source_not_present" | "not_configured"},
+      "open_wearables_db": {
+        "status": "included" | "omitted_missing_dump_url" | "not_configured",
+        "runtime_configured": true,
+        "dump_configured": false
+      },
+      "hermes_home": {"status": "included" | "source_not_present" | "not_configured"}
+    },
+    "operational_warnings": [
+      "Partial backup: Open Wearables is configured for runtime, but ..."
+    ]
+  },
   "contents": {
     "healthmes_db":      {"kind": "sqlite_file" | "pg_dump", "arcname": "db/…"},
     "open_wearables_db": {"kind": "pg_dump", "arcname": "db/open_wearables.dump"} | null,
@@ -91,7 +109,10 @@ both directions** (every listed file exists with matching size + SHA-256;
 the archive holds nothing undeclared) and only then replaces live targets.
 A snapshot with `schema_version` greater than the tool's supported version
 is refused with an upgrade hint; older versions must remain restorable
-forever (schema changes are additive or come with migration code).
+forever (schema changes are additive or come with migration code). The
+additive `recovery` block does not change schema version 2 payload or restore
+semantics. It records what the snapshot can recover and never marks an
+envelope as a full-node backup.
 
 ### Recovery boundary
 
@@ -102,6 +123,27 @@ the selected Hermes home, external object stores, device secrets, or the
 Open Wearables database when `HEALTHMES_OW_DATABASE_URL` is unset. Restoring
 the snapshot therefore restores the archived data components; reconnecting
 external providers and secrets remains an operator step.
+
+Open Wearables runtime access and Open Wearables backup access are separate
+capabilities:
+
+- `HEALTHMES_OW_API_KEY` means HealthMes is configured to read Open Wearables
+  at runtime.
+- `HEALTHMES_OW_DATABASE_URL` gives `pg_dump` the independent database access
+  needed to archive Open Wearables.
+- When runtime access is configured but the dump URL is absent, backup
+  creation still succeeds and produces a valid partial snapshot. The local
+  provider, CLI, weekly scheduler job, and remote-create path emit an explicit
+  `Partial backup` warning, and `manifest.json` records
+  `omitted_missing_dump_url`. That snapshot can recover only the archived
+  HealthMes DB, media/raw-ingest trees that were present, and any included
+  Hermes state. It cannot recover Open Wearables data.
+
+`GET /v1/storage/settings` reports the same current boundary as
+`recovery_scope=partial_component_snapshot`,
+`full_node_recovery=false`, the runtime/dump configuration booleans, and the
+operational warning when this mismatch exists. Snapshot listing alone cannot
+prove recoverability because the manifest is encrypted.
 
 ### Consistency caveats
 
@@ -139,19 +181,24 @@ Configuration (Settings fields / env fallbacks — see `resolve_*` in
 |---|---|---|---|
 | `backup_dir` | `HEALTHMES_BACKUP_DIR` | `{data_dir}/backups` | Where `LocalDirectoryProvider` stores snapshots. |
 | `backup_passphrase` | `HEALTHMES_BACKUP_PASSPHRASE` | — (required) | age scrypt passphrase; `--passphrase-file` overrides. |
-| `ow_database_url` | `HEALTHMES_OW_DATABASE_URL` | unset → OW dump skipped | Direct postgres URL of the open-wearables DB. |
+| `ow_database_url` | `HEALTHMES_OW_DATABASE_URL` | unset → OW dump skipped | Direct postgres URL of the open-wearables DB. If runtime API access is configured, leaving this unset creates a valid snapshot with an explicit partial-backup warning. |
 | `hermes_home` | `HERMES_HOME` | unset → Hermes state skipped | Hermes state directory. |
 
 The weekly snapshot runs through the scheduler hook
 `healthmes.engine.scheduler.register_backup_job` with the callable from
 `healthmes.backup.local.build_backup_job` (Sunday 03:30 local, inside quiet
-hours; skips with a log warning when no passphrase is configured).
+hours; skips with a log warning when no passphrase is configured). A
+successful weekly snapshot also logs the explicit partial-backup warning when
+Open Wearables runtime access is configured without a dump URL.
 
 Restore drill (PLAN §10 Phase 3 / 검증 방법): on a fresh checkout, set
 `HEALTHMES_DATABASE_URL`/`HEALTHMES_DATA_DIR`/`HERMES_HOME` to the new
 locations, run `backup restore <file> --yes`, start the stack, and re-run
 the Phase-0 demo query. Opening a snapshot without the passphrase must fail
-(`WrongPassphraseError`).
+(`WrongPassphraseError`). The automated hardening drill creates representative
+HealthMes DB rows plus binary `media/` and `raw_ingest/` files, snapshots
+them, deletes all three live stores, restores, and byte-verifies both file
+trees before reopening the database.
 
 ## 3. RemoteVault (the business seam — implemented)
 

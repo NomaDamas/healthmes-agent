@@ -57,6 +57,13 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["decision"] == "forever"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0
+    assert body["backup"]["recovery_scope"] == "partial_component_snapshot"
+    assert body["backup"]["full_node_recovery"] is False
+    assert body["backup"]["open_wearables_runtime_configured"] is True
+    assert body["backup"]["open_wearables_dump_configured"] is False
+    assert "HEALTHMES_OW_DATABASE_URL is unset" in body["backup"][
+        "operational_warning"
+    ]
 
 
 def test_retention_update_is_persisted(client: TestClient, session) -> None:

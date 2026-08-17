@@ -216,6 +216,10 @@ Apple prerequisites, and verification criteria are tracked in
   (passphrase). It does not currently include `.env`, external OAuth
   credentials, or an Open Wearables DB unless its dump URL is configured, so
   it is not yet a complete Personal Data Node disaster-recovery image.
+  When Open Wearables runtime access is configured without
+  `HEALTHMES_OW_DATABASE_URL`, creation still succeeds but emits an explicit
+  partial-backup warning; the manifest and storage status report that the
+  Open Wearables database is not recoverable from that snapshot.
   `healthmes backup
   create/list/restore` CLI + weekly scheduler job. The `BackupProvider`
   protocol is the seam for a future `RemoteVaultProvider` (ciphertext-only

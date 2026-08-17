@@ -56,8 +56,10 @@ class SeededStore:
 
     db_path: Path
     media_dir: Path
+    raw_ingest_dir: Path
     expected_counts: dict[str, int]
     media_files: dict[str, bytes]  # relative path under media_dir -> content
+    raw_ingest_files: dict[str, bytes]  # relative path under raw_ingest_dir -> content
 
     @property
     def database_url(self) -> str:
@@ -143,6 +145,7 @@ def seeded_store(tmp_path: Path) -> SeededStore:
     live = tmp_path / "live"
     db_path = live / "healthmes.db"
     media_dir = live / "media"
+    raw_ingest_dir = live / "raw_ingest"
     database_url = f"sqlite:///{db_path}"
 
     _migrate(database_url)  # create_db_engine makes the parent dir on demand
@@ -157,9 +160,22 @@ def seeded_store(tmp_path: Path) -> SeededStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
 
+    raw_ingest_files = {
+        "healthkit/2026/08/17/batch.json": (
+            b'{"source":"healthkit","samples":[{"type":"heart_rate","value":72}]}'
+        ),
+        "manual/device-export.bin": b"\x00\xffraw-ingest\x10" + bytes(range(64)),
+    }
+    for relative, content in raw_ingest_files.items():
+        target = raw_ingest_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
     return SeededStore(
         db_path=db_path,
         media_dir=media_dir,
+        raw_ingest_dir=raw_ingest_dir,
         expected_counts=expected_counts,
         media_files=media_files,
+        raw_ingest_files=raw_ingest_files,
     )

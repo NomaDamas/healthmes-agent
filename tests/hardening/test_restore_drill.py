@@ -4,8 +4,9 @@ Drives the real backup seam end-to-end on a live, migrated, seeded store
 (the ``seeded_store`` fixture): ``LocalDirectoryProvider.export_snapshot()``
 -> destroy the live store -> ``restore()`` -> reopen through the production
 engine machinery -> count rows, check the alembic stamp, verify media bytes
-and that the store accepts new writes. Also drills the §9 encryption
-promise: a wrong passphrase must fail loudly *before* touching live data.
+and raw-ingest bytes, and confirm that the store accepts new writes. Also
+drills the §9 encryption promise: a wrong passphrase must fail loudly
+*before* touching live data.
 
 Everything is offline: sqlite database, local directory provider, pyrage
 age encryption in-process. No pg_dump path is exercised here (needs a live
@@ -51,15 +52,17 @@ def make_provider(seeded_store, backup_dir: Path, passphrase: str = PASSPHRASE):
         locations=DataLocations(
             database_url=seeded_store.database_url,
             media_dir=seeded_store.media_dir,
+            raw_ingest_dir=seeded_store.raw_ingest_dir,
         ),
         passphrase=passphrase,
     )
 
 
 def destroy_live_store(seeded_store) -> None:
-    """The 'disaster': remove the database file and the media tree."""
+    """The 'disaster': remove the database, media, and raw-ingest trees."""
     seeded_store.db_path.unlink()
     shutil.rmtree(seeded_store.media_dir)
+    shutil.rmtree(seeded_store.raw_ingest_dir)
 
 
 def count_rows(database_url: str) -> dict[str, int]:
@@ -97,6 +100,8 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
 
     destroy_live_store(seeded_store)
     assert not seeded_store.db_path.exists()
+    assert not seeded_store.media_dir.exists()
+    assert not seeded_store.raw_ingest_dir.exists()
 
     provider.restore(info.path)
 
@@ -136,9 +141,11 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
     finally:
         engine.dispose()
 
-    # Media bytes round-trip exactly.
+    # Media and raw-ingest bytes round-trip exactly.
     for relative, content in seeded_store.media_files.items():
         assert (seeded_store.media_dir / relative).read_bytes() == content
+    for relative, content in seeded_store.raw_ingest_files.items():
+        assert (seeded_store.raw_ingest_dir / relative).read_bytes() == content
 
 
 def test_restore_by_bare_snapshot_name(seeded_store, tmp_path: Path) -> None:

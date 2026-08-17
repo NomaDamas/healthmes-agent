@@ -575,7 +575,11 @@ open-wearables pg_dump, the media tree and optional Hermes state, then
 age-encrypt them with a passphrase (docs/PLAN.md §9; format spec +
 remote-vault contract in `docs/BACKUP.md`). This is a partial component
 snapshot: `.env`, external OAuth credentials and an unconfigured
-Open Wearables DB are not included.
+Open Wearables DB are not included. If `HEALTHMES_OW_API_KEY` configures
+Open Wearables for runtime use while `HEALTHMES_OW_DATABASE_URL` is absent,
+manual and weekly creation still write a valid snapshot but emit an explicit
+partial-backup warning; the manifest records that Open Wearables data cannot
+be recovered from it.
 
 ```bash
 export HEALTHMES_BACKUP_PASSPHRASE='...'    # or set it in .env
@@ -592,8 +596,10 @@ the API.) Knobs: `HEALTHMES_BACKUP_DIR` (default `{data_dir}/backups`),
 `HEALTHMES_HERMES_HOME`/`HERMES_HOME` (include Hermes state),
 `--passphrase-file` (keep the passphrase out of argv/history). A weekly
 backup job (Sunday 03:30) runs when the scheduler is enabled; without a
-passphrase it skips with a warning. **Losing the passphrase means losing the
-backups** — there is no recovery path by design.
+passphrase it skips with a warning. `/v1/storage/settings` always labels this
+as a `partial_component_snapshot` with `full_node_recovery=false` and reports
+the Open Wearables runtime/dump mismatch. **Losing the passphrase means
+losing the backups** — there is no recovery path by design.
 
 ### Remote vault (S3-compatible, ciphertext-only)
 
@@ -1054,8 +1060,9 @@ mirroring the run targets:
 Everything the two test jobs run is reproducible locally with the same
 commands; the test suite is offline by convention (see "Tests and lint"
 above). The hardening
-tests under `tests/hardening/` add a restore drill (backup snapshot →
-destroy → restore → reopen the store) and trigger-flood tests pinning the
+tests under `tests/hardening/` add a restore drill (HealthMes DB + media +
+raw-ingest snapshot → destroy all three → restore → byte-verify the file
+trees → reopen the store) and trigger-flood tests pinning the
 alert-hygiene guarantees of `docs/PLAN.md` §11 (daily budget, dedup storms,
 quiet-hours no-redelivery).
 

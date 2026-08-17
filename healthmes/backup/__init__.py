@@ -1,7 +1,7 @@
 """Local-first encrypted backup seam (BackupProvider protocol).
 
-Snapshot envelope (manifest + pg dumps + media + hermes state) encrypted
-with age (pyrage). LocalDirectoryProvider is the default;
+Snapshot envelope (manifest + pg dumps + media + raw_ingest + optional
+Hermes state) encrypted with age (pyrage). LocalDirectoryProvider is the default;
 RemoteVaultProvider (healthmes/backup/remote_vault.py) replicates the same
 encrypted envelopes to any S3-compatible vault. No data leaves the machine
 except through this interface. See docs/PLAN.md section 9 and
@@ -24,11 +24,13 @@ from healthmes.backup.provider import (
 from healthmes.backup.snapshot import (
     PROVIDER_LOCAL,
     PROVIDER_REMOTE_VAULT,
+    RECOVERY_SCOPE_PARTIAL_COMPONENT,
     SCHEMA_VERSION,
     SNAPSHOT_PREFIX,
     SNAPSHOT_SUFFIX,
     DataLocations,
     create_snapshot,
+    partial_backup_warning,
     read_manifest,
     resolve_backup_dir,
     resolve_backup_provider_name,
@@ -40,6 +42,7 @@ from healthmes.backup.snapshot import (
 __all__ = [
     "PROVIDER_LOCAL",
     "PROVIDER_REMOTE_VAULT",
+    "RECOVERY_SCOPE_PARTIAL_COMPONENT",
     "SCHEMA_VERSION",
     "SNAPSHOT_PREFIX",
     "SNAPSHOT_SUFFIX",
@@ -52,6 +55,7 @@ __all__ = [
     "WrongPassphraseError",
     "build_backup_job",
     "create_snapshot",
+    "partial_backup_warning",
     "read_manifest",
     "resolve_backup_dir",
     "resolve_backup_provider_name",

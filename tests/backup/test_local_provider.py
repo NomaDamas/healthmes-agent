@@ -123,6 +123,7 @@ class TestSettingsResolution:
         assert resolve_passphrase(settings) == "s3cret"
 
     def test_data_locations_resolution(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HEALTHMES_OW_API_KEY", raising=False)
         monkeypatch.delenv("HEALTHMES_OW_DATABASE_URL", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         settings = make_settings(tmp_path)
@@ -130,12 +131,15 @@ class TestSettingsResolution:
         assert locations.database_url == settings.database_url
         assert locations.media_dir == tmp_path / "data" / "media"
         assert locations.ow_database_url is None
+        assert locations.ow_runtime_configured is False
         assert locations.hermes_home is None
 
+        monkeypatch.setenv("HEALTHMES_OW_API_KEY", "runtime-key")
         monkeypatch.setenv("HEALTHMES_OW_DATABASE_URL", "postgresql+psycopg://ow@localhost/ow")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         locations = resolve_data_locations(settings)
         assert locations.ow_database_url == "postgresql+psycopg://ow@localhost/ow"
+        assert locations.ow_runtime_configured is True
         assert locations.hermes_home == tmp_path / "hermes"
 
     def test_from_settings_wires_everything(self, source_env, tmp_path, monkeypatch):
@@ -178,6 +182,29 @@ class TestWeeklyJob:
         build_backup_job(settings)()
         snapshots = list(backup_dir.glob("healthmes-backup-*.tar.gz.age"))
         assert len(snapshots) == 1
+
+    def test_writes_partial_snapshot_and_warns_when_runtime_ow_dump_is_absent(
+        self, source_env, tmp_path, monkeypatch, caplog
+    ):
+        backup_dir = tmp_path / "weekly"
+        monkeypatch.setenv("HEALTHMES_BACKUP_DIR", str(backup_dir))
+        monkeypatch.setenv("HEALTHMES_BACKUP_PASSPHRASE", source_env.passphrase)
+        monkeypatch.setenv("HEALTHMES_OW_API_KEY", "runtime-key")
+        monkeypatch.delenv("HEALTHMES_OW_DATABASE_URL", raising=False)
+        settings = Settings(
+            database_url=source_env.database_url,
+            data_dir=source_env.data_dir,
+            scheduler_enabled=False,
+            _env_file=None,
+        )
+
+        with caplog.at_level("WARNING", logger="healthmes.backup.snapshot"):
+            build_backup_job(settings)()
+
+        snapshots = list(backup_dir.glob("healthmes-backup-*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert "Partial backup" in caplog.text
+        assert "cannot recover that data" in caplog.text
 
     def test_logs_and_swallows_failures(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setenv("HEALTHMES_BACKUP_PASSPHRASE", "pp")

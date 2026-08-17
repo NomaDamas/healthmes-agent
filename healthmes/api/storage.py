@@ -21,9 +21,12 @@ from healthmes.api.decision_html import shell_context, template_environment
 from healthmes.api.errors import APIError
 from healthmes.api.local_session import issue_local_session, require_local_session
 from healthmes.backup.snapshot import (
+    RECOVERY_SCOPE_PARTIAL_COMPONENT,
     SNAPSHOT_SUFFIX,
+    partial_backup_warning,
     resolve_backup_dir,
     resolve_backup_provider_name,
+    resolve_data_locations,
 )
 from healthmes.config import Settings
 from healthmes.storage import (
@@ -102,6 +105,7 @@ def _settings_payload(session: SessionDep, settings: Settings) -> StorageSetting
     disk = shutil.disk_usage(settings.data_dir.resolve().parent)
     backup_dir = resolve_backup_dir(settings)
     snapshots = sorted(backup_dir.glob(f"*{SNAPSHOT_SUFFIX}"), reverse=True)
+    backup_locations = resolve_data_locations(settings)
     return StorageSettingsOut(
         data_dir=str(settings.data_dir.resolve()),
         disk_total_bytes=disk.total,
@@ -124,6 +128,15 @@ def _settings_payload(session: SessionDep, settings: Settings) -> StorageSetting
             "encryption_configured": bool(
                 settings.backup_passphrase.get_secret_value()
             ),
+            "recovery_scope": RECOVERY_SCOPE_PARTIAL_COMPONENT,
+            "full_node_recovery": False,
+            "open_wearables_runtime_configured": (
+                backup_locations.ow_runtime_configured
+            ),
+            "open_wearables_dump_configured": bool(
+                backup_locations.ow_database_url
+            ),
+            "operational_warning": partial_backup_warning(backup_locations),
         },
     )
 

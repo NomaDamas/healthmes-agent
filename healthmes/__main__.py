@@ -51,6 +51,7 @@ from healthmes.backup.provider import BackupError
 from healthmes.backup.snapshot import (
     PROVIDER_LOCAL,
     PROVIDER_REMOTE_VAULT,
+    RECOVERY_SCOPE_PARTIAL_COMPONENT,
     read_manifest,
     resolve_backup_provider_name,
     resolve_passphrase,
@@ -226,16 +227,23 @@ def _cmd_backup_push(args: argparse.Namespace) -> int:
 
 def _summarize_manifest(manifest: dict) -> list[str]:
     contents = manifest.get("contents", {})
+    recovery = manifest.get("recovery") or {}
     lines = [
         f"created_at:         {manifest.get('created_at')}",
         f"schema_version:     {manifest.get('schema_version')}",
         f"healthmes_version:  {manifest.get('healthmes_version')}",
+        f"recovery scope:     {recovery.get('scope', RECOVERY_SCOPE_PARTIAL_COMPONENT)}",
+        "full-node recovery: no",
     ]
     db_entry = contents.get("healthmes_db") or {}
     lines.append(f"healthmes db:       {db_entry.get('kind', 'missing')}")
     ow_entry = contents.get("open_wearables_db")
     lines.append(f"open-wearables db:  {ow_entry['kind'] if ow_entry else 'not included'}")
-    for label, key in (("media", "media"), ("hermes state", "hermes_home")):
+    for label, key in (
+        ("media", "media"),
+        ("raw ingest", "raw_ingest"),
+        ("hermes state", "hermes_home"),
+    ):
         entry = contents.get(key)
         if entry:
             lines.append(
@@ -244,6 +252,8 @@ def _summarize_manifest(manifest: dict) -> list[str]:
             )
         else:
             lines.append(f"{label + ':':<20}not included")
+    for warning in recovery.get("operational_warnings", []):
+        lines.append(f"warning:             {warning}")
     return lines
 
 
@@ -271,7 +281,9 @@ def _cmd_backup_restore(args: argparse.Namespace) -> int:
         for line in _summarize_manifest(manifest):
             print(line)
         print(
-            "\nrestore REPLACES the live database, media tree and Hermes state.\n"
+            "\nrestore REPLACES archived live components: HealthMes database, "
+            "media/raw-ingest trees, configured Open Wearables database, and "
+            "Hermes state.\n"
             f"re-run with --yes to apply:  healthmes backup restore {args.snapshot} --yes",
             file=sys.stderr,
         )
@@ -666,7 +678,9 @@ def build_parser() -> argparse.ArgumentParser:
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
 
     create = backup_sub.add_parser(
-        "create", help="Snapshot databases + media + Hermes state into an age-encrypted archive."
+        "create",
+        help="Snapshot HealthMes DB/media/raw_ingest plus configured "
+        "Open Wearables/Hermes state into an age-encrypted archive.",
     )
     _add_passphrase_file(create)
     _add_provider_flag(create)

@@ -12,6 +12,7 @@ recipient (pyrage). Inside the tar::
     db/open_wearables.dump        pg_dump -Fc       (optional, when the
                                   open-wearables database URL is configured)
     media/**                      HEALTHMES_DATA_DIR/media tree
+    raw_ingest/**                 HEALTHMES_DATA_DIR/raw_ingest tree
     hermes/**                     HERMES_HOME memory/state (when configured)
 
 Design points:
@@ -64,6 +65,7 @@ from healthmes.config import Settings
 __all__ = [
     "PROVIDER_LOCAL",
     "PROVIDER_REMOTE_VAULT",
+    "RECOVERY_SCOPE_PARTIAL_COMPONENT",
     "SCHEMA_VERSION",
     "SNAPSHOT_PREFIX",
     "SNAPSHOT_SUFFIX",
@@ -73,6 +75,7 @@ __all__ = [
     "libpq_env",
     "libpq_url",
     "parse_snapshot_name",
+    "partial_backup_warning",
     "read_manifest",
     "resolve_backup_dir",
     "resolve_backup_provider_name",
@@ -85,6 +88,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2  # v2: adds the raw_ingest section (older binaries must refuse)
+RECOVERY_SCOPE_PARTIAL_COMPONENT = "partial_component_snapshot"
 
 SNAPSHOT_PREFIX = "healthmes-backup-"
 SNAPSHOT_SUFFIX = ".tar.gz.age"
@@ -130,9 +134,12 @@ def _unwrap_secret(value: Any) -> str | None:
 class DataLocations:
     """Where the live data lives — read at export time, written at restore.
 
-    ``ow_database_url``, ``media_dir`` and ``hermes_home`` are optional
-    sections: unset (or missing on disk at export time) sections are recorded
-    as absent in the manifest and skipped symmetrically on restore.
+    ``ow_database_url``, ``media_dir``, ``raw_ingest_dir`` and ``hermes_home``
+    are optional sections: unset (or missing on disk at export time) sections
+    are recorded as absent in the manifest and skipped symmetrically on
+    restore. ``ow_runtime_configured`` records whether HealthMes can access
+    Open Wearables at runtime independently of whether a database dump URL is
+    available.
     """
 
     database_url: str
@@ -140,6 +147,7 @@ class DataLocations:
     media_dir: Path | None = None
     raw_ingest_dir: Path | None = None
     hermes_home: Path | None = None
+    ow_runtime_configured: bool = False
 
 
 def resolve_backup_dir(settings: Settings) -> Path:
@@ -202,12 +210,19 @@ def resolve_data_locations(settings: Settings) -> DataLocations:
     - open-wearables database: optional — ``Settings.ow_database_url`` or
       the ``HEALTHMES_OW_DATABASE_URL`` env var (direct postgres URL; the
       REST ``ow_base_url`` cannot produce a dump);
+    - open-wearables runtime: configured when ``Settings.ow_api_key`` /
+      ``HEALTHMES_OW_API_KEY`` is non-empty, independently of dump access;
     - media: always ``{data_dir}/media`` (healthmes/api/food.py convention);
+    - raw ingest: always ``{data_dir}/raw_ingest``;
     - Hermes state: optional — ``Settings.hermes_home`` or the vendor's own
       ``HERMES_HOME`` env var; only included "when configured" (PLAN §9).
     """
     ow_database_url = _unwrap_secret(getattr(settings, "ow_database_url", None)) or _unwrap_secret(
         os.environ.get("HEALTHMES_OW_DATABASE_URL")
+    )
+    ow_runtime_configured = bool(
+        _unwrap_secret(getattr(settings, "ow_api_key", None))
+        or _unwrap_secret(os.environ.get("HEALTHMES_OW_API_KEY"))
     )
     hermes_home = getattr(settings, "hermes_home", None)
     if not hermes_home:
@@ -219,7 +234,20 @@ def resolve_data_locations(settings: Settings) -> DataLocations:
         media_dir=Path(settings.data_dir) / "media",
         raw_ingest_dir=Path(settings.data_dir) / "raw_ingest",
         hermes_home=Path(hermes_home) if hermes_home else None,
+        ow_runtime_configured=ow_runtime_configured,
     )
+
+
+def partial_backup_warning(locations: DataLocations) -> str | None:
+    """Operational warning when runtime Open Wearables data cannot be recovered."""
+    if locations.ow_runtime_configured and not locations.ow_database_url:
+        return (
+            "Partial backup: Open Wearables is configured for runtime, but "
+            "HEALTHMES_OW_DATABASE_URL is unset, so this valid snapshot omits "
+            "the Open Wearables database and cannot recover that data. It "
+            "restores only the components listed in manifest.json."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +560,57 @@ def _tar_gz_bytes(stage: Path) -> bytes:
     return buffer.getvalue()
 
 
+def _tree_recovery_status(
+    configured_path: Path | None,
+    manifest_entry: dict[str, Any] | None,
+) -> str:
+    if manifest_entry is not None:
+        return "included"
+    if configured_path is None:
+        return "not_configured"
+    return "source_not_present"
+
+
+def _build_recovery_metadata(
+    locations: DataLocations,
+    contents: dict[str, Any],
+) -> dict[str, Any]:
+    warning = partial_backup_warning(locations)
+    ow_entry = contents["open_wearables_db"]
+    if ow_entry is not None:
+        ow_status = "included"
+    elif locations.ow_runtime_configured:
+        ow_status = "omitted_missing_dump_url"
+    else:
+        ow_status = "not_configured"
+    return {
+        "scope": RECOVERY_SCOPE_PARTIAL_COMPONENT,
+        "full_node_recovery": False,
+        "components": {
+            "healthmes_db": {"status": "included"},
+            "media": {
+                "status": _tree_recovery_status(locations.media_dir, contents["media"])
+            },
+            "raw_ingest": {
+                "status": _tree_recovery_status(
+                    locations.raw_ingest_dir, contents["raw_ingest"]
+                )
+            },
+            "open_wearables_db": {
+                "status": ow_status,
+                "runtime_configured": locations.ow_runtime_configured,
+                "dump_configured": bool(locations.ow_database_url),
+            },
+            "hermes_home": {
+                "status": _tree_recovery_status(
+                    locations.hermes_home, contents["hermes_home"]
+                )
+            },
+        },
+        "operational_warnings": [warning] if warning else [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public API — create / read / restore
 # ---------------------------------------------------------------------------
@@ -583,6 +662,7 @@ def create_snapshot(
             "schema_version": SCHEMA_VERSION,
             "created_at": created_at.isoformat(),
             "healthmes_version": __version__,
+            "recovery": _build_recovery_metadata(locations, contents),
             "contents": contents,
             "inventory": _build_inventory(stage),
         }
@@ -597,6 +677,8 @@ def create_snapshot(
     partial.write_bytes(ciphertext)
     partial.replace(out_path)
     logger.info("Snapshot written: %s (%d bytes encrypted)", out_path, len(ciphertext))
+    for warning in manifest["recovery"]["operational_warnings"]:
+        logger.warning("%s Snapshot written: %s", warning, out_path)
     return manifest
 
 

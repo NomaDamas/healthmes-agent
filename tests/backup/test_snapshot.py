@@ -20,6 +20,7 @@ from healthmes.backup.snapshot import (
     HERMES_ARCROOT,
     MANIFEST_ARCNAME,
     MEDIA_ARCROOT,
+    RECOVERY_SCOPE_PARTIAL_COMPONENT,
     DataLocations,
     create_snapshot,
     find_pg_tool,
@@ -195,6 +196,19 @@ class TestManifest:
         )
         assert manifest["schema_version"] == snapshot_mod.SCHEMA_VERSION == 2
         assert manifest["created_at"] == CREATED_AT.isoformat()
+        recovery = manifest["recovery"]
+        assert recovery["scope"] == RECOVERY_SCOPE_PARTIAL_COMPONENT
+        assert recovery["full_node_recovery"] is False
+        assert recovery["components"]["healthmes_db"]["status"] == "included"
+        assert recovery["components"]["media"]["status"] == "included"
+        assert recovery["components"]["raw_ingest"]["status"] == "not_configured"
+        assert recovery["components"]["open_wearables_db"] == {
+            "status": "not_configured",
+            "runtime_configured": False,
+            "dump_configured": False,
+        }
+        assert recovery["components"]["hermes_home"]["status"] == "included"
+        assert recovery["operational_warnings"] == []
         contents = manifest["contents"]
         assert contents["healthmes_db"] == {
             "kind": "sqlite_file",
@@ -228,6 +242,51 @@ class TestManifest:
         out_path = make_snapshot(source_env, tmp_path / "backups")
         manifest = read_manifest(out_path, source_env.passphrase)
         assert manifest["created_at"] == CREATED_AT.isoformat()
+
+    def test_runtime_ow_without_dump_warns_but_writes_valid_partial_snapshot(
+        self,
+        source_env,
+        fresh_locations,
+        tmp_path,
+        sqlite_dump,
+        caplog,
+    ):
+        locations = DataLocations(
+            database_url=source_env.database_url,
+            media_dir=source_env.media_dir,
+            hermes_home=source_env.hermes_home,
+            ow_runtime_configured=True,
+        )
+        out_path = tmp_path / "partial" / snapshot_name(CREATED_AT)
+        with caplog.at_level("WARNING", logger="healthmes.backup.snapshot"):
+            manifest = create_snapshot(
+                locations,
+                passphrase=source_env.passphrase,
+                out_path=out_path,
+                created_at=CREATED_AT,
+            )
+
+        assert out_path.is_file()
+        assert "Partial backup" in caplog.text
+        assert "HEALTHMES_OW_DATABASE_URL is unset" in caplog.text
+        assert manifest["recovery"]["full_node_recovery"] is False
+        assert manifest["recovery"]["components"]["open_wearables_db"] == {
+            "status": "omitted_missing_dump_url",
+            "runtime_configured": True,
+            "dump_configured": False,
+        }
+        assert len(manifest["recovery"]["operational_warnings"]) == 1
+        assert read_manifest(out_path, source_env.passphrase) == manifest
+
+        target, target_root = fresh_locations("partial-target")
+        restore_snapshot(
+            out_path,
+            passphrase=source_env.passphrase,
+            locations=target,
+        )
+        assert sqlite_dump(target_root / "data" / "healthmes.db") == sqlite_dump(
+            source_env.db_path
+        )
 
     def test_newer_schema_version_is_refused(self, source_env, tmp_path, monkeypatch):
         monkeypatch.setattr(snapshot_mod, "SCHEMA_VERSION", 99)
@@ -359,12 +418,19 @@ class TestDatabaseBackends:
             ow_database_url=ow_url,
             media_dir=source_env.media_dir,
             hermes_home=source_env.hermes_home,
+            ow_runtime_configured=True,
         )
         out_path = tmp_path / "mixed" / snapshot_name(CREATED_AT)
         manifest = create_snapshot(
             locations, passphrase="pp", out_path=out_path, created_at=CREATED_AT
         )
         assert manifest["contents"]["open_wearables_db"]["arcname"] == "db/open_wearables.dump"
+        assert manifest["recovery"]["components"]["open_wearables_db"] == {
+            "status": "included",
+            "runtime_configured": True,
+            "dump_configured": True,
+        }
+        assert manifest["recovery"]["operational_warnings"] == []
 
         pg_stubs.write_text("")
         target, _root = fresh_locations("ow-target")

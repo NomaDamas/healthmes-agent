@@ -39,6 +39,17 @@ class TestBackupCreateAndList:
         assert path.startswith(str(cli_env.data_dir / "backups"))
         assert path.endswith(".tar.gz.age")
 
+    def test_create_warns_when_runtime_ow_dump_is_absent(
+        self, cli_env, capsys, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("HEALTHMES_OW_API_KEY", "runtime-key")
+        with caplog.at_level("WARNING", logger="healthmes.backup.snapshot"):
+            path = create_snapshot_via_cli(capsys)
+
+        assert path.endswith(".tar.gz.age")
+        assert "Partial backup" in caplog.text
+        assert "HEALTHMES_OW_DATABASE_URL is unset" in caplog.text
+
     def test_list_shows_snapshots_without_passphrase(self, cli_env, capsys, monkeypatch):
         create_snapshot_via_cli(capsys)
         monkeypatch.delenv("HEALTHMES_BACKUP_PASSPHRASE")
@@ -81,6 +92,9 @@ class TestBackupRestore:
         assert main(["backup", "restore", path]) == 2
         captured = capsys.readouterr()
         assert "healthmes db:       sqlite_file" in captured.out
+        assert "recovery scope:     partial_component_snapshot" in captured.out
+        assert "full-node recovery: no" in captured.out
+        assert "raw ingest:" in captured.out
         assert "re-run with --yes" in captured.err
         # Dry run must not touch live data.
         assert marker.read_text(encoding="utf-8") == "mutated after snapshot"
