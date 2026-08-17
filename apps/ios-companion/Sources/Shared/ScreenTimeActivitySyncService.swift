@@ -563,8 +563,42 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         self.cleanupDeviceIDs = cleanupDeviceIDs.union([deviceID])
     }
 
+    func currentAuthorizationStatus() async -> ScreenTimeCollectorResult {
+        await collector.currentAuthorizationStatus()
+    }
+
     func requestAuthorization() async throws -> ScreenTimeCollectorResult {
         try await collector.requestAuthorization()
+    }
+
+    func authorizationRestorationFence(
+        pairing: Pairing,
+        now: Date
+    ) async throws -> ScreenTimeAuthorizationRestorationFence {
+        try Task.checkCancellation()
+        guard ScreenTimeDeviceIdentity.isStableCollectorID(deviceID) else {
+            throw ScreenTimeInputControlError.invalidCollectorIdentity
+        }
+        let state = try await transport.collectionState(
+            pairing: pairing,
+            deviceID: deviceID
+        )
+        try Task.checkCancellation()
+        guard state.deviceID == deviceID else {
+            throw ScreenTimeInputControlError.invalidDescriptor
+        }
+        return ScreenTimeAuthorizationRestorationFence(
+            deviceID: deviceID,
+            destinationID:
+                ScreenTimeActivityReportIdentity.destinationID(
+                    for: pairing
+                ),
+            configRevision: state.configRevision,
+            blockedReason: ScreenTimeSyncPlanner.skipReason(
+                state: state,
+                now: now
+            )
+        )
     }
 
     func registerAuthorizedCollector(

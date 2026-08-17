@@ -97,6 +97,11 @@ private struct ScreenTimeAuthorizationRefresh {
     var waiterLeases: [UUID: ScreenTimeSyncCancellationLease]
 }
 
+private enum ScreenTimeAutomaticAuthorizationInteraction {
+    case foreground
+    case noninteractive
+}
+
 private final class ScreenTimeAuthorizationWaiter:
     @unchecked Sendable
 {
@@ -285,12 +290,9 @@ final class ScreenTimeActivityRuntime {
             )
         }
         if authorizationIntentStore.isOptedIn {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                await self.runAutomaticCatchUp(
-                    trigger: .authorizationChanged
-                )
-            }
+            startAutomaticCatchUp(
+                trigger: .authorizationChanged
+            )
         }
     }
 
@@ -345,7 +347,8 @@ final class ScreenTimeActivityRuntime {
         let result = await automaticCatchUp(
             now: now,
             timezone: timezone,
-            trigger: .routine
+            trigger: .routine,
+            authorizationInteraction: .foreground
         )
         schedule()
         return result
@@ -496,8 +499,18 @@ final class ScreenTimeActivityRuntime {
     private func runAutomaticCatchUp(
         trigger: ScreenTimeSyncTrigger
     ) async {
-        guard authorizationIntentStore.isOptedIn else {
+        guard let task = startAutomaticCatchUp(trigger: trigger) else {
             return
+        }
+        _ = await task.result
+    }
+
+    @discardableResult
+    private func startAutomaticCatchUp(
+        trigger: ScreenTimeSyncTrigger
+    ) -> Task<Void, Never>? {
+        guard authorizationIntentStore.isOptedIn else {
+            return nil
         }
         let taskID = UUID()
         let now = nowProvider()
@@ -521,7 +534,7 @@ final class ScreenTimeActivityRuntime {
             self.schedule()
         }
         automaticTasks[taskID] = task
-        _ = await task.result
+        return task
     }
 
     func waitForAutomaticWork() async {
@@ -536,18 +549,123 @@ final class ScreenTimeActivityRuntime {
     private func automaticCatchUp(
         now: Date = Date(),
         timezone: TimeZone = .current,
-        trigger: ScreenTimeSyncTrigger = .routine
+        trigger: ScreenTimeSyncTrigger = .routine,
+        authorizationInteraction:
+            ScreenTimeAutomaticAuthorizationInteraction =
+                .noninteractive
     ) async -> ScreenTimeActivityLifecycleResult {
         guard authorizationIntentStore.isOptedIn else {
             return .skipped(
                 reason: "ios_screen_time_not_opted_in"
             )
         }
-        return await lifecycleController().catchUp(
+        let lifecycle = lifecycleController()
+        let currentAuthorization =
+            await lifecycle.currentAuthorizationStatus()
+        guard !Task.isCancelled else {
+            return .failed(reason: "cancelled")
+        }
+        guard authorizationIntentStore.isOptedIn else {
+            return .skipped(
+                reason: "ios_screen_time_not_opted_in"
+            )
+        }
+        if currentAuthorization.permitsAggregateUpload {
+            return await lifecycle.catchUp(
+                now: now,
+                timezone: timezone,
+                trigger: trigger
+            )
+        }
+        if currentAuthorization.permissionStatus == .unavailable {
+            return .skipped(
+                reason: currentAuthorization.reason
+                    ?? "ios_screen_time_unavailable"
+            )
+        }
+        let preparation =
+            await lifecycle.prepareAuthorizationRestoration(now: now)
+        guard !Task.isCancelled else {
+            return .failed(reason: "cancelled")
+        }
+        guard authorizationIntentStore.isOptedIn else {
+            return .skipped(
+                reason: "ios_screen_time_not_opted_in"
+            )
+        }
+        guard case .ready(let context) = preparation else {
+            switch preparation {
+            case .skipped(let reason):
+                return .skipped(reason: reason)
+            case .failed(let reason):
+                return .failed(reason: reason)
+            case .ready:
+                preconditionFailure("handled by guard")
+            }
+        }
+        guard activeIdentityMatches(context.fence.deviceID) else {
+            return .failed(
+                reason: "ios_screen_time_invalid_collector_identity"
+            )
+        }
+        guard authorizationInteraction == .foreground else {
+            return .skipped(
+                reason: "ios_screen_time_reauthorization_required"
+            )
+        }
+
+        let attempt: ScreenTimeAuthorizationAttempt
+        do {
+            attempt = try await authorizationAttempt(trigger: trigger)
+        } catch {
+            return .failed(reason: "cancelled")
+        }
+        guard !Task.isCancelled else {
+            return .failed(reason: "cancelled")
+        }
+        guard authorizationIntentStore.isOptedIn else {
+            return .skipped(
+                reason: "ios_screen_time_not_opted_in"
+            )
+        }
+        guard activeIdentityMatches(context.fence.deviceID) else {
+            return .failed(
+                reason: "ios_screen_time_invalid_collector_identity"
+            )
+        }
+        guard let restoredAuthorization = attempt.authorization else {
+            return .failed(
+                reason: attempt.failureReason
+                    ?? "ios_screen_time_authorization_failed"
+            )
+        }
+        guard restoredAuthorization.permitsAggregateUpload else {
+            if restoredAuthorization.permissionStatus == .unavailable {
+                return .skipped(
+                    reason: restoredAuthorization.reason
+                        ?? "ios_screen_time_unavailable"
+                )
+            }
+            return .skipped(
+                reason: "ios_screen_time_reauthorization_required"
+            )
+        }
+        return await lifecycle.syncAfterAuthorizationRestoration(
+            restoredAuthorization,
+            context: context,
             now: now,
             timezone: timezone,
-            trigger: trigger
+            trigger: .authorizationChanged
         )
+    }
+
+    private func activeIdentityMatches(_ deviceID: String) -> Bool {
+        guard let activeDeviceID =
+            authorizationIntentStore.activeDeviceID
+        else {
+            return true
+        }
+        return activeDeviceID == deviceID
     }
 
     private func cancelAndWaitForExplicitAuthorizationWork() async {

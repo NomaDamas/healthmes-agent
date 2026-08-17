@@ -323,11 +323,20 @@ ScreenTimeActivitySyncService.sync(pairing:)
           activity.* WellnessEvent
 ```
 
-cold launch, foreground, authorization status 변경 알림, background task는
-Apple 권한 UI를 호출하지 않는다. 이 자동 경로들은 저장된 opt-in을 확인하고
-`currentAuthorizationStatus()`로 현재 상태를 읽은 뒤 허용된 경우에만 sync한다.
-Apple의 `requestAuthorization()`을 호출할 수 있는 유일한 제품 경로는 사용자가
-직접 선택한 `requestAuthorizationAndSync()`이다.
+cold launch, authorization status 변경 알림과 background task는 Apple 권한 UI를
+호출하지 않는다. 저장된 opt-in과 현재 authorization을 읽어 이미 허용된 경우에만
+sync한다. 권한 상태를 비대화형으로 확정할 수 없으면 중앙 enabled/pause, pairing,
+collector identity와 revision을 먼저 확인한 뒤
+`ios_screen_time_reauthorization_required`를 반환하고 업로드를 미룬다.
+
+저장된 opt-in이 있는 상태에서 앱이 active foreground로 들어오면
+`foregroundCatchUp()`은 최초 자동 sync 전에 authorization 복원을 시도할 수 있다.
+이 복원은 동시 foreground 호출 사이에서 single-flight이며, 권한 요청 전후로
+local opt-out, pairing, 기억된 collector identity, 중앙 enabled/pause와 revision을
+다시 확인한다. 중간에 하나라도 바뀌면 sync하지 않는다. 복원 경로는 input
+registration PUT을 호출하지 않으므로 중앙에서 disabled인 instance를 다시
+enable할 수 없다. 신규 opt-in과 absent collector 등록은 계속 사용자가 직접
+선택한 `requestAuthorizationAndSync()`만 담당한다.
 
 명시적 authorization 결과가 `aggregate + granted`이면 runtime은 첫 sync 전에
 안정적인 collector ID가 input descriptor에 존재하는지 확인한다. 없을 때만 상세
@@ -344,9 +353,11 @@ conflict 소진은 Screen Time을 읽기 전에 fail closed한다.
 cold launch, foreground, background, pairing/configuration observer와
 authorization-status observer는 위 bootstrap PUT을 호출하지 않는다. 이 자동
 경로는 중앙 설정을 읽기만 하며 disabled 또는 paused instance를 자동으로 다시
-enable하지 않는다. local opt-out은 진행 중인 명시적 authorization/bootstrap
-task를 취소하고 종료를 기다린 뒤 outbox/state/key cleanup을 수행하므로 stale
-bootstrap이 cleanup 뒤 첫 sync를 시작할 수 없다.
+enable하지 않는다. foreground authorization 복원도 등록과 분리되어 같은
+read-only 중앙 fence를 따른다. local opt-out은 진행 중인 명시적
+authorization/bootstrap과 foreground 복원을 취소하고 종료를 기다린 뒤
+outbox/state/key cleanup을 수행하므로 stale 작업이 cleanup 뒤 첫 sync를 시작할
+수 없다.
 pairing이 bootstrap 도중 바뀌어도 해당 작업을 취소하고 등록 뒤 pairing을 다시
 검증하므로 이전 HealthMes node로 첫 sync하지 않는다. 새 node에 instance가 없다면
 현재 pairing에서 명시적 authorize action을 다시 실행해야 한다.
@@ -630,7 +641,9 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 6. 명시적 사용자 action은 `requestAuthorizationAndSync()`만 호출한다. 성공한
    `aggregate + granted` 결과는 absent stable instance를 엔진이 CAS bootstrap한
    뒤 첫 sync한다. pairing 전에는 이 action을 실행하지 않으며, device UI가 같은
-   등록 PUT을 중복 구현하지 않는다.
+   등록 PUT을 중복 구현하지 않는다. 기존 opt-in의 foreground 복원은 runtime이
+   담당하며, `ios_screen_time_reauthorization_required`는 재승인이 필요한 상태로
+   표시한다.
 7. 설정 저장은 반드시 상세 GET의 `ETag`를 `If-Match`로 보내고, 428/409에서는
    최신 descriptor와 ETag를 재조회해 사용자 편집을 재적용한다. 성공 후에는 PUT
    응답 descriptor와 ETag를 다음 편집의 정본으로 사용한다.

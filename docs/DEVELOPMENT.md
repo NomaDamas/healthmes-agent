@@ -367,9 +367,16 @@ activation, pairing changes and a Screen Time-specific `BGAppRefreshTask`
 enter the same single-flight sync and bounded-outbox pipeline. Registration
 writes only `instance_id`, `platform=ios`, and `enabled=true`, retries CAS
 conflicts by re-reading, and never overwrites an existing disabled or paused
-instance. Automatic lifecycle paths only read central state. The normal
-repository build always selects the unavailable adapter and collects no Apple
-activity. Saved input/retention revisions have a UI-neutral
+instance. Automatic lifecycle paths only read central state and never register
+or reactivate an instance. Cold launch, authorization notifications, and
+background refresh never open a permission sheet. For a persisted opt-in, the
+first active foreground catch-up may restore authorization through a
+single-flight request after a read-only central-state preflight; it rechecks
+opt-out, pairing, collector identity, enabled/pause, and revision before
+upload. An unresolved noninteractive status returns
+`ios_screen_time_reauthorization_required`. The normal repository build always
+selects the unavailable adapter and collects no Apple activity. Saved
+input/retention revisions have a UI-neutral
 `inputConfigurationDidChange()` hook. Authorization, configuration, and
 timezone changes observed during an active sync coalesce into one fresh
 pending run. BG task expiration cancels the service pipeline only when no
@@ -377,8 +384,8 @@ foreground waiter shares it. The local outbox is capped at 8 entries/16 MiB,
 expires entries after 14 days across restart and offline retry, and is
 excluded from device backup. Explicit authorization requires an existing
 HealthMes pairing; unpaired calls fail before Apple authorization. Local
-opt-out cancels and awaits an in-flight authorization/bootstrap before privacy
-cleanup.
+opt-out cancels and awaits an in-flight authorization/bootstrap or foreground
+restoration before privacy cleanup.
 
 `HealthMesCompanionScreenTimeOptIn` is an opt-in request scheme, not an
 eligibility assertion. Run

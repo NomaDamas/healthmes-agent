@@ -25,8 +25,33 @@ enum ScreenTimeSyncCancellationLease: Equatable, Sendable {
     case background
 }
 
+struct ScreenTimeAuthorizationRestorationFence: Equatable, Sendable {
+    let deviceID: String
+    let destinationID: String
+    let configRevision: Int
+    let blockedReason: String?
+}
+
+struct ScreenTimeAuthorizationRestorationContext: Equatable {
+    let pairing: Pairing
+    let fence: ScreenTimeAuthorizationRestorationFence
+}
+
+enum ScreenTimeAuthorizationRestorationPreparation: Equatable {
+    case ready(ScreenTimeAuthorizationRestorationContext)
+    case skipped(reason: String)
+    case failed(reason: String)
+}
+
 protocol ScreenTimeActivitySyncing: Sendable {
+    func currentAuthorizationStatus() async -> ScreenTimeCollectorResult
+
     func requestAuthorization() async throws -> ScreenTimeCollectorResult
+
+    func authorizationRestorationFence(
+        pairing: Pairing,
+        now: Date
+    ) async throws -> ScreenTimeAuthorizationRestorationFence
 
     func registerAuthorizedCollector(
         pairing: Pairing
@@ -230,6 +255,109 @@ final class ScreenTimeActivityLifecycleController {
                 failureReason: Self.failureReason(
                     for: error,
                     fallback: "ios_screen_time_authorization_failed"
+                )
+            )
+        }
+    }
+
+    func currentAuthorizationStatus() async -> ScreenTimeCollectorResult {
+        await syncService.currentAuthorizationStatus()
+    }
+
+    func prepareAuthorizationRestoration(
+        now: Date = Date()
+    ) async -> ScreenTimeAuthorizationRestorationPreparation {
+        guard let pairing = pairingProvider() else {
+            do {
+                try await syncService.reconcilePendingUploads(
+                    pairing: nil
+                )
+                return .skipped(reason: "not_paired")
+            } catch {
+                return .failed(
+                    reason: Self.failureReason(
+                        for: error,
+                        fallback:
+                            "ios_screen_time_outbox_reconciliation_failed"
+                    )
+                )
+            }
+        }
+        do {
+            let fence =
+                try await syncService.authorizationRestorationFence(
+                    pairing: pairing,
+                    now: now
+                )
+            if let blockedReason = fence.blockedReason {
+                return .skipped(reason: blockedReason)
+            }
+            return .ready(
+                ScreenTimeAuthorizationRestorationContext(
+                    pairing: pairing,
+                    fence: fence
+                )
+            )
+        } catch {
+            return .failed(
+                reason: Self.failureReason(
+                    for: error,
+                    fallback:
+                        "ios_screen_time_authorization_preflight_failed"
+                )
+            )
+        }
+    }
+
+    func syncAfterAuthorizationRestoration(
+        _ authorization: ScreenTimeCollectorResult,
+        context: ScreenTimeAuthorizationRestorationContext,
+        now: Date = Date(),
+        timezone: TimeZone = .current,
+        trigger: ScreenTimeSyncTrigger = .authorizationChanged
+    ) async -> ScreenTimeActivityLifecycleResult {
+        guard authorization.permitsAggregateUpload else {
+            return .skipped(
+                reason: "ios_screen_time_reauthorization_required"
+            )
+        }
+        do {
+            try Task.checkCancellation()
+            guard pairingProvider() == context.pairing else {
+                return .failed(reason: "pairing_changed")
+            }
+            let refreshedFence =
+                try await syncService.authorizationRestorationFence(
+                    pairing: context.pairing,
+                    now: now
+                )
+            if let blockedReason = refreshedFence.blockedReason {
+                return .skipped(reason: blockedReason)
+            }
+            guard refreshedFence == context.fence else {
+                return .skipped(
+                    reason:
+                        "ios_screen_time_collection_configuration_changed"
+                )
+            }
+            try Task.checkCancellation()
+            guard pairingProvider() == context.pairing else {
+                return .failed(reason: "pairing_changed")
+            }
+            return .completed(
+                try await syncService.sync(
+                    pairing: context.pairing,
+                    now: now,
+                    timezone: timezone,
+                    trigger: trigger
+                )
+            )
+        } catch {
+            return .failed(
+                reason: Self.failureReason(
+                    for: error,
+                    fallback:
+                        "ios_screen_time_authorization_restoration_failed"
                 )
             )
         }

@@ -276,6 +276,13 @@ app active / pairing changed / saved input configuration
   / Screen Time BGAppRefreshTask
   -> read-only central-state check
   -> the same single-flight sync + persistent outbox pipeline
+
+persisted opt-in + authorization not yet restored
+  -> cold launch / background: no permission sheet, defer upload
+  -> active foreground: read-only central fence
+  -> single-flight authorization restoration
+  -> re-check opt-out + pairing + identity + central revision
+  -> sync without collector registration
 ```
 
 The device team still owns the settings screen. It should call
@@ -292,14 +299,19 @@ are already wired in `HealthMesCompanionApp` and
 `ScreenTimeActivityRuntime`. A timezone change is detected on the next
 lifecycle sync and also receives a fresh run.
 
-Cold launch, foreground activation, authorization-status notifications, and
-background refresh never call Apple's authorization UI. They only inspect the
-current status and sync when the user has already opted in. The sole
-authorization entry point is the explicit device-team
-`requestAuthorizationAndSync()` seam. Automatic lifecycle and authorization
-status callbacks never write input settings or re-enable a centrally disabled
-or paused collector. Local opt-out cancels and awaits any in-flight explicit
-authorization/bootstrap task before purging its outbox, state, and key.
+Cold launch, authorization-status notifications, and background refresh never
+call Apple's authorization UI. They inspect the persisted opt-in and current
+status, then sync only when authorization is already usable. If status cannot
+be restored without foreground interaction, they return
+`ios_screen_time_reauthorization_required` and defer upload. On the first
+active foreground catch-up, a persisted opt-in may restore authorization
+through a single-flight request. That path checks central enabled/pause and
+revision before and after the request, rechecks pairing and the remembered
+collector identity, and never registers or re-enables an instance.
+`requestAuthorizationAndSync()` remains the explicit new-opt-in seam and the
+only path that can bootstrap an absent collector. Local opt-out cancels and
+awaits any in-flight explicit authorization/bootstrap or foreground
+restoration task before purging its outbox, state, and key.
 A pairing change also cancels bootstrap before first sync; the explicit action
 must be retried against the current pairing if that node has no registered
 instance.

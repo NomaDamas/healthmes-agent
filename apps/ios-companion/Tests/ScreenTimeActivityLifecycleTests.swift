@@ -702,6 +702,17 @@ private actor ScreenTimeLifecycleBlockingRegistrationService:
     private var syncPairings: [Pairing] = []
     private var disableCalls = 0
 
+    func currentAuthorizationStatus() async
+        -> ScreenTimeCollectorResult
+    {
+        ScreenTimeCollectorResult(
+            capability: .aggregate,
+            permissionStatus: .granted,
+            reason: nil,
+            samples: []
+        )
+    }
+
     func requestAuthorization() async throws
         -> ScreenTimeCollectorResult
     {
@@ -711,6 +722,22 @@ private actor ScreenTimeLifecycleBlockingRegistrationService:
             permissionStatus: .granted,
             reason: nil,
             samples: []
+        )
+    }
+
+    func authorizationRestorationFence(
+        pairing: Pairing,
+        now _: Date
+    ) async throws -> ScreenTimeAuthorizationRestorationFence {
+        ScreenTimeAuthorizationRestorationFence(
+            deviceID:
+                "ios-collector-v1-" + String(repeating: "1", count: 40),
+            destinationID:
+                ScreenTimeActivityReportIdentity.destinationID(
+                    for: pairing
+                ),
+            configRevision: 3,
+            blockedReason: nil
         )
     }
 
@@ -799,12 +826,17 @@ private actor ScreenTimeLifecycleBlockingRegistrationService:
 private actor ScreenTimeLifecycleMockSyncService:
     ScreenTimeActivitySyncing
 {
+    private let currentAuthorizationResult: ScreenTimeCollectorResult
     private let authorizationResult: ScreenTimeCollectorResult
     private let syncResult: ScreenTimeSyncOutcome
     private let authorizationError: Error?
     private let registrationError: Error?
     private let exclusionApprovalError: Error?
+    private var restorationFences:
+        [ScreenTimeAuthorizationRestorationFence]
+    private var currentAuthorizationCalls = 0
     private var authorizationCalls = 0
+    private var restorationFenceCalls = 0
     private var registrationCalls = 0
     private var approvedExclusions: [Set<String>] = []
     private var syncCalls = 0
@@ -816,15 +848,28 @@ private actor ScreenTimeLifecycleMockSyncService:
     init(
         authorizationResult: ScreenTimeCollectorResult,
         syncResult: ScreenTimeSyncOutcome,
+        currentAuthorizationResult: ScreenTimeCollectorResult? = nil,
+        restorationFences:
+            [ScreenTimeAuthorizationRestorationFence] = [],
         authorizationError: Error? = nil,
         registrationError: Error? = nil,
         exclusionApprovalError: Error? = nil
     ) {
+        self.currentAuthorizationResult =
+            currentAuthorizationResult ?? authorizationResult
         self.authorizationResult = authorizationResult
         self.syncResult = syncResult
+        self.restorationFences = restorationFences
         self.authorizationError = authorizationError
         self.registrationError = registrationError
         self.exclusionApprovalError = exclusionApprovalError
+    }
+
+    func currentAuthorizationStatus() async
+        -> ScreenTimeCollectorResult
+    {
+        currentAuthorizationCalls += 1
+        return currentAuthorizationResult
     }
 
     func requestAuthorization() async throws
@@ -835,6 +880,29 @@ private actor ScreenTimeLifecycleMockSyncService:
             throw authorizationError
         }
         return authorizationResult
+    }
+
+    func authorizationRestorationFence(
+        pairing: Pairing,
+        now _: Date
+    ) async throws -> ScreenTimeAuthorizationRestorationFence {
+        restorationFenceCalls += 1
+        if restorationFences.count > 1 {
+            return restorationFences.removeFirst()
+        }
+        if let fence = restorationFences.first {
+            return fence
+        }
+        return ScreenTimeAuthorizationRestorationFence(
+            deviceID:
+                "ios-collector-v1-" + String(repeating: "1", count: 40),
+            destinationID:
+                ScreenTimeActivityReportIdentity.destinationID(
+                    for: pairing
+                ),
+            configRevision: 3,
+            blockedReason: nil
+        )
     }
 
     func registerAuthorizedCollector(
@@ -878,7 +946,9 @@ private actor ScreenTimeLifecycleMockSyncService:
     }
 
     func calls() -> (
+        currentAuthorization: Int,
         authorization: Int,
+        restorationFence: Int,
         registration: Int,
         approvedExclusions: [Set<String>],
         sync: Int,
@@ -888,7 +958,9 @@ private actor ScreenTimeLifecycleMockSyncService:
         disable: Int
     ) {
         (
+            currentAuthorizationCalls,
             authorizationCalls,
+            restorationFenceCalls,
             registrationCalls,
             approvedExclusions,
             syncCalls,
@@ -903,10 +975,15 @@ private actor ScreenTimeLifecycleMockSyncService:
 private actor ScreenTimeLifecycleBlockingAuthorizationService:
     ScreenTimeActivitySyncing
 {
+    private let currentAuthorizationResult: ScreenTimeCollectorResult
     private let authorizationResult: ScreenTimeCollectorResult
     private let syncResult: ScreenTimeSyncOutcome
+    private var restorationFences:
+        [ScreenTimeAuthorizationRestorationFence]
+    private var currentAuthorizationCalls = 0
     private var authorizationCalls = 0
     private var authorizationCancellations = 0
+    private var restorationFenceCalls = 0
     private var authorizationWaiters:
         [CheckedContinuation<Void, Never>] = []
     private var registrationCalls = 0
@@ -915,10 +992,23 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
 
     init(
         authorizationResult: ScreenTimeCollectorResult,
-        syncResult: ScreenTimeSyncOutcome
+        syncResult: ScreenTimeSyncOutcome,
+        currentAuthorizationResult: ScreenTimeCollectorResult? = nil,
+        restorationFences:
+            [ScreenTimeAuthorizationRestorationFence] = []
     ) {
+        self.currentAuthorizationResult =
+            currentAuthorizationResult ?? authorizationResult
         self.authorizationResult = authorizationResult
         self.syncResult = syncResult
+        self.restorationFences = restorationFences
+    }
+
+    func currentAuthorizationStatus() async
+        -> ScreenTimeCollectorResult
+    {
+        currentAuthorizationCalls += 1
+        return currentAuthorizationResult
     }
 
     func requestAuthorization() async throws
@@ -931,11 +1021,34 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
             }
         } onCancel: {
             Task {
-                await self.recordAuthorizationCancellation()
+                await self.cancelAuthorization()
             }
         }
         try Task.checkCancellation()
         return authorizationResult
+    }
+
+    func authorizationRestorationFence(
+        pairing: Pairing,
+        now _: Date
+    ) async throws -> ScreenTimeAuthorizationRestorationFence {
+        restorationFenceCalls += 1
+        if restorationFences.count > 1 {
+            return restorationFences.removeFirst()
+        }
+        if let fence = restorationFences.first {
+            return fence
+        }
+        return ScreenTimeAuthorizationRestorationFence(
+            deviceID:
+                "ios-collector-v1-" + String(repeating: "1", count: 40),
+            destinationID:
+                ScreenTimeActivityReportIdentity.destinationID(
+                    for: pairing
+                ),
+            configRevision: 3,
+            blockedReason: nil
+        )
     }
 
     func registerAuthorizedCollector(
@@ -973,23 +1086,30 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
     }
 
     func calls() -> (
+        currentAuthorization: Int,
         authorization: Int,
         cancellations: Int,
+        restorationFence: Int,
         registration: Int,
         sync: Int,
         disable: Int
     ) {
         (
+            currentAuthorizationCalls,
             authorizationCalls,
             authorizationCancellations,
+            restorationFenceCalls,
             registrationCalls,
             syncCalls,
             disableCalls
         )
     }
 
-    private func recordAuthorizationCancellation() {
+    private func cancelAuthorization() {
         authorizationCancellations += 1
+        let waiters = authorizationWaiters
+        authorizationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 
@@ -1116,6 +1236,25 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             permissionStatus: permission,
             reason: reason,
             samples: []
+        )
+    }
+
+    private func authorizationRestorationFence(
+        pairing: Pairing? = nil,
+        deviceID: String =
+            "ios-collector-v1-" + String(repeating: "1", count: 40),
+        configRevision: Int = 3,
+        blockedReason: String? = nil
+    ) -> ScreenTimeAuthorizationRestorationFence {
+        let pairing = pairing ?? self.pairing()
+        return ScreenTimeAuthorizationRestorationFence(
+            deviceID: deviceID,
+            destinationID:
+                ScreenTimeActivityReportIdentity.destinationID(
+                    for: pairing
+                ),
+            configRevision: configRevision,
+            blockedReason: blockedReason
         )
     }
 
@@ -4933,6 +5072,94 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(counts.pending, 0)
     }
 
+    func testAuthorizationRestorationFenceReadsCentralRevisionAndIdentity()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "a", count: 40)
+        let state = ScreenTimeCollectionState(
+            deviceID: deviceID,
+            enabled: true,
+            excludedApps: [],
+            pausedUntil: nil,
+            effectiveCollecting: true,
+            blockedReason: nil,
+            configRevision: 17,
+            rawRetentionCutoff: nil
+        )
+        let transport = ScreenTimeLifecycleTestTransport(state: state)
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport
+        )
+
+        let fence = try await service.authorizationRestorationFence(
+            pairing: pairing(),
+            now: date("2026-08-16T10:34:00Z")
+        )
+        let stateCalls = await transport.capturedStateCalls()
+        let reports = await transport.capturedReports()
+
+        XCTAssertEqual(
+            fence,
+            authorizationRestorationFence(
+                deviceID: deviceID,
+                configRevision: 17
+            )
+        )
+        XCTAssertEqual(stateCalls, 1)
+        XCTAssertTrue(reports.isEmpty)
+    }
+
+    func testAuthorizationRestorationFenceRejectsMismatchedDevice()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "a", count: 40)
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: ScreenTimeCollectionState(
+                deviceID:
+                    "ios-collector-v1-"
+                    + String(repeating: "b", count: 40),
+                enabled: true,
+                excludedApps: [],
+                pausedUntil: nil,
+                effectiveCollecting: true,
+                blockedReason: nil,
+                configRevision: 17,
+                rawRetentionCutoff: nil
+            )
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport
+        )
+
+        do {
+            _ = try await service.authorizationRestorationFence(
+                pairing: pairing(),
+                now: date("2026-08-16T10:34:00Z")
+            )
+            XCTFail("expected mismatched central device identity")
+        } catch let error as ScreenTimeInputControlError {
+            XCTAssertEqual(error, .invalidDescriptor)
+        }
+        let stateCalls = await transport.capturedStateCalls()
+        let reports = await transport.capturedReports()
+        XCTAssertEqual(stateCalls, 1)
+        XCTAssertTrue(reports.isEmpty)
+    }
+
     @MainActor
     func testAuthorizationSuccessImmediatelyUsesSyncPipeline()
         async
@@ -5710,6 +5937,640 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             ]
         )
         XCTAssertEqual(backgroundTasks.schedules, 3)
+    }
+
+    @MainActor
+    func testRuntimeForegroundRestoresPersistedAuthorizationBeforeSync()
+        async
+    {
+        let suiteName =
+            "healthmes.screen-time.restore-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let notDetermined = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test"),
+            currentAuthorizationResult: notDetermined
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+
+        runtime.register()
+        await runtime.waitForAutomaticWork()
+        var calls = await service.calls()
+        XCTAssertEqual(calls.currentAuthorization, 1)
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(calls.restorationFence, 1)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 0)
+
+        let foreground = await runtime.foregroundCatchUp(
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        calls = await service.calls()
+
+        XCTAssertEqual(
+            foreground,
+            .completed(.skipped(reason: "test"))
+        )
+        XCTAssertEqual(calls.currentAuthorization, 2)
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.restorationFence, 3)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 1)
+        XCTAssertEqual(calls.syncTriggers, [.authorizationChanged])
+    }
+
+    @MainActor
+    func testRuntimeColdLaunchAndBackgroundNeverPromptWhenRestorationNeeded()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.noninteractive-tests."
+            + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let notDetermined = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "unused"),
+            currentAuthorizationResult: notDetermined
+        )
+        let backgroundTasks = ScreenTimeLifecycleBackgroundTasks()
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: backgroundTasks,
+            notificationCenter: NotificationCenter()
+        )
+
+        runtime.register()
+        await runtime.waitForAutomaticWork()
+        let backgroundTask = backgroundTasks.launch()
+        try await waitForBackgroundCompletion(backgroundTask)
+        let calls = await service.calls()
+
+        XCTAssertEqual(backgroundTask.completionValues, [true])
+        XCTAssertEqual(calls.currentAuthorization, 2)
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(calls.restorationFence, 2)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 0)
+    }
+
+    @MainActor
+    func testRuntimeForegroundDefersWhenAuthorizationCannotBeRestored()
+        async
+    {
+        for permission:
+            ScreenTimeActivityPermissionStatus
+            in [.unknown, .revoked, .denied, .restricted]
+        {
+            let suiteName =
+                "healthmes.screen-time.reauth-tests."
+                + permission.rawValue + "." + UUID().uuidString
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer {
+                defaults.removePersistentDomain(forName: suiteName)
+            }
+            let intentStore = ScreenTimeAuthorizationIntentStore(
+                defaults: defaults
+            )
+            intentStore.setOptedIn(true)
+            let unresolved = collectorResult(
+                capability: .unavailable,
+                permission: permission,
+                reason: "authorization_not_restored"
+            )
+            let service = ScreenTimeLifecycleMockSyncService(
+                authorizationResult: unresolved,
+                syncResult: .skipped(reason: "unused"),
+                currentAuthorizationResult: unresolved
+            )
+            let runtime = ScreenTimeActivityRuntime(
+                lifecycle: ScreenTimeActivityLifecycleController(
+                    syncService: service,
+                    pairingProvider: { self.pairing() }
+                ),
+                authorizationIntentStore: intentStore,
+                backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+                notificationCenter: NotificationCenter()
+            )
+
+            let result = await runtime.foregroundCatchUp()
+            let calls = await service.calls()
+
+            XCTAssertEqual(
+                result,
+                .skipped(
+                    reason:
+                        "ios_screen_time_reauthorization_required"
+                ),
+                "permission=\(permission.rawValue)"
+            )
+            XCTAssertEqual(calls.authorization, 1)
+            XCTAssertEqual(calls.restorationFence, 1)
+            XCTAssertEqual(calls.registration, 0)
+            XCTAssertEqual(calls.sync, 0)
+        }
+    }
+
+    @MainActor
+    func testRuntimeRestorationRespectsCentralDisableAndPause()
+        async
+    {
+        for reason in ["collection_disabled", "collection_paused"] {
+            let suiteName =
+                "healthmes.screen-time.central-block-tests."
+                + reason + "." + UUID().uuidString
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer {
+                defaults.removePersistentDomain(forName: suiteName)
+            }
+            let intentStore = ScreenTimeAuthorizationIntentStore(
+                defaults: defaults
+            )
+            intentStore.setOptedIn(true)
+            let unknown = collectorResult(
+                capability: .unavailable,
+                permission: .unknown,
+                reason: "ios_screen_time_permission_not_determined"
+            )
+            let service = ScreenTimeLifecycleMockSyncService(
+                authorizationResult: collectorResult(),
+                syncResult: .skipped(reason: "unused"),
+                currentAuthorizationResult: unknown,
+                restorationFences: [
+                    authorizationRestorationFence(
+                        blockedReason: reason
+                    )
+                ]
+            )
+            let runtime = ScreenTimeActivityRuntime(
+                lifecycle: ScreenTimeActivityLifecycleController(
+                    syncService: service,
+                    pairingProvider: { self.pairing() }
+                ),
+                authorizationIntentStore: intentStore,
+                backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+                notificationCenter: NotificationCenter()
+            )
+
+            let result = await runtime.foregroundCatchUp()
+            let calls = await service.calls()
+
+            XCTAssertEqual(
+                result,
+                .skipped(reason: reason)
+            )
+            XCTAssertEqual(calls.authorization, 0)
+            XCTAssertEqual(calls.restorationFence, 1)
+            XCTAssertEqual(calls.registration, 0)
+            XCTAssertEqual(calls.sync, 0)
+        }
+    }
+
+    @MainActor
+    func testRuntimeRestorationRejectsCentralRevisionChange()
+        async
+    {
+        let suiteName =
+            "healthmes.screen-time.revision-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let unknown = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "unused"),
+            currentAuthorizationResult: unknown,
+            restorationFences: [
+                authorizationRestorationFence(configRevision: 3),
+                authorizationRestorationFence(configRevision: 4),
+            ]
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+
+        let result = await runtime.foregroundCatchUp()
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            result,
+            .skipped(
+                reason:
+                    "ios_screen_time_collection_configuration_changed"
+            )
+        )
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.restorationFence, 2)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 0)
+    }
+
+    @MainActor
+    func testRuntimeRestorationStopsWhenCentralStateDisablesAfterGrant()
+        async
+    {
+        let suiteName =
+            "healthmes.screen-time.disable-race-tests."
+            + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let unknown = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "unused"),
+            currentAuthorizationResult: unknown,
+            restorationFences: [
+                authorizationRestorationFence(configRevision: 3),
+                authorizationRestorationFence(
+                    configRevision: 4,
+                    blockedReason: "collection_disabled"
+                ),
+            ]
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+
+        let result = await runtime.foregroundCatchUp()
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            result,
+            .skipped(reason: "collection_disabled")
+        )
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.restorationFence, 2)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 0)
+    }
+
+    @MainActor
+    func testRuntimeRestorationRechecksPairingAndRememberedIdentity()
+        async throws
+    {
+        let firstPairing = pairing(
+            token: "first",
+            baseURL: "https://first.healthmes.test"
+        )
+        let secondPairing = pairing(
+            token: "second",
+            baseURL: "https://second.healthmes.test"
+        )
+        let unknown = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+
+        do {
+            let suiteName =
+                "healthmes.screen-time.identity-fence-tests."
+                + UUID().uuidString
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer {
+                defaults.removePersistentDomain(forName: suiteName)
+            }
+            let intentStore = ScreenTimeAuthorizationIntentStore(
+                defaults: defaults
+            )
+            intentStore.setOptedIn(true)
+            intentStore.rememberActiveDeviceID(
+                "ios-collector-v1-" + String(repeating: "2", count: 40)
+            )
+            let service = ScreenTimeLifecycleMockSyncService(
+                authorizationResult: collectorResult(),
+                syncResult: .skipped(reason: "unused"),
+                currentAuthorizationResult: unknown
+            )
+            let runtime = ScreenTimeActivityRuntime(
+                lifecycle: ScreenTimeActivityLifecycleController(
+                    syncService: service,
+                    pairingProvider: { firstPairing }
+                ),
+                authorizationIntentStore: intentStore,
+                backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+                notificationCenter: NotificationCenter()
+            )
+
+            let result = await runtime.foregroundCatchUp()
+            let calls = await service.calls()
+
+            XCTAssertEqual(
+                result,
+                .failed(
+                    reason:
+                        "ios_screen_time_invalid_collector_identity"
+                )
+            )
+            XCTAssertEqual(calls.authorization, 0)
+            XCTAssertEqual(calls.restorationFence, 1)
+            XCTAssertEqual(calls.sync, 0)
+        }
+
+        do {
+            let suiteName =
+                "healthmes.screen-time.pairing-fence-tests."
+                + UUID().uuidString
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer {
+                defaults.removePersistentDomain(forName: suiteName)
+            }
+            let intentStore = ScreenTimeAuthorizationIntentStore(
+                defaults: defaults
+            )
+            intentStore.setOptedIn(true)
+            var currentPairing: Pairing? = firstPairing
+            let service = ScreenTimeLifecycleBlockingAuthorizationService(
+                authorizationResult: collectorResult(),
+                syncResult: .skipped(reason: "unused"),
+                currentAuthorizationResult: unknown,
+                restorationFences: [
+                    authorizationRestorationFence(
+                        pairing: firstPairing
+                    )
+                ]
+            )
+            let runtime = ScreenTimeActivityRuntime(
+                lifecycle: ScreenTimeActivityLifecycleController(
+                    syncService: service,
+                    pairingProvider: { currentPairing }
+                ),
+                authorizationIntentStore: intentStore,
+                backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+                notificationCenter: NotificationCenter()
+            )
+            let restoration = Task { @MainActor in
+                await runtime.foregroundCatchUp()
+            }
+            try await waitForAuthorizationCalls(1, from: service)
+
+            currentPairing = secondPairing
+            await service.releaseAuthorizationCalls()
+            let result = await restoration.value
+            let calls = await service.calls()
+
+            XCTAssertEqual(
+                result,
+                .failed(reason: "pairing_changed")
+            )
+            XCTAssertEqual(calls.authorization, 1)
+            XCTAssertEqual(calls.restorationFence, 1)
+            XCTAssertEqual(calls.sync, 0)
+        }
+    }
+
+    @MainActor
+    func testRuntimeConcurrentForegroundRestorationIsSingleFlight()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.single-flight-tests."
+            + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let unknown = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleBlockingAuthorizationService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test"),
+            currentAuthorizationResult: unknown
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+
+        let first = Task { @MainActor in
+            await runtime.foregroundCatchUp()
+        }
+        let second = Task { @MainActor in
+            await runtime.foregroundCatchUp()
+        }
+        try await waitForAuthorizationCalls(1, from: service)
+        let callsWhileBlocked = await service.calls()
+        XCTAssertEqual(callsWhileBlocked.authorization, 1)
+
+        await service.releaseAuthorizationCalls()
+        let results = await [first.value, second.value]
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            results,
+            [
+                .completed(.skipped(reason: "test")),
+                .completed(.skipped(reason: "test")),
+            ]
+        )
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.cancellations, 0)
+        XCTAssertEqual(calls.restorationFence, 4)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 2)
+    }
+
+    @MainActor
+    func testRuntimeForegroundRestorationCancellationKeepsSharedWork()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.restore-cancel-tests."
+            + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let unknown = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleBlockingAuthorizationService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test"),
+            currentAuthorizationResult: unknown
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+
+        let cancelled = Task { @MainActor in
+            await runtime.foregroundCatchUp()
+        }
+        let survivor = Task { @MainActor in
+            await runtime.foregroundCatchUp()
+        }
+        try await waitForAuthorizationCalls(1, from: service)
+        cancelled.cancel()
+        let cancelledResult = await cancelled.value
+
+        XCTAssertEqual(
+            cancelledResult,
+            .failed(reason: "cancelled")
+        )
+        let callsAfterCancellation = await service.calls()
+        XCTAssertEqual(callsAfterCancellation.cancellations, 0)
+
+        await service.releaseAuthorizationCalls()
+        let survivorResult = await survivor.value
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            survivorResult,
+            .completed(.skipped(reason: "test"))
+        )
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.cancellations, 0)
+        XCTAssertEqual(calls.sync, 1)
+    }
+
+    @MainActor
+    func testRuntimeOptOutCancelsForegroundAuthorizationRestoration()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.restore-optout-tests."
+            + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let unknown = collectorResult(
+            capability: .unavailable,
+            permission: .unknown,
+            reason: "ios_screen_time_permission_not_determined"
+        )
+        let service = ScreenTimeLifecycleBlockingAuthorizationService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "unused"),
+            currentAuthorizationResult: unknown
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+        let restoration = Task { @MainActor in
+            await runtime.foregroundCatchUp()
+        }
+        try await waitForAuthorizationCalls(1, from: service)
+
+        let disabled = await runtime.clearAuthorizationOptIn()
+        let restorationResult = await restoration.value
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            disabled,
+            .skipped(reason: "ios_screen_time_disabled")
+        )
+        XCTAssertEqual(
+            restorationResult,
+            .skipped(reason: "ios_screen_time_not_opted_in")
+        )
+        XCTAssertFalse(intentStore.isOptedIn)
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.cancellations, 1)
+        XCTAssertEqual(calls.registration, 0)
+        XCTAssertEqual(calls.sync, 0)
+        XCTAssertEqual(calls.disable, 1)
     }
 
     @MainActor
