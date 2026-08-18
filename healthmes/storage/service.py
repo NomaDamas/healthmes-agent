@@ -14,6 +14,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
@@ -80,7 +81,7 @@ def build_storage_maintenance_job(settings: Settings):
 
 
 def _now() -> datetime:
-    return datetime.now(UTC)
+    return clock.utc_now()
 
 
 def ensure_default_policies(session: Session) -> list[RetentionPolicy]:

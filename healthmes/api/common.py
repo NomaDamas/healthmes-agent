@@ -13,6 +13,8 @@ from typing import Annotated
 
 from pydantic import AfterValidator
 
+from healthmes import clock
+
 __all__ = ["ensure_utc", "utc_now", "UTCDateTime"]
 
 
@@ -24,8 +26,8 @@ def ensure_utc(value: datetime) -> datetime:
 
 
 def utc_now() -> datetime:
-    """Current aware UTC time (single seam for tests via freezegun)."""
-    return datetime.now(UTC)
+    """Current aware UTC time."""
+    return clock.utc_now()
 
 
 # Pydantic field type: any incoming datetime is normalised to aware UTC.

@@ -58,6 +58,8 @@ from healthmes.storage import (
 )
 from healthmes.store import AppUsageSample, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def _interval_batch(
     records: list[AppIntervalRecord],
@@ -1315,8 +1317,9 @@ def test_natural_raw_expiry_keeps_longer_lived_hourly_and_daily_summaries(sessio
 
 def test_shortening_activity_raw_retention_deletes_expired_legacy_rows_immediately(
     session,
+    fixture_clock,
 ) -> None:
-    now = datetime.now(UTC)
+    now = fixture_clock()
     session.add(
         AppUsageSample(
             device_id="legacy-expired-on-policy-change",
@@ -1344,8 +1347,9 @@ def test_shortening_activity_raw_retention_deletes_expired_legacy_rows_immediate
 
 def test_switching_activity_raw_retention_to_forever_does_not_resurrect_legacy_rows(
     session,
+    fixture_clock,
 ) -> None:
-    now = datetime.now(UTC)
+    now = fixture_clock()
     update_retention_policy(session, "activity_raw", "1d")
     session.add_all(
         [

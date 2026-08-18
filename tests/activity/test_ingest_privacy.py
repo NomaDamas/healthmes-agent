@@ -42,6 +42,8 @@ from healthmes.activity.service import (
 )
 from healthmes.store import RetentionPolicy, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def _hour_batch(
     *,

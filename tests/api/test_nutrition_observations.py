@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import select
 
 from healthmes.nutrition.contracts import (
@@ -22,6 +23,8 @@ from healthmes.nutrition.schema import (
 from healthmes.nutrition.vision import VisionInvalidOutput, VisionUnavailable
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
+
+pytestmark = pytest.mark.usefixtures("fixture_clock")
 
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
 
@@ -560,7 +563,11 @@ def test_photo_raw_evidence_expires_with_media(client, session, settings):
     assert fetched.json()["capture"]["media_path"] == ""
 
 
-def test_expired_observation_cannot_be_read_or_confirmed(client, session):
+def test_expired_observation_cannot_be_read_or_confirmed(
+    client,
+    session,
+    fixture_clock,
+):
     client.app.state.nutrition_vision_provider = FakeVision()
     media_path = _upload(client)
     created = client.post(
@@ -576,7 +583,7 @@ def test_expired_observation_cannot_be_read_or_confirmed(client, session):
         )
     )
     assert event is not None
-    event.expires_at = datetime.now(UTC)
+    event.expires_at = fixture_clock()
     session.commit()
 
     assert (

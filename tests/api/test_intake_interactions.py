@@ -39,6 +39,8 @@ from healthmes.nutrition.vision import VisionUnavailable
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
 
 
@@ -1284,7 +1286,11 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
     assert "nutrition_analysis_reservations" not in session.info
 
 
-def test_expired_sqlite_reservation_rejects_late_owner(client, session):
+def test_expired_sqlite_reservation_rejects_late_owner(
+    client,
+    session,
+    fixture_clock,
+):
     operation_id = uuid.uuid4()
     fingerprint = operation_fingerprint({"fixture": "late-owner"})
 
@@ -1297,9 +1303,9 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
                 reservation = (
                     intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key]
                 )
-                reservation["lease_expires_at"] = datetime.now(
-                    UTC
-                ) - timedelta(seconds=1)
+                reservation["lease_expires_at"] = fixture_clock() - timedelta(
+                    seconds=1
+                )
             with Session(bind=session.get_bind()) as winner_session:
                 create_analyzed_interaction(
                     winner_session,
@@ -1320,7 +1326,7 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
                     source="winner",
                     source_text=text,
                     media_path=None,
-                    recorded_at=datetime.now(UTC),
+                    recorded_at=fixture_clock(),
                     allow_remote_analysis=False,
                     provider=FakeAnalysis(),
                 )
@@ -1343,7 +1349,7 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
             source="late-owner",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=fixture_clock(),
             allow_remote_analysis=False,
             provider=ReclaimedDuringAnalysis(),
         )
@@ -2478,11 +2484,12 @@ def test_expired_raw_capture_is_hidden_before_maintenance(client):
 def test_expired_structured_interaction_cannot_be_read_or_promoted(
     client,
     session,
+    fixture_clock,
 ):
     created = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(
-            observed_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+            observed_at=(fixture_clock() - timedelta(minutes=1)).isoformat(),
             timezone="UTC",
         ),
     )
@@ -2495,7 +2502,7 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
         )
     )
     assert structured is not None
-    structured.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    structured.expires_at = fixture_clock() - timedelta(seconds=1)
     session.commit()
 
     assert (
@@ -2511,7 +2518,7 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
             "operation_id": str(uuid.uuid4()),
             "status": "consumed",
             "source": "test",
-            "consumed_at": datetime.now(UTC).isoformat(),
+            "consumed_at": fixture_clock().isoformat(),
         },
     )
     assert outcome.status_code == 422
@@ -2526,7 +2533,11 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
     assert decision.status_code == 422
 
 
-def test_expired_snapshots_cannot_restore_an_interaction(client, session):
+def test_expired_snapshots_cannot_restore_an_interaction(
+    client,
+    session,
+    fixture_clock,
+):
     created = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(),
@@ -2567,7 +2578,7 @@ def test_expired_snapshots_cannot_restore_an_interaction(client, session):
         )
     )
     for event in events:
-        event.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        event.expires_at = fixture_clock() - timedelta(seconds=1)
     session.commit()
 
     assert (
@@ -2583,7 +2594,11 @@ def test_expired_snapshots_cannot_restore_an_interaction(client, session):
     )
 
 
-def test_expired_direct_capture_retry_returns_conflict(client, session):
+def test_expired_direct_capture_retry_returns_conflict(
+    client,
+    session,
+    fixture_clock,
+):
     body = _text_interaction()
     created = client.post("/v1/intake-interactions", json=body)
     assert created.status_code == 201
@@ -2595,7 +2610,7 @@ def test_expired_direct_capture_retry_returns_conflict(client, session):
         )
     )
     assert event is not None
-    event.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    event.expires_at = fixture_clock() - timedelta(seconds=1)
     session.commit()
 
     retried = client.post("/v1/intake-interactions", json=body)
@@ -2722,7 +2737,11 @@ def test_provider_warnings_cannot_preserve_raw_owner_text(client, session):
     assert owner_text not in str(event.quality_flags)
 
 
-def test_raw_warnings_never_copy_into_unlimited_snapshots(client, session):
+def test_raw_warnings_never_copy_into_unlimited_snapshots(
+    client,
+    session,
+    fixture_clock,
+):
     owner_text = "private owner text: medication X at 8pm"
 
     class WarningEchoAnalysis(FakeAnalysis):
@@ -2736,7 +2755,7 @@ def test_raw_warnings_never_copy_into_unlimited_snapshots(client, session):
             return extraction
 
     client.app.state.nutrition_analysis_provider = WarningEchoAnalysis()
-    observed_at = datetime.now(UTC).replace(microsecond=0)
+    observed_at = fixture_clock().replace(microsecond=0)
     created = client.post(
         "/v1/intake-interactions/analyze",
         json={
