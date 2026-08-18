@@ -10,7 +10,7 @@ plugins {
 // module stays untouched.
 android {
     namespace = "com.healthmes.briefing"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         // Must stay <= every consumer's minSdk (:companion 26, :wear 30).
@@ -25,7 +25,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.19.0")
+    implementation("androidx.core:core-ktx:1.18.0")
     // EncryptedSharedPreferences for base URL + token at rest (same artifact
     // and pattern as the :app collector's CollectorPrefs).
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

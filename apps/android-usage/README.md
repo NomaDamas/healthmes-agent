@@ -19,7 +19,7 @@ deliberately *duplicates* its pairing-prefs pattern instead of importing it.
 
 Toolchain for everything: Gradle 9.6.1, AGP 9.3.1 built-in Kotlin
 (+ `org.jetbrains.kotlin.plugin.compose` 2.4.10 for `:companion`), JDK 17+,
-`compileSdk = 37`. Point the build at an SDK with platform 37 via
+`compileSdk = 36`. Point the build at an SDK with platform 36 via
 `ANDROID_HOME` or `local.properties`.
 
 | Module | Type | minSdk | Key libraries | Build | JVM unit tests |

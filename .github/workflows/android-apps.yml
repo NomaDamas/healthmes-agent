@@ -50,12 +50,6 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      - name: Setup Android SDK tools
-        uses: android-actions/setup-android@v4
-
-      - name: Install Android SDK 37
-        run: sdkmanager "platforms;android-37"
-
       - name: Build all modules + run JVM unit tests
         run: >
           ./gradlew --no-daemon

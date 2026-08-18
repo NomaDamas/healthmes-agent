@@ -9,7 +9,7 @@ plugins {
 // deliverable (docs/design/WATCH-NOTIFICATIONS.ko.md).
 android {
     namespace = "com.healthmes.wear"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.healthmes.wear"
@@ -41,7 +41,7 @@ android {
 dependencies {
     implementation(project(":shared"))
 
-    implementation("androidx.core:core-ktx:1.19.0")
+    implementation("androidx.core:core-ktx:1.18.0")
     // Tiles and ProtoLayout stay on their compatible 1.4.x line.
     implementation("androidx.wear.tiles:tiles:1.4.1")
     implementation("androidx.wear.protolayout:protolayout:1.4.2")

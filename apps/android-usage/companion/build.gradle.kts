@@ -17,7 +17,7 @@ plugins {
 // before.
 android {
     namespace = "com.healthmes.companion"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.healthmes.companion"
@@ -52,7 +52,7 @@ android {
 dependencies {
     implementation(project(":shared"))
 
-    implementation("androidx.core:core-ktx:1.19.0")
+    implementation("androidx.core:core-ktx:1.18.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("com.google.android.material:material:1.12.0")
     // 15-minute periodic refresh + one-shot notification-action calls.
