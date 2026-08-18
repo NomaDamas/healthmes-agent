@@ -103,7 +103,7 @@ public struct GlanceTimelineProvider: TimelineProvider {
             )
         } catch {
             // Unreachable instance: honest stale rendering beats a blank.
-            if let cached = client.cache.decodedPayload() {
+            if let cached = client.cache.decodedPayload(for: pairing) {
                 return (
                     GlanceEntry(date: now, state: .snapshot(cached, stale: true)),
                     now.addingTimeInterval(staleRetryInterval)

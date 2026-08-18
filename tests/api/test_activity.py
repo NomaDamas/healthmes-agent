@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import select
 
 import healthmes.activity.api as activity_api_module
@@ -16,6 +17,14 @@ from healthmes.activity.repository import (
 )
 from healthmes.activity.service import ingest_activity_batch
 from healthmes.store import WellnessEvent
+
+
+@pytest.fixture(autouse=True)
+def stable_activity_api_wall_clock(client):
+    """Build FastAPI first, then freeze activity API wall-clock checks."""
+    assert client.get("/v1/activity/devices/clock-prime/collection").status_code == 200
+    with freeze_time("2026-08-14 12:00:00", tick=True, real_asyncio=True):
+        yield
 
 
 def _hour_record(

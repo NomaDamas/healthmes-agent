@@ -60,7 +60,7 @@
 <ul class="decision-list">
   {% for r in records %}
   <li>
-    <a class="row" href="/decisions/{{ r.id }}{{ token_qs }}">
+    <a class="row" href="{{ app_path('/decisions/' ~ r.id) }}{{ token_qs }}">
       <span class="row-summary">{{ r.summary }}</span>
       <span class="row-meta">
         <span class="badge kind-{{ r.kind.value }}" title="{{ r.kind.value }}">{{ kind_labels.get(r.kind.value, r.kind.value) }}</span>

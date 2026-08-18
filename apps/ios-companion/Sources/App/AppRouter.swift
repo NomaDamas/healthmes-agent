@@ -1,12 +1,6 @@
 import Foundation
 import SwiftUI
 
-extension Notification.Name {
-    /// Posted by the pairing screen after save/unpair so every surface
-    /// (root gate, home model, watch sync) reloads its pairing-derived state.
-    static let healthmesPairingChanged = Notification.Name("healthmes.pairing.changed")
-}
-
 /// A URL wrapped for `.sheet(item:)` presentation.
 struct DecisionSheetTarget: Identifiable {
     let id = UUID()
@@ -14,32 +8,117 @@ struct DecisionSheetTarget: Identifiable {
 }
 
 enum AppTab: Hashable {
-    case home
-    case report
-    case capture
-    case settings
+    case today
+    case plan
+    case decisions
 }
 
-/// Central navigation state: tab selection, the in-app decision viewer
-/// sheet, and the proposal-detail sheet. Notification taps and
+enum AppModal: String, Identifiable {
+    case settings
+    case report
+    case capture
+
+    var id: String { rawValue }
+}
+
+/// Central navigation state: core product selection, modal tools, the
+/// in-app decision viewer sheet, and the proposal-detail sheet. Notification taps and
 /// `healthmes://` deep links (widgets, Live Activity) land here.
 @MainActor
 final class AppRouter: ObservableObject {
     static let shared = AppRouter()
 
-    @Published var tab: AppTab = .home
+    @Published var tab: AppTab = .today
+    @Published var modal: AppModal?
     @Published var decisionSheet: DecisionSheetTarget?
     @Published var proposalSheetID: UUID?
+    @Published private(set) var commandFocusRequest = 0
+    @Published private(set) var agentChannelRequest = 0
+    @Published private(set) var voiceStartRequest = 0
+    @Published private(set) var pendingCommand: String?
+    @Published private(set) var pendingVoicePrefill: String?
+    private var pendingVoiceStartRequest: Int?
+    @Published private(set) var homeRequest = 0
+    @Published private(set) var pairingImportMessage: String?
+
+    func focusCommandDock() {
+        commandFocusRequest += 1
+    }
+
+    func focusCommandDock(prefill: String) {
+        let clean = prefill.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            focusCommandDock()
+            return
+        }
+        pendingCommand = clean
+        commandFocusRequest += 1
+    }
+
+    func openAgentCommandDock(prefill: String? = nil) {
+        if let prefill {
+            let clean = prefill.trimmingCharacters(in: .whitespacesAndNewlines)
+            pendingCommand = clean.isEmpty ? nil : clean
+        }
+        agentChannelRequest += 1
+    }
+
+    func openAgentVoice(prefill: String? = nil) {
+        if let prefill {
+            let clean = prefill.trimmingCharacters(in: .whitespacesAndNewlines)
+            pendingVoicePrefill = clean.isEmpty ? nil : clean
+        } else {
+            pendingVoicePrefill = nil
+        }
+        agentChannelRequest += 1
+        let nextRequest = voiceStartRequest + 1
+        pendingVoiceStartRequest = nextRequest
+        voiceStartRequest = nextRequest
+    }
+
+    func consumePendingCommand() -> String? {
+        defer { pendingCommand = nil }
+        return pendingCommand
+    }
+
+    func consumePendingVoiceStart(
+        request: Int
+    ) -> (shouldStart: Bool, prefill: String?) {
+        guard pendingVoiceStartRequest == request else {
+            return (false, nil)
+        }
+        pendingVoiceStartRequest = nil
+        defer { pendingVoicePrefill = nil }
+        return (true, pendingVoicePrefill)
+    }
+
+    func showHome() {
+        tab = .today
+        modal = nil
+        decisionSheet = nil
+        proposalSheetID = nil
+        homeRequest += 1
+    }
+
+    func dismissPairingImportMessage() {
+        pairingImportMessage = nil
+    }
 
     /// Open a tokenized decision/report URL in the in-app viewer. Only URLs
     /// that come from server payloads (glance/alerts/reports) or pass the
     /// deep-link host check reach this point.
     func openDecision(_ url: URL) {
-        decisionSheet = DecisionSheetTarget(url: url)
+        guard
+            let pairing = PairingStore.shared.load(),
+            Self.isAllowedViewerURL(url)
+        else { return }
+        decisionSheet = DecisionSheetTarget(
+            url: ViewerURL.authenticate(url, pairing: pairing)
+        )
     }
 
     func openProposalDetail(_ id: UUID) {
-        tab = .home
+        tab = .decisions
         proposalSheetID = id
     }
 
@@ -56,7 +135,7 @@ final class AppRouter: ObservableObject {
                 let targetURL = URL(string: target),
                 Self.isAllowedViewerURL(targetURL)
             else {
-                tab = .home
+                showHome()
                 return
             }
             openDecision(targetURL)
@@ -65,16 +144,64 @@ final class AppRouter: ObservableObject {
                 let raw = Self.queryValue(of: url, name: "id"),
                 let id = UUID(uuidString: raw)
             else {
-                tab = .home
+                showHome()
                 return
             }
             openProposalDetail(id)
         case "capture":
-            tab = .capture
+            modal = .capture
         case "report":
-            tab = .report
+            modal = .report
+        case "speak":
+            if
+                let rawProposalID = Self.queryValue(of: url, name: "proposal"),
+                let proposalID = UUID(uuidString: rawProposalID)
+            {
+                openAgentVoice(
+                    prefill: String(
+                        localized:
+                            "I want to change proposal \(proposalID.uuidString.lowercased()). "
+                    )
+                )
+            } else {
+                openAgentVoice()
+            }
+        case "pair":
+            Task { await importPairing(url) }
         default:
-            tab = .home
+            showHome()
+        }
+    }
+
+    private func importPairing(_ url: URL) async {
+        do {
+            let exchanged = try await PairingExchangeClient().exchange(url)
+            let pairing = try PairingStore.shared.save(
+                baseURLString: exchanged.baseURL.absoluteString,
+                token: exchanged.token ?? ""
+            )
+            PhoneWatchSync.shared.pushPairing(
+                baseURL: pairing.baseURL.absoluteString,
+                token: pairing.token ?? ""
+            )
+            pairingImportMessage = "Connected to \(pairing.baseURL.host ?? "HealthMes")."
+            NotificationCenter.default.post(
+                name: .healthmesPairingChanged,
+                object: nil
+            )
+            showHome()
+            Task {
+                _ = await NotificationManager.shared.requestAuthorization()
+                BackgroundRefreshManager.shared.schedule()
+                await RefreshCoordinator.shared.sync(isForeground: true)
+                await HealthKitSyncManager.shared.requestAuthorizationAndSync()
+            }
+        } catch let error as PairingError {
+            pairingImportMessage = error.localizedDescription
+            modal = .settings
+        } catch {
+            pairingImportMessage = "HealthMes could not complete pairing. Try again."
+            modal = .settings
         }
     }
 
@@ -95,6 +222,6 @@ final class AppRouter: ObservableObject {
             scheme == "http" || scheme == "https",
             let pairing = PairingStore.shared.load()
         else { return false }
-        return url.host?.lowercased() == pairing.baseURL.host?.lowercased()
+        return ViewerURL.hasSameOrigin(url, as: pairing.baseURL)
     }
 }

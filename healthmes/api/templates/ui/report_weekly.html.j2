@@ -240,7 +240,7 @@
   </ul>
   {% if report.decisions.count > report.decisions.items | length %}
   <p class="muted">최신 {{ report.decisions.items | length }}개 표시 —
-    <a href="/decisions{{ token_qs }}">전체 결정 기록</a>.</p>
+    <a href="{{ app_path('/decisions') }}{{ token_qs }}">전체 결정 기록</a>.</p>
   {% endif %}
   {% else %}
   <p class="muted">이번 주에는 기록된 결정이 없습니다.</p>

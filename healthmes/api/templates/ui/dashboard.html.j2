@@ -1,0 +1,1169 @@
+{% extends "ui/_base.html.j2" %}
+
+{% block title %}Workspace — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ Workspace</span>{% endblock %}
+
+{% block head %}
+<style>
+{% include "ui/_dashboard_workspace.css.j2" %}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="workspace-shell"
+     data-workspace-shell
+     data-control-shell
+     data-enhanced="false"
+     data-sidebar-open="false"
+     data-thread-open="false">
+  <header class="workspace-topbar">
+    <button class="workspace-mobile-toggle"
+            type="button"
+            data-action="toggle-sidebar"
+            aria-expanded="false"
+            aria-label="채널 사이드바 열기">☰</button>
+    <div class="workspace-heading">
+      <p>HealthMes workspace</p>
+      <h1>Wellness operating canvas</h1>
+    </div>
+    <div class="workspace-status" aria-label="워크스페이스 상태">
+      <span class="updated-label">업데이트 {{ format_rel(dashboard.generated_at) }}</span>
+      <span class="local-only">채널·대화는 브라우저 로컬</span>
+      <span class="storage-status"
+            data-storage-status
+            role="status"
+            aria-live="polite"
+            hidden></span>
+    </div>
+  </header>
+
+  <div class="workspace-layout">
+    <aside class="workspace-sidebar"
+           data-workspace-sidebar
+           aria-label="채널 탐색"
+           aria-hidden="false">
+      <div class="workspace-identity">
+        <strong>My HealthMes</strong>
+        <span>{{ dashboard.local_today.isoformat() }} · {{ dashboard.timezone }}</span>
+      </div>
+
+      <nav aria-label="HealthMes 채널">
+        <section class="sidebar-section" data-favorites-section hidden>
+          <div class="sidebar-section-head"><span>Favorites</span></div>
+          <ul class="channel-list" data-favorites-list></ul>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="sidebar-section-head">
+            <span>Basic features</span>
+          </div>
+          <ul class="channel-list" data-system-channels>
+            <li class="channel-row-wrap"
+                draggable="true"
+                data-channel-wrapper="overview"
+                data-channel-scope="system">
+              <a class="channel-row"
+                 href="{{ app_path('/dashboard') }}{{ token_qs }}#channel-overview"
+                 data-channel-id="overview"
+                 aria-current="page">
+                <span class="channel-glyph">O</span>
+                <span class="channel-label">overview</span>
+              </a>
+              <button class="channel-action"
+                      type="button"
+                      data-action="toggle-favorite"
+                      data-channel-id="overview"
+                      data-active="false"
+                      aria-label="overview 즐겨찾기">☆</button>
+              <button class="channel-action"
+                      type="button"
+                      data-action="hide-system-channel"
+                      data-channel-id="overview"
+                      aria-label="overview 숨기기">×</button>
+            </li>
+            <li class="channel-row-wrap"
+                draggable="true"
+                data-channel-wrapper="calendar"
+                data-channel-scope="system">
+              <a class="channel-row"
+                 href="{{ app_path('/dashboard/plan') }}{{ token_qs }}#channel-calendar"
+                 data-channel-id="calendar">
+                <span class="channel-glyph">C</span>
+                <span class="channel-label">calendar</span>
+              </a>
+              <button class="channel-action"
+                      type="button"
+                      data-action="toggle-favorite"
+                      data-channel-id="calendar"
+                      data-active="false"
+                      aria-label="calendar 즐겨찾기">☆</button>
+              <button class="channel-action"
+                      type="button"
+                      data-action="hide-system-channel"
+                      data-channel-id="calendar"
+                      aria-label="calendar 숨기기">×</button>
+            </li>
+            <li class="channel-row-wrap"
+                draggable="true"
+                data-channel-wrapper="insights"
+                data-channel-scope="system">
+              <a class="channel-row"
+                 href="{{ app_path('/dashboard/history') }}{{ token_qs }}#channel-insights"
+                 data-channel-id="insights">
+                <span class="channel-glyph">I</span>
+                <span class="channel-label">insights</span>
+              </a>
+              <button class="channel-action"
+                      type="button"
+                      data-action="toggle-favorite"
+                      data-channel-id="insights"
+                      data-active="false"
+                      aria-label="insights 즐겨찾기">☆</button>
+              <button class="channel-action"
+                      type="button"
+                      data-action="hide-system-channel"
+                      data-channel-id="insights"
+                      aria-label="insights 숨기기">×</button>
+            </li>
+            <li class="channel-row-wrap"
+                draggable="true"
+                data-channel-wrapper="decisions"
+                data-channel-scope="system">
+              <a class="channel-row"
+                 href="{{ app_path('/dashboard/decisions') }}{{ token_qs }}#channel-decisions"
+                 data-channel-id="decisions">
+                <span class="channel-glyph">D</span>
+                <span class="channel-label">decisions</span>
+                {% if dashboard.pending_proposals_total %}
+                <span class="channel-count">{{ dashboard.pending_proposals_total }}</span>
+                {% endif %}
+              </a>
+              <button class="channel-action"
+                      type="button"
+                      data-action="toggle-favorite"
+                      data-channel-id="decisions"
+                      data-active="false"
+                      aria-label="decisions 즐겨찾기">☆</button>
+              <button class="channel-action"
+                      type="button"
+                      data-action="hide-system-channel"
+                      data-channel-id="decisions"
+                      aria-label="decisions 숨기기">×</button>
+            </li>
+            <li class="channel-row-wrap"
+                draggable="true"
+                data-channel-wrapper="agent"
+                data-channel-scope="system">
+              <a class="channel-row"
+                 href="{{ app_path('/dashboard') }}{{ token_qs }}#channel-agent"
+                 data-channel-id="agent">
+                <span class="channel-glyph">A</span>
+                <span class="channel-label">agent</span>
+              </a>
+              <button class="channel-action"
+                      type="button"
+                      data-action="toggle-favorite"
+                      data-channel-id="agent"
+                      data-active="false"
+                      aria-label="agent 즐겨찾기">☆</button>
+              <button class="channel-action"
+                      type="button"
+                      data-action="hide-system-channel"
+                      data-channel-id="agent"
+                      aria-label="agent 숨기기">×</button>
+            </li>
+          </ul>
+        </section>
+
+        <div data-local-categories aria-live="polite"></div>
+
+        <section class="sidebar-section">
+          <div class="sidebar-section-head">
+            <span>Your workspace</span>
+            <button class="category-add"
+                    type="button"
+                    data-action="open-category-dialog"
+                    aria-label="카테고리 추가">+</button>
+          </div>
+        </section>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button type="button"
+                data-action="restore-system-channels"
+                data-restore-system
+                hidden>숨긴 기본 채널 복원</button>
+        <a href="{{ app_path('/connect') }}{{ token_qs }}">Connections</a>
+        <a href="#advanced" data-action="open-advanced">Advanced</a>
+      </div>
+    </aside>
+
+    <div class="workspace-main" id="workspace-main">
+      <header class="channel-header">
+        <div class="channel-header-copy">
+          <h2 data-current-channel-title># overview</h2>
+          <p data-current-channel-description>현재 상태, 일정, 목표, 필요한 결정</p>
+        </div>
+        <div class="channel-header-actions">
+          <button class="workspace-icon-button"
+                  type="button"
+                  data-action="open-category-dialog"
+                  aria-label="카테고리 추가">+</button>
+        </div>
+      </header>
+
+      <section class="channel-panel"
+               id="channel-panel-overview"
+               data-channel-panel="overview"
+               data-active="true"
+               aria-hidden="false">
+        <article class="primitive capacity-card"
+                 data-ui-primitive="capacity_bar"
+                 data-thread-anchor-card="capacity">
+          <div class="capacity-score{% if dashboard.energy.score is none %} is-missing{% endif %}"
+               {% if dashboard.energy.score is not none %}style="--capacity-value: {{ dashboard.energy.score }}"{% endif %}
+               role="img"
+               aria-label="현재 에너지 {{ dashboard.energy.score if dashboard.energy.score is not none else '측정 중' }}{% if dashboard.energy.score is not none %}점{% endif %}">
+            {% if dashboard.energy.score is not none %}
+              {{ dashboard.energy.score }}
+              <span>/ 100</span>
+            {% else %}
+              —
+              <span>측정 중</span>
+            {% endif %}
+          </div>
+          <div class="capacity-copy">
+            <h3>{{ dashboard.headline }}</h3>
+            <p>
+              {% if dashboard.energy.score is none %}
+                데이터 없음
+              {% elif dashboard.energy.confidence == "high" %}
+                데이터 최신성 현재 시간대
+              {% elif dashboard.energy.confidence == "medium" %}
+                데이터 최신성 최대 3시간 전
+              {% else %}
+                데이터 최신성 오래됨
+              {% endif %}
+            </p>
+          </div>
+          <div class="capacity-meta">
+            <span>확인할 신호 {{ dashboard.alert_count }}개</span>
+            <button class="thread-trigger"
+                    type="button"
+                    data-action="open-thread"
+                    data-thread-anchor="card:capacity"
+                    data-thread-title="{{ dashboard.headline }}"
+                    data-thread-kind="capacity card">스레드</button>
+          </div>
+        </article>
+
+        <div class="canvas-grid">
+          <article class="primitive primitive-body canvas-span-7"
+                   data-ui-primitive="calendar_canvas">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>오늘과 다음 일정</h3>
+                <p>Apple·Google Calendar와 승인 전 HealthMes 제안</p>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="card:overview-calendar"
+                      data-thread-title="오늘과 다음 일정"
+                      data-thread-kind="calendar card">스레드</button>
+            </div>
+            {% set overview_items = (dashboard.plan_events + dashboard.calendar_proposals)
+                |sort(attribute='starts_at') %}
+            {% if overview_items %}
+            <ol class="calendar-timeline" aria-label="요약 캘린더">
+              {% for item in overview_items[:3] %}
+              {% set duration_minutes = ((item.ends_at - item.starts_at).total_seconds() / 60)|round|int %}
+              {% if item.source is defined %}
+              <li class="calendar-event provider-{{ item.source }}"
+                  data-calendar-provider="{{ item.source }}"
+                  data-provider-status="{{ item.status or 'unknown' }}"
+                  data-organizer-self="{{ 'true' if item.organizer_self else 'false' }}"
+                  data-all-day="{{ 'true' if item.is_all_day else 'false' }}"
+                  {% if not item.is_all_day %}data-duration-minutes="{{ duration_minutes }}"{% endif %}
+                  data-gap-minutes="0">
+                <time class="event-time" datetime="{{ item.starts_at.isoformat() }}">
+                  {{ "종일 일정" if item.is_all_day else format_local(item.starts_at) }}
+                </time>
+                <div class="event-copy">
+                  <strong>{{ item.title }}</strong>
+                  <div class="event-meta">
+                    <span class="provider-badge">
+                      {{ "Google Calendar" if item.source == "google" else "Apple / iCloud Calendar" }}
+                    </span>
+                    {% if item.energy_demand %}<span>요구 에너지 {{ item.energy_demand }}</span>{% endif %}
+                  </div>
+                </div>
+                <button class="thread-trigger"
+                        type="button"
+                        data-action="open-thread"
+                        data-thread-anchor="calendar:{{ item.source }}:{{ item.external_id }}"
+                        data-thread-title="{{ item.title }}"
+                        data-thread-kind="calendar event">스레드</button>
+              </li>
+              {% else %}
+              <li class="calendar-event proposal-preview-event"
+                  data-calendar-provider="healthmes"
+                  data-proposal-preview
+                  data-proposal-id="{{ item.id }}"
+                  data-duration-minutes="{{ duration_minutes }}"
+                  data-gap-minutes="0">
+                <time class="event-time" datetime="{{ item.starts_at.isoformat() }}">
+                  {{ format_local(item.starts_at) }}
+                </time>
+                <div class="event-copy">
+                  <strong>{{ item.task_title }} 블록 후보</strong>
+                  <div class="event-meta">
+                    <span class="provider-badge">HealthMes 제안</span>
+                    <span>승인 전 미리보기</span>
+                  </div>
+                </div>
+                <button class="thread-trigger"
+                        type="button"
+                        data-action="open-thread"
+                        data-thread-anchor="proposal:{{ item.id }}"
+                        data-thread-title="{{ item.task_title }} 블록 후보"
+                        data-thread-kind="schedule proposal">스레드</button>
+              </li>
+              {% endif %}
+              {% endfor %}
+            </ol>
+            {% else %}
+            <p class="empty-state">표시할 Apple 또는 Google Calendar 일정이 없습니다.</p>
+            {% endif %}
+          </article>
+
+          <article class="primitive primitive-body canvas-span-5"
+                   data-ui-primitive="proposal_preview"
+                   {% if dashboard.pending_proposals %}data-proposal-id="{{ dashboard.pending_proposals[0].id }}"{% endif %}>
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>지금 필요한 결정</h3>
+                <p>{{ dashboard.pending_proposals_total }}개 대기</p>
+              </div>
+              {% if dashboard.pending_proposals %}
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="proposal:{{ dashboard.pending_proposals[0].id }}"
+                      data-thread-title="{{ dashboard.pending_proposals[0].task_title }} 블록 제안"
+                      data-thread-kind="schedule proposal">스레드</button>
+              {% endif %}
+            </div>
+            {% if dashboard.pending_proposals %}
+              {% set proposal = dashboard.pending_proposals[0] %}
+              <strong>{{ proposal.task_title }} 블록을 적용할까요?</strong>
+              <dl class="change-preview" aria-label="현재 proposal 계약과 제안 블록">
+                <div class="change-state before">
+                  <dt>현재 계약</dt>
+                  <dd>변경 유형과 원본 event identity 미제공</dd>
+                </div>
+                <div class="change-arrow" aria-hidden="true">↓</div>
+                <div class="change-state after">
+                  <dt>제안 블록</dt>
+                  <dd>{{ format_local(proposal.starts_at) }}<br>{{ format_local(proposal.ends_at) }}</dd>
+                </div>
+              </dl>
+              <dl class="semantic-result">
+                <div class="semantic-row">
+                  <dt>이유</dt>
+                  <dd>{{ proposal.decision_summary or "연결된 판단 기록을 검증하지 못해 이유를 표시하지 않습니다." }}</dd>
+                </div>
+                <div class="semantic-row">
+                  <dt>결과</dt>
+                  <dd>승인하면 이 변경안이 연결된 캘린더 쓰기 절차로 전달됩니다. 이 화면은 반영 완료를 미리 주장하지 않습니다.</dd>
+                </div>
+              </dl>
+              {% if proposal.expires_at %}
+              <p class="muted">응답 기한 {{ format_local(proposal.expires_at) }}</p>
+              {% endif %}
+              <div class="decision-actions">
+                <p>Yes/No는 iPhone, Mac 또는 Apple Watch에서 실행합니다.</p>
+                {% if proposal.decision_url %}
+                <a class="btn" href="{{ proposal.decision_url }}">판단 근거 보기</a>
+                {% endif %}
+              </div>
+            {% else %}
+              <p class="empty-state">지금 결정할 제안이 없습니다.</p>
+              <p class="honesty-note">제안이 없으면 임의의 일정 변경이나 건강 원인을 만들어 표시하지 않습니다.</p>
+            {% endif %}
+          </article>
+
+          <article class="primitive primitive-body canvas-span-7"
+                   data-ui-primitive="comparison_bar">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>이번 주 목표</h3>
+                <p>현재 계획이 보호해야 하는 결과</p>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="card:weekly-goals"
+                      data-thread-title="이번 주 목표"
+                      data-thread-kind="goal card">스레드</button>
+            </div>
+            {% if dashboard.goals %}
+            <div class="goal-list">
+              {% for goal in dashboard.goals %}
+              {% set pct = (goal.done_tasks * 100 / goal.total_tasks) if goal.total_tasks else 0 %}
+              <div class="goal-item">
+                <div class="goal-top">
+                  <strong>{{ goal.title }}</strong>
+                  <span>{{ goal.done_tasks }}/{{ goal.total_tasks }} 완료</span>
+                </div>
+                <div class="progress-track"
+                     role="progressbar"
+                     aria-label="{{ goal.title }} 완료율"
+                     aria-valuemin="0"
+                     aria-valuemax="100"
+                     aria-valuenow="{{ pct|round|int }}">
+                  <span style="width: {{ pct }}%"></span>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <p class="empty-state">이번 주 활성 목표가 없습니다.</p>
+            {% endif %}
+          </article>
+
+          <article class="primitive primitive-body canvas-span-5"
+                   data-ui-primitive="outcome_summary">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>이번 주 결과</h3>
+                <p>저장된 결과만 표시</p>
+              </div>
+            </div>
+            <div class="metric-grid">
+              <div class="metric">
+                <strong>{{ dashboard.weekly.energy.overall_avg if dashboard.weekly.energy.overall_avg is not none else "—" }}</strong>
+                <span>평균 에너지</span>
+              </div>
+              <div class="metric">
+                <strong>{{ dashboard.weekly.schedule.acceptance_pct if dashboard.weekly.schedule.acceptance_pct is not none else "—" }}{% if dashboard.weekly.schedule.acceptance_pct is not none %}%{% endif %}</strong>
+                <span>제안 수용률</span>
+              </div>
+              <div class="metric">
+                <strong>{{ dashboard.weekly.decisions.count }}</strong>
+                <span>판단 기록</span>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <details class="primitive advanced" id="advanced">
+          <summary>Advanced · 연결, 원시 데이터, 진단</summary>
+          <div class="advanced-body">
+            <div class="connection-list" aria-label="캘린더와 웨어러블 연결 상태">
+              {% for connection in dashboard.calendar_connections %}
+              <span class="connection-chip">
+                {{ connection.label }} · {{ "연결됨" if connection.connected else "설정 필요" }}
+              </span>
+              {% endfor %}
+            </div>
+            <div class="advanced-links">
+              <a href="{{ app_path('/connect') }}{{ token_qs }}">
+                <strong>Connections</strong><br>
+                <span class="muted">Google · iCloud · Wearables 설정</span>
+              </a>
+              <a href="{{ app_path('/sleep') }}{{ token_qs }}">
+                <strong>Actual sleep</strong><br>
+                <span class="muted">수면 원본과 캘린더 비교</span>
+              </a>
+              <a href="{{ dashboard.decisions_url }}">
+                <strong>Decision history</strong><br>
+                <span class="muted">판단 트리와 근거 전체 보기</span>
+              </a>
+              <a href="{{ dashboard.weekly_url }}">
+                <strong>Weekly report</strong><br>
+                <span class="muted">장기 집계와 변화 검토</span>
+              </a>
+              <a href="{{ app_path('/storage') }}{{ token_qs }}">
+                <strong>Storage & diagnostics</strong><br>
+                <span class="muted">저장소 상태와 운영 진단</span>
+              </a>
+              <div class="advanced-item" data-ui-primitive="nutrition_summary">
+                <strong>오늘 섭취 {{ dashboard.nutrition.interaction_count }}건</strong><br>
+                {% if dashboard.nutrition.latest_items %}
+                <span class="muted">
+                  {{ dashboard.nutrition.latest_items|join(", ") }}
+                  · 확인 완료 {{ dashboard.nutrition.confirmed_count }}건
+                </span>
+                {% else %}
+                <span class="muted">오늘 기록된 식사나 섭취가 없습니다.</span>
+                {% endif %}
+              </div>
+            </div>
+            <p class="honesty-note">
+              원시 건강 데이터, provider 연결, 동기화 충돌, 전체 판단 근거와 운영 진단은
+              기본 화면에서 숨깁니다. 이 대시보드는 읽기 전용이며 캘린더를 직접 변경하지 않습니다.
+            </p>
+          </div>
+        </details>
+      </section>
+
+      <section class="channel-panel"
+               id="channel-panel-calendar"
+               data-channel-panel="calendar"
+               data-active="false"
+               aria-hidden="true">
+        <article class="primitive primitive-body calendar-canvas"
+                 data-ui-primitive="calendar_canvas">
+          <div class="calendar-toolbar">
+            <div class="calendar-title">
+              <h3>연결된 캘린더 일정</h3>
+              {% if dashboard.calendar_sources %}
+              <div class="calendar-freshness" aria-label="캘린더 동기화 상태">
+                {% for source in dashboard.calendar_sources %}
+                  {% set observed = dashboard.calendar_sync_observed_at.get(source) %}
+                  {% set sync_status = dashboard.calendar_sync_statuses.get(source, 'unconfirmed') %}
+                  <span class="{{ sync_status | replace('_', '-') }}">
+                    {{ 'Google' if source == 'google' else 'Apple / iCloud' }}
+                    {% if sync_status == 'current' %}
+                      sync {{ format_rel(observed) }}
+                    {% elif sync_status == 'stale' %}
+                      sync 오래됨
+                    {% elif sync_status == 'future_skew' %}
+                      sync 시간 확인 필요
+                    {% else %}
+                      sync 미확인
+                    {% endif %}
+                  </span>
+                {% endfor %}
+              </div>
+              {% endif %}
+            </div>
+            {% if dashboard.calendar_sources or dashboard.pending_proposals %}
+            <div class="provider-legend" aria-label="캘린더 출처 범례">
+              {% if "google" in dashboard.calendar_sources %}
+              <span class="provider-key provider-google">
+                <span class="provider-dot" aria-hidden="true"></span>Google
+              </span>
+              {% endif %}
+              {% if "caldav" in dashboard.calendar_sources %}
+              <span class="provider-key provider-caldav">
+                <span class="provider-dot" aria-hidden="true"></span>Apple / iCloud
+              </span>
+              {% endif %}
+              {% if dashboard.pending_proposals %}
+              <span class="provider-key provider-healthmes">
+                <span class="provider-dot" aria-hidden="true"></span>HealthMes 제안
+              </span>
+              {% endif %}
+            </div>
+            {% endif %}
+          </div>
+
+          {% set known_energy = dashboard.energy.curve_24h
+              |selectattr('score', 'ne', none)|list|length %}
+          {% if known_energy >= 6 %}
+          <figure class="energy-chart" data-ui-primitive="energy_curve">
+            <figcaption>
+              <strong>오늘의 시간대별 에너지</strong>
+              <span>저장된 샘플만 표시</span>
+            </figcaption>
+            <svg class="energy-svg"
+                 viewBox="0 0 400 112"
+                 role="img"
+                 aria-labelledby="energy-title"
+                 aria-describedby="energy-desc energy-values">
+              <title id="energy-title">24시간 인지 에너지 막대 그래프</title>
+              <desc id="energy-desc">점수가 저장된 시간은 색 막대로, 데이터가 없는 시간은 바닥의 짧은 회색 표시로 나타냅니다.</desc>
+              <line class="energy-grid" x1="8" y1="18" x2="392" y2="18"></line>
+              <line class="energy-grid" x1="8" y1="57" x2="392" y2="57"></line>
+              <line class="energy-grid" x1="8" y1="96" x2="392" y2="96"></line>
+              {% for point in dashboard.energy.curve_24h %}
+                {% set x = 10 + (point.hour * 16) %}
+                {% if point.score is not none %}
+                  {% set height = point.score * 0.78 %}
+                  <rect class="energy-bar"
+                        data-energy-hour="{{ point.hour }}"
+                        data-energy-score="{{ point.score }}"
+                        x="{{ x }}"
+                        y="{{ 96 - height }}"
+                        width="10"
+                        height="{{ height }}"
+                        rx="3">
+                    <title>{{ "%02d"|format(point.hour) }}시 {{ point.score }}점</title>
+                  </rect>
+                {% else %}
+                  <rect class="energy-missing"
+                        data-energy-hour="{{ point.hour }}"
+                        x="{{ x }}"
+                        y="94"
+                        width="10"
+                        height="2"
+                        rx="1">
+                    <title>{{ "%02d"|format(point.hour) }}시 데이터 없음</title>
+                  </rect>
+                {% endif %}
+              {% endfor %}
+              <text class="energy-axis" x="8" y="108">00</text>
+              <text class="energy-axis" x="102" y="108">06</text>
+              <text class="energy-axis" x="198" y="108">12</text>
+              <text class="energy-axis" x="294" y="108">18</text>
+              <text class="energy-axis" x="378" y="108">23</text>
+            </svg>
+            <ol class="visually-hidden" id="energy-values">
+              {% for point in dashboard.energy.curve_24h %}
+              <li data-energy-value-hour="{{ point.hour }}">
+                {{ "%02d"|format(point.hour) }}시:
+                {% if point.score is not none %}{{ point.score }}점{% else %}데이터 없음{% endif %}
+              </li>
+              {% endfor %}
+            </ol>
+          </figure>
+          {% endif %}
+
+          {% if dashboard.plan_events or dashboard.calendar_proposals %}
+          {% set calendar_items = (dashboard.plan_events + dashboard.calendar_proposals)
+              |sort(attribute='starts_at') %}
+          {% set timeline = namespace(latest_end=none) %}
+          <ol class="calendar-timeline" aria-label="앞으로 7일 캘린더 일정">
+            {% for item in calendar_items %}
+            {% set gap_minutes = [((item.starts_at - timeline.latest_end).total_seconds() / 60)|round|int, 0]|max if timeline.latest_end else 0 %}
+            {% set duration_minutes = ((item.ends_at - item.starts_at).total_seconds() / 60)|round|int %}
+            {% if timeline.latest_end is none or item.ends_at > timeline.latest_end %}
+              {% set timeline.latest_end = item.ends_at %}
+            {% endif %}
+            {% if item.source is defined %}
+            <li class="calendar-event provider-{{ item.source }}"
+                data-calendar-provider="{{ item.source }}"
+                data-provider-status="{{ item.status or 'unknown' }}"
+                data-organizer-self="{{ 'true' if item.organizer_self else 'false' }}"
+                data-all-day="{{ 'true' if item.is_all_day else 'false' }}"
+                {% if not item.is_all_day %}
+                data-duration-minutes="{{ duration_minutes }}"
+                {% endif %}
+                data-gap-minutes="{{ gap_minutes }}"
+                style="{% if not item.is_all_day %}--duration-minutes: {{ duration_minutes }}; {% endif %}--gap-minutes: {{ gap_minutes }};">
+              <time class="event-time" datetime="{{ item.starts_at.isoformat() }}">
+                {% if item.is_all_day %}
+                  종일 일정
+                {% else %}
+                  {{ format_local(item.starts_at) }}<br>
+                  {{ format_local(item.ends_at) }}
+                {% endif %}
+              </time>
+              <div class="event-copy">
+                <strong>{{ item.title }}</strong>
+                <div class="event-meta">
+                  <span class="provider-badge">
+                    {% if item.source == "google" %}
+                      Google Calendar
+                    {% elif item.source == "caldav" %}
+                      Apple / iCloud Calendar
+                    {% else %}
+                      {{ item.source }}
+                    {% endif %}
+                  </span>
+                  {% if item.is_agent_created %}
+                  <span>HealthMes가 관리하는 블록</span>
+                  {% else %}
+                  <span>외부 일정 · 기본 고정</span>
+                  {% endif %}
+                  {% if item.is_all_day %}<span>종일</span>{% endif %}
+                  {% if item.is_recurring %}<span>반복</span>{% endif %}
+                  {% if item.organizer_self %}
+                  <span>내가 주최</span>
+                  {% elif item.has_attendees %}
+                  <span>외부 주최</span>
+                  {% endif %}
+                  {% if item.is_locked %}<span>잠김</span>{% endif %}
+                  {% if item.energy_demand %}<span>요구 에너지 {{ item.energy_demand }}</span>{% endif %}
+                  {% if item.status %}<span>상태 {{ item.status }}</span>{% endif %}
+                </div>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="calendar:{{ item.source }}:{{ item.external_id }}"
+                      data-thread-title="{{ item.title }}"
+                      data-thread-kind="calendar event">스레드</button>
+            </li>
+            {% else %}
+            <li class="calendar-event proposal-preview-event"
+                data-calendar-provider="healthmes"
+                data-proposal-preview
+                data-proposal-id="{{ item.id }}"
+                data-duration-minutes="{{ duration_minutes }}"
+                data-gap-minutes="{{ gap_minutes }}"
+                style="--duration-minutes: {{ duration_minutes }}; --gap-minutes: {{ gap_minutes }};">
+              <time class="event-time" datetime="{{ item.starts_at.isoformat() }}">
+                {{ format_local(item.starts_at) }}<br>
+                {{ format_local(item.ends_at) }}
+              </time>
+              <div class="event-copy">
+                <strong>{{ item.task_title }} 블록 후보</strong>
+                <div class="event-meta">
+                  <span class="provider-badge">HealthMes 제안</span>
+                  <span>승인 전 미리보기</span>
+                </div>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="proposal:{{ item.id }}"
+                      data-thread-title="{{ item.task_title }} 블록 후보"
+                      data-thread-kind="schedule proposal">스레드</button>
+            </li>
+            {% endif %}
+            {% endfor %}
+          </ol>
+          {% if dashboard.plan_events_truncated %}
+          <p class="honesty-note">
+            캘린더 {{ dashboard.plan_events_total }}건 중 시간순으로
+            {{ dashboard.plan_events|length }}건을 표시합니다.
+          </p>
+          {% endif %}
+          {% if dashboard.calendar_proposals_truncated %}
+          <p class="honesty-note">
+            변경 제안 {{ dashboard.calendar_proposals_total }}건 중 시간순으로
+            {{ dashboard.calendar_proposals|length }}건을 표시합니다.
+          </p>
+          {% endif %}
+          {% else %}
+          <p class="empty-state">표시할 Apple 또는 Google Calendar 일정이 없습니다.</p>
+          {% endif %}
+        </article>
+
+        <div class="canvas-grid">
+          <article class="primitive primitive-body canvas-span-7"
+                   data-ui-primitive="weekly_plan">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>앞으로 7일의 조율 기준</h3>
+                <p>현재 read model 요약</p>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="card:weekly-plan"
+                      data-thread-title="앞으로 7일의 조율 기준"
+                      data-thread-kind="planning card">스레드</button>
+            </div>
+            <ul class="signal-list">
+              <li class="signal-row">
+                <strong>현재 에너지</strong>
+                <span>{{ dashboard.energy.score if dashboard.energy.score is not none else "측정 중" }}</span>
+              </li>
+              <li class="signal-row">
+                <strong>캘린더 일정</strong>
+                <span>{{ dashboard.plan_events|length }}/{{ dashboard.plan_events_total }}개 표시</span>
+              </li>
+              <li class="signal-row">
+                <strong>결정 대기</strong>
+                <span>{{ dashboard.pending_proposals_total }}개</span>
+              </li>
+              <li class="signal-row">
+                <strong>활성 목표</strong>
+                <span>{{ dashboard.goals|length }}개</span>
+              </li>
+            </ul>
+            <p class="honesty-note">이 표면은 기존 건강·목표·캘린더 read model을 조합합니다. 새로운 점수나 원인을 계산하지 않습니다.</p>
+          </article>
+
+          <article class="primitive primitive-body canvas-span-5"
+                   data-ui-primitive="calendar_ownership">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>일정 변경 경계</h3>
+                <p>원본 Calendar 소유권 보존</p>
+              </div>
+            </div>
+            <ul class="signal-list">
+              <li class="signal-row">
+                <strong>HealthMes 관리 블록</strong>
+                <span>승인 후 변경 가능</span>
+              </li>
+              <li class="signal-row">
+                <strong>외부 회의·초대 일정</strong>
+                <span>기본 고정</span>
+              </li>
+              <li class="signal-row">
+                <strong>Apple·Google 원본</strong>
+                <span>출처 보존</span>
+              </li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="channel-panel"
+               id="channel-panel-insights"
+               data-channel-panel="insights"
+               data-active="false"
+               aria-hidden="true">
+        <div class="canvas-grid">
+          <article class="primitive primitive-body canvas-span-7"
+                   data-ui-primitive="weekly_energy_trajectory">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>주간 에너지 추이</h3>
+                <p>{{ dashboard.weekly.energy.samples }}개 저장 샘플</p>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="visualization:weekly-energy"
+                      data-thread-title="주간 에너지 추이"
+                      data-thread-kind="visualization">스레드</button>
+            </div>
+            <div class="weekly-energy"
+                 role="img"
+                 aria-label="최근 7일의 저장된 평균 에너지. {% for day in dashboard.weekly.energy.days %}{{ day.date }} {% if day.avg_score is not none %}평균 {{ day.avg_score }}점{% else %}데이터 없음{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}">
+              {% for day in dashboard.weekly.energy.days %}
+              <div class="week-day">
+                <div class="week-bar-wrap">
+                  {% if day.avg_score is not none %}
+                  <span class="week-bar"
+                        style="height: {{ day.avg_score }}%"
+                        title="{{ day.date }} 평균 {{ day.avg_score }}점"></span>
+                  {% else %}
+                  <span class="week-bar missing" title="{{ day.date }} 데이터 없음"></span>
+                  {% endif %}
+                </div>
+                <span class="week-score">{{ day.avg_score if day.avg_score is not none else "—" }}</span>
+                <span class="week-label">{{ day.date.strftime("%m-%d") }}</span>
+              </div>
+              {% endfor %}
+            </div>
+          </article>
+
+          <article class="primitive primitive-body canvas-span-5"
+                   data-ui-primitive="outcome_summary">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>결정 결과</h3>
+                <p>{{ dashboard.weekly.week_start }} — {{ dashboard.weekly.week_end }}</p>
+              </div>
+            </div>
+            <div class="outcome-stats">
+              <div class="outcome-stat">
+                <strong>{{ dashboard.weekly.energy.overall_avg if dashboard.weekly.energy.overall_avg is not none else "—" }}</strong>
+                <span>평균 에너지</span>
+              </div>
+              <div class="outcome-stat">
+                <strong>{{ dashboard.weekly.schedule.acceptance_pct if dashboard.weekly.schedule.acceptance_pct is not none else "—" }}{% if dashboard.weekly.schedule.acceptance_pct is not none %}%{% endif %}</strong>
+                <span>제안 수용률</span>
+              </div>
+              <div class="outcome-stat">
+                <strong>{{ dashboard.weekly.decisions.count }}</strong>
+                <span>판단 기록</span>
+              </div>
+            </div>
+            <p class="honesty-note">수용률만으로 건강 효과를 단정하지 않습니다.</p>
+          </article>
+
+          <article class="primitive primitive-body canvas-span-7"
+                   data-ui-primitive="insight_list">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>최근 관찰된 패턴</h3>
+                <p>저장된 insight와 confidence</p>
+              </div>
+            </div>
+            {% if dashboard.recent_insights %}
+            <div class="insight-list">
+              {% for insight in dashboard.recent_insights %}
+              <div class="insight-item">
+                <div class="primitive-head">
+                  <div class="primitive-head-copy">
+                    <strong>{{ insight.statement }}</strong>
+                    <span class="insight-meta">
+                      <span>{{ format_rel(insight.created_at) }}</span>
+                      {% if insight.confidence is not none %}
+                      <span class="badge">confidence {{ "%.0f"|format(insight.confidence * 100) }}%</span>
+                      {% endif %}
+                    </span>
+                  </div>
+                  <button class="thread-trigger"
+                          type="button"
+                          data-action="open-thread"
+                          data-thread-anchor="insight:{{ insight.created_at.isoformat() }}:{{ insight.statement }}"
+                          data-thread-title="{{ insight.statement }}"
+                          data-thread-kind="wellness insight">스레드</button>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <p class="empty-state">아직 비교할 인사이트가 없습니다.</p>
+            {% endif %}
+          </article>
+
+          <article class="primitive primitive-body canvas-span-5"
+                   data-ui-primitive="nutrition_summary">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>오늘 섭취</h3>
+                <p>{{ dashboard.nutrition.interaction_count }}건 · 확인 완료 {{ dashboard.nutrition.confirmed_count }}건</p>
+              </div>
+              <button class="thread-trigger"
+                      type="button"
+                      data-action="open-thread"
+                      data-thread-anchor="nutrition:{{ dashboard.local_today.isoformat() }}"
+                      data-thread-title="오늘 섭취"
+                      data-thread-kind="nutrition summary">스레드</button>
+            </div>
+            {% if dashboard.nutrition.latest_items %}
+            <ul class="signal-list">
+              {% for item in dashboard.nutrition.latest_items %}
+              <li class="signal-row">
+                <strong>{{ item }}</strong>
+                <span>기록됨</span>
+              </li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            <p class="empty-state">오늘 기록된 식사나 섭취가 없습니다.</p>
+            {% endif %}
+          </article>
+
+          <article class="primitive primitive-body canvas-span-12"
+                   data-ui-primitive="learning_loop">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>결정이 다음 판단으로 이어지는 방식</h3>
+                <p>상태 → 행동 → 결과</p>
+              </div>
+            </div>
+            <div class="metric-grid">
+              <div class="metric"><strong>상태</strong><span>건강·에너지·일정</span></div>
+              <div class="metric"><strong>행동</strong><span>수락·수정·거절</span></div>
+              <div class="metric"><strong>결과</strong><span>집중·회복·완료</span></div>
+            </div>
+            <p class="honesty-note">현재 저장된 결과가 부족하면 모름으로 남깁니다. 상관관계를 원인으로 표현하지 않습니다.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="channel-panel"
+               id="channel-panel-decisions"
+               data-channel-panel="decisions"
+               data-active="false"
+               aria-hidden="true">
+        <div class="canvas-grid">
+          <article class="primitive primitive-body canvas-span-5"
+                   data-ui-primitive="proposal_preview">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>결정 대기</h3>
+                <p>{{ dashboard.pending_proposals_total }}개</p>
+              </div>
+            </div>
+            {% if dashboard.pending_proposals %}
+              {% for proposal in dashboard.pending_proposals %}
+              <article class="goal-item" data-proposal-id="{{ proposal.id }}">
+                <div class="primitive-head">
+                  <div class="primitive-head-copy">
+                    <strong>{{ proposal.task_title }}</strong>
+                    <p>{{ format_local(proposal.starts_at) }} — {{ format_local(proposal.ends_at) }}</p>
+                  </div>
+                  <button class="thread-trigger"
+                          type="button"
+                          data-action="open-thread"
+                          data-thread-anchor="proposal:{{ proposal.id }}"
+                          data-thread-title="{{ proposal.task_title }} 블록 제안"
+                          data-thread-kind="schedule proposal">스레드</button>
+                </div>
+                <p class="muted">{{ proposal.decision_summary or "연결된 판단 기록을 검증하지 못해 이유를 표시하지 않습니다." }}</p>
+                {% if proposal.decision_url %}
+                <a href="{{ proposal.decision_url }}">판단 근거 보기</a>
+                {% endif %}
+              </article>
+              {% endfor %}
+              {% if dashboard.pending_proposals_truncated %}
+              <p class="honesty-note">
+                총 {{ dashboard.pending_proposals_total }}개 중
+                {{ dashboard.pending_proposals|length }}개를 시간순으로 불러왔고,
+                나머지는 전체 판단 보기에서 확인할 수 있습니다.
+              </p>
+              {% endif %}
+              <div class="decision-actions">
+                <p>Yes/No는 iPhone, Mac 또는 Apple Watch에서 실행합니다.</p>
+              </div>
+            {% else %}
+            <p class="empty-state">지금 결정할 제안이 없습니다.</p>
+            {% endif %}
+          </article>
+
+          <article class="primitive primitive-body canvas-span-7"
+                   id="decisions"
+                   data-ui-primitive="decision_history">
+            <div class="primitive-head">
+              <div class="primitive-head-copy">
+                <h3>최근 판단</h3>
+                <p>검증 가능한 판단 기록</p>
+              </div>
+              <a href="{{ dashboard.decisions_url }}">전체 판단 보기</a>
+            </div>
+            {% if dashboard.recent_decisions %}
+            <ul class="decision-list">
+              {% for decision in dashboard.recent_decisions %}
+              <li>
+                <div class="primitive-head">
+                  <a href="{{ decision.url }}">
+                    <strong>{{ decision.summary }}</strong>
+                    <span class="decision-meta">
+                      <span class="badge kind-{{ decision.kind }}">{{ kind_labels.get(decision.kind, decision.kind) }}</span>
+                      <span>{{ format_rel(decision.created_at) }}</span>
+                    </span>
+                  </a>
+                  <button class="thread-trigger"
+                          type="button"
+                          data-action="open-thread"
+                          data-thread-anchor="decision:{{ decision.url.split('?')[0] }}"
+                          data-thread-title="{{ decision.summary }}"
+                          data-thread-kind="decision record">스레드</button>
+                </div>
+              </li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            <p class="empty-state">아직 기록된 판단이 없습니다.</p>
+            {% endif %}
+          </article>
+        </div>
+      </section>
+
+      <section class="channel-panel"
+               id="channel-panel-agent"
+               data-channel-panel="agent"
+               data-active="false"
+               aria-hidden="true">
+        <article class="primitive custom-canvas-intro">
+          <h3>Agent canvas</h3>
+          <p>대화형 무한 피드가 아니라, 작업 맥락을 채널과 스레드로 정리하는 로컬 캔버스입니다.</p>
+          <p class="local-only-note">
+            현재 웹 클라이언트는 HealthMes Agent 실행 API에 연결하지 않습니다.
+            아래 글과 초안은 이 브라우저에만 저장되며 서버로 전송되지 않습니다.
+          </p>
+        </article>
+        <article class="primitive agent-canvas"
+                 id="command-dock"
+                 data-command-dock>
+          <ul class="local-feed"
+              data-local-feed="agent"
+              aria-label="브라우저 로컬 Agent 글"></ul>
+          <div class="local-composer" data-local-composer="agent">
+            <label class="visually-hidden" for="command-preview">HealthMes에 말하거나 입력하기</label>
+            <textarea id="command-preview"
+                      data-local-draft="agent"
+                      maxlength="4000"
+                      placeholder="예: 오후 집중 블록을 검토할 때 확인할 맥락"></textarea>
+            <button type="button"
+                    data-action="submit-local-post"
+                    data-channel-id="agent">로컬에 저장</button>
+            <p class="composer-note">⌘/Ctrl + Enter로 저장 · 서버나 Calendar에는 반영되지 않습니다.</p>
+          </div>
+        </article>
+      </section>
+
+      <div data-custom-panels></div>
+    </div>
+
+    <aside class="workspace-thread-panel"
+           data-thread-panel
+           aria-label="스레드"
+           aria-modal="true"
+           role="dialog"
+           tabindex="-1"
+           hidden>
+      <div class="thread-panel-inner">
+        <header class="thread-header">
+          <div class="thread-header-copy">
+            <h2 data-thread-title>Thread</h2>
+            <p data-thread-kind>이 브라우저에만 저장</p>
+          </div>
+          <button class="thread-close"
+                  type="button"
+                  data-action="close-thread"
+                  aria-label="스레드 닫기">×</button>
+        </header>
+        <div class="thread-anchor-preview">
+          <strong>원본 컨텍스트</strong>
+          <span>카드·일정·제안·그래프에서 시작된 로컬 스레드</span>
+        </div>
+        <ul class="thread-messages"
+            data-thread-messages
+            aria-live="polite"></ul>
+        <div class="thread-composer">
+          <textarea data-thread-draft
+                    maxlength="4000"
+                    placeholder="답글을 남기세요"></textarea>
+          <button type="button" data-action="submit-thread">답글</button>
+          <p class="composer-note">이 스레드는 현재 브라우저에만 저장됩니다.</p>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <button class="sidebar-scrim"
+          type="button"
+          data-action="close-sidebar"
+          aria-label="사이드바 닫기"></button>
+
+  <dialog class="workspace-dialog" data-category-dialog>
+    <div class="dialog-body">
+      <h2>카테고리 추가</h2>
+      <div class="dialog-field">
+        <label for="workspace-category-name">이름</label>
+        <input id="workspace-category-name"
+               data-category-name
+               maxlength="48"
+               autocomplete="off"
+               placeholder="예: Work, Recovery, Experiments">
+      </div>
+      <p class="local-only-note">카테고리와 채널은 이 브라우저에만 저장됩니다.</p>
+      <div class="dialog-actions">
+        <button type="button" data-action="close-dialog">취소</button>
+        <button class="primary" type="button" data-action="submit-category">추가</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="workspace-dialog" data-channel-dialog>
+    <div class="dialog-body">
+      <h2>채널 추가</h2>
+      <div class="dialog-field">
+        <label for="workspace-channel-name">이름</label>
+        <input id="workspace-channel-name"
+               data-channel-name
+               maxlength="48"
+               autocomplete="off"
+               placeholder="예: launch-recovery">
+      </div>
+      <div class="dialog-field">
+        <label for="workspace-channel-category">카테고리</label>
+        <select id="workspace-channel-category" data-channel-category></select>
+      </div>
+      <div class="dialog-field">
+        <label for="workspace-channel-kind">캔버스</label>
+        <select id="workspace-channel-kind" data-channel-kind>
+          <option value="dashboard">Dashboard</option>
+          <option value="calendar">Calendar</option>
+          <option value="visualization">Visualization</option>
+          <option value="decision">Decision feed</option>
+          <option value="conversation">Conversation</option>
+          <option value="mixed" selected>Mixed canvas</option>
+        </select>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" data-action="close-dialog">취소</button>
+        <button class="primary" type="button" data-action="submit-channel">추가</button>
+      </div>
+    </div>
+  </dialog>
+</div>
+
+<script>
+{% include "ui/_dashboard_workspace.js.j2" %}
+</script>
+{% endblock %}

@@ -4,10 +4,9 @@
 #   brew install xcodegen        # once
 #   cd apps/ios-companion && xcodegen generate
 #
-# Everything here is simulator-only plumbing: build with
-# CODE_SIGNING_ALLOWED=NO and never configure signing identities in this
-# repo (see README.md). The generated .xcodeproj and Support/ files are
-# derived artifacts and gitignored.
+# CI and simulator builds use CODE_SIGNING_ALLOWED=NO. Local hardware QA may
+# select a personal development team and override the user-defined bundle/App
+# Group settings below; no repository-owned signing identity is committed.
 #
 # Source layout rule (issue #11 prep): Sources/Shared is platform-agnostic
 # (Foundation+Security only — models, clients, formatting, pairing; NO
@@ -28,6 +27,11 @@ settings:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.2.0"
     CURRENT_PROJECT_VERSION: "1"
+    # Override these two user-defined settings for a personal development
+    # team before a signed hardware build. Simulator/CI builds keep the
+    # stable defaults below.
+    HEALTHMES_BUNDLE_ID_PREFIX: com.healthmes
+    HEALTHMES_APP_GROUP_ID: group.com.healthmes.companion
 
 targets:
   # ---------------------------------------------------------------- iOS app
@@ -47,16 +51,20 @@ targets:
     dependencies:
       - target: HealthMesWidgets
       - target: HealthMesNotificationContent
+      - target: HealthMesWatchApp
+      - sdk: HealthKit.framework
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion
         TARGETED_DEVICE_FAMILY: "1"
     info:
       path: Support/HealthMesCompanion-Info.plist
       properties:
         CFBundleDisplayName: HealthMes
-        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)group.com.healthmes.companion
+        HealthMesAppGroupIdentifier: $(HEALTHMES_APP_GROUP_ID)
+        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)$(HEALTHMES_APP_GROUP_ID)
+        HealthMesBackgroundRefreshIdentifier: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.refresh
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
@@ -70,9 +78,9 @@ targets:
             CFBundleURLSchemes: [healthmes]
         # Native alert loop: BGAppRefreshTask polls /v1/alerts (OS-throttled;
         # README documents the honesty story — Telegram stays guaranteed).
-        UIBackgroundModes: [fetch]
+        UIBackgroundModes: [fetch, processing]
         BGTaskSchedulerPermittedIdentifiers:
-          - com.healthmes.companion.refresh
+          - $(HEALTHMES_BUNDLE_ID_PREFIX).companion.refresh
         # Capture shortcuts (photos re-encoded to JPEG, voice memos to m4a;
         # bytes go only to the paired instance's POST /v1/media).
         NSCameraUsageDescription: >-
@@ -80,25 +88,35 @@ targets:
           HealthMes instance.
         NSMicrophoneUsageDescription: >-
           Voice memos are uploaded only to your own HealthMes instance.
+        NSSpeechRecognitionUsageDescription: >-
+          HealthMes turns your spoken goal or task into a Plan item without
+          offering a text-command composer.
+        NSFaceIDUsageDescription: >-
+          HealthMes verifies that it is you before applying a calendar
+          decision from the lock screen.
+        NSCalendarsFullAccessUsageDescription: >-
+          HealthMes checks calendars already configured on this iPhone so
+          device permission and server synchronization can be shown separately.
+        NSHealthShareUsageDescription: >-
+          HealthMes reads health and activity data from Apple Health to make
+          wellness-aware schedule suggestions on your own paired server.
         # Focus-block Live Activity (polling-updated; no push channel).
         NSSupportsLiveActivities: true
         NSSupportsLiveActivitiesFrequentUpdates: false
-        # LAN-HTTP exception SCOPED to local networking instead of disabling
-        # ATS globally: the typical pairing target is http://<LAN-IP>:8100 —
-        # ATS never applies to IP-literal URLs anyway, and
-        # NSAllowsLocalNetworking covers .local / unqualified hostnames
-        # (localhost included). Plain HTTP to a qualified public DNS name
-        # fails CLOSED (use HTTPS there) — the bearer token / tokenized
-        # viewer URLs must never cross an untrusted network in clear text.
+        # Keep ATS scoped for loopback development. Pairing validation permits
+        # HTTP only for localhost/127.0.0.0/8/::1 and requires HTTPS for every
+        # remote host, including private-LAN addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     entitlements:
       path: Support/HealthMesCompanion.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.com.healthmes.companion
+          - $(HEALTHMES_APP_GROUP_ID)
         keychain-access-groups:
-          - $(AppIdentifierPrefix)group.com.healthmes.companion
+          - $(AppIdentifierPrefix)$(HEALTHMES_APP_GROUP_ID)
+        com.apple.developer.healthkit: true
+        com.apple.developer.healthkit.background-delivery: true
 
   # ------------------------------------------- iOS home + lock-screen widgets
   # Also hosts the focus-block Live Activity UI (ActivityKit renders live
@@ -115,27 +133,28 @@ targets:
       - Resources/Localizable.xcstrings
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.widgets
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.widgets
         TARGETED_DEVICE_FAMILY: "1"
         SKIP_INSTALL: true
     info:
       path: Support/HealthMesWidgets-Info.plist
       properties:
         CFBundleDisplayName: HealthMes Glance
-        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)group.com.healthmes.companion
+        HealthMesAppGroupIdentifier: $(HEALTHMES_APP_GROUP_ID)
+        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)$(HEALTHMES_APP_GROUP_ID)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
         NSSupportsLiveActivities: true
-        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
+        # Scoped like the app target for loopback development only.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     entitlements:
       path: Support/HealthMesWidgets.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.com.healthmes.companion
+          - $(HEALTHMES_APP_GROUP_ID)
         keychain-access-groups:
-          - $(AppIdentifierPrefix)group.com.healthmes.companion
+          - $(AppIdentifierPrefix)$(HEALTHMES_APP_GROUP_ID)
 
   # --------------------------------------- expanded actionable notification UI
   HealthMesNotificationContent:
@@ -147,18 +166,20 @@ targets:
     resources:
       - Resources/Localizable.xcstrings
     dependencies:
+      - sdk: LocalAuthentication.framework
       - sdk: UserNotifications.framework
       - sdk: UserNotificationsUI.framework
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.notification-content
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.notification-content
         TARGETED_DEVICE_FAMILY: "1"
         SKIP_INSTALL: true
     info:
       path: Support/HealthMesNotificationContent-Info.plist
       properties:
         CFBundleDisplayName: HealthMes Decision
-        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)group.com.healthmes.companion
+        HealthMesAppGroupIdentifier: $(HEALTHMES_APP_GROUP_ID)
+        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)$(HEALTHMES_APP_GROUP_ID)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.content-extension
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationViewController
@@ -173,16 +194,15 @@ targets:
       path: Support/HealthMesNotificationContent.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.com.healthmes.companion
+          - $(HEALTHMES_APP_GROUP_ID)
         keychain-access-groups:
-          - $(AppIdentifierPrefix)group.com.healthmes.companion
+          - $(AppIdentifierPrefix)$(HEALTHMES_APP_GROUP_ID)
 
   # ------------------------------------------------------------- watchOS app
-  # Modern single-target watch app. Declared as companion of the iOS app so
-  # WatchConnectivity can push the pairing from the phone; it can also run
-  # (and fetch) independently once paired. NOT embedded into the iOS app —
-  # distribution embedding is out of scope until real-device signing exists
-  # (README "not yet verified").
+  # Modern single-target watch app. It is embedded in the iOS companion so
+  # paired simulator and signed-device installs preserve the counterpart
+  # relationship required by WatchConnectivity. It can also fetch
+  # independently after receiving the pairing from the phone.
   HealthMesWatchApp:
     type: application
     platform: watchOS
@@ -195,14 +215,15 @@ targets:
       - target: HealthMesWatchWidgets
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.watchkitapp
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.watchkitapp
         TARGETED_DEVICE_FAMILY: "4"
     info:
       path: Support/HealthMesWatchApp-Info.plist
       properties:
         CFBundleDisplayName: HealthMes
         WKApplication: true
-        WKCompanionAppBundleIdentifier: com.healthmes.companion
+        HealthMesAppGroupIdentifier: $(HEALTHMES_APP_GROUP_ID)
+        WKCompanionAppBundleIdentifier: $(HEALTHMES_BUNDLE_ID_PREFIX).companion
         WKRunsIndependentlyOfCompanionApp: true
         # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
         NSAppTransportSecurity:
@@ -211,7 +232,7 @@ targets:
       path: Support/HealthMesWatchApp.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.com.healthmes.companion
+          - $(HEALTHMES_APP_GROUP_ID)
 
   # -------------------------------------------------- watchOS complications
   HealthMesWatchWidgets:
@@ -223,13 +244,14 @@ targets:
       - Sources/WatchWidgets
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.watchkitapp.widgets
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.watchkitapp.widgets
         TARGETED_DEVICE_FAMILY: "4"
         SKIP_INSTALL: true
     info:
       path: Support/HealthMesWatchWidgets-Info.plist
       properties:
         CFBundleDisplayName: HealthMes Energy
+        HealthMesAppGroupIdentifier: $(HEALTHMES_APP_GROUP_ID)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
         # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
@@ -239,7 +261,7 @@ targets:
       path: Support/HealthMesWatchWidgets.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.com.healthmes.companion
+          - $(HEALTHMES_APP_GROUP_ID)
 
   # ------------------------------------------------------------------ tests
   # Host-less unit-test bundle: compiles Sources/Shared directly, so the
@@ -249,6 +271,7 @@ targets:
     platform: iOS
     sources:
       - Sources/Shared
+      - Sources/App/DeviceCalendarPermission.swift
       - path: Tests
         excludes:
           - Fixtures
@@ -256,7 +279,7 @@ targets:
         buildPhase: resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.tests
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.tests
     info:
       path: Support/HealthMesCompanionTests-Info.plist
       properties: {}
@@ -274,7 +297,7 @@ targets:
       - target: HealthMesCompanion
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.uitests
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEALTHMES_BUNDLE_ID_PREFIX).companion.uitests
         TEST_TARGET_NAME: HealthMesCompanion
     info:
       path: Support/HealthMesCompanionUITests-Info.plist

@@ -41,12 +41,21 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             options: protectedActionOptions,
             icon: UNNotificationActionIcon(systemImageName: "xmark.circle")
         )
+        let speak = UNTextInputNotificationAction(
+            identifier: AlertNotificationActionID.speak,
+            title: String(localized: "Speak"),
+            options: protectedActionOptions,
+            icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
+            textInputButtonTitle: String(localized: "Apply"),
+            textInputPlaceholder: String(localized: "Speak, review the text, then apply")
+        )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,
             // Apple Watch Double Tap can invoke the first non-destructive
             // action. Default to the non-mutating choice so an accidental
-            // gesture can never approve a calendar change.
-            actions: [no, yes],
+            // gesture can never approve a calendar change. Keep Yes second
+            // so both primary decisions remain visible on the 42 mm screen.
+            actions: [no, yes, speak],
             intentIdentifiers: []
         )
         let info = UNNotificationCategory(
@@ -74,12 +83,12 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     /// Post one local notification for an alert-history item.
     func post(content: AlertNotificationContent) async {
         let notification = UNMutableNotificationContent()
-        notification.title = content.title
+        notification.title = content.systemTitle
         if !content.subtitle.isEmpty {
             notification.subtitle = content.subtitle
         }
-        if !content.body.isEmpty {
-            notification.body = content.body
+        if !content.systemBody.isEmpty {
+            notification.body = content.systemBody
         }
         notification.categoryIdentifier = content.categoryID
         notification.threadIdentifier = content.threadID
@@ -124,10 +133,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             let proposalID =
                 UUID(uuidString: DecisionActivityAttributes.demoProposalID)!
             let prompt = String(
-                format: String(localized: "Move %@?"),
-                String(localized: "Deep Work")
+                localized:
+                    "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
             )
-            let reason = String(localized: "Low recovery · sleep debt")
+            let reason = String(
+                localized:
+                    "Recovery is below your baseline after short sleep and a high-stress morning"
+            )
             let target = AlertNotificationContent.targetLine(after: proposedStart)
             let expiresAt = now.addingTimeInterval(30 * 60)
 
@@ -155,7 +167,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     AlertNotificationContent.userInfoProposalID:
                         proposalID.uuidString.lowercased(),
                     AlertNotificationContent.userInfoDecisionObservation:
-                        String(localized: "Low recovery · sleep debt"),
+                        reason,
                     AlertNotificationContent.userInfoDecisionTitle:
                         String(localized: "Deep Work"),
                     AlertNotificationContent.userInfoDecisionEvidence:
@@ -165,6 +177,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                             localized:
                                 "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
                         ),
+                    AlertNotificationContent.userInfoDecisionCompactPrompt:
+                        String(localized: "Move Deep Work?"),
                     AlertNotificationContent.userInfoDecisionBefore:
                         formatter.string(from: currentStart),
                     AlertNotificationContent.userInfoDecisionAfter:
@@ -227,6 +241,21 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             resolve(proposalID, action: .accept, completionHandler: completionHandler)
         case AlertNotificationActionID.no:
             resolve(proposalID, action: .decline, completionHandler: completionHandler)
+        case AlertNotificationActionID.speak,
+            AlertNotificationActionID.legacyAlternative:
+            let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
+            let command = SpeakCommand.compose(
+                userText: text,
+                proposalID: proposalID,
+                title: userInfo[AlertNotificationContent.userInfoDecisionTitle] as? String,
+                proposedAction: userInfo[
+                    AlertNotificationContent.userInfoDecisionAction
+                ] as? String
+            )
+            Task { @MainActor in
+                AppRouter.shared.openAgentCommandDock(prefill: command)
+                completionHandler()
+            }
         case UNNotificationDefaultActionIdentifier:
             // Tap-through = the §8.5 "why this?" link when the alert has a
             // decision record; home otherwise.
@@ -234,7 +263,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 if let decisionURL {
                     AppRouter.shared.openDecision(decisionURL)
                 } else {
-                    AppRouter.shared.tab = .home
+                    AppRouter.shared.showHome()
                 }
                 completionHandler()
             }
@@ -280,15 +309,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     // delegate, which cannot reliably distinguish the device.
                     surface: "apple_notification"
                 )
-                let title =
-                    proposal.status == .accepted
-                    ? String(localized: "Calendar change approved")
-                    : String(localized: "Calendar change declined")
                 await postOutcome(
-                    title: title,
-                    body: proposal.status == .accepted
-                        ? String(localized: "HealthMes recorded Yes. Calendar sync will apply it.")
-                        : String(localized: "HealthMes recorded No. The calendar stays unchanged.")
+                    title: ProposalStatusPresentation.label(for: proposal.status),
+                    body: ProposalStatusPresentation.detail(for: proposal.status)
                 )
             } catch let error as HealthMesAPIError where error.isAlreadyResolved {
                 await postOutcome(

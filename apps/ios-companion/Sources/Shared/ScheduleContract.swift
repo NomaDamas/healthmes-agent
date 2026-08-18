@@ -3,9 +3,8 @@ import Foundation
 // Codable contract for the schedule-proposal surface
 // (healthmes/api/schedule.py): `GET /v1/schedule/proposals` and the
 // propose-then-confirm actions `POST …/{id}/accept` / `…/{id}/decline`.
-// These are the REAL endpoints behind the §8.5 alert buttons
-// (✅ Apply → accept, ❌ Keep as-is → decline, ✏️ Adjust → open the
-// proposal in-app).
+// These are the real endpoints behind the compact No/Yes decision remote
+// and the longer in-app proposal controls.
 
 /// Mirror of healthmes.store.enums.ProposalStatus.
 public enum ProposalStatus: String, Codable {
@@ -23,6 +22,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
     public let proposedEnd: Date
     public let status: ProposalStatus
     public let decisionRecordId: UUID?
+    public let healthmesKind: String?
     public let decidedAt: Date?
     public let decisionSurface: String?
     public let acceptResolutionToken: String?
@@ -35,6 +35,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         proposedEnd: Date,
         status: ProposalStatus,
         decisionRecordId: UUID?,
+        healthmesKind: String? = nil,
         decidedAt: Date? = nil,
         decisionSurface: String? = nil,
         acceptResolutionToken: String?,
@@ -46,6 +47,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         self.proposedEnd = proposedEnd
         self.status = status
         self.decisionRecordId = decisionRecordId
+        self.healthmesKind = healthmesKind
         self.decidedAt = decidedAt
         self.decisionSurface = decisionSurface
         self.acceptResolutionToken = acceptResolutionToken
@@ -59,6 +61,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         case proposedEnd = "proposed_end"
         case status
         case decisionRecordId = "decision_record_id"
+        case healthmesKind = "healthmes_kind"
         case decidedAt = "decided_at"
         case decisionSurface = "decision_surface"
         case acceptResolutionToken = "accept_resolution_token"
@@ -77,9 +80,26 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
             && acceptResolutionToken != nil
             && declineResolutionToken != nil
     }
+
+    public var canComposeProactiveScene: Bool {
+        isActionable && decisionRecordId != nil
+    }
 }
 
 public typealias ProposalsPage = APIPage<ProposalItem>
+
+public enum ProactiveProposalSelection {
+    public static func firstEligible(in proposals: [ProposalItem]) -> ProposalItem? {
+        proposals.first(where: \.canComposeProactiveScene)
+    }
+
+    public static func containsEligibleProposal(
+        id: UUID,
+        in proposals: [ProposalItem]
+    ) -> Bool {
+        proposals.contains { $0.id == id && $0.canComposeProactiveScene }
+    }
+}
 
 public enum ProposalAction: String {
     case accept

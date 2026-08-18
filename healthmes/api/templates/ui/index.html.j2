@@ -60,27 +60,32 @@
     <span class="loop-arrow" aria-hidden="true">→</span> 궁금할 땐 "왜?"를 눌러 근거 숲을 봅니다.</p>
 
   <nav class="surface-grid" aria-label="서비스 표면">
-    <a class="surface-card" href="/decisions">
+    <a class="surface-card" href="{{ app_path('/dashboard') }}">
+      <h2>통합 Dashboard</h2>
+      <p>Today · Plan · Decisions · History를 한 화면에서 확인합니다.</p>
+      <code>GET /dashboard</code>
+    </a>
+    <a class="surface-card" href="{{ app_path('/decisions') }}">
       <h2>제안 · 피드백 기록</h2>
       <p>일정 조정 제안과 하루 피드백, 근거 숲과 함께 최신순.</p>
       <code>GET /decisions</code>
     </a>
-    <a class="surface-card" href="/reports/weekly">
+    <a class="surface-card" href="{{ app_path('/reports/weekly') }}">
       <h2>주간 리포트</h2>
       <p>에너지 추이 · 인사이트 · 일정 수용률 · 알림 예산.</p>
       <code>GET /reports/weekly</code>
     </a>
-    <a class="surface-card" href="/v1/briefing/glance">
+    <a class="surface-card" href="{{ app_path('/v1/briefing/glance') }}">
       <h2>글랜스 브리핑</h2>
       <p>컴패니언 앱이 읽는 지금-상태 스냅샷 (JSON).</p>
       <code>GET /v1/briefing/glance</code>
     </a>
-    <a class="surface-card" href="/connect">
+    <a class="surface-card" href="{{ app_path('/connect') }}">
       <h2>캘린더 연결</h2>
       <p>Google · iCloud 캘린더 연결 상태와 연결 방법 (읽기 전용).</p>
       <code>GET /connect</code>
     </a>
-    <a class="surface-card" href="/docs">
+    <a class="surface-card" href="{{ app_path('/docs') }}">
       <h2>API 문서</h2>
       <p>REST 전체 표면의 OpenAPI 문서.</p>
       <code>GET /docs</code>
@@ -88,6 +93,6 @@
   </nav>
 
   <p class="local-note"><span class="brand-dot" aria-hidden="true"></span>
-    모든 건강 데이터는 이 기기에만 머뭅니다 · Local-first, no cloud.</p>
+    데이터 위치와 동기화 범위는 선택한 저장 모드와 연결 설정을 따릅니다.</p>
 </div>
 {% endblock %}

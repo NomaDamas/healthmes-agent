@@ -16,7 +16,7 @@ struct PairingView: View {
     var body: some View {
         Form {
             Section {
-                TextField(text: $baseURL, prompt: Text(verbatim: "http://192.168.1.20:8100")) {
+                TextField(text: $baseURL, prompt: Text(verbatim: "https://healthmes.example.com")) {
                     Text("Base URL")
                 }
                 .keyboardType(.URL)
@@ -28,10 +28,10 @@ struct PairingView: View {
                 }
                 .accessibilityLabel(Text("API token"))
             } header: {
-                Text("Your HealthMes instance")
+                Text("Manual connection")
             } footer: {
                 Text(
-                    "The URL of your own healthmes service (HEALTHMES_API_TOKEN from its .env). This is the only server this app ever contacts."
+                    "Advanced fallback only. The normal setup uses Tailscale and a one-time QR, so no URL or API token is typed."
                 )
             }
 
@@ -109,6 +109,7 @@ struct PairingView: View {
                     SeenAlertsStore.shared.deferPrimingUntilNextFeed()
                 }
                 BackgroundRefreshManager.shared.schedule()
+                await HealthKitSyncManager.shared.requestAuthorizationAndSync()
             }
         } catch {
             status = error.localizedDescription

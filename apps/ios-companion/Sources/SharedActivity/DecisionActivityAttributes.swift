@@ -4,8 +4,14 @@
 
     public enum DecisionActivityStatus: String, Codable, Hashable {
         case pending
+        case applying
         case accepted
+        case pushed
         case declined
+        case alreadyAccepted
+        case alreadyPushed
+        case alreadyDeclined
+        case expired
         case failed
     }
 

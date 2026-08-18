@@ -3,6 +3,48 @@ import Foundation
 public enum AlertNotificationActionID {
     public static let yes = "HEALTHMES_YES"
     public static let no = "HEALTHMES_NO"
+    public static let speak = "HEALTHMES_SPEAK"
+    // Keep handling already-delivered notifications from older builds.
+    public static let legacyAlternative = "HEALTHMES_ALTERNATIVE"
+}
+
+public enum SpeakCommandSyncKeys {
+    // Keep the wire key stable so phones and watches on adjacent builds
+    // continue to exchange dictated instructions.
+    public static let command = "healthmes_alternative_command"
+    public static let requestID = "healthmes_speak_request_id"
+    public static let proposalID = "healthmes_speak_proposal_id"
+    public static let resultTitle = "healthmes_speak_result_title"
+    public static let resultDetail = "healthmes_speak_result_detail"
+    public static let resultStatus = "healthmes_speak_result_status"
+}
+
+public enum SpeakCommand {
+    public static func compose(
+        userText: String,
+        proposalID: UUID?,
+        title: String?,
+        proposedAction: String?
+    ) -> String {
+        let cleanText = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var context: [String] = []
+        if let proposalID {
+            context.append("proposal:\(proposalID.uuidString.lowercased())")
+        }
+        if let title {
+            let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty { context.append("title:\(clean)") }
+        }
+        if let proposedAction {
+            let clean = proposedAction.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty { context.append("action:\(clean)") }
+        }
+
+        let header = context.isEmpty
+            ? "Spoken instruction"
+            : "Spoken instruction [\(context.joined(separator: " | "))]"
+        return cleanText.isEmpty ? header : "\(header)\n\(cleanText)"
+    }
 }
 
 // The docs/PLAN.md §8.5 notification grammar, as data (parity with the
@@ -10,7 +52,7 @@ public enum AlertNotificationActionID {
 //
 //   [decision, 1 line]      -> notification title
 //   [result, 1 line]        -> notification body
-//   [buttons]  No / Yes   -> UNNotificationActions
+//   [buttons]  No / Yes / Speak -> UNNotificationActions
 //   [details]  Why / change -> userInfo for expanded or tapped surfaces
 //
 // Pure Foundation so the mapping from a `GET /v1/alerts` item is unit-
@@ -24,7 +66,7 @@ public enum AlertNotificationActionID {
 // silent — is the healthcare domain expert's deliverable
 // (docs/design/WATCH-NOTIFICATIONS.ko.md Q2/Q3/Q5).
 public struct AlertNotificationContent: Equatable {
-    /// Category with No / Yes actions — used only when
+    /// Category with No / Yes / Speak actions — used only when
     /// a pending schedule proposal is attached, so every button maps to a
     /// REAL endpoint call instead of a stub.
     public static let actionableCategoryID = "HEALTHMES_ALERT_ACTIONABLE"
@@ -38,14 +80,14 @@ public struct AlertNotificationContent: Equatable {
     public static let userInfoDecisionObservation = "healthmes_decision_observation"
     public static let userInfoDecisionEvidence = "healthmes_decision_evidence"
     public static let userInfoDecisionAction = "healthmes_decision_action"
+    public static let userInfoDecisionCompactPrompt = "healthmes_decision_compact_prompt"
     public static let userInfoDecisionBefore = "healthmes_decision_before"
     public static let userInfoDecisionAfter = "healthmes_decision_after"
     public static let userInfoDecisionEndsAt = "healthmes_decision_ends_at"
     public static let userInfoDecisionExpiresAt = "healthmes_decision_expires_at"
 
-    /// A glanceable decision question. Actionable content is kept to one
-    /// short line so watchOS can surface the actions without scrolling past
-    /// health evidence first.
+    /// The complete decision question. Compact system banners may truncate it,
+    /// but expanded iPhone and Watch surfaces must retain the original text.
     public let title: String
     /// One short health reason shown directly below the decision.
     public let subtitle: String
@@ -57,6 +99,19 @@ public struct AlertNotificationContent: Equatable {
     /// Routing payload: alert id, optional decision link, optional pending
     /// proposal id (string values only — plist-safe).
     public let userInfo: [String: String]
+
+    /// The system-owned compact notification cannot render category buttons.
+    /// Keep its copy short enough that the explicit expansion affordance is
+    /// visible; the complete action remains in `title` and `userInfo`.
+    public var systemTitle: String {
+        userInfo[Self.userInfoDecisionCompactPrompt] ?? title
+    }
+
+    public var systemBody: String {
+        guard categoryID == Self.actionableCategoryID else { return body }
+        let hint = String(localized: "Hold to decide · No / Yes / Speak")
+        return body.isEmpty ? hint : "\(body)\n\(hint)"
+    }
 
     /// Deterministic placeholder rendering of the evidence facts: keys
     /// sorted, "key value" pairs joined with " · ". Never invents data.
@@ -81,13 +136,52 @@ public struct AlertNotificationContent: Equatable {
     }
 
     public static func decisionPrompt(for card: DecisionCard) -> String {
-        // Every decision card currently comes from a schedule proposal.
-        // `kind` identifies the calendar event subtype (`schedule_change`,
-        // `planned_sleep`, `actual_sleep`, ...), not whether it is movable.
-        return String(
-            format: String(localized: "Move %@?"),
-            compactLine(card.title, limit: 22)
+        let serverAction = questionLine(card.proposedAction, limit: 34)
+        if !serverAction.isEmpty {
+            return serverAction
+        }
+        let title = compactLine(card.title, limit: 22)
+        switch card.kind {
+        case "schedule_change":
+            return String(format: String(localized: "Move %@?"), title)
+        case "planned_sleep":
+            return String(format: String(localized: "Schedule %@?"), title)
+        case "actual_sleep":
+            return String(format: String(localized: "Review %@?"), title)
+        default:
+            return String(format: String(localized: "Review %@?"), title)
+        }
+    }
+
+    public static func questionLine(_ text: String, limit: Int = 34) -> String {
+        let singleLine = text
+            .split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !singleLine.isEmpty else { return "" }
+        if singleLine.hasSuffix("?") {
+            return compactLine(singleLine, limit: limit)
+        }
+        let stem = singleLine.trimmingCharacters(
+            in: CharacterSet(charactersIn: ".!。！？? ")
         )
+        guard !stem.isEmpty else { return "" }
+        return compactLine(stem, limit: max(1, limit - 1)) + "?"
+    }
+
+    public static func fullQuestionLine(_ text: String) -> String {
+        let singleLine = text
+            .split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !singleLine.isEmpty else { return "" }
+        if singleLine.hasSuffix("?") {
+            return singleLine
+        }
+        let stem = singleLine.trimmingCharacters(
+            in: CharacterSet(charactersIn: ".!。！？? ")
+        )
+        return stem.isEmpty ? "" : stem + "?"
     }
 
     public init(
@@ -131,7 +225,9 @@ public struct AlertNotificationContent: Equatable {
         alert: AlertItem,
         pendingProposalID: UUID? = nil
     ) -> AlertNotificationContent {
-        let exactProposalID = pendingProposalID ?? alert.proposalId
+        let identityIsSafe = alert.hasConsistentProposalIdentity
+        let correlatedCard = identityIsSafe ? alert.correlatedDecisionCard : nil
+        let exactProposalID = identityIsSafe ? (pendingProposalID ?? alert.proposalId) : nil
         var bodyLines: [String] = []
         if let evidence = evidenceLine(alert.evidence) {
             bodyLines.append(evidence)
@@ -143,13 +239,13 @@ public struct AlertNotificationContent: Equatable {
         var userInfo: [String: String] = [
             userInfoAlertID: alert.id.uuidString.lowercased()
         ]
-        if let decisionUrl = alert.decisionUrl {
+        if let decisionUrl = correlatedCard?.decisionUrl ?? alert.decisionUrl {
             userInfo[userInfoDecisionURL] = decisionUrl
         }
         if let exactProposalID {
             userInfo[userInfoProposalID] = exactProposalID.uuidString.lowercased()
         }
-        if let card = alert.decisionCard {
+        if let card = correlatedCard {
             let formatter = ISO8601DateFormatter()
             userInfo[userInfoDecisionTitle] = card.title
             userInfo[userInfoDecisionObservation] = card.observationShort
@@ -157,6 +253,7 @@ public struct AlertNotificationContent: Equatable {
                 userInfo[userInfoDecisionEvidence] = evidence
             }
             userInfo[userInfoDecisionAction] = card.proposedAction
+            userInfo[userInfoDecisionCompactPrompt] = decisionPrompt(for: card)
             if let before = card.before {
                 userInfo[userInfoDecisionBefore] = formatter.string(from: before)
             }
@@ -165,18 +262,31 @@ public struct AlertNotificationContent: Equatable {
             userInfo[userInfoDecisionExpiresAt] = formatter.string(from: card.expiresAt)
         }
 
-        let isActionable = exactProposalID != nil
+        let actionText =
+            correlatedCard?.proposedAction
+            ?? alert.proposal
+        let actionPrompt = actionText.flatMap {
+            let prompt = fullQuestionLine($0)
+            return prompt.isEmpty ? nil : prompt
+        }
+        // A proposal id is not enough for safe Yes/No controls. The user must
+        // also see the concrete mutation those controls will resolve.
+        let isActionable = exactProposalID != nil && actionPrompt != nil
         let title: String
         let subtitle: String
         let body: String
-        if let card = alert.decisionCard, isActionable {
-            title = decisionPrompt(for: card)
-            subtitle = compactLine(card.observationShort, limit: 28)
+        if let card = correlatedCard, let actionPrompt, isActionable {
+            title = actionPrompt
+            subtitle = card.observationShort
             body = targetLine(after: card.after)
+        } else if let actionPrompt, isActionable {
+            title = actionPrompt
+            subtitle = alert.summary
+            body = evidenceLine(alert.evidence) ?? ""
         } else {
-            title = compactLine(alert.summary, limit: 26)
+            title = alert.summary
             subtitle = ""
-            body = compactLine(bodyLines.joined(separator: " "), limit: 32)
+            body = bodyLines.joined(separator: " ")
         }
 
         return AlertNotificationContent(

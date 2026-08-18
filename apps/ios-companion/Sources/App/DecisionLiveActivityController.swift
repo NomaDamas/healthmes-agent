@@ -18,6 +18,7 @@ final class DecisionLiveActivityController {
             let candidate = alerts.first {
                 $0.proposalId != nil
                     && $0.decisionCard != nil
+                    && ProposalActionPresentation.exactPrompt(alert: $0) != nil
                     && ($0.decisionCard?.expiresAt ?? .distantPast) > now
             }
             let running = Activity<DecisionActivityAttributes>.activities
@@ -25,7 +26,8 @@ final class DecisionLiveActivityController {
             guard
                 let alert = candidate,
                 let proposalID = alert.proposalId,
-                let card = alert.decisionCard
+                let card = alert.decisionCard,
+                let prompt = ProposalActionPresentation.exactPrompt(alert: alert)
             else {
                 for activity in running {
                     await activity.end(activity.content, dismissalPolicy: .immediate)
@@ -34,7 +36,7 @@ final class DecisionLiveActivityController {
             }
 
             let state = DecisionActivityAttributes.ContentState(
-                title: AlertNotificationContent.decisionPrompt(for: card),
+                title: prompt,
                 reason: AlertNotificationContent.compactLine(card.observationShort, limit: 34),
                 target: AlertNotificationContent.targetLine(after: card.after),
                 expiresAt: card.expiresAt

@@ -137,8 +137,11 @@ def _untrusted_collision(
 
 
 async def test_unconfirmed_estimate_is_visible_but_not_known_total(
-    mcp_client, call_tool, store_factory
+    mcp_client, call_tool, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        dt.datetime(2026, 8, 7, 12, tzinfo=dt.UTC), "nutrition_repository"
+    )
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     observation = _seed(
@@ -185,8 +188,11 @@ async def test_unconfirmed_estimate_is_visible_but_not_known_total(
 
 
 async def test_confirmed_observation_and_daily_proof_produce_known_total(
-    mcp_client, call_tool, store_factory
+    mcp_client, call_tool, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        dt.datetime(2026, 8, 7, 12, tzinfo=dt.UTC), "nutrition_repository"
+    )
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     observed_at = dt.datetime(2026, 8, 6, 1, tzinfo=dt.UTC)
@@ -285,8 +291,11 @@ def _nutrition_review_items(
 
 
 async def test_trusted_mcp_confirmation_flow(
-    mcp_client, call_tool, store_factory
+    mcp_client, call_tool, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        dt.datetime(2026, 8, 7, 12, tzinfo=dt.UTC), "nutrition_repository"
+    )
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     observation = _seed(
@@ -325,8 +334,11 @@ async def test_trusted_mcp_confirmation_flow(
 
 
 async def test_trusted_mcp_full_nutrition_review_is_visible(
-    mcp_client, call_tool, store_factory
+    mcp_client, call_tool, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        dt.datetime(2026, 8, 7, 12, tzinfo=dt.UTC), "nutrition_repository"
+    )
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     observation = _seed(
@@ -359,8 +371,11 @@ async def test_trusted_mcp_full_nutrition_review_is_visible(
 
 
 async def test_mcp_nutrition_review_rejects_oversized_estimate_fields(
-    mcp_client, call_tool, store_factory
+    mcp_client, call_tool, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        dt.datetime(2026, 8, 7, 12, tzinfo=dt.UTC), "nutrition_repository"
+    )
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     observation = _seed(
@@ -383,8 +398,11 @@ async def test_mcp_nutrition_review_rejects_oversized_estimate_fields(
 
 
 async def test_confirmation_tools_reject_missing_or_tampered_proof(
-    mcp_client, store_factory
+    mcp_client, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        dt.datetime(2026, 8, 7, 12, tzinfo=dt.UTC), "nutrition_repository"
+    )
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     observation = _seed(

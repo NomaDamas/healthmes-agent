@@ -98,17 +98,31 @@ public final class GlanceClient {
 
     /// Conditional GET honoring ETag/Cache-Control.
     public func fetch(pairing: Pairing, now: Date = Date()) async throws -> GlanceSnapshot {
+        guard let cacheIdentity = pairingStore.cacheIdentity(for: pairing) else {
+            throw GlanceClientError.notPaired
+        }
         do {
-            return try await performFetch(pairing: pairing, cached: cache.load(), now: now)
+            return try await performFetch(
+                pairing: pairing,
+                cacheIdentity: cacheIdentity,
+                cached: cache.load(for: cacheIdentity),
+                now: now
+            )
         } catch GlanceClientError.staleCacheMiss {
             // The server said 304 but our cached body was gone (evicted or
             // corrupted): one unconditional retry fetches a full body.
-            return try await performFetch(pairing: pairing, cached: nil, now: now)
+            return try await performFetch(
+                pairing: pairing,
+                cacheIdentity: cacheIdentity,
+                cached: nil,
+                now: now
+            )
         }
     }
 
     private func performFetch(
         pairing: Pairing,
+        cacheIdentity: PairingCacheIdentity,
         cached: CachedGlance?,
         now: Date
     ) async throws -> GlanceSnapshot {
@@ -139,6 +153,8 @@ public final class GlanceClient {
             }
             cache.store(
                 CachedGlance(
+                    pairingFingerprint: cacheIdentity.fingerprint,
+                    pairingGeneration: cacheIdentity.generation,
                     etag: http.value(forHTTPHeaderField: "ETag"),
                     fetchedAt: now,
                     maxAgeSeconds: maxAge,
@@ -160,6 +176,8 @@ public final class GlanceClient {
             // ETag/Cache-Control per the endpoint contract).
             cache.store(
                 CachedGlance(
+                    pairingFingerprint: cacheIdentity.fingerprint,
+                    pairingGeneration: cacheIdentity.generation,
                     etag: cached.etag,
                     fetchedAt: now,
                     maxAgeSeconds: maxAge,

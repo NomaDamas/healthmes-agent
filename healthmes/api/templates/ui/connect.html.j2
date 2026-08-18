@@ -29,6 +29,31 @@
   .conn-actions .secondary {
     border-color: var(--line); background: var(--surface); color: var(--ink);
   }
+  .conn-secret-form {
+    display: grid; gap: 0.65rem; max-width: 34rem; margin-top: 0.7rem;
+  }
+  .conn-secret-form label { display: grid; gap: 0.25rem; font-weight: 700; }
+  .conn-secret-form input {
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 0.62rem 0.75rem; background: var(--surface); color: var(--ink);
+    font: inherit;
+  }
+  .pairing-flow {
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.55rem; margin-top: 0.8rem;
+  }
+  .pairing-step {
+    padding: 0.75rem; border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm); background: var(--surface-2);
+  }
+  .pairing-step strong {
+    display: block; color: var(--brand-deep); font-size: 0.78rem;
+    margin-bottom: 0.2rem;
+  }
+  .pairing-step span { display: block; font-size: 0.82rem; color: var(--ink-2); }
+  @media (max-width: 700px) {
+    .pairing-flow { grid-template-columns: 1fr; }
+  }
 </style>
 {% endblock %}
 
@@ -44,7 +69,26 @@
 {% if google_result %}
 <p class="conn-note">Google Calendar: {{ google_result }}</p>
 {% endif %}
+{% if icloud_result %}
+<p class="conn-note">Apple Calendar: {{ icloud_result }}</p>
+{% endif %}
 {% if local_unlock_url %}
+<section class="card">
+  <p class="eyebrow">Apple 연결</p>
+  <h2>iPhone 연결</h2>
+  <div class="pairing-flow" aria-label="Tailscale 기반 iPhone 연결 5단계">
+    <div class="pairing-step"><strong>1 · 설치</strong><span>Mac/Linux와 iPhone에 Tailscale 설치</span></div>
+    <div class="pairing-step"><strong>2 · 로그인</strong><span>두 기기에서 같은 Tailnet 로그인</span></div>
+    <div class="pairing-step"><strong>3 · 연결</strong><span>HealthMes에서 iPhone 연결 선택</span></div>
+    <div class="pairing-step"><strong>4 · 스캔</strong><span>iPhone 카메라로 일회용 QR 스캔</span></div>
+    <div class="pairing-step"><strong>5 · 완료</strong><span>Watch는 iPhone을 통해 자동 연결</span></div>
+  </div>
+  <p class="conn-note">일반 사용자는 IP 주소, 포트, 도메인, API token 또는 인증서를 직접 입력하지 않습니다.</p>
+  <div class="conn-actions">
+    <a href="https://tailscale.com/download" rel="noopener noreferrer">Tailscale 설치</a>
+    <a href="{{ local_unlock_url }}" rel="noreferrer">이 Mac에서 iPhone 연결</a>
+  </div>
+</section>
 <section class="card">
   <h2>이 Mac에서 연결 관리 잠금 해제</h2>
   <p class="muted">전체 API 토큰 입력은 이 Mac의 직접 loopback 화면에서만 받습니다.</p>
@@ -82,6 +126,31 @@
       <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
       <button type="submit">이 Mac에서 Google 로그인</button>
     </form>
+    {% endif %}
+  {% endif %}
+  {% if cal.key == "icloud" and local_session %}
+    {% if cal.connected and cal.disconnect_allowed %}
+    <form class="conn-actions" method="post" action="/connect/icloud/disconnect">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <button class="secondary" type="submit">Apple Calendar 연결 해제</button>
+    </form>
+    {% elif cal.connected %}
+    <p class="conn-note">.env에서 자격증명을 제거한 뒤 HealthMes를 다시 시작하세요.</p>
+    {% else %}
+    <form class="conn-secret-form" method="post" action="/connect/icloud">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <label>Apple ID
+        <input name="username" type="email" autocomplete="username" required>
+      </label>
+      <label>앱 전용 암호
+        <input name="app_password" type="password" autocomplete="new-password" required>
+      </label>
+      <div class="conn-actions">
+        <button type="submit">Apple Calendar 연결</button>
+      </div>
+    </form>
+    <p class="conn-note">이 값은 이 머신의 owner-only credential 파일에만 저장되며
+      화면과 로그에는 다시 표시되지 않습니다.</p>
     {% endif %}
   {% endif %}
   {% if not cal.connected and cal.command %}
