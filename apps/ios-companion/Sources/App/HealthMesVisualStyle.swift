@@ -8,20 +8,14 @@ enum HealthMesVisualStyle {
         light: UIColor(red: 0.72, green: 0.20, blue: 0.10, alpha: 1),
         dark: UIColor(red: 1.0, green: 0.53, blue: 0.38, alpha: 1)
     )
-    static let data = Color(red: 0.24, green: 0.44, blue: 0.84)
-    static let dataDeep = dynamicColor(
+    static let capacity = Color(red: 0.24, green: 0.44, blue: 0.84)
+    static let capacityDeep = dynamicColor(
         light: UIColor(red: 0.16, green: 0.31, blue: 0.67, alpha: 1),
         dark: UIColor(red: 0.47, green: 0.66, blue: 1.0, alpha: 1)
     )
-    static let decision = data
-    static let decisionDeep = dataDeep
     static let calendar = Color(red: 0.20, green: 0.40, blue: 0.82)
     static let proposal = Color(red: 0.78, green: 0.36, blue: 0.08)
     static let recovery = Color(red: 0.39, green: 0.56, blue: 0.86)
-    static let error = Color(red: 0.79, green: 0.21, blue: 0.24)
-    // Compatibility aliases for views that still describe measured data as capacity.
-    static let capacity = data
-    static let capacityDeep = dataDeep
     static let graphite = Color(red: 0.12, green: 0.14, blue: 0.17)
     static let line = dynamicColor(
         light: UIColor(red: 0.31, green: 0.27, blue: 0.22, alpha: 0.12),
@@ -66,7 +60,7 @@ enum HealthMesVisualStyle {
 
     static func capacityColor(_ score: Int?) -> Color {
         switch score {
-        case .some(70...): return data
+        case .some(70...): return capacity
         case .some(45..<70): return Color(red: 0.40, green: 0.50, blue: 0.74)
         case .some: return proposal
         case .none: return .secondary.opacity(0.3)

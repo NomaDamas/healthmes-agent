@@ -30,7 +30,7 @@ struct BriefingHomeView: View {
             }
             .padding(16)
         }
-        .background(HealthMesVisualStyle.canvas.ignoresSafeArea())
+        .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle(Text("Today"))
         .refreshable {
             await model.refresh()
@@ -48,11 +48,7 @@ struct BriefingHomeView: View {
 
     @ViewBuilder
     private var nowCard: some View {
-        ProductCard(
-            kicker: "Now",
-            systemImage: "sun.max.fill",
-            accent: HealthMesVisualStyle.brand
-        ) {
+        ProductCard(kicker: "Now", systemImage: "waveform.path.ecg") {
             if let payload = model.snapshot?.payload {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline) {
@@ -88,11 +84,7 @@ struct BriefingHomeView: View {
 
     @ViewBuilder
     private var nextCard: some View {
-        ProductCard(
-            kicker: "Next",
-            systemImage: "calendar",
-            accent: HealthMesVisualStyle.calendar
-        ) {
+        ProductCard(kicker: "Next", systemImage: "calendar") {
             if let payload = model.snapshot?.payload, let block = payload.nextBlocks.first {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -123,11 +115,7 @@ struct BriefingHomeView: View {
 
     @ViewBuilder
     private var decisionCard: some View {
-        ProductCard(
-            kicker: "Decision",
-            systemImage: "checkmark.circle",
-            accent: HealthMesVisualStyle.proposal
-        ) {
+        ProductCard(kicker: "Decision", systemImage: "checkmark.circle") {
             if let decision = model.pendingDecisions.first {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(verbatim: decision.prompt)
@@ -161,24 +149,9 @@ struct BriefingHomeView: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(HealthMesVisualStyle.decision)
+                        .tint(HealthMesVisualStyle.capacity)
                     }
                     .disabled(model.busyProposalIDs.contains(decision.id))
-
-                    Button {
-                        router.openAgentVoice(
-                            prefill: "I want a different option for \(decision.primaryActionText). "
-                        )
-                    } label: {
-                        Label("Speak", systemImage: "microphone.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(HealthMesVisualStyle.brand)
-                    .disabled(model.busyProposalIDs.contains(decision.id))
-                    .accessibilityHint(
-                        Text("Speak a different instruction, review it, then confirm")
-                    )
 
                     if model.busyProposalIDs.contains(decision.id) {
                         HStack(spacing: 8) {
@@ -286,18 +259,15 @@ struct BriefingHomeView: View {
 struct ProductCard<Content: View>: View {
     let kicker: LocalizedStringKey
     let systemImage: String
-    let accent: Color
     @ViewBuilder let content: Content
 
     init(
         kicker: LocalizedStringKey,
         systemImage: String,
-        accent: Color = HealthMesVisualStyle.dataDeep,
         @ViewBuilder content: () -> Content
     ) {
         self.kicker = kicker
         self.systemImage = systemImage
-        self.accent = accent
         self.content = content()
     }
 
@@ -305,7 +275,7 @@ struct ProductCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             Label(kicker, systemImage: systemImage)
                 .font(.caption.weight(.bold))
-                .foregroundStyle(accent)
+                .foregroundStyle(HealthMesVisualStyle.capacityDeep)
                 .textCase(.uppercase)
                 .tracking(0.7)
             content

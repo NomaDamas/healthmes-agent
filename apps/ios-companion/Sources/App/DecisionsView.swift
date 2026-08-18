@@ -198,7 +198,7 @@ struct DecisionsView: View {
             }
             .padding(16)
         }
-        .background(HealthMesVisualStyle.canvas.ignoresSafeArea())
+        .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle(Text("Decisions"))
         .refreshable { await model.refresh() }
         .task {
@@ -213,11 +213,7 @@ struct DecisionsView: View {
     }
 
     private var pendingCard: some View {
-        ProductCard(
-            kicker: "Pending",
-            systemImage: "questionmark.circle",
-            accent: HealthMesVisualStyle.proposal
-        ) {
+        ProductCard(kicker: "Pending", systemImage: "questionmark.circle") {
             if model.pending.isEmpty {
                 Text("No pending decisions")
                     .font(.title3.weight(.semibold))
@@ -245,23 +241,9 @@ struct DecisionsView: View {
                                 Text("Yes").frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(HealthMesVisualStyle.decision)
+                            .tint(HealthMesVisualStyle.capacity)
                         }
                         .disabled(model.busyProposalIDs.contains(decision.id))
-                        Button {
-                            router.openAgentVoice(
-                                prefill: "I want a different option for \(decision.primaryActionText). "
-                            )
-                        } label: {
-                            Label("Speak", systemImage: "microphone.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(HealthMesVisualStyle.brand)
-                        .disabled(model.busyProposalIDs.contains(decision.id))
-                        .accessibilityHint(
-                            Text("Speak a different instruction, review it, then confirm")
-                        )
                         if let url = decision.exactWebURL {
                             Button {
                                 router.openDecision(url)
@@ -280,11 +262,7 @@ struct DecisionsView: View {
     }
 
     private var historyCard: some View {
-        ProductCard(
-            kicker: "History",
-            systemImage: "clock.arrow.circlepath",
-            accent: HealthMesVisualStyle.data
-        ) {
+        ProductCard(kicker: "History", systemImage: "clock.arrow.circlepath") {
             if model.records.isEmpty && model.history.isEmpty {
                 Text("No decisions recorded")
                     .font(.title3.weight(.semibold))
@@ -293,7 +271,7 @@ struct DecisionsView: View {
                 ForEach(model.records.prefix(20)) { record in
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: decisionIcon(record.kind))
-                            .foregroundStyle(HealthMesVisualStyle.data)
+                            .foregroundStyle(HealthMesVisualStyle.capacity)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(verbatim: record.summary)
                                 .font(.body.weight(.medium))
