@@ -1,6 +1,5 @@
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Shared glue for the issue #7 companion surfaces (:companion phone widget,
@@ -11,7 +10,7 @@ plugins {
 // module stays untouched.
 android {
     namespace = "com.healthmes.briefing"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         // Must stay <= every consumer's minSdk (:companion 26, :wear 30).
@@ -23,9 +22,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 }
 
 dependencies {

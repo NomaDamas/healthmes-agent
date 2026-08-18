@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Issue #7 Wear OS surface: a ProtoLayout tile (energy score + next block)
@@ -10,7 +9,7 @@ plugins {
 // deliverable (docs/design/WATCH-NOTIFICATIONS.ko.md).
 android {
     namespace = "com.healthmes.wear"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.healthmes.wear"
@@ -37,16 +36,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 }
 
 dependencies {
     implementation(project(":shared"))
 
     implementation("androidx.core:core-ktx:1.19.0")
-    // Tiles 1.4.x builds layouts with the protolayout 1.2.x builders.
+    // Tiles and ProtoLayout stay on their compatible 1.4.x line.
     implementation("androidx.wear.tiles:tiles:1.4.1")
     implementation("androidx.wear.protolayout:protolayout:1.4.2")
     implementation("androidx.wear.protolayout:protolayout-material:1.4.2")

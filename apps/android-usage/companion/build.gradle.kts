@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     // Compose UI + Glance widgets are @Composable code; with Kotlin 2.x the
     // Compose compiler is this Kotlin subplugin (version pinned in the root
     // build).
@@ -18,7 +17,7 @@ plugins {
 // before.
 android {
     namespace = "com.healthmes.companion"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.healthmes.companion"
@@ -45,10 +44,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
     }
@@ -66,13 +61,14 @@ dependencies {
     implementation("androidx.glance:glance-appwidget:1.1.1")
 
     // Compose UI for the single-activity app. The BOM release pairs with the
-    // Kotlin 2.0.x Compose compiler (runtime 1.7.x, material3 1.3.x).
+    // Kotlin 2.4.x Compose compiler.
     val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
 
     // Decision viewer: Custom Tabs first, in-app WebView fallback.
     implementation("androidx.browser:browser:1.10.0")

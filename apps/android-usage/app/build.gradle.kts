@@ -1,11 +1,10 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 android {
     namespace = "com.healthmes.usagecollector"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.healthmes.usagecollector"
@@ -32,9 +31,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 }
 
 dependencies {
