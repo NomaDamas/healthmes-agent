@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, timedelta
 from typing import Annotated, Self
 
 from fastapi import APIRouter, Request, status
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
+from healthmes import clock
 from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError, not_found
 from healthmes.config import Settings
@@ -169,7 +170,7 @@ class CreateInteractionInput(BaseModel):
             ) from exc
         if self.observed_at.utcoffset() != self.observed_at.astimezone(timezone).utcoffset():
             raise ValueError("observed_at offset conflicts with timezone")
-        if self.observed_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+        if self.observed_at.astimezone(UTC) > clock.utc_now() + MAX_CAPTURE_CLOCK_SKEW:
             raise ValueError("observed_at cannot be more than 5 minutes in the future")
         return self
 
@@ -205,7 +206,7 @@ class AnalyzeInteractionInput(BaseModel):
             != self.observed_at.astimezone(timezone).utcoffset()
         ):
             raise ValueError("observed_at offset conflicts with timezone")
-        if self.observed_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+        if self.observed_at.astimezone(UTC) > clock.utc_now() + MAX_CAPTURE_CLOCK_SKEW:
             raise ValueError("observed_at cannot be more than 5 minutes in the future")
         if self.modality is CaptureModality.TEXT:
             if not self.source_text or not self.source_text.strip():

@@ -11,6 +11,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.nutrition.intake_contracts import (
     CaptureModality,
     IntakeDecision,
@@ -160,7 +161,7 @@ def _latest_request_candidate(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
@@ -259,7 +260,7 @@ def search_intake_history(
             WellnessEvent.event_type == INTERACTION_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
         )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
@@ -289,7 +290,7 @@ def search_intake_history(
             WellnessEvent.event_type == OUTCOME_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
@@ -321,7 +322,7 @@ def search_intake_history(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
@@ -383,7 +384,7 @@ def _confirmed_history(
             WellnessEvent.event_type == OUTCOME_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())

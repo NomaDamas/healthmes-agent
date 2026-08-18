@@ -17,17 +17,17 @@ deliberately *duplicates* its pairing-prefs pattern instead of importing it.
 
 ## Build matrix
 
-Toolchain for everything: Gradle 9.6.1 (wrapper), AGP 9.3.1, Kotlin 2.0.21
-(+ `org.jetbrains.kotlin.plugin.compose` 2.0.21 for `:companion`'s Glance
-code), JDK 17+, `compileSdk = 36`. Point the build at an SDK with platform 36
-via `ANDROID_HOME` or `local.properties`.
+Toolchain for everything: Gradle 9.6.1, AGP 9.3.1 built-in Kotlin
+(+ `org.jetbrains.kotlin.plugin.compose` 2.4.10 for `:companion`), JDK 17+,
+`compileSdk = 36`. Point the build at an SDK with platform 36 via
+`ANDROID_HOME` or `local.properties`.
 
 | Module | Type | minSdk | Key libraries | Build | JVM unit tests |
 |---|---|---|---|---|---|
 | `:app` | phone app | 26 | WorkManager 2.9.1, security-crypto | `:app:assembleDebug` | `:app:testDebugUnitTest` (hourly bucketing) |
 | `:shared` | library | 26 | security-crypto, org.json (platform) | `:shared:assembleDebug` | tested via `:companion` |
-| `:companion` | phone app | 26 | Compose BOM 2024.10.01 (material3), activity-compose 1.9.3, browser 1.10.0, Glance 1.1.1, WorkManager 2.9.1 | `:companion:assembleDebug` | `:companion:testDebugUnitTest` (glance/alerts/report/proposals contract parsers, state mapper, notification grammar + action plan, proposal-action logic, multipart upload bodies, curve geometry, focus-block selection) |
-| `:wear` | Wear OS app | 30 | tiles 1.4.1, protolayout 1.2.1, watchface-complications-data-source 1.2.1 | `:wear:assembleDebug` | — (logic lives in `:shared`, tested via `:companion`) |
+| `:companion` | phone app | 26 | Compose BOM 2026.06.01 (material3), activity-compose 1.9.3, browser 1.10.0, Glance 1.1.1, WorkManager 2.9.1 | `:companion:assembleDebug` | `:companion:testDebugUnitTest` (glance/alerts/report/proposals contract parsers, state mapper, notification grammar + action plan, proposal-action logic, multipart upload bodies, curve geometry, focus-block selection) |
+| `:wear` | Wear OS app | 30 | tiles 1.4.1, protolayout 1.4.2, watchface-complications-data-source 1.2.1 | `:wear:assembleDebug` | — (logic lives in `:shared`, tested via `:companion`) |
 
 ```bash
 cd apps/android-usage

@@ -12,6 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     BASELINE_DAYS,
     refresh_existing_day_baseline,
@@ -285,7 +286,7 @@ def run_activity_maintenance(
 ) -> ActivityMaintenanceReport:
     with activity_write_lock():
         lock_activity_write_plane(session)
-        current = as_utc(now or datetime.now(UTC))
+        current = as_utc(now or clock.utc_now())
         policies = ensure_activity_policies(session)
         expired = list(
             session.scalars(
@@ -404,7 +405,7 @@ def delete_activity_data(
 ) -> ActivityDeleteReport:
     with activity_write_lock():
         lock_activity_write_plane(session)
-        current = as_utc(now or datetime.now(UTC))
+        current = as_utc(now or clock.utc_now())
         effective_end = min(as_utc(end), current) if end is not None else current
         selection_end = (
             None

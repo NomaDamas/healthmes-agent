@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, timedelta
 from hashlib import sha256
 from typing import Annotated, Literal, Self
 
 from fastapi import APIRouter, Request, status
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
+from healthmes import clock
 from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError, not_found
 from healthmes.api.media import resolve_media_file
@@ -93,7 +94,7 @@ class AnalyzeNutritionPhoto(BaseModel):
         expected_offset = self.captured_at.astimezone(timezone).utcoffset()
         if self.captured_at.utcoffset() != expected_offset:
             raise ValueError("captured_at offset conflicts with timezone")
-        if self.captured_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+        if self.captured_at.astimezone(UTC) > clock.utc_now() + MAX_CAPTURE_CLOCK_SKEW:
             raise ValueError("captured_at cannot be more than 5 minutes in the future")
         required = {"captured_at", "timezone", "location"}
         if not required.issubset(self.metadata_provenance):

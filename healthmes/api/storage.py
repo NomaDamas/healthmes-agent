@@ -15,6 +15,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from healthmes import clock
 from healthmes.activity.contracts import is_reserved_activity_provider
 from healthmes.activity.locking import activity_write_lock
 from healthmes.api.decision_html import shell_context, template_environment
@@ -199,7 +200,7 @@ def create_wellness_event(
             "unsupported_wellness_data_class",
             "external wellness events must use the normalized data class",
         )
-    if body.observed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(
+    if body.observed_at.astimezone(UTC) > clock.utc_now() + timedelta(
         minutes=5
     ):
         raise APIError(
@@ -223,7 +224,7 @@ def create_wellness_event(
                 if event.expires_at.tzinfo is None
                 else event.expires_at.astimezone(UTC)
             )
-            <= datetime.now(UTC)
+            <= clock.utc_now()
         ):
             raise APIError(
                 409,

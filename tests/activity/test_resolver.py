@@ -50,6 +50,8 @@ from healthmes.nutrition.intake_service import (
 from healthmes.nutrition.repository import persist_daily_confirmation
 from healthmes.store import CalendarEventMirror, CalendarSource, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def _seed_activity(session) -> None:
     ingest_activity_batch(

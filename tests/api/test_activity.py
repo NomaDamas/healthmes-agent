@@ -17,6 +17,8 @@ from healthmes.activity.repository import (
 from healthmes.activity.service import ingest_activity_batch
 from healthmes.store import WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def _hour_record(
     *,

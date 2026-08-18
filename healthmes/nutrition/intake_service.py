@@ -16,6 +16,7 @@ from sqlalchemy import event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
     ConfirmationStatus,
@@ -157,7 +158,7 @@ def _claim_process_local_persistence(
     reservation_token: str,
 ) -> None:
     key = (id(session.get_bind()), interaction.interaction_id)
-    now = datetime.now(UTC)
+    now = clock.utc_now()
     with _STATIC_ANALYSIS_RESERVATIONS_LOCK:
         reservation = _STATIC_ANALYSIS_RESERVATIONS.get(key)
         if (
@@ -318,7 +319,7 @@ def _reject_expired_idempotent(
 ) -> None:
     if (
         event.expires_at is not None
-        and _stored_as_utc(event.expires_at) <= datetime.now(UTC)
+        and _stored_as_utc(event.expires_at) <= clock.utc_now()
     ):
         raise IntakeOperationConflict(
             f"expired {operation_name} cannot be retried"
@@ -468,7 +469,7 @@ def _reserve_interaction_analysis(
     lease_seconds: float,
 ) -> str:
     reservation_token = uuid.uuid4().hex
-    now = datetime.now(UTC)
+    now = clock.utc_now()
     lease_expires_at = now + timedelta(seconds=lease_seconds)
     bind = session.get_bind()
     if _uses_process_local_reservations(session):
@@ -1134,7 +1135,7 @@ def create_interaction(
         )
     observed_at = _as_utc(interaction.observed_at)
     recorded_at = _as_utc(interaction.recorded_at)
-    if observed_at > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+    if observed_at > clock.utc_now() + MAX_CAPTURE_CLOCK_SKEW:
         raise IntakeInteractionError(
             "observed_at cannot be more than 5 minutes in the future"
         )
@@ -1228,7 +1229,7 @@ def create_interaction(
     structured_expiry = _expiry(policy, observed_at)
     if (
         structured_expiry is not None
-        and structured_expiry <= datetime.now(UTC)
+        and structured_expiry <= clock.utc_now()
     ):
         raise IntakeInteractionError(
             "observed_at falls outside the structured retention window"
@@ -1339,7 +1340,7 @@ def get_interaction(
         event is None
         or (
             event.expires_at is not None
-            and _stored_as_utc(event.expires_at) <= datetime.now(UTC)
+            and _stored_as_utc(event.expires_at) <= clock.utc_now()
         )
     ):
         return None
@@ -1353,7 +1354,7 @@ def get_interaction(
         raw is not None
         and (
             raw.expires_at is None
-            or _stored_as_utc(raw.expires_at) > datetime.now(UTC)
+            or _stored_as_utc(raw.expires_at) > clock.utc_now()
         )
     )
     source_text = interaction.source_text
@@ -1411,7 +1412,7 @@ def get_interaction(
             raw is not None
             or (
                 raw_expiry is not None
-                and raw_expiry <= datetime.now(UTC)
+                and raw_expiry <= clock.utc_now()
             )
         ):
             source_text = None
@@ -1651,7 +1652,7 @@ def latest_outcome(
             WellnessEvent.event_type == OUTCOME_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
@@ -1671,7 +1672,7 @@ def latest_outcome(
                 raw is not None
                 and (
                     raw.expires_at is None
-                    or _stored_as_utc(raw.expires_at) > datetime.now(UTC)
+                    or _stored_as_utc(raw.expires_at) > clock.utc_now()
                 )
                 and isinstance(raw.payload.get("note"), str)
             ):
@@ -1695,7 +1696,7 @@ def list_interactions(
             WellnessEvent.event_type == INTERACTION_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
         )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
@@ -1837,7 +1838,7 @@ def get_decision_request(
         event is None
         or (
             event.expires_at is not None
-            and _stored_as_utc(event.expires_at) <= datetime.now(UTC)
+            and _stored_as_utc(event.expires_at) <= clock.utc_now()
         )
     ):
         return None
@@ -2016,7 +2017,7 @@ def latest_decision(
             WellnessEvent.event_type == DECISION_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
