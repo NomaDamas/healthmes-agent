@@ -16,6 +16,8 @@ from healthmes.activity.repository import (
 from healthmes.storage import update_retention_policy
 from healthmes.store import AppUsageSample, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("legacy_api_fixture_clock")
+
 
 def _batch(samples):
     return {

@@ -58,6 +58,8 @@ from healthmes.storage import (
 )
 from healthmes.store import AppUsageSample, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
 
 def _interval_batch(
     records: list[AppIntervalRecord],

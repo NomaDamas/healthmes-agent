@@ -47,6 +47,8 @@ from healthmes.config import Settings
 from healthmes.store import Base, WellnessEvent, create_db_engine
 from healthmes.store.session import get_session
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
 
 @pytest.mark.parametrize(
     ("boundary_change", "expected_reason"),

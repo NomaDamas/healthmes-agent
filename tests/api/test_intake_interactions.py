@@ -39,6 +39,9 @@ from healthmes.nutrition.vision import VisionUnavailable
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("legacy_api_fixture_clock")
+
+
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
 
 

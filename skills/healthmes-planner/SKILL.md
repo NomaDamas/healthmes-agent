@@ -84,6 +84,10 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 - Food, medication, or symptom capture → use the `healthmes-capture` skill.
 - Pure data questions ("how did I sleep?") → answer directly with the MCP
   tools; no proposals, but still record a decision if you give advice.
+- Actual Oura sleep-time Calendar sync/update requests → use
+  `healthmes-sleep` and
+  `mcp__healthmes__prepare_actual_sleep_calendar_update`. Do not turn actual
+  sleep mirroring into a task block or recovery-based schedule adjustment.
 
 ## Core workflow: goal dump → tasks → placement → confirm → record
 

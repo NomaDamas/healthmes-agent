@@ -1,6 +1,6 @@
 ---
 name: healthmes-sleep
-description: Interpret recent sleep and readiness evidence to answer whether today's work or training intensity should be reconsidered. Use for questions about last night's sleep, accumulated sleep debt, recovery after poor sleep, or whether sleep evidence is strong enough to change today's plan.
+description: Interpret recent sleep and readiness evidence, or prepare a confirmed Oura actual-sleep Calendar update. Use for questions about last night's sleep, accumulated sleep debt, recovery after poor sleep, whether sleep evidence is strong enough to change today's plan, or requests to sync/update actual sleep time in Calendar.
 ---
 
 # HealthMes Sleep
@@ -13,10 +13,21 @@ directly.
 
 - Read data only through registered MCP tools. Never call HealthMes or
   open-wearables REST endpoints directly.
+- If the required HealthMes MCP tool is missing or unavailable, or its call
+  fails, fail closed: return `insufficient_data` and state that live HealthMes
+  evidence is unavailable. Do not search session memory or local files, call
+  REST endpoints, or reuse a past observation as current evidence. Do not
+  record a decision from substituted or stale evidence.
 - Start with `mcp__healthmes__get_daily_readiness_context` for the target
   date. It already interprets seven-night sleep debt, last-night sleep score,
   nocturnal HRV versus the personal baseline, stress, charge, yesterday's
   load, and overall confidence.
+- If the user asks to sync or update the actual Oura sleep time in Calendar,
+  call `mcp__healthmes__prepare_actual_sleep_calendar_update` directly. Do not
+  route that request through `healthmes-planner`,
+  `mcp__healthmes__propose_schedule_blocks`, or a raw sleep-summary lookup.
+  Present the returned preview and `review_url`; Calendar remains unchanged
+  until the user opens that local link on this Mac and confirms it.
 - Use `mcp__open_wearables__get_sleep_summary` only when basic sleep timing,
   duration, or source helps explain the interpreted context. It does not expose
   stages, efficiency, HRV, respiration, or SpO2. Defer those reviews instead of
@@ -36,7 +47,8 @@ directly.
 ## Boundaries
 
 - Use this skill for questions such as "How did I sleep?", "Should I push
-  hard today?", or "Is my recent sleep poor enough to change today's plan?"
+  hard today?", "Is my recent sleep poor enough to change today's plan?", or
+  "Oura 수면 시간 업데이트하고 캘린더에도 반영해줘."
 - Do not screen for sleep apnea, diagnose insomnia, predict injury, prescribe
   treatment, or interpret medication effects. Recommend professional care
   when the user asks for medical conclusions or reports concerning symptoms.
@@ -45,7 +57,37 @@ directly.
   require a separate behavior-impact skill with exposure data and explicit
   safeguards.
 - Do not replace `healthmes-planner`. This skill decides whether sleep evidence
-  justifies reconsideration; the planner owns any schedule proposal.
+  justifies reconsideration; the planner owns any daytime schedule proposal.
+  Actual-sleep Calendar mirroring is the exception and stays in this skill
+  through `mcp__healthmes__prepare_actual_sleep_calendar_update`.
+
+## Actual-sleep Calendar update
+
+For a request to update, sync, or reflect Oura sleep time in Calendar:
+
+1. Call `mcp__healthmes__prepare_actual_sleep_calendar_update` once with the
+   date the user names, or omit `date` for today's newly synced Oura record.
+   Use `date_basis="night_start"` for a plain named date such as "7월 29일
+   수면". Use `date_basis="oura_summary"` when the user identifies a session
+   by exact start/wake times or explicitly says Oura summary date. An omitted
+   date uses today's Oura summary. Never substitute a same-day summary when a
+   requested night-start record is missing. If the tool reports that no matching
+   night exists, state that result directly; do not call a clarification tool or
+   ask the user to choose a different record. Every new update or link-refresh
+   request requires a tool call in that turn. Never reuse a proposal id,
+   `review_url`, status, preview, or expiry from an earlier turn, and never claim
+   a link was refreshed without a fresh tool result.
+2. If `status` is `preview_ready`, summarize `preview.action`, start,
+   wake time, and duration using `preview.start_local`,
+   `preview.wake_time_local`, and `preview.timezone`, then give the returned
+   local `review_url`. Say clearly that Calendar has not changed yet and the
+   preview expires.
+3. If `status` is `noop`, say Calendar already matches the fresh Oura record.
+4. If `status` is `blocked`, report the returned safe reason and do not suggest
+   bypassing ownership or freshness checks.
+5. Never claim the Calendar was updated from this tool call. Only the local
+   review page can perform the existing explicit-confirmation and read-back
+   verified write.
 
 ## Judgment procedure
 

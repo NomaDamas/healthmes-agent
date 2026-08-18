@@ -1,0 +1,5 @@
+name: healthmes-routing
+version: 0.1.0
+description: Route explicit HealthMes sleep Calendar requests in long-lived Hermes sessions.
+provides_hooks:
+  - pre_llm_call

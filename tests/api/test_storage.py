@@ -25,6 +25,8 @@ from healthmes.store import (
     WellnessEvent,
 )
 
+pytestmark = pytest.mark.usefixtures("legacy_api_fixture_clock")
+
 
 def test_storage_settings_bootstraps_defaults_and_measures_files(
     client: TestClient, settings

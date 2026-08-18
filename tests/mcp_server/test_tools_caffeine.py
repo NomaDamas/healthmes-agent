@@ -45,6 +45,8 @@ from healthmes.nutrition.repository import (
 from healthmes.storage import register_storage_object
 from healthmes.store import CalendarEventMirror, CalendarSource
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
 
 def _seed_event(
     store_factory,

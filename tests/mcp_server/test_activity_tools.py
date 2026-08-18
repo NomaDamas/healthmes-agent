@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import uuid
 
+import pytest
 from fastmcp import Client, FastMCP
 from sqlalchemy import select
 
@@ -41,6 +42,8 @@ from healthmes.nutrition.intake_service import (
 )
 from healthmes.nutrition.repository import persist_daily_confirmation
 from healthmes.store import WellnessEvent
+
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
 
 
 def _seed_activity(store_factory, pinned_tz) -> None:

@@ -8,9 +8,12 @@ fixture points at in-memory sqlite and dummy endpoints, and disables both
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from freezegun import freeze_time
 
 from healthmes.app import create_app
 from healthmes.config import Settings
+
+LEGACY_FIXTURE_NOW = "2026-08-07T12:00:00Z"
 
 
 @pytest.fixture
@@ -72,3 +75,21 @@ def client(app: FastAPI):
         client=("127.0.0.1", 43123),
     ) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def legacy_fixture_clock():
+    with freeze_time(LEGACY_FIXTURE_NOW, tick=True):
+        yield
+
+
+@pytest.fixture
+def legacy_api_fixture_clock(client):
+    """Freeze API test bodies only after the application is initialized.
+
+    FastAPI builds some route schemas lazily, and that construction must use
+    the real ``datetime`` classes rather than freezegun's replacements.
+    """
+    assert client.get("/__clock_prewarm__").status_code == 404
+    with freeze_time(LEGACY_FIXTURE_NOW, tick=True):
+        yield
