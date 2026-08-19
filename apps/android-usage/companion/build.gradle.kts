@@ -76,5 +76,5 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     // Unit tests exercise the shared org.json-based contract parsers on the
     // JVM; android.jar's org.json is a stub there, so bring the real one.
-    testImplementation("org.json:json:20260719")
+    testImplementation("org.json:json:20260814")
 }

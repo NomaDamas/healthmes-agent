@@ -44,5 +44,5 @@ dependencies {
 
     // HourlyBucketer is pure Kotlin, testable on the JVM.
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.json:json:20260719")
+    testImplementation("org.json:json:20260814")
 }
