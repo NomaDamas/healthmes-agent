@@ -17,6 +17,8 @@ from healthmes.activity.repository import (
 from healthmes.storage import update_retention_policy
 from healthmes.store import AppUsageSample, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def _batch(samples):
     return {
@@ -619,8 +621,9 @@ def test_incomplete_empty_source_set_preserves_completed_hour_and_new_upload(
 def test_expired_incomplete_heartbeat_does_not_block_current_snapshot(
     client,
     session,
+    fixture_clock,
 ):
-    now = datetime.now(UTC)
+    now = fixture_clock()
     update_retention_policy(
         session,
         "activity_raw",
@@ -686,8 +689,9 @@ def test_expired_incomplete_heartbeat_does_not_block_current_snapshot(
 def test_empty_authoritative_snapshot_outside_retention_is_rejected(
     client,
     session,
+    fixture_clock,
 ):
-    now = datetime.now(UTC)
+    now = fixture_clock()
     update_retention_policy(
         session,
         "activity_raw",
@@ -760,8 +764,9 @@ def test_future_empty_authoritative_snapshot_is_rejected_without_fence(
 def test_activity_maintenance_expires_android_snapshot_state(
     client,
     session,
+    fixture_clock,
 ):
-    bucket_start = (datetime.now(UTC) - timedelta(hours=2)).replace(
+    bucket_start = (fixture_clock() - timedelta(hours=2)).replace(
         minute=0,
         second=0,
         microsecond=0,

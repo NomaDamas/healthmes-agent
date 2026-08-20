@@ -14,6 +14,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityBatchOut,
@@ -274,7 +275,7 @@ def event_is_expired(
     now: datetime | None = None,
 ) -> bool:
     expires_at = parse_optional_datetime(event.expires_at)
-    return expires_at is not None and expires_at <= as_utc(now or datetime.now(UTC))
+    return expires_at is not None and expires_at <= as_utc(now or clock.utc_now())
 
 
 def fixed_offset_summary_scopes_by_change(
@@ -284,7 +285,7 @@ def fixed_offset_summary_scopes_by_change(
     now: datetime | None = None,
 ) -> dict[str, set[ActivityLocalScope]]:
     """Map raw changes to materialized fixed-offset summaries they can affect."""
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     normalized: list[tuple[ActivityChangeWindow, datetime, datetime, Any]] = []
     scopes_by_key: dict[str, set[ActivityLocalScope]] = {}
     for change in changes:
@@ -362,7 +363,7 @@ def legacy_app_usage_cutoff(
         return None
     else:
         retention_days = policy.retention_days
-    return as_utc(now or datetime.now(UTC)) - timedelta(days=retention_days)
+    return as_utc(now or clock.utc_now()) - timedelta(days=retention_days)
 
 
 def activity_source_identity_digest(
@@ -1238,7 +1239,7 @@ def _persist_control_payload(
     now: datetime | None = None,
 ) -> WellnessEvent:
     lock_activity_control_device(session, device_id)
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     event = session.scalar(
         select(WellnessEvent)
         .where(
@@ -1670,7 +1671,7 @@ def update_collection_status(
     with activity_write_lock():
         lock_activity_write_plane(session)
         lock_activity_control_device(session, device_id)
-        current = as_utc(now or datetime.now(UTC))
+        current = as_utc(now or clock.utc_now())
         for attempt in range(2):
             payload = {
                 "device_id": device_id,
@@ -1794,7 +1795,7 @@ def create_deletion_tombstone(
     blocked_identity_digests: Iterable[str] = (),
     now: datetime | None = None,
 ) -> WellnessEvent:
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     normalized_start = as_utc(start) if start is not None else None
     normalized_end = min(as_utc(end), current)
     if normalized_start is not None and normalized_start >= normalized_end:
@@ -2155,7 +2156,7 @@ def serialize_collection_state(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     gate = collection_gate(payload, now=current)
     queue_oldest = parse_optional_datetime(payload.get("queue_oldest_at"))
     queue_age = (
@@ -2219,7 +2220,7 @@ def upsert_summary_event(
         )
         .with_for_update()
     )
-    current = datetime.now(UTC)
+    current = clock.utc_now()
     if event is None:
         event = WellnessEvent(
             event_type=event_type,

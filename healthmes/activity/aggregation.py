@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ACTIVITY_DAILY_CLASS,
@@ -1225,7 +1226,7 @@ def personal_baseline_delta(
 ) -> dict[str, Any]:
     if not 1 <= lookback_days <= 90:
         raise ValueError("lookback_days must be between 1 and 90")
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     name = timezone_name(timezone)
     start_day = day - timedelta(days=lookback_days)
     rows = list(
@@ -1297,7 +1298,7 @@ def rebuild_day_summaries(
     force_rebuild: bool = False,
     now: datetime | None = None,
 ) -> WellnessEvent | None:
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     lock_activity_write_plane(session)
     name = timezone_name(timezone)
     start, end = local_day_bounds(day, timezone)
@@ -1644,7 +1645,7 @@ def rebuild_affected_days(
     force_rebuild: bool = False,
     now: datetime | None = None,
 ) -> list[WellnessEvent]:
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     primary = set(days)
     rebuilt: list[WellnessEvent] = []
     for day in sorted(primary):
@@ -1803,7 +1804,7 @@ def migrate_activity_summary_derivations(
     now: datetime | None = None,
 ) -> ActivitySummaryMigrationReport:
     """Rebuild compatible legacy summaries and leave unsafe ones unreadable."""
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     lock_activity_write_plane(session)
     migrated = 0
     incompatible = 0
@@ -1843,7 +1844,7 @@ def refresh_existing_day_baseline(
     timezone: str | tzinfo,
     now: datetime | None = None,
 ) -> WellnessEvent | None:
-    current = as_utc(now or datetime.now(UTC))
+    current = as_utc(now or clock.utc_now())
     lock_activity_write_plane(session)
     event = _daily_summary_event(session, day=day, timezone=timezone)
     if event is None or not summary_has_current_derivation(event):

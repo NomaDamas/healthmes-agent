@@ -13,6 +13,7 @@ from fastapi import APIRouter, Path, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.activitywatch import (
     ActivityWatchError,
     ActivityWatchRequestError,
@@ -438,7 +439,7 @@ def pause_collection(
     body: ActivityPauseRequest,
     session: SessionDep,
 ) -> ActivityCollectionOut:
-    if body.until <= datetime.now(UTC):
+    if body.until <= clock.utc_now():
         raise APIError(422, "invalid_pause", "pause deadline must be in the future")
     with activity_write_lock():
         try:
@@ -512,7 +513,7 @@ def post_collection_status(
                 "and collection_generation",
             )
     observed_at = body.status_observed_at
-    current = datetime.now(UTC)
+    current = clock.utc_now()
     if observed_at is not None and observed_at > current + MAX_FUTURE_SKEW:
         raise APIError(
             409,
@@ -627,7 +628,7 @@ def post_ios_report(
     session: SessionDep,
 ) -> ActivityBatchOut:
     with activity_write_lock():
-        uploaded_at = datetime.now(UTC)
+        uploaded_at = clock.utc_now()
         if body.collected_at > uploaded_at + MAX_FUTURE_SKEW:
             raise APIError(
                 409,
@@ -1075,7 +1076,7 @@ def get_focus_context(
         raise APIError(422, "invalid_time_range", "start must be before end")
     if end - start > timedelta(days=1):
         raise APIError(422, "invalid_time_range", "focus window cannot exceed 24 hours")
-    if end.astimezone(UTC) > datetime.now(UTC) + timedelta(minutes=1):
+    if end.astimezone(UTC) > clock.utc_now() + timedelta(minutes=1):
         raise APIError(422, "invalid_time_range", "future activity is unknown")
     return focus_context(
         session,

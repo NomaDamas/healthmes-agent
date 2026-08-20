@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Issue #7 Wear OS surface: a ProtoLayout tile (energy score + next block)
@@ -37,21 +36,18 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 }
 
 dependencies {
     implementation(project(":shared"))
 
-    implementation("androidx.core:core-ktx:1.13.1")
-    // Tiles 1.4.x builds layouts with the protolayout 1.2.x builders.
+    implementation("androidx.core:core-ktx:1.18.0")
+    // Tiles and ProtoLayout stay on their compatible 1.4.x line.
     implementation("androidx.wear.tiles:tiles:1.4.1")
-    implementation("androidx.wear.protolayout:protolayout:1.2.1")
-    implementation("androidx.wear.protolayout:protolayout-material:1.2.1")
+    implementation("androidx.wear.protolayout:protolayout:1.4.2")
+    implementation("androidx.wear.protolayout:protolayout-material:1.4.2")
     // Watch-face complication data source (energy score).
-    implementation("androidx.wear.watchface:watchface-complications-data-source:1.2.1")
+    implementation("androidx.wear.watchface:watchface-complications-data-source:1.3.0")
     // CallbackToFutureAdapter for the ListenableFuture-based tile callbacks.
     implementation("androidx.concurrent:concurrent-futures:1.2.0")
 }

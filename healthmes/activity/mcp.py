@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.context import (
     activity_summary_context,
     focus_context,
@@ -85,7 +86,7 @@ def register_activity_tools(
             raise ToolError("start must be before end")
         if end_at - start_at > timedelta(days=1):
             raise ToolError("focus window cannot exceed 24 hours")
-        if end_at > datetime.now(UTC) + timedelta(minutes=1):
+        if end_at > clock.utc_now() + timedelta(minutes=1):
             raise ToolError("future activity is unknown")
         with store_session_factory() as session:
             return focus_context(

@@ -11,6 +11,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.nutrition.intake_contracts import (
     CaptureModality,
     IntakeDecision,
@@ -171,7 +172,7 @@ def _latest_request_candidate(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
@@ -248,7 +249,7 @@ def search_intake_history(
     remaining_scan_records = max_scan_records
     scan_truncated = False
     sequence = 0
-    now = datetime.now(UTC)
+    now = clock.utc_now()
     start_utc = _as_utc(start) if start is not None else None
     end_utc = _as_utc(end) if end is not None else None
 
@@ -484,7 +485,7 @@ def _confirmed_history(
             WellnessEvent.event_type == OUTCOME_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > clock.utc_now())
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())

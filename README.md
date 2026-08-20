@@ -1,24 +1,29 @@
-# HealthMes Agent
+# HealthMes
 
-HealthMes Agent is a **proactive, health-aware personal assistant**: it reads
-your wearable data (11 providers via open-wearables), your calendar and your
-app usage, estimates your cognitive energy hour by hour, plans your week
-around it, and surfaces proactive alerts through a HealthMes-owned delivery
-stream when something needs to change — retained decisions are explorable as
-flowcharts in the browser.
+HealthMes is **open, local-first infrastructure for wellness agents**. It
+normalizes wearable, activity, nutrition, calendar, environment and
+subjective inputs behind one product interface, then lets an agent select the
+minimum relevant context for a cross-domain wellness decision.
 
-It is glue around two unmodified vendored upstreams:
+The first product on that infrastructure is a proactive personal assistant:
+it estimates cognitive capacity, plans work around it, proposes schedule or
+recovery interventions, and records selected decisions and later outcomes.
+Native apps, web surfaces and channel adapters are open-source reference
+clients. Individuals and organizations can customize their UI, capture
+adapters, notifications and workflows without replacing the HealthMes data,
+retention and decision contracts.
 
-- `vendor/hermes-agent/` — agent runtime (skills, memory, cron, Telegram
-  gateway, MCP client, Claude API)
-- `vendor/open-wearables/` — wearable data plane (Garmin/Oura/Fitbit/Whoop/
-  Polar/Suunto/Ultrahuman/Strava/Apple/Google/Samsung; sleep/stress/HRV
-  scores; FastAPI + Postgres + Celery; its own MCP server)
+HealthMes uses two unmodified vendored components:
 
-Everything HealthMes adds lives at the repo root (`healthmes/`, `skills/`,
-`config/`, `scripts/`, `apps/`), talking to the vendors only over their
-public contracts (REST, MCP, rendered config, and bounded delivery
-interfaces). Architecture and rationale: [`docs/PLAN.md`](docs/PLAN.md).
+- `vendor/hermes-agent/` provides the replaceable autonomous LLM/tool runtime.
+- `vendor/open-wearables/` provides wearable integrations and health scores.
+
+HealthMes owns the wellness product boundary: the decision ingress, unified
+MCP tool surface, domain providers, source references, consent, retention,
+storage and conditional decision records. Integration with both vendors uses
+only documented REST, MCP, configuration and delivery contracts; the vendored
+trees remain read-only. Architecture and rationale:
+[`docs/PLAN.md`](docs/PLAN.md).
 
 Canonical PR #138 target:
 
@@ -45,6 +50,28 @@ source validation + conditional compact decision record
 PR #138 implements this runtime boundary. Exact capability limits, external
 Apple prerequisites, and verification criteria are tracked in
 [`docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md).
+
+## Why this can compound
+
+Individual connectors, trackers, VLM analysis and chat surfaces are
+replaceable. The potential moat is the user-owned graph accumulated across
+domains:
+
+```text
+state + context -> decision -> proposed intervention
+                -> accept / edit / reject / ignore
+                -> actual behavior -> later wellness and work outcome
+```
+
+That graph can answer the harder personal question: under which conditions
+did which intervention actually help this user? A second moat is the breadth
+of inputs that can join the same contracts; a supporting moat is an
+open-source app layer that makes those contracts easy to customize and
+extend. These remain product hypotheses that require dogfood and measured
+outcomes, not claims of an already proven market moat. See
+[`docs/WELLNESS-DATA-PLATFORM.ko.md`](docs/WELLNESS-DATA-PLATFORM.ko.md),
+[`docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md)
+and [`docs/COMPETITIVE-LANDSCAPE.ko.md`](docs/COMPETITIVE-LANDSCAPE.ko.md).
 
 ## What works today
 

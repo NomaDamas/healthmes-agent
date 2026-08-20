@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     LEGACY_SUMMARY_REASON,
     get_daily_summary,
@@ -702,4 +703,4 @@ def recovery_activity_context(
 
 def default_focus_window(day: date, timezone: str | tzinfo) -> tuple[datetime, datetime]:
     start, end = local_day_bounds(day, timezone)
-    return start, min(end, datetime.now(UTC) + timedelta(seconds=1))
+    return start, min(end, clock.utc_now() + timedelta(seconds=1))

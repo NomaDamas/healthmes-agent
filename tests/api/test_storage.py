@@ -49,6 +49,8 @@ from healthmes.store import (
     create_db_engine,
 )
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def test_storage_settings_bootstraps_defaults_and_measures_files(
     client: TestClient, settings

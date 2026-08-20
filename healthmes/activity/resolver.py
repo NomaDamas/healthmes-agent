@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import local_day_bounds, timezone_name
 from healthmes.activity.context import (
     MIN_CONTEXT_COVERAGE,
@@ -72,7 +73,7 @@ def _parse_day(
         return date.fromisoformat(value)
     if start is not None:
         return start.astimezone(_zone(timezone)).date()
-    return (now or datetime.now(UTC)).astimezone(_zone(timezone)).date()
+    return (now or clock.utc_now()).astimezone(_zone(timezone)).date()
 
 
 def _zone(value: str | tzinfo) -> tzinfo:
@@ -1228,7 +1229,7 @@ async def resolve_wellness_context(
     timezone_value: str | tzinfo = request.timezone or default_timezone
     timezone = _timezone_name(timezone_value)
     zone = _zone(timezone_value)
-    current = (now or datetime.now(UTC)).astimezone(UTC)
+    current = (now or clock.utc_now()).astimezone(UTC)
     day = _parse_day(
         request.date,
         zone,

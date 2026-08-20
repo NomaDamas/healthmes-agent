@@ -5,12 +5,30 @@ fixture points at in-memory sqlite and dummy endpoints, and disables both
 ``.env`` loading and the scheduler.
 """
 
+from datetime import UTC, datetime, timedelta
+from time import monotonic
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from healthmes import clock
 from healthmes.app import create_app
 from healthmes.config import Settings
+
+FIXTURE_NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+
+@pytest.fixture
+def fixture_clock(monkeypatch):
+    """Run fixed-date fixtures against their intended retention timeline."""
+    started_at = monotonic()
+
+    def now() -> datetime:
+        return FIXTURE_NOW + timedelta(seconds=monotonic() - started_at)
+
+    monkeypatch.setattr(clock, "utc_now", now)
+    return now
 
 
 @pytest.fixture

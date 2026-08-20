@@ -31,6 +31,8 @@ from healthmes.storage import register_storage_object
 from healthmes.store import WellnessEvent
 from healthmes.trusted_session import issue_trusted_session_proof
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 class _FixedNutritionDateTime(dt.datetime):
     @classmethod

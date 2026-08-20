@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from healthmes import clock
 from healthmes.timezones import parse_timezone
 
 RESERVED_ACTIVITY_PROVIDER_NAMES = frozenset(
@@ -395,7 +396,7 @@ class ActivityBatchIn(BaseModel):
     platform: ActivityPlatform
     capability: ActivityCapability
     timezone: str = Field(min_length=1, max_length=64)
-    collected_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
+    collected_at: AwareDatetime = Field(default_factory=lambda: clock.utc_now())
     collection_revision: int | None = Field(default=None, ge=0)
     records: list[ActivityRecord] = Field(min_length=1, max_length=5000)
 
@@ -685,7 +686,7 @@ class IOSCapabilityReport(BaseModel):
         pattern=IOS_KEY_ID_PATTERN,
     )
     reason: str | None = Field(default=None, max_length=255)
-    collected_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
+    collected_at: AwareDatetime = Field(default_factory=lambda: clock.utc_now())
     collection_revision: int | None = Field(default=None, ge=0)
     collection_generation: int | None = Field(
         default=None,

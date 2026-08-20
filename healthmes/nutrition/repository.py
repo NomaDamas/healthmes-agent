@@ -12,6 +12,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
@@ -94,7 +95,7 @@ def _expiry(policy: RetentionPolicy, observed_at: datetime) -> datetime | None:
 
 
 def storage_object_for_media(session: Session, media_path: str) -> StorageObject | None:
-    now = datetime.now(UTC)
+    now = clock.utc_now()
     return session.scalar(
         select(StorageObject).where(
             StorageObject.relative_path == media_path,
@@ -121,7 +122,7 @@ def observation_for_media(
             WellnessEvent.raw_object_id == storage_object_id,
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc())
@@ -202,7 +203,7 @@ def persist_observation(
         raise NutritionRepositoryError("nutrition observations require an image object")
 
     observed_at = _as_utc(observation.capture.captured_at)
-    if observed_at > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+    if observed_at > clock.utc_now() + MAX_CAPTURE_CLOCK_SKEW:
         raise NutritionRepositoryError(
             "captured_at cannot be more than 5 minutes in the future"
         )
@@ -210,7 +211,7 @@ def persist_observation(
     structured_expiry = _expiry(policy, observed_at)
     if (
         structured_expiry is not None
-        and structured_expiry <= datetime.now(UTC)
+        and structured_expiry <= clock.utc_now()
     ):
         raise NutritionRepositoryError(
             "captured_at falls outside the observation retention window"
@@ -310,7 +311,7 @@ def get_observation(
             WellnessEvent.source_record_id == str(observation_id),
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
     )
@@ -323,7 +324,7 @@ def get_observation(
             WellnessEvent.source_record_id == str(observation_id),
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
     )
@@ -346,7 +347,7 @@ def list_observations(
             WellnessEvent.source_provider == SOURCE_PROVIDER,
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
@@ -625,7 +626,7 @@ def persist_daily_confirmation(
                 WellnessEvent.observed_at < end,
                 or_(
                     WellnessEvent.expires_at.is_(None),
-                    WellnessEvent.expires_at > datetime.now(UTC),
+                    WellnessEvent.expires_at > clock.utc_now(),
                 ),
             )
         )
@@ -703,7 +704,7 @@ def latest_intake_outcome_states(
             WellnessEvent.source_provider == INTAKE_OUTCOME_PROVIDER,
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
@@ -728,7 +729,7 @@ def intake_outcome_states_for_day(
             WellnessEvent.source_provider == INTAKE_OUTCOME_PROVIDER,
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
@@ -767,7 +768,7 @@ def latest_caffeine_confirmations(
             WellnessEvent.source_provider == "user-confirmation",
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
@@ -795,7 +796,7 @@ def latest_nutrition_reviews(
             WellnessEvent.source_provider == "user-nutrition-review",
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
@@ -821,7 +822,7 @@ def latest_daily_confirmation(
             WellnessEvent.source_provider == "user-confirmation",
             or_(
                 WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > datetime.now(UTC),
+                WellnessEvent.expires_at > clock.utc_now(),
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
