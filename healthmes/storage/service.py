@@ -22,6 +22,7 @@ from pathlib import Path
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from healthmes import clock
@@ -406,44 +407,50 @@ def _now() -> datetime:
 
 
 def ensure_default_policies(session: Session) -> list[RetentionPolicy]:
-    if session.get_bind().dialect.name == "postgresql":
+    policies = {
+        row.data_class: row
+        for row in session.scalars(select(RetentionPolicy))
+    }
+    if DEFAULT_RETENTION.keys() <= policies.keys():
+        return sorted(policies.values(), key=lambda row: row.data_class)
+
+    lock_activity_write_plane(session)
+    policies = {
+        row.data_class: row
+        for row in session.scalars(select(RetentionPolicy))
+    }
+    missing = [
+        {
+            "data_class": data_class,
+            "retention_days": RETENTION_PRESETS[preset],
+            "enabled": True,
+        }
+        for data_class, preset in DEFAULT_RETENTION.items()
+        if data_class not in policies
+    ]
+    dialect = session.get_bind().dialect.name
+    if missing and dialect in {"postgresql", "sqlite"}:
+        insert = pg_insert if dialect == "postgresql" else sqlite_insert
         session.execute(
-            pg_insert(RetentionPolicy)
-            .values(
-                [
-                    {
-                        "data_class": data_class,
-                        "retention_days": RETENTION_PRESETS[preset],
-                        "enabled": True,
-                    }
-                    for data_class, preset in DEFAULT_RETENTION.items()
-                ]
-            )
+            insert(RetentionPolicy)
+            .values(missing)
             .on_conflict_do_nothing(
                 index_elements=[RetentionPolicy.data_class]
             )
         )
-        session.flush()
-        return list(
-            session.scalars(
-                select(RetentionPolicy).order_by(
-                    RetentionPolicy.data_class
-                )
+    elif missing:
+        session.add_all(
+            RetentionPolicy(**values)
+            for values in missing
+        )
+    session.flush()
+    return list(
+        session.scalars(
+            select(RetentionPolicy).order_by(
+                RetentionPolicy.data_class
             )
         )
-
-    policies = {row.data_class: row for row in session.scalars(select(RetentionPolicy))}
-    for data_class, preset in DEFAULT_RETENTION.items():
-        if data_class not in policies:
-            row = RetentionPolicy(
-                data_class=data_class,
-                retention_days=RETENTION_PRESETS[preset],
-                enabled=True,
-            )
-            session.add(row)
-            policies[data_class] = row
-    session.flush()
-    return sorted(policies.values(), key=lambda row: row.data_class)
+    )
 
 
 def update_retention_policy(

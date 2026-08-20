@@ -84,6 +84,7 @@ from healthmes.engine.scheduler import (
 from healthmes.mcp_server import server as mcp_server
 from healthmes.storage import (
     build_storage_maintenance_job,
+    ensure_default_policies,
     reconcile_staging_files,
 )
 from healthmes.store import (
@@ -399,6 +400,7 @@ def _initialize_activity_storage(
     """Bootstrap local data policies under the global write-plane lock."""
     with activity_write_lock():
         lock_activity_write_plane(session)
+        ensure_default_policies(session)
         backfill_android_canonical_events(
             session,
             timezone=timezone,
