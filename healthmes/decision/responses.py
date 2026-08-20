@@ -59,7 +59,13 @@ from healthmes.decision.validation import (
     normalize_untrusted_json,
     strict_model_validate,
 )
-from healthmes.hermes_mcp_inventory import expected_hermes_mcp_inventory
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_SERVER,
+    HERMES_DECISION_SEARCH_COMMON_ARGUMENTS,
+    HERMES_DECISION_SEARCH_PARAMETER_MAP,
+    canonical_decision_search_granularity,
+    expected_hermes_mcp_inventory,
+)
 from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_ATTESTATION_PATH,
     HermesDecisionRuntimeManifest,
@@ -2831,40 +2837,20 @@ def _normalize_tool_arguments(
     tool_name: str,
     decision_session_id: str,
 ) -> dict[str, Any]:
-    common = {
-        "decision_session_id",
-        "capability",
-        "start",
-        "end",
-        "granularity",
-        "fields",
-        "privacy_level",
-        "limit",
-    }
-    parameter_keys: dict[str, dict[str, str]] = {
-        "mcp__healthmes__search_activity": {
-            "date": "date",
-            "lookback_days": "lookback_days",
-        },
-        "mcp__healthmes__search_nutrition": {
-            "date": "date",
-            "confirmed_only": "confirmed_only",
-            "intent": "intent",
-            "modality": "modality",
-            "nutrient": "nutrient",
-            "text_query": "query",
-            "request_id": "request_id",
-        },
-        "mcp__healthmes__search_calendar": {
-            "date": "date",
-            "minimum_minutes": "minimum_minutes",
-        },
-        "mcp__healthmes__search_wearable": {
-            "date": "date",
-        },
-    }
-    mapping = parameter_keys.get(tool_name)
-    if mapping is None or set(arguments) - common - set(mapping):
+    prefix = f"mcp__{HERMES_DECISION_MCP_SERVER}__"
+    mapping = (
+        HERMES_DECISION_SEARCH_PARAMETER_MAP.get(
+            tool_name.removeprefix(prefix)
+        )
+        if tool_name.startswith(prefix)
+        else None
+    )
+    if (
+        mapping is None
+        or set(arguments)
+        - HERMES_DECISION_SEARCH_COMMON_ARGUMENTS
+        - set(mapping)
+    ):
         raise HermesResponsesContractError(
             "hermes_tool_arguments_trace_mismatch"
         )
@@ -2900,7 +2886,11 @@ def _normalize_tool_arguments(
         "capability": capability,
         "start": _tool_argument_datetime(arguments.get("start")),
         "end": _tool_argument_datetime(arguments.get("end")),
-        "granularity": arguments.get("granularity", "summary"),
+        "granularity": canonical_decision_search_granularity(
+            tool_name.removeprefix(prefix),
+            capability,
+            arguments.get("granularity"),
+        ),
         "fields": tuple(fields),
         "privacy_level": arguments.get(
             "privacy_level",

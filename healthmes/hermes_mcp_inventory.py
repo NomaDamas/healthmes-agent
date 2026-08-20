@@ -19,6 +19,59 @@ HERMES_DECISION_MCP_TOOL_NAMES = (
     "read_wellness_skill",
 )
 HERMES_MCP_INVENTORY_SCHEMA = "healthmes.hermes-mcp-inventory.v1"
+HERMES_DECISION_SEARCH_COMMON_ARGUMENTS = frozenset(
+    {
+        "decision_session_id",
+        "capability",
+        "start",
+        "end",
+        "granularity",
+        "fields",
+        "privacy_level",
+        "limit",
+    }
+)
+HERMES_DECISION_SEARCH_PARAMETER_MAP: Mapping[
+    str,
+    Mapping[str, str],
+] = {
+    "search_activity": {
+        "date": "date",
+        "lookback_days": "lookback_days",
+        "cursor": "cursor",
+        "device_id": "device_id",
+        "platform": "platform",
+    },
+    "search_nutrition": {
+        "date": "date",
+        "confirmed_only": "confirmed_only",
+        "intent": "intent",
+        "modality": "modality",
+        "nutrient": "nutrient",
+        "text_query": "query",
+        "request_id": "request_id",
+    },
+    "search_calendar": {
+        "date": "date",
+        "minimum_minutes": "minimum_minutes",
+        "cursor": "cursor",
+    },
+    "search_wearable": {
+        "date": "date",
+        "cursor": "cursor",
+        "kind": "kind",
+        "metric": "metric",
+        "category": "category",
+        "summary_kind": "summary_kind",
+        "series_type": "series_type",
+        "resolution": "resolution",
+    },
+}
+HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY: Mapping[str, str] = {
+    "wearable.health-scores": "record",
+    "wearable.workouts": "record",
+    "wearable.timeseries": "series",
+}
 
 # These hashes bind the exact FastMCP inputSchema exposed to Hermes. A contract
 # test compares them with the registered HealthMes server tools.
@@ -46,6 +99,23 @@ HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256 = {
 
 class HermesMcpInventoryError(ValueError):
     """A live model-visible MCP inventory violated the owned contract."""
+
+
+def canonical_decision_search_granularity(
+    tool_name: str,
+    capability: str,
+    requested: str | None,
+) -> str:
+    """Apply the exact MCP adapter default used for one search call."""
+
+    if requested is not None:
+        return requested
+    if tool_name == "search_wearable":
+        return HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY.get(
+            capability,
+            "summary",
+        )
+    return "summary"
 
 
 class HermesMcpToolSchemaDigest(BaseModel):

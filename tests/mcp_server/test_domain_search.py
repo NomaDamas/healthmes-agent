@@ -35,6 +35,8 @@ from healthmes.decision import (
 )
 from healthmes.hermes_mcp_inventory import (
     HERMES_DECISION_MCP_TOOL_NAMES,
+    HERMES_DECISION_SEARCH_COMMON_ARGUMENTS,
+    HERMES_DECISION_SEARCH_PARAMETER_MAP,
     expected_hermes_mcp_inventory,
     schema_digests_from_mcp_tools,
     validate_model_visible_mcp_inventory,
@@ -75,69 +77,11 @@ SEARCH_CAPABILITIES = {
     },
 }
 SEARCH_PROPERTIES = {
-    "search_activity": {
-        "decision_session_id",
-        "capability",
-        "start",
-        "end",
-        "date",
-        "lookback_days",
-        "cursor",
-        "device_id",
-        "platform",
-        "granularity",
-        "fields",
-        "privacy_level",
-        "limit",
-    },
-    "search_nutrition": {
-        "decision_session_id",
-        "capability",
-        "start",
-        "end",
-        "date",
-        "confirmed_only",
-        "intent",
-        "modality",
-        "nutrient",
-        "text_query",
-        "request_id",
-        "granularity",
-        "fields",
-        "privacy_level",
-        "limit",
-    },
-    "search_calendar": {
-        "decision_session_id",
-        "capability",
-        "start",
-        "end",
-        "date",
-        "minimum_minutes",
-        "cursor",
-        "granularity",
-        "fields",
-        "privacy_level",
-        "limit",
-    },
-    "search_wearable": {
-        "decision_session_id",
-        "capability",
-        "start",
-        "end",
-        "date",
-        "cursor",
-        "kind",
-        "metric",
-        "category",
-        "summary_kind",
-        "series_type",
-        "resolution",
-        "granularity",
-        "fields",
-        "privacy_level",
-        "limit",
-    },
+    name: (
+        HERMES_DECISION_SEARCH_COMMON_ARGUMENTS
+        | frozenset(parameter_map)
+    )
+    for name, parameter_map in HERMES_DECISION_SEARCH_PARAMETER_MAP.items()
 }
 RESULT_KEYS = {
     "query_id",

@@ -2187,6 +2187,164 @@ async def test_agent_consumes_canonical_trace_and_validates_source_refs() -> Non
     assert run.access_trace == (search_result.access_audit,)
 
 
+@pytest.mark.parametrize(
+    (
+        "tool_name",
+        "provider_id",
+        "capability",
+        "granularity",
+        "arguments",
+        "parameters",
+    ),
+    [
+        (
+            "mcp__healthmes__search_activity",
+            "activity",
+            "activity.timeline",
+            "record",
+            {
+                "date": "2026-08-16",
+                "lookback_days": 7,
+                "cursor": "hmc1_" + "1" * 64,
+                "device_id": "desktop-1",
+                "platform": "macos",
+            },
+            {
+                "date": "2026-08-16",
+                "lookback_days": 7,
+                "cursor": "hmc1_" + "1" * 64,
+                "device_id": "desktop-1",
+                "platform": "macos",
+            },
+        ),
+        (
+            "mcp__healthmes__search_nutrition",
+            "nutrition",
+            "nutrition.intake-history",
+            "record",
+            {
+                "date": "2026-08-16",
+                "confirmed_only": True,
+                "intent": "log_consumed",
+                "modality": "text",
+                "nutrient": "caffeine",
+                "text_query": "coffee",
+                "request_id": "12345678-1234-1234-1234-123456789abc",
+            },
+            {
+                "date": "2026-08-16",
+                "confirmed_only": True,
+                "intent": "log_consumed",
+                "modality": "text",
+                "nutrient": "caffeine",
+                "query": "coffee",
+                "request_id": "12345678-1234-1234-1234-123456789abc",
+            },
+        ),
+        (
+            "mcp__healthmes__search_calendar",
+            "calendar",
+            "calendar.available-windows",
+            "window",
+            {
+                "date": "2026-08-16",
+                "minimum_minutes": 30,
+                "cursor": "hmc1_" + "2" * 64,
+            },
+            {
+                "date": "2026-08-16",
+                "minimum_minutes": 30,
+                "cursor": "hmc1_" + "2" * 64,
+            },
+        ),
+        (
+            "mcp__healthmes__search_wearable",
+            "wearable",
+            "wearable.timeseries",
+            "series",
+            {
+                "date": "2026-08-16",
+                "cursor": "hmc1_" + "3" * 64,
+                "kind": "sleep",
+                "metric": "hrv",
+                "category": "recovery",
+                "summary_kind": "series",
+                "series_type": "heart_rate",
+                "resolution": "1min",
+            },
+            {
+                "date": "2026-08-16",
+                "cursor": "hmc1_" + "3" * 64,
+                "kind": "sleep",
+                "metric": "hrv",
+                "category": "recovery",
+                "summary_kind": "series",
+                "series_type": "heart_rate",
+                "resolution": "1min",
+            },
+        ),
+    ],
+)
+def test_trace_validation_accepts_every_domain_search_parameter(
+    tool_name,
+    provider_id,
+    capability,
+    granularity,
+    arguments,
+    parameters,
+) -> None:
+    query = ContextQuery(
+        provider_id=provider_id,
+        capability=capability,
+        granularity=granularity,
+        parameters=parameters,
+    )
+    call = responses_module.HermesFunctionCallItem(
+        type="function_call",
+        name=tool_name,
+        arguments=json.dumps(
+            {
+                "decision_session_id": DECISION_SESSION_ID,
+                "capability": capability,
+                "granularity": granularity,
+                **arguments,
+            }
+        ),
+        call_id="call-all-parameters",
+    )
+
+    responses_module._validate_tool_arguments_against_query(
+        call,
+        query,
+        decision_session_id=DECISION_SESSION_ID,
+    )
+
+
+def test_trace_validation_uses_wearable_capability_granularity_default() -> None:
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.timeseries",
+        granularity="series",
+    )
+    call = responses_module.HermesFunctionCallItem(
+        type="function_call",
+        name="mcp__healthmes__search_wearable",
+        arguments=json.dumps(
+            {
+                "decision_session_id": DECISION_SESSION_ID,
+                "capability": "wearable.timeseries",
+            }
+        ),
+        call_id="call-default-granularity",
+    )
+
+    responses_module._validate_tool_arguments_against_query(
+        call,
+        query,
+        decision_session_id=DECISION_SESSION_ID,
+    )
+
+
 @pytest.mark.asyncio
 async def test_contract_failure_preserves_finished_server_trace() -> None:
     trace, search_result, source_ref = _activity_trace()

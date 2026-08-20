@@ -16,6 +16,9 @@ from healthmes.decision.search import (
     DecisionContextSearchSessionService,
     DecisionSearchSessionError,
 )
+from healthmes.hermes_mcp_inventory import (
+    canonical_decision_search_granularity,
+)
 
 DecisionSessionId = Annotated[
     str,
@@ -287,13 +290,11 @@ def _wearable_granularity(
     capability: WearableCapability,
     requested: WearableGranularity | None,
 ) -> WearableGranularity:
-    if requested is not None:
-        return requested
-    return {
-        "wearable.health-scores": "record",
-        "wearable.workouts": "record",
-        "wearable.timeseries": "series",
-    }.get(capability, "summary")  # type: ignore[return-value]
+    return canonical_decision_search_granularity(
+        "search_wearable",
+        capability,
+        requested,
+    )  # type: ignore[return-value]
 
 
 async def _search(
