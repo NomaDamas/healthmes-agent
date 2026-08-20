@@ -327,6 +327,43 @@ def _vault_object_receipt(
     return _VaultObjectReceipt(version_id=version_id, etag=etag)
 
 
+def _latest_vault_entries(
+    pages: Iterator[Mapping[str, Any]],
+    *,
+    action: str,
+) -> dict[str, tuple[str, Mapping[str, Any]]]:
+    """Return each key's explicitly latest version or delete marker."""
+    latest: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    for page in pages:
+        if not isinstance(page, Mapping):
+            raise BackupError(
+                f"vault returned an invalid version listing while attempting to {action}"
+            )
+        for listing_field, kind in (
+            ("Versions", "version"),
+            ("DeleteMarkers", "delete_marker"),
+        ):
+            entries = page.get(listing_field, [])
+            if not isinstance(entries, list):
+                raise BackupError(
+                    "vault returned an invalid version listing while "
+                    f"attempting to {action}"
+                )
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                key = entry.get("Key")
+                if not isinstance(key, str) or entry.get("IsLatest") is not True:
+                    continue
+                if key in latest:
+                    raise BackupError(
+                        "vault returned multiple latest generations for one "
+                        f"object while attempting to {action}"
+                    )
+                latest[key] = (kind, entry)
+    return latest
+
+
 # ---------------------------------------------------------------------------
 # Settings resolution (attribute-first, HEALTHMES_VAULT_* env fallback)
 # ---------------------------------------------------------------------------
@@ -535,7 +572,6 @@ class RemoteVaultProvider:
         self._local = local
         self._keep_local = keep_local
         self._s3: Any = None  # lazily built boto3 client
-        self._known_versions: dict[str, str] = {}
 
     @classmethod
     def from_settings(
@@ -885,8 +921,6 @@ class RemoteVaultProvider:
         logger.info(
             "Snapshot pushed to vault: %s (%d bytes)", self.object_uri(local_path.name), size
         )
-        if remote_receipt.version_id is not None:
-            self._known_versions[local_path.name] = remote_receipt.version_id
         return (
             remote_info,
             identity if _sealed is None else _local_identity,
@@ -894,10 +928,7 @@ class RemoteVaultProvider:
         )
 
     def _discover_snapshot_version(self, name: str) -> str | None:
-        """Resolve the newest valid HealthMes generation for one object key."""
-        known = self._known_versions.get(name)
-        if known is not None:
-            return known
+        """Resolve only the currently visible generation for one object key."""
         client = self._client()
         paginator_factory = getattr(client, "get_paginator", None)
         head_object = getattr(client, "head_object", None)
@@ -913,55 +944,53 @@ class RemoteVaultProvider:
         expected_created_at = created_at.isoformat()
         try:
             with self._vault_call("resolve a snapshot generation"):
-                pages = paginator.paginate(
-                    Bucket=self._config.bucket,
-                    Prefix=key,
+                latest = _latest_vault_entries(
+                    paginator.paginate(
+                        Bucket=self._config.bucket,
+                        Prefix=key,
+                    ),
+                    action="resolve a snapshot generation",
                 )
-                for page in pages:
-                    versions = page.get("Versions", [])
-                    if not isinstance(versions, list):
-                        raise BackupError(
-                            "vault returned an invalid version listing while "
-                            "resolving a snapshot generation"
-                        )
-                    for version in versions:
-                        if not isinstance(version, Mapping):
-                            continue
-                        if version.get("Key") != key:
-                            continue
-                        raw_version = version.get("VersionId")
-                        version_id = (
-                            raw_version.strip()
-                            if isinstance(raw_version, str)
-                            else ""
-                        )
-                        request: dict[str, Any] = {
-                            "Bucket": self._config.bucket,
-                            "Key": key,
-                        }
-                        if version_id and version_id.lower() != "null":
-                            request["VersionId"] = version_id
-                        response = _vault_response(
-                            head_object(**request),
-                            action="resolve a snapshot generation",
-                        )
-                        metadata = _vault_metadata(
-                            response,
-                            action="resolve a snapshot generation",
-                        )
-                        if (
-                            metadata.get("healthmes-created-at")
-                            != expected_created_at
-                            or not _vault_sha256_metadata(
-                                response,
-                                action="resolve a snapshot generation",
-                            )
-                        ):
-                            continue
-                        if "VersionId" not in request:
-                            return None
-                        self._known_versions[name] = version_id
-                        return version_id
+                state = latest.get(key)
+                if state is None:
+                    return None
+                kind, version = state
+                if kind == "delete_marker":
+                    raise BackupError(
+                        "snapshot not found in vault while trying to resolve "
+                        f"a snapshot generation ({self.vault_uri}); run "
+                        "`healthmes backup list --provider remote`"
+                    )
+                raw_version = version.get("VersionId")
+                version_id = (
+                    raw_version.strip()
+                    if isinstance(raw_version, str)
+                    else ""
+                )
+                request: dict[str, Any] = {
+                    "Bucket": self._config.bucket,
+                    "Key": key,
+                }
+                if version_id and version_id.lower() != "null":
+                    request["VersionId"] = version_id
+                response = _vault_response(
+                    head_object(**request),
+                    action="resolve a snapshot generation",
+                )
+                metadata = _vault_metadata(
+                    response,
+                    action="resolve a snapshot generation",
+                )
+                if (
+                    metadata.get("healthmes-created-at")
+                    != expected_created_at
+                    or not _vault_sha256_metadata(
+                        response,
+                        action="resolve a snapshot generation",
+                    )
+                ):
+                    return None
+                return version_id if "VersionId" in request else None
         except BackupError:
             raise
         except Exception as exc:
@@ -1157,6 +1186,16 @@ class RemoteVaultProvider:
         if isinstance(name, SnapshotInfo):
             requested_version = name.version_id
             name = name.name
+        if requested_version is not None:
+            requested_version = requested_version.strip()
+            if (
+                not requested_version
+                or requested_version.lower() == "null"
+            ):
+                raise BackupError(
+                    "snapshot version_id must identify an immutable vault "
+                    "generation"
+                )
         if parse_snapshot_name(name) is None:
             raise BackupError(
                 f"not a snapshot name: {name!r} (expected "
@@ -1178,7 +1217,11 @@ class RemoteVaultProvider:
                     f"local snapshot destination is not a regular file: {dest}"
                 )
         key = self._key_for(name)
-        version_id = requested_version or self._discover_snapshot_version(name)
+        version_id = (
+            requested_version
+            if requested_version is not None
+            else self._discover_snapshot_version(name)
+        )
         request: dict[str, Any] = {
             "Bucket": self._config.bucket,
             "Key": key,
@@ -1549,61 +1592,61 @@ class RemoteVaultProvider:
                             )
                         )
             else:
-                selected: set[str] = set()
-                for page in paginator.paginate(
-                    Bucket=self._config.bucket,
-                    Prefix=key_prefix,
-                ):
-                    for obj in page.get("Versions", []):
-                        key = obj["Key"]
-                        name = key[len(key_prefix):]
-                        if name in selected or "/" in name:
-                            continue
-                        created_at = parse_snapshot_name(name)
-                        if created_at is None:
-                            continue
-                        version_id = str(obj.get("VersionId", "")).strip()
-                        request: dict[str, Any] = {
-                            "Bucket": self._config.bucket,
-                            "Key": key,
-                        }
-                        if version_id and version_id.lower() != "null":
-                            request["VersionId"] = version_id
-                        response = _vault_response(
-                            client.head_object(**request),
-                            action="list snapshots",
-                        )
-                        metadata = _vault_metadata(
+                latest = _latest_vault_entries(
+                    paginator.paginate(
+                        Bucket=self._config.bucket,
+                        Prefix=key_prefix,
+                    ),
+                    action="list snapshots",
+                )
+                for key, (kind, obj) in latest.items():
+                    if kind == "delete_marker":
+                        continue
+                    name = key[len(key_prefix):]
+                    if "/" in name:
+                        continue
+                    created_at = parse_snapshot_name(name)
+                    if created_at is None:
+                        continue
+                    version_id = str(obj.get("VersionId", "")).strip()
+                    request: dict[str, Any] = {
+                        "Bucket": self._config.bucket,
+                        "Key": key,
+                    }
+                    if version_id and version_id.lower() != "null":
+                        request["VersionId"] = version_id
+                    response = _vault_response(
+                        client.head_object(**request),
+                        action="list snapshots",
+                    )
+                    metadata = _vault_metadata(
+                        response,
+                        action="list snapshots",
+                    )
+                    if (
+                        metadata.get("healthmes-created-at")
+                        != created_at.isoformat()
+                        or not _vault_sha256_metadata(
                             response,
                             action="list snapshots",
                         )
-                        if (
-                            metadata.get("healthmes-created-at")
-                            != created_at.isoformat()
-                            or not _vault_sha256_metadata(
-                                response,
-                                action="list snapshots",
-                            )
-                        ):
-                            continue
-                        resolved_version = (
-                            version_id
-                            if version_id
-                            and version_id.lower() != "null"
-                            else None
+                    ):
+                        continue
+                    resolved_version = (
+                        version_id
+                        if version_id
+                        and version_id.lower() != "null"
+                        else None
+                    )
+                    snapshots.append(
+                        SnapshotInfo(
+                            name=name,
+                            path=Path(key),
+                            created_at=created_at,
+                            size_bytes=int(obj["Size"]),
+                            version_id=resolved_version,
                         )
-                        snapshots.append(
-                            SnapshotInfo(
-                                name=name,
-                                path=Path(key),
-                                created_at=created_at,
-                                size_bytes=int(obj["Size"]),
-                                version_id=resolved_version,
-                            )
-                        )
-                        selected.add(name)
-                        if resolved_version is not None:
-                            self._known_versions[name] = resolved_version
+                    )
         snapshots.sort(key=lambda info: (info.created_at, info.name), reverse=True)
         return snapshots
 

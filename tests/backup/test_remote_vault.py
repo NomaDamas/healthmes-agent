@@ -23,6 +23,7 @@ from pyrage import passphrase as age_passphrase
 
 from healthmes.__main__ import main
 from healthmes.backup import local as local_mod
+from healthmes.backup import remote_vault as remote_vault_mod
 from healthmes.backup.local import LocalDirectoryProvider, build_backup_job
 from healthmes.backup.provider import BackupError, BackupProvider, SnapshotInfo
 from healthmes.backup.remote_vault import (
@@ -96,6 +97,63 @@ def enable_versioning(s3) -> None:
     s3.put_bucket_versioning(
         Bucket=BUCKET,
         VersioningConfiguration={"Status": "Enabled"},
+    )
+
+
+def test_latest_vault_entries_use_is_latest_across_pages_and_array_order():
+    version_key = f"{PREFIX}/versioned"
+    deleted_key = f"{PREFIX}/deleted"
+    latest = remote_vault_mod._latest_vault_entries(
+        iter(
+            [
+                {
+                    "Versions": [
+                        {
+                            "Key": version_key,
+                            "VersionId": "old-v1",
+                            "IsLatest": False,
+                        },
+                        {
+                            "Key": version_key,
+                            "VersionId": "current-v2",
+                            "IsLatest": True,
+                        },
+                        {
+                            "Key": deleted_key,
+                            "VersionId": "historical-v1",
+                            "IsLatest": False,
+                        },
+                    ]
+                },
+                {
+                    "DeleteMarkers": [
+                        {
+                            "Key": deleted_key,
+                            "VersionId": "delete-v2",
+                            "IsLatest": True,
+                        }
+                    ]
+                },
+            ]
+        ),
+        action="test version selection",
+    )
+
+    assert latest[version_key] == (
+        "version",
+        {
+            "Key": version_key,
+            "VersionId": "current-v2",
+            "IsLatest": True,
+        },
+    )
+    assert latest[deleted_key] == (
+        "delete_marker",
+        {
+            "Key": deleted_key,
+            "VersionId": "delete-v2",
+            "IsLatest": True,
+        },
     )
 
 
@@ -306,6 +364,55 @@ class TestPushDownloadList:
         assert downloaded.read_bytes() == original
         with pytest.raises(BackupError, match="already exists"):
             vault.download(local_info.name, overwrite=False)
+
+    def test_latest_delete_marker_hides_bare_name_but_explicit_version_survives(
+        self,
+        vault,
+        s3,
+        local_provider,
+    ):
+        enable_versioning(s3)
+        local_info = local_provider.export_snapshot()
+        original = local_info.path.read_bytes()
+        remote_info = vault.push(local_info.path)
+        assert remote_info.version_id is not None
+        local_info.path.unlink()
+        s3.delete_object(
+            Bucket=BUCKET,
+            Key=f"{PREFIX}/{local_info.name}",
+        )
+
+        with pytest.raises(BackupError, match="snapshot not found in vault"):
+            vault.download(local_info.name)
+
+        assert vault.list_snapshots() == []
+        assert not local_info.path.exists()
+        assert vault.download(remote_info) == local_info.path
+        assert local_info.path.read_bytes() == original
+
+    def test_blank_explicit_version_is_rejected_before_vault_access(
+        self,
+        local_provider,
+    ):
+        class NoReadClient:
+            def get_object(self, **_kwargs):
+                raise AssertionError("invalid version must fail before vault access")
+
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = NoReadClient()
+        invalid = SnapshotInfo(
+            name="healthmes-backup-20260705T033000Z.tar.gz.age",
+            path=Path("unused"),
+            created_at=T1,
+            size_bytes=1,
+            version_id=" ",
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="version_id must identify an immutable vault generation",
+        ):
+            provider.download(invalid)
 
     def test_satisfies_backup_provider_protocol(self, vault):
         assert isinstance(vault, BackupProvider)
