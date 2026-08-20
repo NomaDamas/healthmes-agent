@@ -43,6 +43,7 @@ from healthmes.backup.snapshot import (
     SNAPSHOT_SUFFIX,
     DataLocations,
     RestoreResult,
+    _require_disk_capacity,
     create_snapshot,
     parse_snapshot_name,
     resolve_backup_dir,
@@ -1265,6 +1266,7 @@ def _publish_staged_snapshot(
     staged_path: Path,
     destination: Path,
     *,
+    limits: SnapshotResourceLimits,
     pinned: PinnedPublishedFile | None = None,
 ) -> None:
     """Durably publish one staged ciphertext without replacing any entry."""
@@ -1272,6 +1274,7 @@ def _publish_staged_snapshot(
         _publish_open_snapshot(
             source,
             destination,
+            limits=limits,
             pinned=pinned,
         )
 
@@ -1280,6 +1283,7 @@ def _publish_open_snapshot(
     source: BinaryIO,
     destination: Path,
     *,
+    limits: SnapshotResourceLimits,
     pinned: PinnedPublishedFile | None = None,
 ) -> RegularFileIdentity:
     """Publish the exact regular-file generation held by ``source``."""
@@ -1287,6 +1291,12 @@ def _publish_open_snapshot(
     source.seek(0)
     copied = 0
     try:
+        _require_disk_capacity(
+            destination.parent,
+            payload_bytes=expected.size,
+            limits=limits,
+            label="final local backup publication",
+        )
         with durable_atomic_writer(
             destination,
             replace_existing=False,
@@ -1482,6 +1492,7 @@ class LocalDirectoryProvider:
                             _publish_staged_snapshot(
                                 staged_path,
                                 out_path,
+                                limits=self.resource_limits,
                                 pinned=publish_pin,
                             )
                         except FileExistsError:
@@ -1632,6 +1643,7 @@ class LocalDirectoryProvider:
                                     _publish_open_snapshot(
                                         sealed,
                                         candidate,
+                                        limits=self.resource_limits,
                                         pinned=published,
                                     )
                                 )

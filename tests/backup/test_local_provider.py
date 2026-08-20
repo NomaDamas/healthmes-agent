@@ -252,17 +252,131 @@ class TestProvider:
         self,
         source_env,
         tmp_path,
+        monkeypatch,
     ):
         target = tmp_path / "physical-backups"
         target.mkdir()
         configured = tmp_path / "configured-backups"
         configured.symlink_to(target, target_is_directory=True)
         provider = make_provider(source_env, configured, clock=lambda: T1)
+        checked_paths = []
+        real_require_capacity = local_mod._require_disk_capacity
+
+        def record_capacity_check(path, **kwargs):
+            checked_paths.append((path, kwargs))
+            return real_require_capacity(path, **kwargs)
+
+        monkeypatch.setattr(
+            local_mod,
+            "_require_disk_capacity",
+            record_capacity_check,
+        )
 
         info = provider.export_snapshot()
 
         assert info.path.parent == target.resolve()
         assert (configured / info.name).samefile(info.path)
+        assert checked_paths == [
+            (
+                target.resolve(),
+                {
+                    "payload_bytes": info.size_bytes,
+                    "limits": source_env.locations.resource_limits,
+                    "label": "final local backup publication",
+                },
+            )
+        ]
+
+    def test_export_rejects_insufficient_final_destination_reserve(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        backup_dir = tmp_path / "backups"
+        provider = make_provider(source_env, backup_dir, clock=lambda: T1)
+        staged_size = None
+        real_create_snapshot = local_mod.create_snapshot
+
+        def capture_staged_snapshot(*args, **kwargs):
+            nonlocal staged_size
+            result = real_create_snapshot(*args, **kwargs)
+            staged_size = kwargs["out_path"].stat().st_size
+            return result
+
+        def reject_final_publication(path, **kwargs):
+            assert path == backup_dir.resolve()
+            assert staged_size is not None
+            assert kwargs == {
+                "payload_bytes": staged_size,
+                "limits": source_env.locations.resource_limits,
+                "label": "final local backup publication",
+            }
+            raise BackupError(
+                "insufficient disk space for final local backup publication"
+            )
+
+        monkeypatch.setattr(
+            local_mod,
+            "create_snapshot",
+            capture_staged_snapshot,
+        )
+        monkeypatch.setattr(
+            local_mod,
+            "_require_disk_capacity",
+            reject_final_publication,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="insufficient disk space for final local backup publication",
+        ):
+            provider.export_snapshot()
+
+        assert staged_size is not None
+        assert list(backup_dir.glob("*.tar.gz.age")) == []
+
+    def test_collision_relocation_preserves_source_when_destination_reserve_fails(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+
+        def reject_final_publication(path, **kwargs):
+            assert path == info.path.parent
+            assert kwargs == {
+                "payload_bytes": info.size_bytes,
+                "limits": source_env.locations.resource_limits,
+                "label": "final local backup publication",
+            }
+            raise BackupError(
+                "insufficient disk space for final local backup publication"
+            )
+
+        monkeypatch.setattr(
+            local_mod,
+            "_require_disk_capacity",
+            reject_final_publication,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="insufficient disk space for final local backup publication",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        assert info.path.read_bytes() == original
+        assert not candidate.exists()
 
     def test_collision_relocation_keeps_candidate_when_source_retirement_fails(
         self,
