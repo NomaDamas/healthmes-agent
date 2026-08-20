@@ -1330,12 +1330,70 @@ def _publish_open_snapshot(
     return expected
 
 
+def _link_relocation_hold(
+    candidate: Path,
+    hold: Path,
+    *,
+    parent_descriptor: int | None,
+) -> None:
+    """Keep a second durable name for a relocation candidate."""
+    if parent_descriptor is None:  # pragma: no cover - Windows
+        os.link(candidate, hold, follow_symlinks=False)
+        fsync_directory(hold.parent)
+        return
+    os.link(
+        candidate.name,
+        hold.name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    os.fsync(parent_descriptor)
+
+
+def _named_regular_file_identity(
+    path: Path,
+    *,
+    label: str,
+) -> RegularFileIdentity | None:
+    """Read one named regular-file identity without hiding I/O failures."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BackupError(f"could not inspect {label} {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return RegularFileIdentity.from_metadata(metadata)
+
+
+def _same_relocation_payload(
+    expected: RegularFileIdentity,
+    observed: RegularFileIdentity,
+) -> bool:
+    """Match a published payload while allowing hard-link ctime changes."""
+    return (
+        observed.device == expected.device
+        and observed.inode == expected.inode
+        and observed.size == expected.size
+        and observed.mtime_ns == expected.mtime_ns
+    )
+
+
 def _seal_open_snapshot(
     source: BinaryIO,
     sealed: BinaryIO,
+    *,
+    expected: RegularFileIdentity | None = None,
 ) -> RegularFileIdentity:
     """Copy one open generation into an anonymous, durable sealed handle."""
-    expected = RegularFileIdentity.from_descriptor(source.fileno())
+    opened_identity = RegularFileIdentity.from_descriptor(source.fileno())
+    if expected is not None and opened_identity != expected:
+        raise BackupError(
+            "snapshot generation changed before it could be sealed"
+        )
+    expected = opened_identity
     source.seek(0)
     sealed.seek(0)
     sealed.truncate()
@@ -1536,10 +1594,7 @@ class LocalDirectoryProvider:
             info.path
         )
         try:
-            with (
-                open_regular_file(source) as opened,
-                tempfile.TemporaryFile(mode="w+b") as sealed,
-            ):
+            with open_regular_file(source) as opened:
                 opened_identity = RegularFileIdentity.from_descriptor(
                     opened.fileno()
                 )
@@ -1548,16 +1603,33 @@ class LocalDirectoryProvider:
                         "colliding snapshot changed before it could be sealed: "
                         f"{source}"
                     )
-                _seal_open_snapshot(opened, sealed)
-                relocated, _identity = (
-                    self._relocate_sealed_snapshot_after_collision(
-                        info,
-                        minimum_counter=minimum_counter,
-                        sealed=sealed,
+                max_bytes = self.resource_limits.max_encrypted_bytes
+                if opened_identity.size > max_bytes:
+                    raise BackupError(
+                        "snapshot exceeds the configured "
+                        f"{max_bytes}-byte encrypted limit"
+                    )
+                _require_disk_capacity(
+                    Path(tempfile.gettempdir()),
+                    payload_bytes=opened_identity.size,
+                    limits=self.resource_limits,
+                    label="collision relocation sealed generation",
+                )
+                with tempfile.TemporaryFile(mode="w+b") as sealed:
+                    _seal_open_snapshot(
+                        opened,
+                        sealed,
                         expected=opened_identity,
                     )
-                )
-                return relocated
+                    relocated, _identity = (
+                        self._relocate_sealed_snapshot_after_collision(
+                            info,
+                            minimum_counter=minimum_counter,
+                            sealed=sealed,
+                            expected=opened_identity,
+                        )
+                    )
+                    return relocated
         except BackupError:
             raise
         except OSError as exc:
@@ -1596,87 +1668,266 @@ class LocalDirectoryProvider:
             raise BackupError(
                 f"could not verify colliding snapshot parent {source}: {exc}"
             ) from exc
-        try:
-            with open_directory_anchored(storage_dir) as (
-                canonical_storage_dir,
-                parent_descriptor,
-            ):
-                if source_parent != canonical_storage_dir:
-                    raise BackupError(
-                        "refusing to relocate a snapshot outside the configured "
-                        "backup directory"
-                    )
-                with exclusive_file_lock(
-                    canonical_storage_dir / _EXPORT_LOCK_NAME,
-                    parent_descriptor=parent_descriptor,
-                ):
-                    opened_parent = os.fstat(parent_descriptor)
-                    named_parent = os.stat(
-                        storage_dir,
-                        follow_symlinks=True,
-                    )
-                    if (
-                        not stat.S_ISDIR(named_parent.st_mode)
-                        or named_parent.st_dev != opened_parent.st_dev
-                        or named_parent.st_ino != opened_parent.st_ino
+        source_retirement_done = False
+        source_retirement_error: BackupError | None = None
+        counter = minimum_counter
+        while True:
+            published = PinnedPublishedFile()
+            try:
+                try:
+                    with open_directory_anchored(storage_dir) as (
+                        canonical_storage_dir,
+                        parent_descriptor,
                     ):
-                        raise BackupError(
-                            "backup directory changed while relocating the "
-                            "colliding snapshot"
-                        )
-                    base = snapshot_name(info.created_at)
-                    stem = base[: -len(SNAPSHOT_SUFFIX)]
-                    counter = minimum_counter
-                    while True:
-                        candidate_name = (
-                            base
-                            if counter == 1
-                            else f"{stem}-{counter}{SNAPSHOT_SUFFIX}"
-                        )
-                        counter = max(2, counter + 1)
-                        candidate = (
-                            canonical_storage_dir / candidate_name
-                        )
-                        with PinnedPublishedFile() as published:
+                        if source_parent != canonical_storage_dir:
+                            raise BackupError(
+                                "refusing to relocate a snapshot outside the configured "
+                                "backup directory"
+                            )
+                        with exclusive_file_lock(
+                            canonical_storage_dir / _EXPORT_LOCK_NAME,
+                            parent_descriptor=parent_descriptor,
+                        ):
+                            opened_parent = os.fstat(parent_descriptor)
+                            named_parent = os.stat(
+                                storage_dir,
+                                follow_symlinks=True,
+                            )
+                            if (
+                                not stat.S_ISDIR(named_parent.st_mode)
+                                or named_parent.st_dev != opened_parent.st_dev
+                                or named_parent.st_ino != opened_parent.st_ino
+                            ):
+                                raise BackupError(
+                                    "backup directory changed while relocating the "
+                                    "colliding snapshot"
+                                )
+                            base = snapshot_name(info.created_at)
+                            stem = base[: -len(SNAPSHOT_SUFFIX)]
+                            candidate_name = (
+                                base
+                                if counter == 1
+                                else f"{stem}-{counter}{SNAPSHOT_SUFFIX}"
+                            )
+                            candidate = (
+                                canonical_storage_dir / candidate_name
+                            )
                             try:
-                                candidate_identity = (
-                                    _publish_open_snapshot(
-                                        sealed,
-                                        candidate,
-                                        limits=self.resource_limits,
-                                        pinned=published,
-                                    )
+                                published_identity = _publish_open_snapshot(
+                                    sealed,
+                                    candidate,
+                                    limits=self.resource_limits,
+                                    pinned=published,
                                 )
                             except FileExistsError:
+                                counter = max(2, counter + 1)
                                 continue
-                        break
-        except BackupError:
-            raise
-        except OSError as exc:
-            raise BackupError(
-                f"could not relocate colliding snapshot {source}: {exc}"
-            ) from exc
+                            hold_counter = max(2, counter + 1)
+                            while True:
+                                hold_name = (
+                                    f"{stem}-{hold_counter}{SNAPSHOT_SUFFIX}"
+                                )
+                                hold = (
+                                    canonical_storage_dir / hold_name
+                                )
+                                try:
+                                    hold.lstat()
+                                except FileNotFoundError:
+                                    try:
+                                        _link_relocation_hold(
+                                            candidate,
+                                            hold,
+                                            parent_descriptor=parent_descriptor,
+                                        )
+                                    except FileExistsError:
+                                        hold_counter += 1
+                                        continue
+                                    break
+                                hold_counter += 1
+                            if published.handle is None:
+                                raise BackupError(
+                                    "published collision candidate was not retained"
+                                )
+                            current_pinned = (
+                                RegularFileIdentity.from_descriptor(
+                                    published.handle.fileno()
+                                )
+                            )
+                            if not _same_relocation_payload(
+                                published_identity,
+                                current_pinned,
+                            ):
+                                logger.warning(
+                                    "Published collision candidate changed while "
+                                    "creating its recovery name; retrying without "
+                                    "removing %s",
+                                    source,
+                                )
+                                counter = max(2, hold_counter + 1)
+                                continue
+                            named_hold = _named_regular_file_identity(
+                                hold,
+                                label="relocation safety name",
+                            )
+                            if named_hold != current_pinned:
+                                logger.warning(
+                                    "Relocation safety name changed before "
+                                    "source retirement; retrying without "
+                                    "removing %s",
+                                    source,
+                                )
+                                counter = max(2, hold_counter + 1)
+                                continue
+                except BackupError:
+                    raise
+                except OSError as exc:
+                    raise BackupError(
+                        f"could not relocate colliding snapshot {source}: {exc}"
+                    ) from exc
 
-        try:
-            self.remove_snapshot_if_unchanged(
-                source,
-                expected=expected,
-            )
-        except _SnapshotGenerationChanged:
-            logger.warning(
-                "Colliding snapshot name now belongs to another generation; "
-                "preserving it after publishing %s",
-                candidate,
-            )
-        return (
-            SnapshotInfo(
-                name=candidate_name,
-                path=candidate,
-                created_at=info.created_at,
-                size_bytes=candidate_identity.size,
-            ),
-            candidate_identity,
-        )
+                if not source_retirement_done:
+                    try:
+                        self.remove_snapshot_if_unchanged(
+                            source,
+                            expected=expected,
+                        )
+                    except _SnapshotGenerationChanged:
+                        logger.warning(
+                            "Colliding snapshot name now belongs to another generation; "
+                            "preserving it after publishing %s",
+                            candidate,
+                        )
+                    except BackupError as exc:
+                        source_retirement_error = exc
+                    source_retirement_done = True
+
+                named_candidate = _named_regular_file_identity(
+                    candidate,
+                    label="published collision candidate",
+                )
+                named_hold = _named_regular_file_identity(
+                    hold,
+                    label="relocation safety name",
+                )
+                try:
+                    if published.handle is None:
+                        raise BackupError(
+                            "published collision candidate was not retained"
+                        )
+                    current_pinned = RegularFileIdentity.from_descriptor(
+                        published.handle.fileno()
+                    )
+                except OSError as exc:
+                    raise BackupError(
+                        "could not verify the retained collision candidate"
+                    ) from exc
+                if not _same_relocation_payload(
+                    published_identity,
+                    current_pinned,
+                ):
+                    logger.warning(
+                        "Published collision candidate payload changed during "
+                        "source retirement; retrying from the sealed generation"
+                    )
+                    counter = max(2, hold_counter + 1)
+                    continue
+                if named_candidate != current_pinned:
+                    logger.warning(
+                        "Published collision candidate changed during source "
+                        "retirement; using the retained relocation copy after %s",
+                        candidate,
+                    )
+                    if named_hold == current_pinned:
+                        if source_retirement_error is not None:
+                            raise source_retirement_error
+                        return (
+                            SnapshotInfo(
+                                name=hold_name,
+                                path=hold,
+                                created_at=info.created_at,
+                                size_bytes=current_pinned.size,
+                            ),
+                            current_pinned,
+                        )
+                    counter = max(2, hold_counter)
+                    continue
+                if source_retirement_error is not None:
+                    raise source_retirement_error
+                try:
+                    self.remove_snapshot_if_unchanged(
+                        hold,
+                        expected=current_pinned,
+                    )
+                except _SnapshotGenerationChanged:
+                    logger.warning(
+                        "Relocation safety name now belongs to another "
+                        "generation; preserving it at %s",
+                        hold,
+                    )
+                except BackupError as exc:
+                    source_retirement_error = exc
+                final_candidate = _named_regular_file_identity(
+                    candidate,
+                    label="published collision candidate",
+                )
+                try:
+                    if published.handle is None:
+                        raise BackupError(
+                            "published collision candidate was not retained"
+                        )
+                    final_pinned = RegularFileIdentity.from_descriptor(
+                        published.handle.fileno()
+                    )
+                except OSError as exc:
+                    raise BackupError(
+                        "could not verify the retained collision candidate"
+                    ) from exc
+                if not _same_relocation_payload(
+                    published_identity,
+                    final_pinned,
+                ):
+                    logger.warning(
+                        "Published collision candidate payload changed while "
+                        "retiring its recovery name; retrying from the sealed "
+                        "generation"
+                    )
+                    counter = max(2, hold_counter + 1)
+                    continue
+                if (
+                    final_candidate is not None
+                    and final_candidate == final_pinned
+                ):
+                    if source_retirement_error is not None:
+                        raise source_retirement_error
+                    return (
+                        SnapshotInfo(
+                            name=candidate_name,
+                            path=candidate,
+                            created_at=info.created_at,
+                            size_bytes=final_candidate.size,
+                        ),
+                        final_candidate,
+                    )
+                final_hold = _named_regular_file_identity(
+                    hold,
+                    label="relocation safety name",
+                )
+                if final_hold is not None and final_hold == final_pinned:
+                    if source_retirement_error is not None:
+                        raise source_retirement_error
+                    return (
+                        SnapshotInfo(
+                            name=hold_name,
+                            path=hold,
+                            created_at=info.created_at,
+                            size_bytes=final_hold.size,
+                        ),
+                        final_hold,
+                    )
+                counter = max(2, hold_counter + 1)
+                continue
+            finally:
+                published.close()
 
     def remove_snapshot_if_unchanged(
         self,

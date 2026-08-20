@@ -644,6 +644,176 @@ class TestExportAndRestore:
             / "healthmes-backup-20260705T033000Z-2.tar.gz.age"
         ).exists()
 
+    def test_keep_local_rejects_path_replaced_during_sealed_upload(
+        self,
+        local_provider,
+    ):
+        replacement = b"unrelated file replacing the retained local snapshot"
+
+        class ReplacingClient:
+            def __init__(self) -> None:
+                self.uploaded = b""
+
+            def put_object(self, **kwargs):
+                local_path = next(
+                    local_provider.backup_dir.glob("*.tar.gz.age")
+                )
+                local_path.unlink()
+                local_path.write_bytes(replacement)
+                self.uploaded = kwargs["Body"].read()
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def get_object(self, **kwargs):
+                assert kwargs["VersionId"] == "uploaded-v1"
+                return {
+                    "Body": io.BytesIO(self.uploaded),
+                    "ContentLength": len(self.uploaded),
+                    "Metadata": {},
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+        client = ReplacingClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        with pytest.raises(
+            BackupError,
+            match="local snapshot changed while it was being uploaded",
+        ):
+            provider.create_and_replicate()
+
+        local_snapshots = list(
+            local_provider.backup_dir.glob("*.tar.gz.age")
+        )
+        assert len(local_snapshots) == 1
+        assert local_snapshots[0].read_bytes() == replacement
+        assert client.uploaded
+        assert client.uploaded != replacement
+
+    def test_create_and_replicate_normalizes_sealed_tempfile_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        def fail_temporary_file(*args, **kwargs):
+            raise OSError("injected private temporary storage failure")
+
+        monkeypatch.setattr(
+            remote_vault_mod.tempfile,
+            "TemporaryFile",
+            fail_temporary_file,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not allocate private sealed snapshot generation",
+        ) as excinfo:
+            provider.create_and_replicate()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert list(local_provider.backup_dir.glob("*.tar.gz.age")) == []
+
+    def test_create_and_replicate_normalizes_private_seal_write_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        class FailingSealedFile(io.BytesIO):
+            def write(self, _data):
+                raise OSError("injected private seal write failure")
+
+        monkeypatch.setattr(
+            remote_vault_mod,
+            "_open_private_sealed_snapshot",
+            FailingSealedFile,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not prepare private sealed snapshot generation",
+        ) as excinfo:
+            provider.create_and_replicate()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_size > 0
+
+    def test_create_and_replicate_normalizes_private_seal_fsync_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        real_temporary_file = remote_vault_mod.tempfile.TemporaryFile
+        sealed = real_temporary_file(mode="w+b")
+        sealed_descriptor = sealed.fileno()
+        real_fsync = remote_vault_mod.os.fsync
+
+        def open_sealed():
+            return sealed
+
+        def fail_sealed_fsync(descriptor):
+            if descriptor == sealed_descriptor:
+                raise OSError("injected private seal fsync failure")
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(
+            remote_vault_mod,
+            "_open_private_sealed_snapshot",
+            open_sealed,
+        )
+        monkeypatch.setattr(
+            remote_vault_mod.os,
+            "fsync",
+            fail_sealed_fsync,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not prepare private sealed snapshot generation",
+        ) as excinfo:
+            provider.create_and_replicate()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_size > 0
+
+    def test_push_reports_upload_body_allocation_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        info = local_provider.export_snapshot()
+
+        def fail_temporary_file(*args, **kwargs):
+            raise OSError("injected upload body allocation failure")
+
+        monkeypatch.setattr(
+            remote_vault_mod.tempfile,
+            "TemporaryFile",
+            fail_temporary_file,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not allocate private vault upload generation",
+        ) as excinfo:
+            provider.push(info.path)
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_size > 0
+
     def test_remote_only_collision_does_not_delete_replaced_original_name(
         self,
         local_provider,

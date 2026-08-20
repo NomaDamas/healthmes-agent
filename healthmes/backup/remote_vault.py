@@ -41,7 +41,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
 import boto3
@@ -137,6 +137,26 @@ _SAFE_VAULT_ERROR_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 class _VaultObjectCollision(BackupError):
     """A different immutable vault object already owns this snapshot name."""
+
+
+def _open_private_sealed_snapshot() -> BinaryIO:
+    """Allocate the private upload generation with a provider-level error."""
+    try:
+        return tempfile.TemporaryFile(mode="w+b")
+    except OSError as exc:
+        raise BackupError(
+            "could not allocate private sealed snapshot generation"
+        ) from exc
+
+
+def _open_private_upload_body() -> BinaryIO:
+    """Allocate one private upload body with a precise provider error."""
+    try:
+        return tempfile.TemporaryFile(mode="w+b")
+    except OSError as exc:
+        raise BackupError(
+            "could not allocate private vault upload generation"
+        ) from exc
 
 
 def _redacted_endpoint_label(endpoint_url: str | None) -> str:
@@ -785,9 +805,7 @@ class RemoteVaultProvider:
                 if _sealed is not None
                 else open_regular_file(local_path)
             )
-            with source_scope as source, tempfile.TemporaryFile(
-                mode="w+b"
-            ) as body:
+            with source_scope as source, _open_private_upload_body() as body:
                 identity = RegularFileIdentity.from_descriptor(
                     source.fileno()
                 )
@@ -896,16 +914,19 @@ class RemoteVaultProvider:
                     RegularFileIdentity.from_descriptor(source.fileno())
                     != identity
                 )
-                if _sealed is None:
-                    try:
-                        named_identity = RegularFileIdentity.from_metadata(
-                            local_path.lstat()
-                        )
-                    except (OSError, ValueError):
-                        named_identity = None
-                    source_changed = (
-                        source_changed or named_identity != identity
+                expected_local_identity = (
+                    identity if _sealed is None else _local_identity
+                )
+                try:
+                    named_identity = RegularFileIdentity.from_metadata(
+                        local_path.lstat()
                     )
+                except (OSError, ValueError):
+                    named_identity = None
+                source_changed = (
+                    source_changed
+                    or named_identity != expected_local_identity
+                )
                 if source_changed:
                     raise BackupError(
                         "local snapshot changed while it was being uploaded; "
@@ -916,7 +937,7 @@ class RemoteVaultProvider:
             raise
         except OSError as exc:
             raise BackupError(
-                f"could not read local snapshot {local_path}: {exc}"
+                f"could not prepare local snapshot upload {local_path}: {exc}"
             ) from exc
         logger.info(
             "Snapshot pushed to vault: %s (%d bytes)", self.object_uri(local_path.name), size
@@ -1408,111 +1429,119 @@ class RemoteVaultProvider:
         endpoints still replicate normally, but remote-only mode fails safely
         and preserves the local copy.
         """
-        with (
-            PinnedPublishedFile() as published,
-            tempfile.TemporaryFile(mode="w+b") as sealed,
-        ):
-            local_info = self._local.export_snapshot(_pinned=published)
-            if published.handle is None or published.identity is None:
-                raise BackupError(
-                    "local export did not retain its published snapshot generation"
-                )
-            published_identity = published.identity
-            if (
-                RegularFileIdentity.from_descriptor(
-                    published.handle.fileno()
-                )
-                != published_identity
+        try:
+            with (
+                PinnedPublishedFile() as published,
+                _open_private_sealed_snapshot() as sealed,
             ):
-                raise BackupError(
-                    "local snapshot changed before it could be sealed for upload"
-                )
-            _require_disk_capacity(
-                Path(tempfile.gettempdir()),
-                payload_bytes=published_identity.size,
-                limits=self._local.resource_limits,
-                label="private vault sealed generation",
-            )
-            copied = 0
-            max_bytes = self._local.resource_limits.max_encrypted_bytes
-            published.handle.seek(0)
-            for chunk in iter(
-                lambda: published.handle.read(_CHUNK),
-                b"",
-            ):
-                copied += len(chunk)
-                if copied > max_bytes:
+                local_info = self._local.export_snapshot(_pinned=published)
+                if published.handle is None or published.identity is None:
                     raise BackupError(
-                        "snapshot exceeds the configured "
-                        f"{max_bytes}-byte encrypted limit"
+                        "local export did not retain its published snapshot generation"
                     )
-                sealed.write(chunk)
-            sealed.flush()
-            os.fsync(sealed.fileno())
-            if (
-                copied != published_identity.size
-                or RegularFileIdentity.from_descriptor(
-                    published.handle.fileno()
-                )
-                != published_identity
-            ):
-                raise BackupError(
-                    "local snapshot changed while it was being sealed for upload"
-                )
-            sealed.seek(0)
-            sealed_identity = RegularFileIdentity.from_descriptor(
-                sealed.fileno()
-            )
-            current_local_identity = published_identity
-            collisions = 0
-            while True:
-                try:
-                    (
-                        remote_info,
-                        _uploaded_local_identity,
-                        remote_receipt,
-                    ) = self._push_with_receipt(
-                        local_info.path,
-                        _sealed=sealed,
-                        _sealed_identity=sealed_identity,
-                        _local_identity=current_local_identity,
+                published_identity = published.identity
+                if (
+                    RegularFileIdentity.from_descriptor(
+                        published.handle.fileno()
                     )
-                    break
-                except _VaultObjectCollision:
-                    collisions += 1
-                    if collisions > _MAX_REMOTE_NAME_COLLISIONS:
+                    != published_identity
+                ):
+                    raise BackupError(
+                        "local snapshot changed before it could be sealed for upload"
+                    )
+                _require_disk_capacity(
+                    Path(tempfile.gettempdir()),
+                    payload_bytes=published_identity.size,
+                    limits=self._local.resource_limits,
+                    label="private vault sealed generation",
+                )
+                copied = 0
+                max_bytes = self._local.resource_limits.max_encrypted_bytes
+                published.handle.seek(0)
+                for chunk in iter(
+                    lambda: published.handle.read(_CHUNK),
+                    b"",
+                ):
+                    copied += len(chunk)
+                    if copied > max_bytes:
                         raise BackupError(
-                            "could not allocate an immutable vault snapshot name after "
-                            f"{_MAX_REMOTE_NAME_COLLISIONS} collision retries; "
-                            "the local encrypted snapshot remains available"
+                            "snapshot exceeds the configured "
+                            f"{max_bytes}-byte encrypted limit"
                         )
-                    (
-                        local_info,
-                        current_local_identity,
-                    ) = (
-                        self._local._relocate_sealed_snapshot_after_collision(
-                            local_info,
-                            minimum_counter=collisions + 1,
-                            sealed=sealed,
-                            expected=current_local_identity,
-                        )
+                    sealed.write(chunk)
+                sealed.flush()
+                os.fsync(sealed.fileno())
+                if (
+                    copied != published_identity.size
+                    or RegularFileIdentity.from_descriptor(
+                        published.handle.fileno()
                     )
-            if not self._keep_local:
-                if not remote_receipt.proves_immutable_generation:
+                    != published_identity
+                ):
                     raise BackupError(
-                        "remote-only mode requires an immutable vault generation "
-                        "receipt (VersionId); this endpoint did not provide one, "
-                        f"so the local snapshot was preserved at {local_info.path}"
+                        "local snapshot changed while it was being sealed for upload"
                     )
-                self._local.remove_snapshot_if_unchanged(
-                    local_info.path,
-                    expected=current_local_identity,
+                sealed.seek(0)
+                sealed_identity = RegularFileIdentity.from_descriptor(
+                    sealed.fileno()
                 )
-                logger.info(
-                    "Local snapshot copy removed after replication (keep_local=False): %s",
-                    local_info.path,
-                )
-            return local_info, remote_info
+                current_local_identity = published_identity
+                collisions = 0
+                while True:
+                    try:
+                        (
+                            remote_info,
+                            _uploaded_local_identity,
+                            remote_receipt,
+                        ) = self._push_with_receipt(
+                            local_info.path,
+                            _sealed=sealed,
+                            _sealed_identity=sealed_identity,
+                            _local_identity=current_local_identity,
+                        )
+                        break
+                    except _VaultObjectCollision:
+                        collisions += 1
+                        if collisions > _MAX_REMOTE_NAME_COLLISIONS:
+                            raise BackupError(
+                                "could not allocate an immutable vault snapshot name after "
+                                f"{_MAX_REMOTE_NAME_COLLISIONS} collision retries; "
+                                "the local encrypted snapshot remains available"
+                            )
+                        (
+                            local_info,
+                            current_local_identity,
+                        ) = (
+                            self._local._relocate_sealed_snapshot_after_collision(
+                                local_info,
+                                minimum_counter=collisions + 1,
+                                sealed=sealed,
+                                expected=current_local_identity,
+                            )
+                        )
+                if not self._keep_local:
+                    if not remote_receipt.proves_immutable_generation:
+                        raise BackupError(
+                            "remote-only mode requires an immutable vault generation "
+                            "receipt (VersionId); this endpoint did not provide one, "
+                            f"so the local snapshot was preserved at {local_info.path}"
+                        )
+                    self._local.remove_snapshot_if_unchanged(
+                        local_info.path,
+                        expected=current_local_identity,
+                    )
+                    logger.info(
+                        "Local snapshot copy removed after replication "
+                        "(keep_local=False): %s",
+                        local_info.path,
+                    )
+                return local_info, remote_info
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupError(
+                "could not prepare private sealed snapshot generation"
+            ) from exc
 
     # -- BackupProvider protocol -------------------------------------------
 

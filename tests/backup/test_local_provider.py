@@ -4,7 +4,9 @@ import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Lock
 from time import sleep
 
@@ -345,8 +347,18 @@ class TestProvider:
         provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
         info = provider.export_snapshot()
         original = info.path.read_bytes()
+        capacity_checks = []
 
         def reject_final_publication(path, **kwargs):
+            capacity_checks.append((path, kwargs))
+            if kwargs["label"] == "collision relocation sealed generation":
+                assert path == Path(local_mod.tempfile.gettempdir())
+                assert kwargs == {
+                    "payload_bytes": info.size_bytes,
+                    "limits": source_env.locations.resource_limits,
+                    "label": "collision relocation sealed generation",
+                }
+                return
             assert path == info.path.parent
             assert kwargs == {
                 "payload_bytes": info.size_bytes,
@@ -377,6 +389,470 @@ class TestProvider:
         )
         assert info.path.read_bytes() == original
         assert not candidate.exists()
+        assert [kwargs["label"] for _path, kwargs in capacity_checks] == [
+            "collision relocation sealed generation",
+            "final local backup publication",
+        ]
+
+    def test_collision_relocation_preserves_source_when_seal_reserve_fails(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        temporary_file_calls = 0
+
+        def reject_sealed_generation(path, **kwargs):
+            assert path == Path(local_mod.tempfile.gettempdir())
+            assert kwargs == {
+                "payload_bytes": info.size_bytes,
+                "limits": source_env.locations.resource_limits,
+                "label": "collision relocation sealed generation",
+            }
+            raise BackupError(
+                "insufficient disk space for collision relocation sealed generation"
+            )
+
+        def count_temporary_file(*args, **kwargs):
+            nonlocal temporary_file_calls
+            temporary_file_calls += 1
+            raise AssertionError("temporary file must not be opened without reserve")
+
+        monkeypatch.setattr(
+            local_mod,
+            "_require_disk_capacity",
+            reject_sealed_generation,
+        )
+        monkeypatch.setattr(
+            local_mod.tempfile,
+            "TemporaryFile",
+            count_temporary_file,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="insufficient disk space for collision relocation sealed generation",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        assert temporary_file_calls == 0
+        assert info.path.read_bytes() == original
+        assert not candidate.exists()
+
+    def test_collision_relocation_rejects_oversized_source_before_sealing(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        backup_dir = tmp_path / "backups"
+        provider = make_provider(source_env, backup_dir, clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        limited_locations = replace(
+            source_env.locations,
+            resource_limits=replace(
+                source_env.locations.resource_limits,
+                max_encrypted_bytes=info.size_bytes - 1,
+            ),
+        )
+        limited_provider = LocalDirectoryProvider(
+            backup_dir,
+            locations=limited_locations,
+            passphrase=source_env.passphrase,
+        )
+        temporary_file_calls = 0
+
+        def count_temporary_file(*args, **kwargs):
+            nonlocal temporary_file_calls
+            temporary_file_calls += 1
+            raise AssertionError("oversized snapshot must not be sealed")
+
+        monkeypatch.setattr(
+            local_mod.tempfile,
+            "TemporaryFile",
+            count_temporary_file,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="snapshot exceeds the configured .* encrypted limit",
+        ):
+            limited_provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        assert temporary_file_calls == 0
+        assert info.path.read_bytes() == original
+        assert not candidate.exists()
+
+    def test_collision_relocation_rejects_same_size_mutation_before_sealing(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        replacement = bytes([original[0] ^ 1]) + original[1:]
+        real_require_capacity = local_mod._require_disk_capacity
+        mutated = False
+
+        def mutate_after_seal_reserve(path, **kwargs):
+            nonlocal mutated
+            real_require_capacity(path, **kwargs)
+            if kwargs["label"] == "collision relocation sealed generation":
+                with info.path.open("r+b") as raced:
+                    raced.write(replacement)
+                    raced.flush()
+                    os.fsync(raced.fileno())
+                mutated = True
+
+        monkeypatch.setattr(
+            local_mod,
+            "_require_disk_capacity",
+            mutate_after_seal_reserve,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="snapshot generation changed before it could be sealed",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        assert mutated is True
+        assert info.path.read_bytes() == replacement
+        assert not candidate.exists()
+
+    def test_collision_relocation_keeps_source_if_hold_links_wrong_generation(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        replacement = b"unrelated generation raced into the collision name"
+        first_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        first_hold = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        real_link = local_mod._link_relocation_hold
+
+        def link_raced_generation(candidate, hold, *, parent_descriptor):
+            candidate.unlink()
+            candidate.write_bytes(replacement)
+            real_link(
+                candidate,
+                hold,
+                parent_descriptor=parent_descriptor,
+            )
+
+        monkeypatch.setattr(
+            local_mod,
+            "_link_relocation_hold",
+            link_raced_generation,
+        )
+        real_publish = local_mod._publish_open_snapshot
+        publish_calls = 0
+
+        def fail_retry_publication(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                raise BackupError("injected collision retry failure")
+            return real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            local_mod,
+            "_publish_open_snapshot",
+            fail_retry_publication,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="injected collision retry failure",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        assert publish_calls == 2
+        assert info.path.read_bytes() == original
+        assert first_candidate.read_bytes() == replacement
+        assert first_hold.read_bytes() == replacement
+
+    def test_collision_relocation_keeps_source_if_linked_candidate_is_mutated(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        replacement = bytes([original[0] ^ 1]) + original[1:]
+        first_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        first_hold = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        real_link = local_mod._link_relocation_hold
+
+        def link_then_mutate(candidate, hold, *, parent_descriptor):
+            real_link(
+                candidate,
+                hold,
+                parent_descriptor=parent_descriptor,
+            )
+            metadata = candidate.stat()
+            with candidate.open("r+b") as raced:
+                raced.write(replacement)
+                raced.flush()
+                os.fsync(raced.fileno())
+            os.utime(
+                candidate,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1),
+            )
+
+        monkeypatch.setattr(
+            local_mod,
+            "_link_relocation_hold",
+            link_then_mutate,
+        )
+        real_publish = local_mod._publish_open_snapshot
+        publish_calls = 0
+
+        def fail_retry_publication(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                raise BackupError("injected collision retry failure")
+            return real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            local_mod,
+            "_publish_open_snapshot",
+            fail_retry_publication,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="injected collision retry failure",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        assert publish_calls == 2
+        assert info.path.read_bytes() == original
+        assert first_candidate.read_bytes() == replacement
+        assert first_hold.read_bytes() == replacement
+
+    def test_collision_relocation_stops_on_hold_metadata_io_error(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        first_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        first_hold = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        real_lstat = Path.lstat
+        hold_lstat_calls = 0
+
+        def fail_second_hold_lstat(path):
+            nonlocal hold_lstat_calls
+            if path == first_hold:
+                hold_lstat_calls += 1
+                if hold_lstat_calls == 2:
+                    raise OSError("injected hold metadata I/O failure")
+            return real_lstat(path)
+
+        monkeypatch.setattr(Path, "lstat", fail_second_hold_lstat)
+        real_publish = local_mod._publish_open_snapshot
+        publish_calls = 0
+
+        def count_publications(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            return real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            local_mod,
+            "_publish_open_snapshot",
+            count_publications,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="could not inspect relocation safety name",
+        ) as excinfo:
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert publish_calls == 1
+        assert info.path.read_bytes() == original
+        assert first_candidate.read_bytes() == original
+        assert first_hold.read_bytes() == original
+
+    def test_collision_relocation_preserves_names_on_post_retirement_metadata_io_error(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        first_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        first_hold = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        real_remove = provider.remove_snapshot_if_unchanged
+        source_retired = False
+
+        def retire_source(path, *, expected):
+            nonlocal source_retired
+            real_remove(path, expected=expected)
+            source_retired = True
+
+        monkeypatch.setattr(
+            provider,
+            "remove_snapshot_if_unchanged",
+            retire_source,
+        )
+        real_lstat = Path.lstat
+
+        def fail_candidate_lstat_after_retirement(path):
+            if source_retired and path == first_candidate:
+                raise OSError("injected candidate metadata I/O failure")
+            return real_lstat(path)
+
+        monkeypatch.setattr(
+            Path,
+            "lstat",
+            fail_candidate_lstat_after_retirement,
+        )
+        real_publish = local_mod._publish_open_snapshot
+        publish_calls = 0
+
+        def count_publications(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            return real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            local_mod,
+            "_publish_open_snapshot",
+            count_publications,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="could not inspect published collision candidate",
+        ) as excinfo:
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert source_retired is True
+        assert publish_calls == 1
+        assert not info.path.exists()
+        assert first_candidate.read_bytes() == original
+        assert first_hold.read_bytes() == original
+
+    @pytest.mark.parametrize(
+        "candidate_race",
+        ("delete", "replace"),
+    )
+    def test_collision_relocation_uses_hold_if_candidate_is_lost_during_retirement(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+        candidate_race,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        first_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        replacement = b"unrelated replacement at the first collision suffix"
+        real_remove = provider.remove_snapshot_if_unchanged
+        raced = False
+
+        def remove_source_then_race_candidate(path, *, expected):
+            nonlocal raced
+            real_remove(path, expected=expected)
+            if not raced:
+                raced = True
+                first_candidate.unlink()
+                if candidate_race == "replace":
+                    first_candidate.write_bytes(replacement)
+
+        monkeypatch.setattr(
+            provider,
+            "remove_snapshot_if_unchanged",
+            remove_source_then_race_candidate,
+        )
+
+        relocated = provider.relocate_snapshot_after_collision(
+            info,
+            minimum_counter=2,
+        )
+
+        assert raced is True
+        assert not info.path.exists()
+        assert relocated.name == (
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        assert relocated.path.read_bytes() == original
+        assert relocated.size_bytes == len(original)
+        if candidate_race == "replace":
+            assert first_candidate.read_bytes() == replacement
+        else:
+            assert not first_candidate.exists()
 
     def test_collision_relocation_keeps_candidate_when_source_retirement_fails(
         self,
@@ -417,6 +893,60 @@ class TestProvider:
         assert not info.path.exists()
         assert candidate.is_file()
         assert candidate.stat().st_size == info.size_bytes
+
+    def test_collision_relocation_keeps_hold_before_retirement_error_escapes(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        first_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        hold_candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        real_remove = provider.remove_snapshot_if_unchanged
+        real_publish = local_mod._publish_open_snapshot
+        publish_calls = 0
+
+        def count_publications(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            return real_publish(*args, **kwargs)
+
+        def retire_source_lose_candidate_then_fail(path, *, expected):
+            real_remove(path, expected=expected)
+            first_candidate.unlink()
+            raise BackupError("injected source retirement acknowledgement failure")
+
+        monkeypatch.setattr(
+            provider,
+            "remove_snapshot_if_unchanged",
+            retire_source_lose_candidate_then_fail,
+        )
+        monkeypatch.setattr(
+            local_mod,
+            "_publish_open_snapshot",
+            count_publications,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="injected source retirement acknowledgement failure",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        assert not info.path.exists()
+        assert not first_candidate.exists()
+        assert publish_calls == 1
+        assert hold_candidate.read_bytes() == original
 
     def test_collision_relocation_preserves_a_snapshot_if_candidate_fsync_fails(
         self,

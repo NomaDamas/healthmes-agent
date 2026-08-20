@@ -664,6 +664,28 @@ The vault is a **replication target**, never the primary store:
   envelope and manifest, hashes it and uploads only that sealed private
   generation. Replacing or overwriting the named local snapshot during this
   interval cannot turn the outbound body into plaintext or another file.
+  After remote verification, HealthMes also re-checks that the local pathname
+  still names the selected generation. A replaced or missing local path makes
+  the operation fail without modifying the raced replacement, including when
+  the caller requested the normal `keep_local` behavior.
+- Remote-name collisions reuse the same sealed ciphertext and publish it under
+  the next local suffix before retiring the old local name. The newly
+  published generation stays pinned by an open descriptor through source
+  retirement and final pathname verification, and a temporary same-directory
+  hard link keeps one durable recovery name until that verification succeeds.
+  HealthMes verifies that recovery name against the pinned descriptor before
+  retiring the old local name. Hard-link `ctime` changes are expected, but the
+  published inode, size, and modification time remain bound to the sealed
+  generation; an in-place write or raced link retries while the source remains.
+  If the candidate is deleted or replaced during retirement, HealthMes
+  preserves the raced entry and promotes the already durable recovery name
+  instead of returning a false success or unnecessarily copying the
+  ciphertext again. Only when neither name still owns the pinned generation
+  does HealthMes retry publication under another suffix. Both the temporary
+  seal and each final publication enforce the configured encrypted-size and
+  free-space-reserve limits. Temporary-storage allocation, write, flush,
+  durability and metadata I/O failures are surfaced as provider errors; only
+  a confirmed missing or replaced pathname enters collision recovery.
 - Downloads land atomically (`.part` + rename). For remote restore the
   verified remote object is authoritative and replaces any same-name local
   cache; corruption is additionally caught by age's authenticated encryption
