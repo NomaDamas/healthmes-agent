@@ -10,6 +10,9 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import context, op
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "e9f0a1b2c3d4"
 down_revision: str | Sequence[str] | None = "d8e9f0a1b2c3"
@@ -113,11 +116,11 @@ def _assert_downgrade_is_safe() -> None:
         )
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        bind.execute(
-            sa.text(
-                "LOCK TABLE retention_policy, decision_record "
-                "IN ACCESS EXCLUSIVE MODE"
-            )
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE retention_policy, decision_record "
+            "IN ACCESS EXCLUSIVE MODE",
+            resource="DecisionRecord retention data",
         )
     elif bind.dialect.name == "sqlite":
         # Acquire SQLite's database-wide writer lock before checking.

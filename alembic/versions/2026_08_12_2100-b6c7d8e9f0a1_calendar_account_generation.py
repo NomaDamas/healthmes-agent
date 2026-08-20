@@ -11,6 +11,9 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from alembic import context, op
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "b6c7d8e9f0a1"
 down_revision: str | Sequence[str] | None = "a5b6c7d8e9f0"
@@ -600,11 +603,11 @@ def _assert_account_generation_downgrade_is_safe() -> None:
         )
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        bind.execute(
-            sa.text(
-                "LOCK TABLE calendar_event_mirror, "
-                "calendar_mutation_proposal IN ACCESS EXCLUSIVE MODE"
-            )
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE calendar_event_mirror, "
+            "calendar_mutation_proposal IN ACCESS EXCLUSIVE MODE",
+            resource="Calendar account-generation data",
         )
     elif bind.dialect.name == "sqlite":
         # Reserve the database before the losslessness checks. A concurrent

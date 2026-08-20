@@ -11,6 +11,9 @@ import sqlalchemy as sa
 
 from alembic import context, op
 from healthmes.store.base import JSONB
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "f0a1b2c3d4e5"
 down_revision: str | Sequence[str] | None = "e9f0a1b2c3d4"
@@ -98,11 +101,10 @@ def _assert_downgrade_is_lossless() -> None:
         )
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        bind.execute(
-            sa.text(
-                "LOCK TABLE decision_request_receipt "
-                "IN ACCESS EXCLUSIVE MODE"
-            )
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE decision_request_receipt IN ACCESS EXCLUSIVE MODE",
+            resource="Decision Agent request receipts",
         )
     existing = bind.execute(
         sa.text("SELECT 1 FROM decision_request_receipt LIMIT 1")

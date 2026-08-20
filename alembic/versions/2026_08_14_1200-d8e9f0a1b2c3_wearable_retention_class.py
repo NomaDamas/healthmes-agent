@@ -14,6 +14,9 @@ from datetime import timedelta
 import sqlalchemy as sa
 
 from alembic import context, op
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "d8e9f0a1b2c3"
 down_revision: str | Sequence[str] | None = "c7d8e9f0a1b2"
@@ -236,11 +239,11 @@ def _assert_downgrade_is_lossless() -> None:
         )
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        bind.execute(
-            sa.text(
-                "LOCK TABLE retention_policy, wellness_event "
-                "IN ACCESS EXCLUSIVE MODE"
-            )
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE retention_policy, wellness_event "
+            "IN ACCESS EXCLUSIVE MODE",
+            resource="wearable retention data",
         )
     elif bind.dialect.name == "sqlite":
         bind.execute(

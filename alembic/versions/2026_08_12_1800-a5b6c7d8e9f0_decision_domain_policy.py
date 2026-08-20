@@ -10,6 +10,9 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import context, op
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "a5b6c7d8e9f0"
 down_revision: str | Sequence[str] | None = "f4a5b6c7d8e9"
@@ -28,11 +31,10 @@ def _assert_downgrade_is_lossless() -> None:
         # Keep the consent check and table drop in one protected migration
         # transaction. Otherwise a concurrent settings request could revoke a
         # domain after the check and have that choice erased by the downgrade.
-        bind.execute(
-            sa.text(
-                "LOCK TABLE decision_domain_policy "
-                "IN ACCESS EXCLUSIVE MODE"
-            )
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE decision_domain_policy IN ACCESS EXCLUSIVE MODE",
+            resource="Decision Agent domain consent",
         )
     elif bind.dialect.name == "sqlite":
         # SQLAlchemy defers SQLite BEGIN until the first write. Reserve the

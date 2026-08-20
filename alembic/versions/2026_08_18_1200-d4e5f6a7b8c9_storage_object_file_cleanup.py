@@ -11,6 +11,9 @@ import sqlalchemy as sa
 
 from alembic import context, op
 from healthmes.store.base import JSONB
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "d4e5f6a7b8c9"
 down_revision: str | Sequence[str] | None = "c3d4e5f6a7b8"
@@ -187,8 +190,10 @@ def _assert_downgrade_is_lossless() -> None:
         )
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        bind.execute(
-            sa.text("LOCK TABLE storage_object IN ACCESS EXCLUSIVE MODE")
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE storage_object IN ACCESS EXCLUSIVE MODE",
+            resource="storage object file cleanup",
         )
     elif bind.dialect.name == "sqlite":
         # SQLAlchemy defers SQLite BEGIN until the first write. Reserve the

@@ -11,6 +11,9 @@ import sqlalchemy as sa
 
 from alembic import context, op
 from healthmes.store.base import JSONB
+from healthmes.store.migration_safety import (
+    acquire_postgres_downgrade_lock,
+)
 
 revision: str = "f4a5b6c7d8e9"
 down_revision: str | Sequence[str] | None = "e3f4a5b6c7d8"
@@ -149,10 +152,10 @@ def _assert_downgrade_is_lossless() -> None:
         # Keep the losslessness check and destructive DDL in one protected
         # migration transaction. Without this lock, a concurrent finalizer can
         # commit correlated audit data after the check but before column drop.
-        bind.execute(
-            sa.text(
-                "LOCK TABLE decision_record IN ACCESS EXCLUSIVE MODE"
-            )
+        acquire_postgres_downgrade_lock(
+            bind,
+            "LOCK TABLE decision_record IN ACCESS EXCLUSIVE MODE",
+            resource="Decision Agent records",
         )
     correlated = bind.execute(
         sa.text(
