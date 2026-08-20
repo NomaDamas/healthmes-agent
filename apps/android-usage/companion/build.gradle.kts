@@ -53,8 +53,8 @@ dependencies {
     implementation(project(":shared"))
 
     implementation("androidx.core:core-ktx:1.18.0")
-    implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.appcompat:appcompat:1.8.0")
+    implementation("com.google.android.material:material:1.14.0")
     // 15-minute periodic refresh + one-shot notification-action calls.
     implementation("androidx.work:work-runtime-ktx:2.9.1")
     // Glance AppWidget (composable RemoteViews) for the briefing widget.
@@ -76,5 +76,5 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     // Unit tests exercise the shared org.json-based contract parsers on the
     // JVM; android.jar's org.json is a stub there, so bring the real one.
-    testImplementation("org.json:json:20260719")
+    testImplementation("org.json:json:20260814")
 }

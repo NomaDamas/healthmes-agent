@@ -47,7 +47,7 @@ dependencies {
     implementation("androidx.wear.protolayout:protolayout:1.4.2")
     implementation("androidx.wear.protolayout:protolayout-material:1.4.2")
     // Watch-face complication data source (energy score).
-    implementation("androidx.wear.watchface:watchface-complications-data-source:1.2.1")
+    implementation("androidx.wear.watchface:watchface-complications-data-source:1.3.0")
     // CallbackToFutureAdapter for the ListenableFuture-based tile callbacks.
     implementation("androidx.concurrent:concurrent-futures:1.2.0")
 }
