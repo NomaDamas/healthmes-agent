@@ -810,6 +810,77 @@ def test_sqlite_expired_lease_preserves_first_committed_result(
     assert delayed_completion.result_payload == canonical
 
 
+def test_sqlite_claim_does_not_delete_unrelated_expired_receipts(
+    service_session_factory,
+) -> None:
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(seconds=1),
+        retention=timedelta(days=30),
+    )
+    expired_request_id = uuid.uuid4()
+    current_request_id = uuid.uuid4()
+
+    store.claim(
+        request_id=expired_request_id,
+        fingerprint="a" * 64,
+        owner_token=uuid.uuid4(),
+        now=NOW - timedelta(days=31),
+    )
+    current = store.claim(
+        request_id=current_request_id,
+        fingerprint="b" * 64,
+        owner_token=uuid.uuid4(),
+        now=NOW,
+    )
+
+    assert current.state is DecisionReceiptClaimState.ACQUIRED
+    with service_session_factory() as session:
+        expired = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id
+                == expired_request_id
+            )
+        )
+        assert expired is not None
+
+
+def test_sqlite_claim_reuses_its_own_expired_request_identity(
+    service_session_factory,
+) -> None:
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(seconds=1),
+        retention=timedelta(days=30),
+    )
+    request_id = uuid.uuid4()
+
+    first = store.claim(
+        request_id=request_id,
+        fingerprint="a" * 64,
+        owner_token=uuid.uuid4(),
+        now=NOW - timedelta(days=31),
+    )
+    second = store.claim(
+        request_id=request_id,
+        fingerprint="b" * 64,
+        owner_token=uuid.uuid4(),
+        now=NOW,
+    )
+
+    assert first.state is DecisionReceiptClaimState.ACQUIRED
+    assert second.state is DecisionReceiptClaimState.ACQUIRED
+    assert second.lease_generation == 1
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.request_fingerprint == "b" * 64
+
+
 def test_sqlite_takeover_preserves_first_server_retention_basis(
     service_session_factory,
 ) -> None:

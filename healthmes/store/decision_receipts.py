@@ -112,7 +112,8 @@ class DecisionReceiptStore:
             session.execute(
                 delete(DecisionRequestReceipt)
                 .where(
-                    DecisionRequestReceipt.expires_at <= current
+                    DecisionRequestReceipt.request_id == request_id,
+                    DecisionRequestReceipt.expires_at <= current,
                 )
                 .execution_options(synchronize_session=False)
             )
