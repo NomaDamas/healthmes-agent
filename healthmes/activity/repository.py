@@ -1010,6 +1010,10 @@ def lock_activity_control_device(session: Session, device_id: str) -> None:
     """Serialize one device's control boundary across PostgreSQL processes."""
     if session.get_bind().dialect.name != "postgresql":
         return
+    # Retention and backup take the shared write plane first. Keep every
+    # per-device transaction lock behind that same boundary so no caller can
+    # accidentally establish the reverse lock order.
+    lock_activity_write_plane(session)
     session.execute(
         text(
             "SELECT pg_advisory_xact_lock("

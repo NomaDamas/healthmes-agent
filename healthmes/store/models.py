@@ -634,7 +634,26 @@ class StorageObject(Base):
     """Index for a large payload stored below ``HEALTHMES_DATA_DIR``."""
 
     __tablename__ = "storage_object"
-    __table_args__ = (UniqueConstraint("relative_path", name="uq_storage_object_relative_path"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "relative_path",
+            name="uq_storage_object_relative_path",
+        ),
+        CheckConstraint(
+            "("
+            "("
+            "file_cleanup_identity IS NULL "
+            "OR CAST(file_cleanup_identity AS TEXT) = 'null'"
+            ") "
+            "AND file_cleanup_completed_at IS NULL"
+            ") OR ("
+            "purged_at IS NOT NULL "
+            "AND file_cleanup_identity IS NOT NULL "
+            "AND CAST(file_cleanup_identity AS TEXT) <> 'null'"
+            ")",
+            name="storage_object_file_cleanup_consistent",
+        ),
+    )
 
     data_class: Mapped[str_64] = mapped_column(index=True)
     relative_path: Mapped[str_255]
@@ -648,6 +667,10 @@ class StorageObject(Base):
     expires_at: Mapped[datetime | None] = mapped_column(index=True)
     safe_to_purge: Mapped[bool] = mapped_column(default=False, index=True)
     purged_at: Mapped[datetime | None] = mapped_column(index=True)
+    file_cleanup_identity: Mapped[JSONDict | None]
+    file_cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        index=True
+    )
 
 
 class WellnessEvent(Base):

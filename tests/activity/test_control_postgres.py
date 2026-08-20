@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
 import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
+import healthmes.activity.locking as locking_module
 from healthmes.activity.activitywatch import import_activitywatch
 from healthmes.activity.aggregation import (
     SUMMARY_DERIVATION_VERSION,
@@ -27,7 +31,11 @@ from healthmes.activity.contracts import (
     AppHourRecord,
     AppIntervalRecord,
 )
-from healthmes.activity.locking import lock_activity_write_plane
+from healthmes.activity.locking import (
+    global_write_plane_guard,
+    lock_activity_write_plane,
+    session_holds_write_plane,
+)
 from healthmes.activity.maintenance import delete_activity_data
 from healthmes.activity.repository import (
     APP_HOUR_EVENT,
@@ -50,6 +58,43 @@ from healthmes.store import Base, WellnessEvent, create_db_engine
 from healthmes.store.session import get_session
 
 
+def _hold_postgres_write_plane(
+    database_url: str,
+    acquired,
+    release,
+) -> None:
+    engine = create_db_engine(database_url)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    try:
+        with factory() as session:
+            lock_activity_write_plane(session)
+            session.execute(sa.text("SELECT 1"))
+            acquired.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError(
+                    "timed out waiting to release PostgreSQL write plane"
+                )
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
+def _acquire_postgres_write_plane(
+    database_url: str,
+    acquired,
+) -> None:
+    engine = create_db_engine(database_url)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    try:
+        with factory() as session:
+            lock_activity_write_plane(session)
+            session.execute(sa.text("SELECT 1"))
+            acquired.set()
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
 def _create_app_with_primed_routes(settings, freezer):
     """Compile FastAPI's lazy route schemas outside freezegun."""
     freezer.stop()
@@ -67,6 +112,518 @@ def _create_app_with_primed_routes(settings, freezer):
     finally:
         freezer.start()
     return application
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_write_plane_serializes_independent_processes() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    context = multiprocessing.get_context("spawn")
+    first_acquired = context.Event()
+    release_first = context.Event()
+    second_acquired = context.Event()
+    first = context.Process(
+        target=_hold_postgres_write_plane,
+        args=(database_url, first_acquired, release_first),
+    )
+    second = context.Process(
+        target=_acquire_postgres_write_plane,
+        args=(database_url, second_acquired),
+    )
+
+    first.start()
+    try:
+        assert first_acquired.wait(timeout=5)
+        second.start()
+        assert not second_acquired.wait(timeout=0.25)
+        release_first.set()
+        assert second_acquired.wait(timeout=5)
+    finally:
+        release_first.set()
+        first.join(timeout=5)
+        if first.is_alive():
+            first.terminate()
+            first.join(timeout=5)
+        if second.pid is not None:
+            second.join(timeout=5)
+            if second.is_alive():
+                second.terminate()
+                second.join(timeout=5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+async def test_child_task_cannot_inherit_postgres_global_guard() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    engine = create_db_engine(
+        database_url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+
+    async def inspect_child_context(connection) -> None:
+        with Session(bind=connection) as child_session:
+            assert not session_holds_write_plane(child_session)
+        assert not locking_module._connection_holds_write_fence(connection)
+
+    try:
+        with global_write_plane_guard(engine) as guard_connection:
+            assert guard_connection is not None
+            with Session(bind=guard_connection) as parent_session:
+                assert session_holds_write_plane(parent_session)
+            assert locking_module._connection_holds_write_fence(
+                guard_connection
+            )
+            await asyncio.create_task(
+                inspect_child_context(guard_connection)
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_same_owner_reuses_postgres_global_guard_connection() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    engine = create_db_engine(
+        database_url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+
+    try:
+        with global_write_plane_guard(engine) as outer_connection:
+            assert outer_connection is not None
+            with global_write_plane_guard(
+                engine,
+                timeout_seconds=0.02,
+            ) as inner_connection:
+                assert inner_connection is outer_connection
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("guard_name", "process_lock_name"),
+    (
+        ("global_write_plane_guard", "_ACTIVITY_WRITE_LOCK"),
+        ("payload_generation_guard", "_PAYLOAD_GENERATION_LOCK"),
+    ),
+)
+def test_postgres_guard_new_engine_uses_remaining_deadline(
+    monkeypatch,
+    guard_name,
+    process_lock_name,
+) -> None:
+    clock = [100.0]
+    captured: dict[str, object] = {}
+    connection_closed = False
+
+    class FakeConnection:
+        closed = False
+        invalidated = False
+        dialect = type("FakeDialect", (), {"name": "postgresql"})()
+
+        def __init__(self) -> None:
+            self.info: dict[str, object] = {}
+            self.in_transaction_state = False
+
+        def in_transaction(self) -> bool:
+            return self.in_transaction_state
+
+        def get_isolation_level(self) -> str:
+            return "READ COMMITTED"
+
+        def execution_options(self, **_options):
+            return self
+
+        def commit(self) -> None:
+            self.in_transaction_state = False
+
+        def rollback(self) -> None:
+            self.in_transaction_state = False
+
+        def close(self) -> None:
+            nonlocal connection_closed
+            connection_closed = True
+            self.closed = True
+
+    class FakeEngine:
+        def connect(self) -> FakeConnection:
+            return FakeConnection()
+
+        def dispose(self) -> None:
+            captured["disposed"] = True
+
+    @contextmanager
+    def delayed_process_lock(deadline):
+        assert deadline == pytest.approx(101.0)
+        clock[0] += 0.4
+        yield
+
+    process_lock = getattr(locking_module, process_lock_name)
+    real_process_acquire = process_lock.acquire
+
+    def delayed_process_acquire(
+        lease,
+        *,
+        timeout_seconds,
+        deadline=None,
+    ):
+        assert deadline == pytest.approx(101.0)
+        acquired = real_process_acquire(
+            lease,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        )
+        clock[0] += 0.4
+        return acquired
+
+    def fake_create_engine(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeEngine()
+
+    monkeypatch.setattr(locking_module, "steady_time", lambda: clock[0])
+    if guard_name == "global_write_plane_guard":
+        monkeypatch.setattr(
+            locking_module,
+            "_activity_write_lock_until",
+            delayed_process_lock,
+        )
+    else:
+        monkeypatch.setattr(
+            process_lock,
+            "acquire",
+            delayed_process_acquire,
+        )
+    monkeypatch.setattr(locking_module, "create_engine", fake_create_engine)
+    monkeypatch.setattr(
+        locking_module,
+        "try_postgres_advisory_lock",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        locking_module,
+        "release_postgres_advisory_lock",
+        lambda *_args: True,
+    )
+
+    guard = getattr(locking_module, guard_name)
+    with guard(
+        "postgresql+psycopg://healthmes@example/healthmes",
+        timeout_seconds=1.0,
+    ) as connection:
+        assert connection is not None
+
+    assert captured["pool_timeout"] == pytest.approx(0.6)
+    assert captured["connect_args"] == {"connect_timeout": 1}
+    assert captured["disposed"] is True
+    assert connection_closed is True
+
+
+@pytest.mark.parametrize(
+    ("guard_name", "timeout_message"),
+    (
+        (
+            "global_write_plane_guard",
+            "PostgreSQL activity write-plane connection",
+        ),
+        (
+            "payload_generation_guard",
+            "PostgreSQL payload-generation connection",
+        ),
+    ),
+)
+def test_postgres_guard_supplied_engine_checkout_cannot_exceed_deadline(
+    monkeypatch,
+    guard_name,
+    timeout_message,
+) -> None:
+    source = sa.create_engine(
+        "postgresql+psycopg://healthmes@example/healthmes"
+    )
+    late_connection_closed = threading.Event()
+
+    class FakeConnection:
+        closed = False
+        invalidated = False
+        dialect = type("FakeDialect", (), {"name": "postgresql"})()
+
+        def __init__(self) -> None:
+            self.info: dict[str, object] = {}
+
+        def in_transaction(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+            late_connection_closed.set()
+
+    late_connection = FakeConnection()
+
+    def slow_connect():
+        time.sleep(0.08)
+        return late_connection
+
+    monkeypatch.setattr(source, "connect", slow_connect)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match=timeout_message,
+        ):
+            guard = getattr(locking_module, guard_name)
+            with guard(
+                source,
+                timeout_seconds=0.02,
+            ):
+                pytest.fail("slow checkout unexpectedly entered the guard")
+    finally:
+        source.dispose()
+
+    assert time.monotonic() - started < 0.15
+    assert late_connection_closed.wait(timeout=1)
+
+
+def test_postgres_checkout_timeouts_bound_live_workers() -> None:
+    release = threading.Event()
+    state_lock = threading.Lock()
+    started = 0
+    closed = 0
+
+    class FakeConnection:
+        def close(self) -> None:
+            nonlocal closed
+            with state_lock:
+                closed += 1
+
+    class BlockingEngine:
+        def connect(self):
+            nonlocal started
+            with state_lock:
+                started += 1
+            assert release.wait(timeout=5)
+            return FakeConnection()
+
+    engine = BlockingEngine()
+    try:
+        for _ in range(12):
+            with pytest.raises(
+                TimeoutError,
+                match="bounded PostgreSQL checkout",
+            ):
+                locking_module._connect_postgres_before_deadline(
+                    engine,  # type: ignore[arg-type]
+                    deadline=locking_module.steady_time() + 0.01,
+                    timeout_message="bounded PostgreSQL checkout",
+                    dispose_engine=False,
+                )
+
+        assert started == locking_module._POSTGRES_CONNECT_WORKER_LIMIT
+        live_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "healthmes-postgres-guard-connect"
+        ]
+        assert (
+            len(live_workers)
+            <= locking_module._POSTGRES_CONNECT_WORKER_LIMIT
+        )
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with state_lock:
+            if closed == started:
+                break
+        time.sleep(0.01)
+    assert closed == started
+
+
+@pytest.mark.parametrize(
+    "guard_name",
+    ("postgres_activity_write_plane_guard", "payload_generation_guard"),
+)
+def test_postgres_advisory_cleanup_failure_retires_caller_connection(
+    monkeypatch,
+    guard_name,
+) -> None:
+    class BrokenPoolConnection:
+        def __init__(self) -> None:
+            self.invalidate_calls = 0
+
+        def invalidate(self, _cause) -> None:
+            self.invalidate_calls += 1
+            raise RuntimeError("injected pool invalidate failure")
+
+    class FakeEngine:
+        url = sa.make_url(
+            "postgresql+psycopg://healthmes@example/healthmes"
+        )
+
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+
+        def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    class FakeConnection:
+        dialect = type("FakeDialect", (), {"name": "postgresql"})()
+
+        def __init__(self) -> None:
+            self.engine = FakeEngine()
+            self.info: dict[str, object] = {}
+            self.closed = False
+            self.invalidated = False
+            self.invalidate_calls = 0
+            self.detached = False
+            self.pool_connection = BrokenPoolConnection()
+
+        @property
+        def connection(self):
+            return self.pool_connection
+
+        def in_transaction(self) -> bool:
+            return False
+
+        def get_isolation_level(self) -> str:
+            return "READ COMMITTED"
+
+        def execution_options(self, **_options):
+            return self
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            pass
+
+        def invalidate(self, _cause=None) -> None:
+            self.invalidate_calls += 1
+            raise RuntimeError("injected connection invalidate failure")
+
+        def detach(self) -> None:
+            self.detached = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+    monkeypatch.setattr(locking_module, "Connection", FakeConnection)
+    monkeypatch.setattr(
+        locking_module,
+        "try_postgres_advisory_lock",
+        lambda *_args: True,
+    )
+
+    def fail_unlock(*_args):
+        raise RuntimeError("injected advisory unlock failure")
+
+    monkeypatch.setattr(
+        locking_module,
+        "release_postgres_advisory_lock",
+        fail_unlock,
+    )
+
+    guard = getattr(locking_module, guard_name)
+    with pytest.raises(
+        RuntimeError,
+        match="connection was retired",
+    ):
+        with guard(
+            connection,  # type: ignore[arg-type]
+            timeout_seconds=0.2,
+            poll_seconds=0.01,
+        ):
+            pass
+
+    assert connection.invalidate_calls == 1
+    assert connection.pool_connection.invalidate_calls == 1
+    assert connection.detached is True
+    assert connection.closed is True
+    assert connection.engine.dispose_calls == 0
+
+
+def test_postgres_guard_timeout_does_not_unlock_an_unacquired_lock(
+    monkeypatch,
+) -> None:
+    class FakeEngine:
+        url = sa.make_url(
+            "postgresql+psycopg://healthmes@example/healthmes"
+        )
+
+    class FakeConnection:
+        dialect = type("FakeDialect", (), {"name": "postgresql"})()
+
+        def __init__(self) -> None:
+            self.engine = FakeEngine()
+            self.info: dict[str, object] = {}
+            self.closed = False
+            self.invalidated = False
+            self.invalidate_calls = 0
+
+        def in_transaction(self) -> bool:
+            return False
+
+        def get_isolation_level(self) -> str:
+            return "READ COMMITTED"
+
+        def execution_options(self, **_options):
+            return self
+
+        def invalidate(self, _cause=None) -> None:
+            self.invalidate_calls += 1
+            self.invalidated = True
+
+    connection = FakeConnection()
+    unlock_calls = 0
+
+    def unexpected_unlock(*_args):
+        nonlocal unlock_calls
+        unlock_calls += 1
+        return False
+
+    monkeypatch.setattr(locking_module, "Connection", FakeConnection)
+    monkeypatch.setattr(
+        locking_module,
+        "try_postgres_advisory_lock",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        locking_module,
+        "release_postgres_advisory_lock",
+        unexpected_unlock,
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match="timed out waiting for the activity write plane",
+    ):
+        with locking_module.postgres_activity_write_plane_guard(
+            connection,  # type: ignore[arg-type]
+            timeout_seconds=0.01,
+            poll_seconds=0.001,
+        ):
+            pytest.fail("guard unexpectedly acquired")
+
+    assert unlock_calls == 0
+    assert connection.invalidate_calls == 0
+    assert connection.invalidated is False
 
 
 @pytest.mark.parametrize(
@@ -456,7 +1013,6 @@ def test_activitywatch_reservation_waits_for_first_disable_before_network() -> N
     device_id = "mac-first-disable-race"
     network_called = threading.Event()
     worker_started = threading.Event()
-    worker_pid: list[int] = []
     outcome: list[str] = []
 
     class FakeActivityWatchClient:
@@ -489,9 +1045,6 @@ def test_activitywatch_reservation_waits_for_first_disable_before_network() -> N
 
     def run_import() -> None:
         with factory() as session:
-            worker_pid.append(
-                int(session.scalar(sa.text("SELECT pg_backend_pid()")))
-            )
             worker_started.set()
             try:
                 import_activitywatch(
@@ -526,26 +1079,8 @@ def test_activitywatch_reservation_waits_for_first_disable_before_network() -> N
             worker.start()
             assert worker_started.wait(timeout=5)
 
-            deadline = time.monotonic() + 5
-            waiting_for_advisory_lock = False
-            while time.monotonic() < deadline and worker.is_alive():
-                wait_event = writer.execute(
-                    sa.text(
-                        "SELECT wait_event_type, wait_event "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": worker_pid[0]},
-                ).one_or_none()
-                if wait_event is not None and tuple(wait_event) == (
-                    "Lock",
-                    "advisory",
-                ):
-                    waiting_for_advisory_lock = True
-                    break
-                time.sleep(0.05)
-
-            assert waiting_for_advisory_lock
-            assert not network_called.is_set()
+            assert not network_called.wait(timeout=0.2)
+            assert worker.is_alive()
             assert outcome == []
             writer.commit()
             worker.join(timeout=5)
@@ -678,7 +1213,6 @@ def test_concurrent_devices_serialize_one_summary_scope() -> None:
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    worker_pid: list[int] = []
     worker_started = threading.Event()
     outcome: list[str] = []
     failures: list[BaseException] = []
@@ -704,9 +1238,6 @@ def test_concurrent_devices_serialize_one_summary_scope() -> None:
 
     def run_second_ingest() -> None:
         with factory() as session:
-            worker_pid.append(
-                int(session.scalar(sa.text("SELECT pg_backend_pid()")))
-            )
             worker_started.set()
             try:
                 ingest_activity_batch(
@@ -735,25 +1266,8 @@ def test_concurrent_devices_serialize_one_summary_scope() -> None:
             worker.start()
             assert worker_started.wait(timeout=5)
 
-            deadline = time.monotonic() + 5
-            waiting_for_advisory_lock = False
-            while time.monotonic() < deadline and worker.is_alive():
-                wait_event = first.execute(
-                    sa.text(
-                        "SELECT wait_event_type, wait_event "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": worker_pid[0]},
-                ).one_or_none()
-                if wait_event is not None and tuple(wait_event) == (
-                    "Lock",
-                    "advisory",
-                ):
-                    waiting_for_advisory_lock = True
-                    break
-                time.sleep(0.05)
-
-            assert waiting_for_advisory_lock
+            worker.join(timeout=0.2)
+            assert worker.is_alive()
             assert outcome == []
             first.commit()
             worker.join(timeout=5)
@@ -944,16 +1458,12 @@ def test_ios_status_waits_for_write_plane_before_device_lock() -> None:
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     device_id = "ios-lock-order"
-    worker_pid: list[int] = []
     worker_started = threading.Event()
     outcome: list[str] = []
     failures: list[BaseException] = []
 
     def write_ios_status() -> None:
         with factory() as session:
-            worker_pid.append(
-                int(session.scalar(sa.text("SELECT pg_backend_pid()")))
-            )
             worker_started.set()
             try:
                 update_collection_status(
@@ -984,25 +1494,8 @@ def test_ios_status_waits_for_write_plane_before_device_lock() -> None:
             worker.start()
             assert worker_started.wait(timeout=5)
 
-            deadline = time.monotonic() + 5
-            waiting_for_write_plane = False
-            while time.monotonic() < deadline and worker.is_alive():
-                wait_event = first.execute(
-                    sa.text(
-                        "SELECT wait_event_type, wait_event "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": worker_pid[0]},
-                ).one_or_none()
-                if wait_event is not None and tuple(wait_event) == (
-                    "Lock",
-                    "advisory",
-                ):
-                    waiting_for_write_plane = True
-                    break
-                time.sleep(0.05)
-
-            assert waiting_for_write_plane
+            worker.join(timeout=0.2)
+            assert worker.is_alive()
             assert first.scalar(
                 sa.text(
                     "SELECT pg_try_advisory_xact_lock("
@@ -1049,16 +1542,12 @@ def test_control_delete_waits_for_prior_writer_and_removes_its_row() -> None:
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     device_id = "control-delete-order"
-    worker_pid: list[int] = []
     worker_started = threading.Event()
     deleted_counts: list[int] = []
     failures: list[BaseException] = []
 
     def delete_control() -> None:
         with factory() as session:
-            worker_pid.append(
-                int(session.scalar(sa.text("SELECT pg_backend_pid()")))
-            )
             worker_started.set()
             try:
                 report = delete_activity_data(
@@ -1092,25 +1581,8 @@ def test_control_delete_waits_for_prior_writer_and_removes_its_row() -> None:
             worker.start()
             assert worker_started.wait(timeout=5)
 
-            deadline = time.monotonic() + 5
-            waiting_for_write_plane = False
-            while time.monotonic() < deadline and worker.is_alive():
-                wait_event = writer.execute(
-                    sa.text(
-                        "SELECT wait_event_type, wait_event "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": worker_pid[0]},
-                ).one_or_none()
-                if wait_event is not None and tuple(wait_event) == (
-                    "Lock",
-                    "advisory",
-                ):
-                    waiting_for_write_plane = True
-                    break
-                time.sleep(0.05)
-
-            assert waiting_for_write_plane
+            worker.join(timeout=0.2)
+            assert worker.is_alive()
             writer.commit()
             worker.join(timeout=5)
 

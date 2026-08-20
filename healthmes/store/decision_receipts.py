@@ -105,7 +105,10 @@ class DecisionReceiptStore:
         current = _as_utc(now)
         initial_requested_at = _as_utc(requested_at or current)
         expired = False
-        with session_scope(self._session_factory) as session:
+        with activity_write_lock(), session_scope(
+            self._session_factory
+        ) as session:
+            lock_activity_write_plane(session)
             session.execute(
                 delete(DecisionRequestReceipt)
                 .where(
@@ -282,7 +285,10 @@ class DecisionReceiptStore:
         legacy_fingerprint: str | None = None,
     ) -> None:
         current = _as_utc(now)
-        with session_scope(self._session_factory) as session:
+        with activity_write_lock(), session_scope(
+            self._session_factory
+        ) as session:
+            lock_activity_write_plane(session)
             receipt = self._locked_receipt(session, request_id)
             if receipt is None:
                 return
@@ -316,7 +322,10 @@ class DecisionReceiptStore:
 
         current = _as_utc(now)
         expired = False
-        with session_scope(self._session_factory) as session:
+        with activity_write_lock(), session_scope(
+            self._session_factory
+        ) as session:
+            lock_activity_write_plane(session)
             receipt = self._locked_receipt(session, request_id)
             if receipt is None:
                 raise DecisionReceiptOwnershipError(
@@ -420,6 +429,7 @@ class DecisionReceiptStore:
             DecisionRequestReceipt.request_id == request_id
         )
         if session.get_bind().dialect.name == "postgresql":
+            lock_activity_write_plane(session)
             statement = statement.with_for_update()
         return session.scalar(statement)
 
@@ -436,6 +446,9 @@ def scrub_decision_receipt_results(
     current = _as_utc(now)
     if batch_size < 1:
         raise ValueError("decision receipt batch_size must be positive")
+
+    if session.get_bind().dialect.name == "postgresql" and not dry_run:
+        lock_activity_write_plane(session)
 
     candidates = 0
     last_id: uuid.UUID | None = None

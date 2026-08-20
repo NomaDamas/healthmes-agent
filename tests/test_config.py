@@ -32,6 +32,9 @@ ALL_ENV_VARS = [
     "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
     "HEALTHMES_PUBLIC_BASE_URL",
     "HEALTHMES_DATA_DIR",
+    "HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS",
+    "HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES",
+    "HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES",
     "HEALTHMES_PORT",
     "HEALTHMES_HOST",
     "HEALTHMES_API_TOKEN",
@@ -42,6 +45,7 @@ ALL_ENV_VARS = [
     "HEALTHMES_TIMEZONE",
     "HEALTHMES_BACKUP_DIR",
     "HEALTHMES_BACKUP_PASSPHRASE",
+    "HEALTHMES_BACKUP_POSTGRES_TOOL_TIMEOUT_SECONDS",
     "HEALTHMES_OW_DATABASE_URL",
     "HEALTHMES_HERMES_HOME",
     "HEALTHMES_QUIET_HOURS_START",
@@ -99,6 +103,9 @@ def test_defaults(monkeypatch) -> None:
     assert settings.decision_owner_principal_id == "owner"
     assert settings.public_base_url == "http://localhost:8100"
     assert settings.data_dir == Path("data")
+    assert settings.storage_maintenance_timeout_seconds == 10.0
+    assert settings.storage_maintenance_max_hash_bytes == 256 * 1024 * 1024
+    assert settings.storage_maintenance_max_directory_entries == 4096
     assert settings.port == 8100
     # Localhost-native bind + no token by default: the surface stays off the
     # network unless the operator opts in (and then a token is enforced).
@@ -112,6 +119,9 @@ def test_defaults(monkeypatch) -> None:
     # Backup seam (docs/PLAN.md §9): everything optional by default.
     assert settings.backup_dir is None  # -> {data_dir}/backups
     assert settings.backup_passphrase.get_secret_value() == ""
+    assert settings.backup_max_identity_depth == 128
+    assert settings.backup_identity_traversal_timeout_seconds == 300
+    assert settings.backup_postgres_tool_timeout_seconds == 1800
     assert settings.ow_database_url is None
     assert settings.hermes_home is None
     assert settings.quiet_hours_start == datetime.time(22, 30)
@@ -164,6 +174,61 @@ def test_quiet_hours_and_alert_budget_from_env(monkeypatch) -> None:
     assert settings.alert_cooldown_minutes == 120
 
 
+def test_storage_maintenance_budget_from_env(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS",
+        "12.5",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES",
+        "1048576",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES",
+        "128",
+    )
+
+    settings = _clean_settings()
+
+    assert settings.storage_maintenance_timeout_seconds == 12.5
+    assert settings.storage_maintenance_max_hash_bytes == 1048576
+    assert settings.storage_maintenance_max_directory_entries == 128
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_storage_maintenance_timeout_must_be_positive_and_finite(
+    monkeypatch,
+    value,
+) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS",
+        value,
+    )
+
+    with pytest.raises(ValueError):
+        _clean_settings()
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES", "0"),
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES", "-1"),
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES", "0"),
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES", "-1"),
+    ],
+)
+def test_storage_maintenance_integer_budgets_must_be_positive(
+    monkeypatch,
+    variable,
+    value,
+) -> None:
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(ValueError):
+        _clean_settings()
+
+
 def test_alert_budget_must_be_non_negative() -> None:
     with pytest.raises(ValueError):
         _clean_settings(alert_daily_budget=-1)
@@ -201,6 +266,10 @@ def test_timezone_and_backup_settings_from_env(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_BACKUP_DIR", "/tmp/hm-backups")
     monkeypatch.setenv("HEALTHMES_BACKUP_PASSPHRASE", "correct horse battery staple")
     monkeypatch.setenv(
+        "HEALTHMES_BACKUP_POSTGRES_TOOL_TIMEOUT_SECONDS",
+        "2400.5",
+    )
+    monkeypatch.setenv(
         "HEALTHMES_OW_DATABASE_URL", "postgresql://ow:ow@localhost:5432/open-wearables"
     )
     monkeypatch.setenv("HEALTHMES_HERMES_HOME", "/tmp/hermes-home")
@@ -210,9 +279,24 @@ def test_timezone_and_backup_settings_from_env(monkeypatch) -> None:
     assert settings.timezone == "Asia/Seoul"
     assert settings.backup_dir == Path("/tmp/hm-backups")
     assert settings.backup_passphrase.get_secret_value() == "correct horse battery staple"
+    assert settings.backup_postgres_tool_timeout_seconds == 2400.5
     assert "correct horse battery staple" not in repr(settings)
     assert settings.ow_database_url == "postgresql://ow:ow@localhost:5432/open-wearables"
     assert settings.hermes_home == Path("/tmp/hermes-home")
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_postgres_backup_tool_timeout_must_be_positive_and_finite(
+    monkeypatch,
+    value,
+) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_BACKUP_POSTGRES_TOOL_TIMEOUT_SECONDS",
+        value,
+    )
+
+    with pytest.raises(ValueError):
+        _clean_settings()
 
 
 def test_blank_optional_env_vars_behave_like_unset(monkeypatch) -> None:

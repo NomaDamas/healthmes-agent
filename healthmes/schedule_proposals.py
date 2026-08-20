@@ -6,6 +6,10 @@ import uuid
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.calendars.adjustments_logic import verify_reply_handle
 from healthmes.store.enums import ProposalStatus
 from healthmes.store.models import ScheduleProposal
@@ -47,29 +51,33 @@ def _transition_locked_postgres(
     now: dt.datetime | None,
     surface: str | None = None,
 ) -> ScheduleProposal:
-    proposal = session.scalar(
-        select(ScheduleProposal)
-        .where(ScheduleProposal.id == proposal_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if proposal is None:
-        raise ScheduleProposalResolutionError("not_found")
-    current = _as_utc(
-        now or session.scalar(select(func.clock_timestamp())) or dt.datetime.now(dt.UTC)
-    )
-    expires_at = _proposal_expiry(proposal)
-    if proposal.status is not ProposalStatus.PROPOSED:
-        raise ScheduleProposalResolutionError("not_proposed")
-    if expires_at is None or current >= expires_at:
-        raise ScheduleProposalResolutionError("expired")
-    proposal.status = target
-    if surface is not None:
-        proposal.decided_at = current
-        proposal.decision_surface = surface
-    session.flush()
-    session.refresh(proposal)
-    return proposal
+    with activity_write_lock():
+        lock_activity_write_plane(session)
+        proposal = session.scalar(
+            select(ScheduleProposal)
+            .where(ScheduleProposal.id == proposal_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if proposal is None:
+            raise ScheduleProposalResolutionError("not_found")
+        current = _as_utc(
+            now
+            or session.scalar(select(func.clock_timestamp()))
+            or dt.datetime.now(dt.UTC)
+        )
+        expires_at = _proposal_expiry(proposal)
+        if proposal.status is not ProposalStatus.PROPOSED:
+            raise ScheduleProposalResolutionError("not_proposed")
+        if expires_at is None or current >= expires_at:
+            raise ScheduleProposalResolutionError("expired")
+        proposal.status = target
+        if surface is not None:
+            proposal.decided_at = current
+            proposal.decision_surface = surface
+        session.flush()
+        session.refresh(proposal)
+        return proposal
 
 
 def _transition_compare_and_swap(

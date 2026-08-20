@@ -817,12 +817,13 @@ def test_free_text_is_automatically_analyzed_and_retry_is_idempotent(
     provider = FakeAnalysis()
     client.app.state.nutrition_analysis_provider = provider
     operation_id = str(uuid.uuid4())
+    observed_at = _recent_utc()
     body = {
         "operation_id": operation_id,
         "intent": "log_consumed",
         "modality": "text",
-        "observed_at": "2026-08-06T08:30:00+09:00",
-        "timezone": "Asia/Seoul",
+        "observed_at": observed_at,
+        "timezone": "UTC",
         "source": "ios-device",
         "source_text": "아침에 바나나와 우유를 먹었어",
         "allow_remote_analysis": False,
@@ -2299,8 +2300,10 @@ def test_legacy_warnings_are_migrated_for_the_remaining_raw_ttl(
 ):
     warning = "portion is uncertain"
     item_warning = "milk type is unknown"
+    observed_at = datetime.now(UTC) - timedelta(days=1)
     body = _text_interaction(
-        observed_at="2026-08-06T12:30:00+09:00",
+        observed_at=observed_at.isoformat(),
+        timezone="UTC",
         warnings=[warning],
     )
     body["items"][0]["warnings"] = [item_warning]
@@ -2331,7 +2334,7 @@ def test_legacy_warnings_are_migrated_for_the_remaining_raw_ttl(
     run_storage_maintenance(
         session,
         client.app.state.settings,
-        now=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        now=observed_at + timedelta(days=1),
     )
     session.commit()
     session.expire_all()

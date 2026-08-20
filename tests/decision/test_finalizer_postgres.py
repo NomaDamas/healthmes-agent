@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import healthmes.decision.finalizer as finalizer_module
 import healthmes.storage.service as storage_service
+from healthmes.activity import locking as activity_locking
 from healthmes.activity.locking import (
     lock_activity_write_plane,
     postgres_activity_write_plane_guard,
@@ -718,10 +719,15 @@ def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
             retention_worker.start()
             assert retention_holds_write_plane.wait(timeout=5)
             dispatch_worker.start()
-            assert sender_entered.wait(timeout=5)
-            assert finalizer_waiting_for_write_plane.wait(timeout=5)
+            # Dispatch must wait at the shared write-plane fence rather than
+            # taking TriggerEvent first and making the finalizer complete the
+            # opposite half of a lock cycle.
+            assert not sender_entered.wait(timeout=0.2)
+            assert not finalizer_waiting_for_write_plane.is_set()
 
             release_retention.set()
+            assert sender_entered.wait(timeout=5)
+            assert finalizer_waiting_for_write_plane.wait(timeout=5)
             retention_worker.join(timeout=10)
             dispatch_worker.join(timeout=10)
 
@@ -1623,20 +1629,17 @@ def test_cleanup_failure_does_not_reverse_committed_success(
     monkeypatch,
 ) -> None:
     with _postgres_store(pool_size=1) as store:
-        original_execute = sa.engine.Connection.execute
+        original_unlock = activity_locking.release_postgres_advisory_lock
         original_invalidate = sa.engine.Connection.invalidate
         unlock_failed = False
         invalidate_failed = False
 
-        def fail_unlock(connection, statement, *args, **kwargs):
+        def fail_unlock(connection, key):
             nonlocal unlock_failed
-            if (
-                not unlock_failed
-                and "pg_advisory_unlock" in str(statement)
-            ):
+            if not unlock_failed:
                 unlock_failed = True
                 raise RuntimeError("injected unlock failure")
-            return original_execute(connection, statement, *args, **kwargs)
+            return original_unlock(connection, key)
 
         def fail_invalidate(connection, exception=None):
             nonlocal invalidate_failed
@@ -1645,7 +1648,11 @@ def test_cleanup_failure_does_not_reverse_committed_success(
                 raise RuntimeError("injected invalidate failure")
             return original_invalidate(connection, exception)
 
-        monkeypatch.setattr(sa.engine.Connection, "execute", fail_unlock)
+        monkeypatch.setattr(
+            activity_locking,
+            "release_postgres_advisory_lock",
+            fail_unlock,
+        )
         monkeypatch.setattr(
             sa.engine.Connection,
             "invalidate",

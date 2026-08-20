@@ -220,6 +220,12 @@ Apple prerequisites, and verification criteria are tracked in
   `HEALTHMES_OW_DATABASE_URL`, creation still succeeds but emits an explicit
   partial-backup warning; the manifest and storage status report that the
   Open Wearables database is not recoverable from that snapshot.
+  HealthMes DB + media + raw ingest share one cooperative write-fenced
+  recovery point. Restore strictly validates and stages all included
+  components, uses rollback-capable local swaps, and fails before mutation
+  when a required target is missing. PostgreSQL plus another store requires
+  the explicit `--allow-cross-store-partial` operator acknowledgement because
+  distributed atomic commit is unavailable.
   `healthmes backup
   create/list/restore` CLI + weekly scheduler job. The `BackupProvider`
   protocol is the seam for a future `RemoteVaultProvider` (ciphertext-only
@@ -393,6 +399,10 @@ uv run healthmes backup create             # age-encrypted snapshot
 uv run healthmes backup list
 uv run healthmes backup restore <name>     # dry-run; add --yes to apply
 ```
+
+Stop affected services before `--yes`. Applied restore reports the exact
+recovered/skipped component scope; cross-store PostgreSQL recovery fails
+closed unless explicitly acknowledged with `--allow-cross-store-partial`.
 
 With `HEALTHMES_VAULT_*` configured (S3-compatible bucket — AWS/R2/MinIO),
 snapshots can also replicate off-machine as ciphertext only:

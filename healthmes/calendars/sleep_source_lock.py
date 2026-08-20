@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import sqlalchemy as sa
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    _raise_postgres_advisory_cleanup_failure,
+    acquire_postgres_advisory_lock,
+    release_postgres_advisory_lock,
+)
 from healthmes.store.enums import CalendarSource
 
 
@@ -29,13 +32,21 @@ def lock_sleep_source_key(
     engine = bind.engine if isinstance(bind, Connection) else bind
     connection = engine.connect()
     try:
-        connection.execute(
-            sa.text("SELECT pg_advisory_lock(hashtextextended(:source_key, 0))"),
-            {"source_key": f"{calendar_source.value}:{source_key}"},
+        acquire_postgres_advisory_lock(
+            connection,
+            f"{calendar_source.value}:{source_key}",
         )
-    except SQLAlchemyError:
-        connection.close()
-        raise
+    except Exception as exc:
+        try:
+            _raise_postgres_advisory_cleanup_failure(
+                connection,
+                cause=exc,
+                context=(
+                    "failed to acquire PostgreSQL sleep-source advisory lock"
+                ),
+            )
+        finally:
+            connection.close()
     return connection
 
 
@@ -45,11 +56,20 @@ def unlock_sleep_source_key(
     source_key: str,
 ) -> None:
     try:
-        released = connection.scalar(
-            sa.text("SELECT pg_advisory_unlock(hashtextextended(:source_key, 0))"),
-            {"source_key": f"{calendar_source.value}:{source_key}"},
-        )
-        if released is not True:
-            raise AdvisoryLockReleaseError(source_key)
+        try:
+            released = release_postgres_advisory_lock(
+                connection,
+                f"{calendar_source.value}:{source_key}",
+            )
+            if released is not True:
+                raise AdvisoryLockReleaseError(source_key)
+        except Exception as exc:
+            _raise_postgres_advisory_cleanup_failure(
+                connection,
+                cause=exc,
+                context=(
+                    "failed to release PostgreSQL sleep-source advisory lock"
+                ),
+            )
     finally:
         connection.close()

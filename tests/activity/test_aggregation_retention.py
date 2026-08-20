@@ -2598,7 +2598,6 @@ def test_daily_retention_refreshes_following_baselines(session) -> None:
             ),
             now=datetime(2026, 8, day, 13, tzinfo=UTC),
         )
-
     target = next(
         row
         for row in session.scalars(
@@ -2646,6 +2645,7 @@ def test_storage_maintenance_delegates_activity_expiry_before_generic_purge(
             ),
             now=datetime(2026, 8, day, 13, tzinfo=UTC),
         )
+    session.commit()
 
     target = next(
         row

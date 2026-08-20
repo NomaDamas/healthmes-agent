@@ -7,15 +7,30 @@ the derived viewer ``?token=`` for GET only — so decision/report pages can
 embed media).
 """
 
+import asyncio
+import os
 import re
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from threading import Event
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from starlette.datastructures import FormData
 
+from healthmes import durable_files as durable_files_mod
+from healthmes.activity.locking import (
+    global_write_plane_guard as real_global_write_plane_guard,
+)
+from healthmes.api import media as media_mod
 from healthmes.api.auth import viewer_token
 from healthmes.app import create_app
 from healthmes.config import Settings
+from healthmes.store import StorageObject
 
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body" * 32
 MEDIA_PATH_RE = re.compile(r"^media/\d{4}/\d{2}/[0-9a-f]{32}\.[a-z0-9]+$")
@@ -32,6 +47,13 @@ def _stored_files(settings) -> list:
     if not media_root.exists():
         return []
     return [path for path in media_root.rglob("*") if path.is_file()]
+
+
+def _staged_files(settings) -> list:
+    staging_root = settings.data_dir / ".staging" / "media"
+    if not staging_root.exists():
+        return []
+    return [path for path in staging_root.rglob("*.part") if path.is_file()]
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +273,386 @@ def test_upload_rejects_empty_file(client, settings):
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "empty_file"
     assert _stored_files(settings) == []
+
+
+def test_upload_partial_staging_write_failure_removes_bytes_and_index(
+    client,
+    engine,
+    settings,
+    monkeypatch,
+):
+    def write_part_then_fail(output, payload):
+        output.write(payload[:7])
+        raise OSError("injected partial media staging write")
+
+    monkeypatch.setattr(media_mod, "write_all", write_part_then_fail)
+
+    with pytest.raises(OSError, match="injected partial media staging write"):
+        _upload(client)
+
+    assert _staged_files(settings) == []
+    assert _stored_files(settings) == []
+    with Session(engine) as verification:
+        assert verification.scalars(select(StorageObject)).all() == []
+
+
+def test_upload_publish_failure_before_destination_removes_staging(
+    client,
+    engine,
+    settings,
+    monkeypatch,
+):
+    def fail_before_destination(_staged, _destination):
+        raise durable_files_mod.DurablePublishError(
+            "injected pre-publication failure",
+            destination_created=False,
+            identity=None,
+        )
+
+    monkeypatch.setattr(
+        media_mod,
+        "durable_publish_no_clobber",
+        fail_before_destination,
+    )
+
+    with pytest.raises(
+        durable_files_mod.DurablePublishError,
+        match="injected pre-publication failure",
+    ):
+        _upload(client)
+
+    assert _staged_files(settings) == []
+    assert _stored_files(settings) == []
+    with Session(engine) as verification:
+        assert verification.scalars(select(StorageObject)).all() == []
+
+
+def test_upload_publish_directory_fsync_failure_accepts_and_indexes_staging_fallback(
+    client,
+    engine,
+    settings,
+    monkeypatch,
+):
+    observed_at = datetime(2026, 8, 18, 4, 30, tzinfo=UTC)
+    destination_dir = settings.data_dir / "media" / "2026" / "08"
+    destination_dir.mkdir(parents=True)
+    real_fsync_directory = durable_files_mod._fsync_directory
+
+    def fail_destination_directory_fsync(path, descriptor):
+        if path == destination_dir:
+            raise OSError("injected media destination-directory fsync failure")
+        return real_fsync_directory(path, descriptor)
+
+    monkeypatch.setattr(media_mod, "utc_now", lambda: observed_at)
+    monkeypatch.setattr(
+        durable_files_mod,
+        "_fsync_directory",
+        fail_destination_directory_fsync,
+    )
+
+    response = _upload(client)
+
+    assert response.status_code == 201
+    published = _stored_files(settings)
+    staged = _staged_files(settings)
+    assert len(published) == 1
+    assert len(staged) == 1
+    assert published[0].read_bytes() == JPEG_BYTES
+    assert staged[0].read_bytes() == JPEG_BYTES
+    assert published[0].stat().st_ino == staged[0].stat().st_ino
+    with Session(engine) as verification:
+        stored = verification.scalars(select(StorageObject)).one()
+        assert stored.relative_path == response.json()["media_path"]
+
+
+def test_upload_lock_failure_removes_sensitive_staging_file(
+    client,
+    settings,
+    monkeypatch,
+):
+    @contextmanager
+    def failing_lock(_database_url):
+        raise OSError("injected media lock failure")
+        yield
+
+    monkeypatch.setattr(media_mod, "global_write_plane_guard", failing_lock)
+
+    with pytest.raises(OSError, match="injected media lock failure"):
+        _upload(client)
+
+    assert _staged_files(settings) == []
+    assert _stored_files(settings) == []
+
+
+def test_upload_registration_failure_removes_published_and_staging_files(
+    client,
+    settings,
+    monkeypatch,
+):
+    def fail_registration(*_args, **_kwargs):
+        raise OSError("injected storage registration failure")
+
+    monkeypatch.setattr(
+        media_mod,
+        "register_storage_object",
+        fail_registration,
+    )
+
+    with pytest.raises(OSError, match="injected storage registration failure"):
+        _upload(client)
+
+    assert _staged_files(settings) == []
+    assert _stored_files(settings) == []
+
+
+def test_upload_rollback_failure_still_removes_published_file_inside_fence(
+    client,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    guard_active = False
+    cleanup_guard_states: list[bool] = []
+    media_root = settings.data_dir / "media"
+    real_unlink = media_mod.durable_unlink
+
+    @contextmanager
+    def tracked_guard(_database_url):
+        nonlocal guard_active
+        guard_active = True
+        try:
+            yield
+        finally:
+            guard_active = False
+
+    def fail_registration(*_args, **_kwargs):
+        raise OSError("injected storage registration failure")
+
+    def fail_rollback(_session):
+        raise OSError("injected session rollback failure")
+
+    def tracked_unlink(path, *args, **kwargs):
+        if path.is_relative_to(media_root):
+            cleanup_guard_states.append(guard_active)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(media_mod, "global_write_plane_guard", tracked_guard)
+    monkeypatch.setattr(
+        media_mod,
+        "register_storage_object",
+        fail_registration,
+    )
+    monkeypatch.setattr(Session, "rollback", fail_rollback)
+    monkeypatch.setattr(media_mod, "durable_unlink", tracked_unlink)
+
+    with caplog.at_level("ERROR", logger="healthmes.api.media"):
+        with pytest.raises(OSError, match="injected storage registration failure"):
+            _upload(client)
+
+    assert _staged_files(settings) == []
+    assert _stored_files(settings) == []
+    assert cleanup_guard_states == [True]
+    assert "pre-commit failure" in caplog.text
+
+
+def test_upload_form_context_exit_failure_removes_staging_file(
+    client,
+    settings,
+    monkeypatch,
+):
+    real_close = FormData.close
+
+    async def close_then_fail(form):
+        await real_close(form)
+        raise OSError("injected multipart close failure")
+
+    monkeypatch.setattr(FormData, "close", close_then_fail)
+
+    with pytest.raises(OSError, match="injected multipart close failure"):
+        _upload(client)
+
+    assert _staged_files(settings) == []
+    assert _stored_files(settings) == []
+
+
+def test_upload_commit_applied_then_raises_keeps_indexed_bytes(
+    client,
+    engine,
+    settings,
+    monkeypatch,
+):
+    real_commit = Session.commit
+
+    def commit_then_raise(session):
+        real_commit(session)
+        raise OSError("injected lost commit acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", commit_then_raise)
+
+    response = _upload(client)
+
+    assert response.status_code == 201
+    with Session(engine) as verification:
+        stored = verification.scalars(select(StorageObject)).one()
+        path = settings.data_dir / stored.relative_path
+        assert path.read_bytes() == JPEG_BYTES
+
+
+def test_upload_rejects_destination_generation_replaced_before_commit(
+    client,
+    engine,
+    settings,
+    monkeypatch,
+):
+    real_register = media_mod.register_storage_object
+
+    def register_then_replace(session, configured, **kwargs):
+        stored = real_register(session, configured, **kwargs)
+        destination = settings.data_dir / kwargs["relative_path"]
+        replacement = destination.with_name(f".{destination.name}.replacement")
+        replacement.write_bytes(b"replacement media generation")
+        os.replace(replacement, destination)
+        return stored
+
+    monkeypatch.setattr(
+        media_mod,
+        "register_storage_object",
+        register_then_replace,
+    )
+
+    with pytest.raises(OSError, match="file generation changed"):
+        _upload(client)
+
+    with Session(engine) as verification:
+        assert verification.scalars(select(StorageObject)).all() == []
+    published = _stored_files(settings)
+    staged = _staged_files(settings)
+    assert len(published) == 1
+    assert published[0].read_bytes() == b"replacement media generation"
+    assert len(staged) == 1
+    assert staged[0].read_bytes() == JPEG_BYTES
+
+
+def test_upload_ambiguous_commit_rejects_replaced_destination_generation(
+    client,
+    engine,
+    settings,
+    monkeypatch,
+):
+    real_commit = Session.commit
+
+    def commit_replace_then_raise(session):
+        real_commit(session)
+        destination = _stored_files(settings)[0]
+        replacement = destination.with_name(f".{destination.name}.replacement")
+        replacement.write_bytes(b"replacement after media commit")
+        os.replace(replacement, destination)
+        raise OSError("injected replaced media commit acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", commit_replace_then_raise)
+
+    with pytest.raises(
+        OSError,
+        match="injected replaced media commit acknowledgement",
+    ):
+        _upload(client)
+
+    with Session(engine) as verification:
+        stored = verification.scalars(select(StorageObject)).one()
+        destination = settings.data_dir / stored.relative_path
+        assert destination.read_bytes() == b"replacement after media commit"
+    staged = _staged_files(settings)
+    assert len(staged) == 1
+    assert staged[0].read_bytes() == JPEG_BYTES
+
+
+@pytest.mark.asyncio
+async def test_upload_waiting_for_write_plane_does_not_block_health(
+    app,
+    engine,
+    settings,
+    monkeypatch,
+):
+    attempted = Event()
+
+    @contextmanager
+    def tracked_guard(database_url):
+        attempted.set()
+        with real_global_write_plane_guard(database_url):
+            yield
+
+    monkeypatch.setattr(media_mod, "global_write_plane_guard", tracked_guard)
+    app.state.settings = settings.model_copy(update={"database_url": str(engine.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://127.0.0.1:8100",
+    ) as async_client:
+        with real_global_write_plane_guard(str(engine.url)):
+            request_task = asyncio.create_task(
+                async_client.post(
+                    "/v1/media",
+                    files={"file": ("capture.jpg", JPEG_BYTES, "image/jpeg")},
+                )
+            )
+            assert await asyncio.to_thread(attempted.wait, 1)
+            health = await asyncio.wait_for(async_client.get("/health"), timeout=0.5)
+            assert health.status_code == 200
+            assert not request_task.done()
+        response = await asyncio.wait_for(request_task, timeout=2)
+
+    assert response.status_code == 201
+
+
+def test_upload_unknown_commit_outcome_retains_bytes(
+    client,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    def fail_commit(_session):
+        raise OSError("injected unknown commit outcome")
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    monkeypatch.setattr(
+        media_mod,
+        "_verify_media_commit",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with caplog.at_level("WARNING", logger="healthmes.api.media"):
+        with pytest.raises(OSError, match="unknown commit outcome"):
+            _upload(client)
+
+    assert len(_stored_files(settings)) == 1
+    assert "retaining bytes" in caplog.text
+
+
+def test_upload_delayed_commit_visibility_retains_bytes(
+    client,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    def fail_commit(_session):
+        raise OSError("injected delayed media commit visibility")
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    monkeypatch.setattr(
+        media_mod,
+        "_verify_media_commit",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with caplog.at_level("WARNING", logger="healthmes.api.media"):
+        with pytest.raises(OSError, match="delayed media commit visibility"):
+            _upload(client)
+
+    files = _stored_files(settings)
+    assert len(files) == 1
+    assert files[0].read_bytes() == JPEG_BYTES
+    assert "not yet visible" in caplog.text
+    assert "retaining bytes" in caplog.text
 
 
 def test_default_cap_is_15_mib():

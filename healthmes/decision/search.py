@@ -19,6 +19,11 @@ from typing import Any
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.activity.locking import (
+    set_postgres_transaction_read_only,
+    set_sqlite_query_only,
+    sqlite_query_only_enabled,
+)
 from healthmes.decision.access import (
     AccessAuditEntry,
     AccessOutcome,
@@ -263,21 +268,49 @@ def _read_only_session(
         dialect = session.get_bind().dialect.name
         connection = session.connection()
         if dialect == "sqlite":
-            connection.exec_driver_sql("PRAGMA query_only=ON")
+            try:
+                set_sqlite_query_only(connection, enabled=True)
+                if not sqlite_query_only_enabled(connection):
+                    raise DecisionSearchReadOnlyError(
+                        "failed to enable SQLite query-only mode"
+                    )
+            except BaseException as exc:
+                connection.invalidate(exc)
+                raise
         elif dialect == "postgresql":
-            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            set_postgres_transaction_read_only(connection)
         else:
             raise DecisionSearchReadOnlyError(
                 f"unsupported read-only database dialect: {dialect}"
             )
+        body_error: BaseException | None = None
         try:
             yield _ReadOnlySession(session)
+        except BaseException as exc:
+            body_error = exc
+            raise
         finally:
-            session.rollback()
             if dialect == "sqlite":
-                session.connection().exec_driver_sql(
-                    "PRAGMA query_only=OFF"
-                )
+                cleanup_error: BaseException | None = None
+                try:
+                    set_sqlite_query_only(
+                        connection,
+                        enabled=False,
+                    )
+                    if sqlite_query_only_enabled(connection):
+                        raise DecisionSearchReadOnlyError(
+                            "failed to disable SQLite query-only mode"
+                        )
+                except BaseException as exc:
+                    cleanup_error = exc
+                    connection.invalidate(exc)
+                finally:
+                    session.rollback()
+                if cleanup_error is not None and body_error is None:
+                    raise DecisionSearchReadOnlyError(
+                        "SQLite query-only cleanup could not be verified"
+                    ) from cleanup_error
+            else:
                 session.rollback()
 
 

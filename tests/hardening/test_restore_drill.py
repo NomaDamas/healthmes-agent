@@ -13,6 +13,7 @@ age encryption in-process. No pg_dump path is exercised here (needs a live
 postgres); the sqlite path is the mac-native default and the CI path.
 """
 
+import hashlib
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,9 +32,13 @@ from healthmes.backup import (
 )
 from healthmes.store import (
     Base,
+    FoodLog,
+    RawIngestEvent,
     RetentionPolicy,
+    StorageObject,
     Task,
     TriggerEvent,
+    WellnessEvent,
     create_db_engine,
     session_scope,
 )
@@ -146,6 +151,48 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
         assert (seeded_store.media_dir / relative).read_bytes() == content
     for relative, content in seeded_store.raw_ingest_files.items():
         assert (seeded_store.raw_ingest_dir / relative).read_bytes() == content
+
+    # Every raw payload reference is restored as one coherent generation:
+    # RawIngestEvent -> StorageObject -> WellnessEvent -> byte-identical file.
+    engine = create_db_engine(seeded_store.database_url)
+    try:
+        factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        with factory() as session:
+            raw_rows = list(session.scalars(sa.select(RawIngestEvent)))
+            storage_by_path = {
+                row.relative_path: row
+                for row in session.scalars(sa.select(StorageObject))
+            }
+            events_by_source = {
+                (row.source_provider, row.source_record_id): row
+                for row in session.scalars(
+                    sa.select(WellnessEvent).where(
+                        WellnessEvent.event_type == "raw_ingest"
+                    )
+                )
+            }
+            assert len(raw_rows) == len(seeded_store.raw_ingest_files)
+            for raw in raw_rows:
+                file_path = seeded_store.db_path.parent / raw.path
+                payload = file_path.read_bytes()
+                assert raw.size_bytes == len(payload)
+                assert raw.sha256 == hashlib.sha256(payload).hexdigest()
+                storage = storage_by_path[raw.path]
+                assert storage.size_bytes == raw.size_bytes
+                assert storage.sha256 == raw.sha256
+                event = events_by_source[(raw.source, str(raw.id))]
+                assert event.raw_object_id == storage.id
+                assert event.payload["size_bytes"] == raw.size_bytes
+
+            for relative, content in seeded_store.media_files.items():
+                storage = storage_by_path[f"media/{relative}"]
+                assert storage.size_bytes == len(content)
+                assert storage.sha256 == hashlib.sha256(content).hexdigest()
+            food = session.scalars(sa.select(FoodLog)).one()
+            assert food.media_path == "media/food/lunch.jpg"
+            assert (seeded_store.db_path.parent / food.media_path).is_file()
+    finally:
+        engine.dispose()
 
 
 def test_restore_by_bare_snapshot_name(seeded_store, tmp_path: Path) -> None:

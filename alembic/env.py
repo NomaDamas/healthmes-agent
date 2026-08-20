@@ -57,8 +57,17 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode: connect and execute."""
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        _run_online_migrations(supplied_connection)
+        return
+
     url = _database_url()
-    connectable = create_db_engine(url, poolclass=pool.NullPool)
+    connectable = create_db_engine(
+        url,
+        poolclass=pool.NullPool,
+        enforce_runtime_write_fence=False,
+    )
 
     if connectable.dialect.name == "sqlite":
         # The store engine turns PRAGMA foreign_keys=ON at connect time —
@@ -78,17 +87,80 @@ def run_migrations_online() -> None:
 
     try:
         with connectable.connect() as connection:
-            context.configure(
-                connection=connection,
-                target_metadata=target_metadata,
-                # Future ALTERs on sqlite need batch mode (harmless elsewhere).
-                render_as_batch=connection.dialect.name == "sqlite",
-            )
-
-            with context.begin_transaction():
-                context.run_migrations()
+            _run_online_migrations(connection)
     finally:
         connectable.dispose()
+
+
+def _run_online_migrations(connection) -> None:
+    sqlite_dbapi = None
+    restore_sqlite_foreign_keys = False
+    if connection.dialect.name == "sqlite":
+        sqlite_dbapi = connection.connection.driver_connection
+        cursor = sqlite_dbapi.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys")
+            foreign_keys_enabled = bool(cursor.fetchone()[0])
+        finally:
+            cursor.close()
+        if foreign_keys_enabled:
+            if connection.in_transaction() or sqlite_dbapi.in_transaction:
+                raise RuntimeError(
+                    "SQLite migrations require PRAGMA foreign_keys=OFF "
+                    "before the supplied transaction begins"
+                )
+            cursor = sqlite_dbapi.cursor()
+            try:
+                cursor.execute("PRAGMA foreign_keys=OFF")
+                cursor.execute("PRAGMA foreign_keys")
+                if cursor.fetchone()[0] != 0:
+                    raise RuntimeError(
+                        "could not disable SQLite foreign keys for migration"
+                    )
+            finally:
+                cursor.close()
+            restore_sqlite_foreign_keys = True
+
+    try:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            # Future ALTERs on sqlite need batch mode (harmless elsewhere).
+            render_as_batch=connection.dialect.name == "sqlite",
+            # PostgreSQL DDL is transactional, so one Alembic command must roll
+            # back every revision if a later revision fails. Pysqlite otherwise
+            # lets DDL run before a physical BEGIN; migrations that reserve the
+            # writer with a no-op UPDATE rely on the same Alembic boundary.
+            transactional_ddl=connection.dialect.name
+            in {"postgresql", "sqlite"},
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+            if sqlite_dbapi is not None:
+                violations = connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).fetchmany(1)
+                if violations:
+                    raise RuntimeError(
+                        "SQLite migration produced foreign-key violations"
+                    )
+    finally:
+        if restore_sqlite_foreign_keys:
+            assert sqlite_dbapi is not None
+            if connection.in_transaction() or sqlite_dbapi.in_transaction:
+                connection.rollback()
+            cursor = sqlite_dbapi.cursor()
+            try:
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA foreign_keys")
+                if cursor.fetchone()[0] != 1:
+                    raise RuntimeError(
+                        "could not restore SQLite foreign-key enforcement "
+                        "after migration"
+                    )
+            finally:
+                cursor.close()
 
 
 if context.is_offline_mode():

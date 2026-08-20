@@ -180,14 +180,20 @@ Celery task also completes.
 
 ```bash
 uv sync                              # if you skipped mac-setup
+uv run alembic upgrade head          # required for an existing database
 uv run python -m healthmes           # uvicorn on HEALTHMES_PORT (default 8100)
 ```
 
 For auto-reload during development:
 
 ```bash
+uv run alembic upgrade head
 uv run uvicorn healthmes.app:create_app --factory --reload --port 8100
 ```
+
+Both entrypoints refuse to serve an existing database whose Alembic revision
+is not the current head. A completely empty SQLite database remains
+zero-setup and is initialized on first startup.
 
 Without `HEALTHMES_API_TOKEN`, the app factory accepts only actual loopback
 socket peers even if Uvicorn is accidentally bound to `0.0.0.0`. LAN, proxy,
@@ -589,6 +595,23 @@ uv run healthmes backup restore <name>      # dry-run: prints the manifest
 uv run healthmes backup restore <name> --yes  # actually replaces live data
 ```
 
+Stop HealthMes, Open Wearables and other writers before applying a restore.
+Restore strictly validates archive paths and checksums, preflights and stages
+all included targets, then uses rollback-capable same-filesystem swaps for
+SQLite/media/raw/Hermes. An included component without a configured target
+fails before mutation. For each PostgreSQL database, `pg_restore` first
+expands a complete SQL script into an anonymous temporary file. One `psql`
+connection then checks the physical database identity and executes that SQL
+under `--single-transaction`. A PostgreSQL-plus-files or multi-database restore
+fails closed unless the operator explicitly passes
+`--allow-cross-store-partial`. That flag acknowledges that an already
+committed PostgreSQL database cannot be rolled back together with another
+store. PostgreSQL physical target identity is revalidated before mutation,
+before each restore, and finally in the same `psql` transaction as the restore
+SQL. A same-session identity mismatch executes no restore SQL. Other failed
+`psql` restore commands are reported as `commit outcome unknown` because a
+lost client acknowledgement cannot prove that the server did not commit.
+
 (`healthmes` is a console script installed by `uv sync`; `uv run python -m
 healthmes backup ...` is equivalent. Bare `python -m healthmes` still serves
 the API.) Knobs: `HEALTHMES_BACKUP_DIR` (default `{data_dir}/backups`),
@@ -598,8 +621,171 @@ the API.) Knobs: `HEALTHMES_BACKUP_DIR` (default `{data_dir}/backups`),
 backup job (Sunday 03:30) runs when the scheduler is enabled; without a
 passphrase it skips with a warning. `/v1/storage/settings` always labels this
 as a `partial_component_snapshot` with `full_node_recovery=false` and reports
-the Open Wearables runtime/dump mismatch. **Losing the passphrase means
-losing the backups** — there is no recovery path by design.
+the Open Wearables runtime/dump mismatch. `next_snapshot_scope` is a
+prospective view based on current configuration/source presence and explicitly
+does not describe the encrypted latest snapshot. **Losing the passphrase
+means losing the backups** — there is no recovery path by design.
+
+The snapshot write-plane fence captures the HealthMes DB, media and raw-ingest
+trees as one cooperative generation and blocks raw/media publication and
+retention deletion during that interval. Open Wearables and Hermes are
+separate component snapshots, not part of a distributed point-in-time
+transaction. Local rollback protects against an operation failure while the
+process is running; it does not claim power-loss atomicity.
+
+### Storage maintenance recovery
+
+Startup and every scheduled storage-maintenance run first reconcile
+self-describing `.healthmes-unlink-v2-*` journals and exact DB-indexed
+`.staging/media` / `.staging/raw_ingest` aliases under the global write-plane
+fence. Retention then commits `StorageObject.purged_at` plus a versioned file
+identity before removing bytes, and commits
+`file_cleanup_completed_at` afterward. This order makes an interrupted unlink
+retryable.
+
+One `MaintenanceBudget` is created for the whole run and shared by unindexed
+discovery hashing, directory scans, namespace mutations, cleanup-journal
+publication, quarantine handling and generic durable unlink/recovery. The
+defaults are a 10-second absolute deadline, 256 MiB of cumulative hashing and
+4,096 cumulative scan/mutation entries:
+
+```text
+HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS=10
+HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES=268435456
+HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES=4096
+```
+
+Pending purged-row retries are prepared before unindexed discovery and before
+any new retention tombstone. If the shared budget is exhausted, the current
+unfinished candidate and every later candidate remain pending, bounded cursors
+retain the completed scan position, and a fresh maintenance run continues with
+a new budget. No later candidate starts under an already exhausted budget.
+
+Rows already marked `purged_at` before file-cleanup identities were introduced
+remain pending after migration. The first current maintenance run acknowledges
+a missing path, or captures and removes an existing regular file only when its
+size and indexed SHA-256 match. Existing bytes without a digest, symlinks,
+replacement generations and unverifiable paths are preserved and reported.
+An absent final path with no deterministic staging aliases is acknowledged
+even when the legacy indexed digest is missing or malformed, because no
+HealthMes-owned payload name remains to delete.
+
+Use the API to distinguish row purging from physical cleanup:
+
+```bash
+curl -sS -X POST \
+  'http://127.0.0.1:8100/v1/storage/maintenance?dry_run=true'
+curl -sS -X POST \
+  'http://127.0.0.1:8100/v1/storage/maintenance'
+```
+
+- `records_purged` is the number of rows tombstoned by the live run.
+- `files_deleted` is the number of object cleanups that removed a proved
+  HealthMes-owned name; legacy `deleted` is an alias for this field.
+- `file_cleanup_pending` is the unresolved purged-row count after a live run,
+  or the already-existing unresolved count in dry-run.
+- `bytes_reclaimed` is credited only after no unknown hard link remains.
+- `decision_receipt_candidates` / `decision_receipts_deleted` report compact
+  decision-receipt retention separately from full decision records.
+- `budget_exhausted`, `budget_resource` and `budget_phase` provide a structured
+  continuation signal instead of requiring clients to parse `errors`.
+
+Do not manually remove `.healthmes-unlink-*`,
+`.healthmes-storage-delete-*`, or
+`raw_ingest/.healthmes-storage-delete-journal/*` entries based on age. The
+generic v2 journal is self-describing, but retention quarantine authority
+lives in `StorageObject.file_cleanup_identity`. Retention also writes a
+canonical central journal before deleting any name:
+
+```text
+...-intent.json
+    fsynced deletion intent + exact guarded inode generations
+...-complete.json
+    every guarded generation proved st_nlink == 0
+...-manual-review.json
+    physical outcome is ambiguous; automatic completion is blocked
+```
+
+The state files bind to the SHA-256 of `intent`. A `complete` journal survives
+a failed second database commit and lets the next maintenance run acknowledge
+the already-finished deletion without unlinking again. The journal is removed
+only after `file_cleanup_completed_at` commits. Corrupt, conflicting,
+ownerless, active-object, legacy and malformed recovery artifacts are
+preserved intentionally and reported in maintenance errors.
+
+All three private recovery namespaces are excluded from
+`_discover_unindexed()` and `measure_usage()`: they remain on disk for
+recovery but cannot become new wellness records or active quota usage. If a
+live retry leaves pending rows, stop duplicate writers, preserve a
+snapshot/copy, and inspect the object IDs and paths in `PurgeJob.detail`.
+Never clear `file_cleanup_completed_at` or use a blind `rm` to silence
+recovery state.
+
+Bounded reconciliation persists five owner-only operational cursors:
+
+- `.healthmes-recovery/unlink-recovery-v1.json` tracks the round-robin
+  durable-unlink directory queue and retry state.
+- `.staging/.healthmes-unindexed-discovery-v2.json` tracks independent
+  `media` and `raw_ingest` DFS stacks.
+- `.staging/.healthmes-staging-index-cursor-v1.json` tracks the
+  `StorageObject` keyset page used by exact staging reconciliation.
+- `.staging/.healthmes-staging-fallback-cursor-v1.json` tracks independent
+  resumable DFS stacks, kernel offsets and directory generations for
+  unindexed staging traversal.
+- `.staging/.healthmes-storage-cleanup-scan-cursor-v1.json` tracks the
+  central retention-journal directory identity, kernel offset and in-batch
+  position. A bounded maintenance run therefore continues past persistent
+  malformed, ownerless or active-object journals instead of rescanning the
+  same first page forever.
+
+Within the shared entry budget, exact indexed reconciliation receives at most
+three quarters of a multi-entry slice while fallback retains at least one
+quarter; unused indexed capacity flows to fallback. A one-entry slice
+alternates passes through the persisted index-cursor `next_pass`.
+
+A fallback root completed in one slice is re-armed in the next while its peer
+is still in progress. This catches additions in existing deep descendants
+that cannot be inferred from root-directory metadata, while the per-root
+quantum preserves round-robin fairness.
+
+The control directories are `0700`; cursor files are `0600` and are published
+with temp-write, file `fsync`, atomic replace and directory `fsync`. Invalid,
+unsafe or stale state restarts a sweep. These cursors are not `StorageObject`
+rows, active usage/quota, retention candidates or snapshot members. Do not
+copy or edit them to force progress; preserve the data tree and let the next
+maintenance run rebuild state.
+
+Cursor publication and a pre-reserved terminal cleanup capsule are deliberately
+small, fixed crash-progress writes. If the shared deadline expires just after a
+destructive durable transition has started, HealthMes may finish that capsule
+or publish the cursor so the next run can prove where to resume. This exception
+does not permit another candidate, another hash, or an unbounded scan after the
+deadline.
+
+These cursor basenames are internal only as direct children of `.staging/`.
+The same exact basename under `media/` or `raw_ingest/` is a normal user
+payload and must remain indexed and measured.
+
+The whole `raw_ingest/.healthmes-storage-delete-journal/` subtree is reserved,
+including malformed and unknown names. Never index those entries as
+`raw_payload`; the bounded journal reconciler owns preservation and reporting.
+Usage measurement uses no-follow metadata and counts only regular files, never
+the target bytes of a symlink that escapes the HealthMes data tree. The scan is
+capped at 100,000 entries and two seconds and runs after scheduled/API
+maintenance releases the global write-plane fence. Results are written only
+after a complete scan and root-inode revalidation. A missing/replaced root,
+permission failure or exhausted bound rolls back the measurement and preserves
+the previous `storage_usage_daily` rows for a later retry. When a successful
+scan finds that the last regular file in a class disappeared or became a
+symlink, the current row is explicitly updated to zero.
+
+`StorageObject` has a database CHECK for the two-phase cleanup state: an active
+row cannot carry cleanup identity/completion metadata, a populated cleanup
+identity requires `purged_at`, and completion requires both `purged_at` and a
+populated identity. SQL `NULL` and JSON `null` both mean unset. The central
+journal directory is owner-only, and retiring any completed journal resets its
+bounded directory cursor so a deletion cannot make the next entry disappear
+behind a stale directory cookie.
 
 ### Remote vault (S3-compatible, ciphertext-only)
 
@@ -1061,8 +1247,10 @@ Everything the two test jobs run is reproducible locally with the same
 commands; the test suite is offline by convention (see "Tests and lint"
 above). The hardening
 tests under `tests/hardening/` add a restore drill (HealthMes DB + media +
-raw-ingest snapshot → destroy all three → restore → byte-verify the file
-trees → reopen the store) and trigger-flood tests pinning the
+raw-ingest snapshot → destroy all three → restore → byte-verify files and
+`RawIngestEvent -> StorageObject -> WellnessEvent` references → reopen the
+store), while backup/API tests prove concurrent ingest and retention wait on
+the same snapshot fence. Trigger-flood tests pin the
 alert-hygiene guarantees of `docs/PLAN.md` §11 (daily budget, dedup storms,
 quiet-hours no-redelivery).
 

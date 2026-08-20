@@ -4,13 +4,21 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Session, sessionmaker
 
-from healthmes.activity.locking import lock_activity_write_plane
+from healthmes.activity.locking import (
+    fenced_core_transaction,
+    global_write_plane_guard,
+    lock_activity_write_plane,
+    session_holds_write_plane,
+)
 from healthmes.activity.repository import ensure_activity_policies
 from healthmes.app import _initialize_activity_storage
 from healthmes.storage import (
@@ -29,6 +37,7 @@ from healthmes.store import (
     ProposalStatus,
     RetentionPolicy,
     ScheduleProposal,
+    StorageObject,
     Task,
     TriggerEvent,
     WellnessEvent,
@@ -43,6 +52,56 @@ from healthmes.wearables.provenance import (
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
     persist_open_wearables_observation,
 )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_raw_text_dml_claims_postgres_write_plane() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_text_fence_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "CREATE TABLE raw_write_fence_probe "
+                    "(value TEXT NOT NULL)"
+                )
+            )
+        factory = sessionmaker(
+            bind=engine,
+            autocommit=False,
+            autoflush=False,
+        )
+        with factory() as session:
+            session.execute(sa.text("SELECT 1"))
+            assert not session_holds_write_plane(session)
+            session.rollback()
+
+            session.execute(
+                sa.text(
+                    "INSERT INTO raw_write_fence_probe (value) "
+                    "VALUES ('fenced')"
+                )
+            )
+            assert session_holds_write_plane(session)
+            session.rollback()
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
 
 
 @pytest.mark.skipif(
@@ -595,6 +654,7 @@ def test_postgres_retention_locks_trigger_before_linked_decision() -> None:
 def test_activity_bootstrap_takes_write_plane_before_policy_inserts(
     settings,
     bootstrap_path,
+    monkeypatch,
 ) -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
@@ -609,14 +669,25 @@ def test_activity_bootstrap_takes_write_plane_before_policy_inserts(
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     worker_started = threading.Event()
-    worker_pid: list[int] = []
     failures: list[BaseException] = []
+    maintenance_guard_attempted = threading.Event()
+    if bootstrap_path == "maintenance":
+        real_guard = storage_service.global_write_plane_guard
+
+        @contextmanager
+        def tracked_guard(bind):
+            maintenance_guard_attempted.set()
+            with real_guard(bind) as connection:
+                yield connection
+
+        monkeypatch.setattr(
+            storage_service,
+            "global_write_plane_guard",
+            tracked_guard,
+        )
 
     def bootstrap() -> None:
         with factory() as session:
-            worker_pid.append(
-                int(session.scalar(sa.text("SELECT pg_backend_pid()")))
-            )
             worker_started.set()
             try:
                 if bootstrap_path == "startup":
@@ -646,25 +717,20 @@ def test_activity_bootstrap_takes_write_plane_before_policy_inserts(
             worker.start()
             assert worker_started.wait(timeout=5)
 
-            deadline = time.monotonic() + 5
-            waiting_for_advisory_lock = False
-            while time.monotonic() < deadline and worker.is_alive():
-                wait_event = first.execute(
-                    sa.text(
-                        "SELECT wait_event_type, wait_event "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": worker_pid[0]},
-                ).one_or_none()
-                if wait_event is not None and tuple(wait_event) == (
-                    "Lock",
-                    "advisory",
-                ):
-                    waiting_for_advisory_lock = True
-                    break
-                time.sleep(0.05)
+            if bootstrap_path == "maintenance":
+                # Same-process writers stop at the process lock before they
+                # attempt the cross-process database guard.
+                assert not maintenance_guard_attempted.wait(timeout=0.2)
+            else:
+                time.sleep(0.2)
 
-            assert waiting_for_advisory_lock
+            assert worker.is_alive()
+            assert (
+                first.scalar(
+                    sa.select(sa.func.count()).select_from(RetentionPolicy)
+                )
+                == 0
+            )
             policies = ensure_activity_policies(first)
             assert set(policies) == {
                 "activity_raw",
@@ -677,6 +743,8 @@ def test_activity_bootstrap_takes_write_plane_before_policy_inserts(
         assert worker is not None
         assert not worker.is_alive()
         assert failures == []
+        if bootstrap_path == "maintenance":
+            assert maintenance_guard_attempted.is_set()
         with factory() as session:
             assert session.scalar(
                 sa.select(sa.func.count()).select_from(RetentionPolicy)
@@ -740,7 +808,6 @@ def test_wearable_writer_and_retention_shrink_share_write_fence(
         paused_policy,
     )
     failures: list[BaseException] = []
-    updater_pid: list[int] = []
     updater_started = threading.Event()
 
     def write_snapshot() -> None:
@@ -764,13 +831,6 @@ def test_wearable_writer_and_retention_shrink_share_write_fence(
 
     def shrink_retention() -> None:
         with factory() as session:
-            updater_pid.append(
-                int(
-                    session.scalar(
-                        sa.text("SELECT pg_backend_pid()")
-                    )
-                )
-            )
             updater_started.set()
             try:
                 storage_service._update_retention_policy(
@@ -793,29 +853,19 @@ def test_wearable_writer_and_retention_shrink_share_write_fence(
         updater.start()
         assert updater_started.wait(timeout=5)
 
-        deadline = time.monotonic() + 5
-        waiting_for_advisory_lock = False
-        while (
-            time.monotonic() < deadline
-            and updater.is_alive()
-        ):
-            with factory() as observer:
-                wait_event = observer.execute(
-                    sa.text(
-                        "SELECT wait_event_type, wait_event "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": updater_pid[0]},
-                ).one_or_none()
-            if wait_event is not None and tuple(wait_event) == (
-                "Lock",
-                "advisory",
-            ):
-                waiting_for_advisory_lock = True
-                break
-            time.sleep(0.05)
-
-        assert waiting_for_advisory_lock
+        # The writer already owns the process-first lock order. The updater
+        # must not reach or mutate PostgreSQL until that writer releases it.
+        time.sleep(0.2)
+        assert updater.is_alive()
+        with factory() as observer:
+            policy = observer.scalar(
+                sa.select(RetentionPolicy).where(
+                    RetentionPolicy.data_class
+                    == OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS
+                )
+            )
+            assert policy is not None
+            assert policy.retention_days == 30
         release_writer.set()
         writer.join(timeout=10)
         updater.join(timeout=10)
@@ -850,6 +900,325 @@ def test_wearable_writer_and_retention_shrink_share_write_fence(
         writer.join(timeout=5)
         if updater is not None:
             updater.join(timeout=5)
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_direct_core_dml_requires_fenced_transaction() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_core_fence_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "CREATE TABLE core_write_fence_probe "
+                    "(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            )
+
+        with engine.connect() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match=r"fenced_core_transaction\(\)",
+            ):
+                connection.execute(
+                    sa.text(
+                        "INSERT INTO core_write_fence_probe (id, value) "
+                        "VALUES (1, 'unfenced')"
+                    )
+                )
+
+        with fenced_core_transaction(engine) as connection:
+            connection.execute(
+                sa.text(
+                    "INSERT INTO core_write_fence_probe (id, value) "
+                    "VALUES (1, 'fenced')"
+                )
+            )
+
+        with engine.connect() as connection:
+            assert connection.execute(
+                sa.text(
+                    "SELECT id, value FROM core_write_fence_probe "
+                    "ORDER BY id"
+                )
+            ).all() == [(1, "fenced")]
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_fenced_core_reuses_caller_connection_with_pool_size_one() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_caller_guard_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "CREATE TABLE caller_guard_probe "
+                    "(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            )
+
+        with engine.connect() as supplied_connection:
+            original_isolation = supplied_connection.get_isolation_level()
+            with fenced_core_transaction(
+                supplied_connection,
+                timeout_seconds=1,
+            ) as guard_connection:
+                assert guard_connection is supplied_connection
+                guard_connection.execute(
+                    sa.text(
+                        "INSERT INTO caller_guard_probe (id, value) "
+                        "VALUES (1, 'same connection')"
+                    )
+                )
+
+            assert not supplied_connection.closed
+            assert (
+                supplied_connection.get_isolation_level()
+                == original_isolation
+            )
+            assert supplied_connection.execute(
+                sa.text(
+                    "SELECT id, value FROM caller_guard_probe "
+                    "ORDER BY id"
+                )
+            ).all() == [(1, "same connection")]
+            supplied_connection.rollback()
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_guard_rejects_caller_connection_with_active_transaction() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    engine = create_db_engine(
+        database_url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    try:
+        with engine.connect() as connection:
+            connection.execute(sa.text("SELECT 1"))
+            with pytest.raises(
+                RuntimeError,
+                match="without an active transaction",
+            ):
+                with global_write_plane_guard(connection):
+                    pytest.fail("active caller connection unexpectedly guarded")
+            connection.rollback()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_same_url_session_is_not_mistaken_for_guarded_connection() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    engine = create_db_engine(
+        database_url,
+        pool_size=2,
+        max_overflow=0,
+        pool_timeout=1,
+    )
+    try:
+        with global_write_plane_guard(engine) as guard_connection:
+            assert guard_connection is not None
+            with Session(engine) as unrelated:
+                assert not session_holds_write_plane(unrelated)
+                with pytest.raises(
+                    TimeoutError,
+                    match="activity write plane",
+                ):
+                    lock_activity_write_plane(
+                        unrelated,
+                        timeout_seconds=0.1,
+                        poll_seconds=0.01,
+                    )
+                unrelated.rollback()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_maintenance_reuses_guard_connection_for_both_commits(
+    settings,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_maintenance_guard_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=1,
+    )
+    Base.metadata.create_all(engine)
+    current = datetime(2026, 8, 18, 12, tzinfo=UTC)
+    payload = b"guarded PostgreSQL maintenance"
+    data_dir = tmp_path / "postgres-maintenance"
+    target = data_dir / "raw_ingest" / "guarded.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    live_settings = settings.model_copy(
+        update={
+            "database_url": str(engine.url),
+            "data_dir": data_dir,
+        }
+    )
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    with factory() as setup:
+        obj = StorageObject(
+            data_class="raw_payload",
+            relative_path="raw_ingest/guarded.bin",
+            content_type="application/octet-stream",
+            size_bytes=len(payload),
+            sha256=sha256(payload).hexdigest(),
+            retention_basis_at=current - timedelta(days=30),
+            expires_at=current - timedelta(days=1),
+            safe_to_purge=True,
+        )
+        setup.add(obj)
+        setup.commit()
+        object_id = obj.id
+
+    real_guard = storage_service.global_write_plane_guard
+    guard_pids: list[int] = []
+
+    @contextmanager
+    def tracked_guard(bind):
+        with real_guard(bind) as connection:
+            assert connection is not None
+            guard_pids.append(
+                int(connection.scalar(sa.text("SELECT pg_backend_pid()")))
+            )
+            # The session-scoped advisory lock survives this commit. End the
+            # observation transaction so the maintenance Session owns and
+            # commits its own two root transactions on the guarded connection.
+            connection.commit()
+            yield connection
+
+    real_commit = Session.commit
+    maintenance_commit_pids: list[int] = []
+
+    def tracked_commit(current_session):
+        bind = current_session.get_bind()
+        if isinstance(bind, Connection):
+            maintenance_commit_pids.append(
+                int(
+                    current_session.scalar(
+                        sa.text("SELECT pg_backend_pid()")
+                    )
+                )
+            )
+        return real_commit(current_session)
+
+    real_expire_all = Session.expire_all
+    caller_expirations: list[int] = []
+    caller = factory()
+
+    def tracked_expire_all(current_session):
+        if current_session is caller:
+            caller_expirations.append(id(current_session))
+        return real_expire_all(current_session)
+
+    monkeypatch.setattr(
+        storage_service,
+        "global_write_plane_guard",
+        tracked_guard,
+    )
+    monkeypatch.setattr(Session, "commit", tracked_commit)
+    monkeypatch.setattr(
+        Session,
+        "expire_all",
+        tracked_expire_all,
+    )
+
+    try:
+        assert caller.get_bind() is engine
+        report = run_storage_maintenance(
+            caller,
+            live_settings,
+            now=current,
+        )
+
+        assert report.deleted == 1
+        assert report.bytes_reclaimed == len(payload)
+        assert guard_pids and len(guard_pids) == 1
+        assert maintenance_commit_pids == [
+            guard_pids[0],
+            guard_pids[0],
+        ]
+        assert caller_expirations == [id(caller)]
+        assert caller.get_bind() is engine
+        assert not target.exists()
+
+        stored = caller.get(StorageObject, object_id)
+        assert stored is not None
+        assert stored.purged_at == current
+        assert stored.file_cleanup_completed_at is not None
+    finally:
+        caller.close()
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(

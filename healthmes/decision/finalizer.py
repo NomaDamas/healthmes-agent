@@ -34,6 +34,8 @@ from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
     postgres_activity_write_plane_guard,
+    set_sqlite_busy_timeout_ms,
+    sqlite_busy_timeout_ms,
 )
 from healthmes.calendars.visibility import (
     CalendarVisibility,
@@ -3358,19 +3360,13 @@ def _begin_sqlite_immediate(
 
     connection = session.connection()
     if _SQLITE_BUSY_TIMEOUT_INFO_KEY not in session.info:
-        original_timeout_ms = int(
-            connection.exec_driver_sql(
-                "PRAGMA busy_timeout"
-            ).scalar_one()
-        )
+        original_timeout_ms = sqlite_busy_timeout_ms(connection)
         session.info[_SQLITE_BUSY_TIMEOUT_INFO_KEY] = (
             connection,
             original_timeout_ms,
         )
     timeout_ms = max(1, int(timeout_seconds * 1_000))
-    connection.exec_driver_sql(
-        f"PRAGMA busy_timeout={timeout_ms}"
-    )
+    set_sqlite_busy_timeout_ms(connection, timeout_ms)
     try:
         session.execute(text("BEGIN IMMEDIATE"))
     except BaseException:
@@ -3384,9 +3380,11 @@ def _restore_sqlite_busy_timeout(session: Session) -> None:
         return
     connection, original_timeout_ms = state
     try:
-        connection.exec_driver_sql(
-            f"PRAGMA busy_timeout={original_timeout_ms}"
-        )
+        set_sqlite_busy_timeout_ms(connection, original_timeout_ms)
+        if sqlite_busy_timeout_ms(connection) != original_timeout_ms:
+            raise RuntimeError(
+                "SQLite busy timeout cleanup could not be verified"
+            )
     except Exception as exc:
         try:
             connection.invalidate(exc)

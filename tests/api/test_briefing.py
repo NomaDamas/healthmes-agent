@@ -22,7 +22,6 @@ from healthmes.calendars import creds
 from healthmes.calendars.state import FileSyncHealthStore
 from healthmes.calendars.visibility import CalendarVisibilityChanged
 from healthmes.store import (
-    Base,
     CalendarEventMirror,
     CalendarSource,
     CognitiveEnergyEstimate,
@@ -34,7 +33,7 @@ from healthmes.store import (
     Task,
     TriggerEvent,
 )
-from healthmes.store.session import get_engine, get_session, get_session_factory
+from healthmes.store.session import get_session, get_session_factory
 
 BASE_URL = "http://healthmes.test:8100"  # settings.public_base_url (tests/conftest.py)
 FROZEN_NOW = "2026-07-09 14:23:00"
@@ -748,7 +747,6 @@ def _secured_client(settings):
     secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
     application = create_app(secured)
     with TestClient(application) as test_client:
-        Base.metadata.create_all(get_engine())
         yield test_client
 
 

@@ -66,6 +66,7 @@ from healthmes.calendars.state import (
     sync_state_account_generation,
     with_sync_state_account_generation,
 )
+from healthmes.calendars.write_lock import calendar_write_lock
 from healthmes.storage import retention_cutoff
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror, Task
@@ -264,24 +265,25 @@ class CalendarMirrorService:
         replayed = self._load_pending(source)
         events, new_state = backend.list_changes(previous_state)
 
-        with activity_write_lock():
-            lock_activity_write_plane(self._session)
-            purge_expired_calendar_mirrors(
-                self._session,
-                cutoff=retention_cutoff(
+        with calendar_write_lock(self._session, source):
+            with activity_write_lock():
+                lock_activity_write_plane(self._session)
+                purge_expired_calendar_mirrors(
                     self._session,
-                    "calendar_mirror",
+                    cutoff=retention_cutoff(
+                        self._session,
+                        "calendar_mirror",
+                        now=current,
+                    ),
+                )
+                return self._apply_sync_result(
+                    source=source,
+                    events=events,
+                    new_state=new_state,
+                    bootstrap=bootstrap,
+                    replayed=replayed,
                     now=current,
-                ),
-            )
-            return self._apply_sync_result(
-                source=source,
-                events=events,
-                new_state=new_state,
-                bootstrap=bootstrap,
-                replayed=replayed,
-                now=current,
-            )
+                )
 
     def _apply_sync_result(
         self,
@@ -652,6 +654,17 @@ class CalendarMirrorService:
         self, source: CalendarSource, draft: EventDraft
     ) -> CalendarEventMirror:
         """Create a tagged agent block remotely and mirror it immediately."""
+        if self._session.get_bind().dialect.name == "postgresql":
+            with calendar_write_lock(self._session, source):
+                with activity_write_lock():
+                    return self._create_agent_event_locked(source, draft)
+        return self._create_agent_event_locked(source, draft)
+
+    def _create_agent_event_locked(
+        self,
+        source: CalendarSource,
+        draft: EventDraft,
+    ) -> CalendarEventMirror:
         backend = self._backend_for(source)
         existing: CalendarEventMirror | None = None
         if draft.identity is not None:
@@ -950,6 +963,12 @@ class CalendarMirrorService:
             .execution_options(populate_existing=True)
         )
         with self._session.no_autoflush:
+            if self._session.get_bind().dialect.name == "postgresql":
+                with activity_write_lock():
+                    lock_activity_write_plane(self._session)
+                    return self._session.execute(
+                        statement
+                    ).scalar_one_or_none()
             return self._session.execute(statement).scalar_one_or_none()
 
     def _generation_predicate(self) -> sa.ColumnElement[bool]:

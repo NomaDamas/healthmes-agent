@@ -1115,6 +1115,10 @@ class TriggerEvaluator:
         # temporal scope (date / diff fingerprint), so "again later" is a new
         # key by construction.
         if session.get_bind().dialect.name == "postgresql":
+            # Retention takes the write-plane advisory lock before it locks
+            # TriggerEvent rows. Acquire it before this fire's dedup advisory
+            # lock so the two writers cannot establish opposite lock orders.
+            lock_activity_write_plane(session)
             session.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:dedup_key, 0))"),
                 {"dedup_key": fire.dedup_key},
@@ -1213,6 +1217,11 @@ class TriggerEvaluator:
         event_id: uuid.UUID,
     ) -> _DispatchClaimAttempt:
         """Claim one outbox row without holding its lock during reasoning."""
+
+        if session.get_bind().dialect.name == "postgresql":
+            # Retention locks the write plane before TriggerEvent rows. Keep
+            # dispatch claims in the same order before FOR UPDATE.
+            lock_activity_write_plane(session)
 
         def claim() -> _DispatchClaimAttempt:
             statement = (
@@ -1318,6 +1327,11 @@ class TriggerEvaluator:
         delayed after its initial claim from racing a later takeover, while the
         commit below ensures no TriggerEvent lock spans LLM/finalizer work.
         """
+
+        if session.get_bind().dialect.name == "postgresql":
+            # The row lock below must never be acquired ahead of the shared
+            # write-plane fence used by retention.
+            lock_activity_write_plane(session)
 
         def preflight() -> _DispatchClaimAttempt:
             statement = (
@@ -1465,6 +1479,11 @@ class TriggerEvaluator:
         claim: _DispatchClaim,
         publish: Callable[[TriggerEvent], FireOutcome],
     ) -> FireOutcome:
+        if session.get_bind().dialect.name == "postgresql":
+            # Publication may update both TriggerEvent and DecisionRecord.
+            # Acquire the common fence before taking the TriggerEvent row lock.
+            lock_activity_write_plane(session)
+
         def locked_publish() -> FireOutcome:
             statement = (
                 select(TriggerEvent)

@@ -249,6 +249,60 @@ objects/
 
 객체 경로에 사용자 이름, 증상명, 지표명 같은 민감한 평문을 넣지 않는다.
 
+### 복구·탐색 cursor
+
+대량 디렉터리를 매번 처음부터 읽으면 앞쪽 파일 때문에 뒤쪽 복구 작업이 영원히
+실행되지 않을 수 있다. 따라서 다음 cursor는 유지하되 사용자 wellness 데이터와
+분리한다.
+
+| 경로 | 역할 |
+|---|---|
+| `.healthmes-recovery/unlink-recovery-v1.json` | durable-unlink 복구의 디렉터리별 kernel offset, 재시도 이름, 디렉터리 generation과 round-robin queue |
+| `.staging/.healthmes-unindexed-discovery-v2.json` | `media`와 `raw_ingest`를 서로 독립적으로 순회하는 DFS 상태 |
+| `.staging/.healthmes-staging-index-cursor-v1.json` | DB에 이미 등록된 `StorageObject`의 staging 파일을 확인하는 keyset 위치 |
+| `.staging/.healthmes-staging-fallback-cursor-v1.json` | DB index에 잡히지 않은 나머지 staging tree를 재개하기 위한 독립 DFS stack, kernel offset, 디렉터리 generation |
+| `.staging/.healthmes-storage-cleanup-scan-cursor-v1.json` | 중앙 retention journal namespace의 디렉터리 identity, kernel offset, batch 내부 위치. 손상·고아·활성 journal이 계속 남아 있어도 뒤쪽 journal이 굶지 않게 한다. |
+
+한 번의 reconciliation에서 항목 budget이 2개 이상이면 DB-indexed pass는 최대
+3/4을 사용하고 fallback pass에는 최소 1/4을 남긴다. indexed pass가 쓰지 않은
+budget은 fallback이 이어서 사용한다. budget이 1개이면 index cursor의
+`next_pass`를 저장해 indexed와 fallback을 호출마다 번갈아 실행한다.
+durable-unlink 복구는 독립된 항목 budget을 사용하지만 전체 시간의 앞 절반까지만
+사용하므로 staging 복구가 시간 면에서 굶지 않는다.
+
+한 fallback root가 먼저 완료되고 다른 root가 계속 큰 경우에도, 완료된 root는
+다음 bounded slice에서 다시 arm한다. 상위 root 디렉터리의 generation만으로는
+이미 존재하는 깊은 하위 디렉터리에 새 파일이 생긴 것을 알 수 없기 때문이다.
+각 root는 bounded round-robin quantum만 사용하므로 재검사 때문에 반대 root가
+굶지 않는다.
+
+control 디렉터리는 `0700`, cursor 파일은 `0600`이며 같은 디렉터리의 임시 파일에
+쓴 뒤 file `fsync` → atomic replace → directory `fsync` 순서로 저장한다. cursor가
+없거나 malformed·symlink·stale 상태이면 payload를 삭제하지 않고 안전하게 새
+sweep를 시작한다.
+
+이 cursor들은 운영 제어 상태일 뿐이므로 `StorageObject`로 등록하지 않고,
+사용량·용량 과금·보존기간 삭제 대상으로 계산하지 않는다. 또한 현재 snapshot이
+선택하는 DB, `media/`, `raw_ingest/`, Hermes, Open Wearables 구성요소 밖에 있는
+루트 `.healthmes-recovery/`와 `.staging/`은 백업하지 않는다. 복원 후에는 실제
+DB와 파일 상태를 기준으로 cursor를 다시 만든다.
+
+cursor basename은 `.staging/`의 바로 아래 정확한 경로에서만 예약한다. 따라서
+`media/`나 `raw_ingest/` 아래에 같은 basename을 가진 사용자 payload는 정상
+객체로 색인하고 사용량에 포함한다.
+
+사용량 측정은 no-follow filesystem scan으로 별도 실행하며 한 번에 최대
+100,000개 항목 또는 2초까지만 허용한다. scheduler와 maintenance API는 global
+write-plane fence를 해제한 뒤 이 측정을 실행하므로 큰 데이터 tree의 용량 계산이
+모든 writer를 오래 막지 않는다. 전체 root scan과 마지막 root inode 재검증까지
+성공한 경우에만 새 측정값을 쓴다. root 부재·교체, 권한 오류, 항목/시간 상한
+초과가 발생하면 transaction을 rollback하여 기존 `storage_usage_daily` 값을
+보존하고 다음 실행에서 다시 시도한다.
+
+성공한 사용량 측정은 오늘 이미 기록된 local 데이터 클래스도 모두 갱신한다.
+마지막 regular file이 삭제되거나 외부 symlink로 바뀌어 현재 측정값이 없어지면
+기존 행을 `0 bytes / 0 objects`로 써서 과거 값이 현재 사용량처럼 남지 않게 한다.
+
 ### 고빈도 시계열
 
 심박처럼 표본이 많은 데이터는 샘플 한 개당 Postgres 행 하나로 무기한 저장하면
@@ -413,6 +467,155 @@ raw-first
 
 파싱 실패, 특징 계산 실패, snapshot 실패가 있다고 무조건 원본을 지우지 않는다.
 정책별로 `safe_to_purge` 조건을 통과해야 한다.
+
+### 현재 구현된 파일 삭제 상태 머신
+
+위 제품 정책 중 실제 로컬 파일 삭제는 다음의 2단계 commit으로 구현되어 있다.
+DB 행과 파일을 한 트랜잭션으로 묶을 수 없으므로, 파일을 먼저 지워서 DB가 존재하지
+않는 bytes를 가리키는 위험 대신 재시도 가능한 상태를 택한다.
+
+```text
+활성 StorageObject + 파일
+          │
+          │ 1차 DB commit
+          ▼
+purged_at 설정 + file_cleanup_identity v2 저장
+          │
+          │ 파일 generation 검증·private quarantine·unlink
+          ▼
+파일 없음, 아직 cleanup 미확정
+          │
+          │ 2차 DB commit
+          ▼
+file_cleanup_completed_at 설정
+```
+
+중간에 프로세스나 파일시스템 작업이 실패하면
+`purged_at != NULL AND file_cleanup_completed_at == NULL`이 남는다. 다음
+storage maintenance가 이 행을 다시 읽어 같은 generation만 삭제한다. 경로가
+다른 파일로 교체됐거나 알려지지 않은 hard link가 생겼으면 자동 삭제하지 않고
+pending으로 남긴다.
+
+DB CHECK constraint도 이 경계를 강제한다. 활성 객체에는 cleanup identity나
+완료 시각이 있을 수 없고, 채워진 identity에는 반드시 `purged_at`이 있어야 하며,
+완료 시각에는 `purged_at`과 identity가 모두 있어야 한다. SQL `NULL`과 JSON
+`null`은 모두 identity 미설정으로 처리해 SQLite와 PostgreSQL의 의미를 맞춘다.
+
+파일 cleanup identity가 생기기 전에 이미 `purged_at`이 설정된 과거 행도
+migration에서 완료로 가정하지 않는다. 현재 maintenance의 첫 실행이 경로 부재를
+확인하면 `missing` identity로 완료하고, 파일이 남아 있으면 DB의 `size_bytes`와
+`sha256`이 모두 정확히 일치하는 일반 파일 generation만 v2 identity로 승격해
+삭제한다. SHA-256이 없거나 파일이 symlink·교체 generation이면 보존하고 오류와
+pending 상태로 남긴다. 단, 최종 경로와 결정론적으로 알 수 있는 staging alias가
+모두 실제로 없으면 과거 SHA-256이 없거나 손상됐더라도 삭제할 HealthMes 소유
+bytes가 없으므로 `missing`으로 확인하고 완료한다.
+
+파일 복구에는 서로 대체할 수 없는 세 구조가 있다.
+
+| 종류 | 구조 | 누가 복구하는가 |
+|---|---|---|
+| 일반 durable unlink journal | `.healthmes-unlink-v2-<uuid>/metadata.json` + 선택적 `payload` | metadata가 원래 이름과 generation을 스스로 설명하므로 startup reconciliation이 복구할 수 있다. |
+| retention payload quarantine | `.healthmes-storage-delete-<name-hash>-<uuid>/payload` | DB의 `StorageObject.file_cleanup_identity`가 있어야 하므로 storage maintenance만 처리한다. |
+| retention 중앙 cleanup journal | `raw_ingest/.healthmes-storage-delete-journal/.healthmes-storage-cleanup-v1-<object-id>-<state>.json` | 하나의 pending `StorageObject`와 실제 삭제 중 보호한 inode generation을 묶는다. storage maintenance만 기록하고 복구한다. |
+
+중앙 cleanup journal의 상태 계약은 다음과 같다.
+
+| 상태 | 정확한 의미 |
+|---|---|
+| `intent` | 어떤 이름도 unlink하기 전에 파일과 부모 디렉터리까지 fsync한다. object ID, 경로, 정규화된 cleanup identity, 보호 중인 device/inode generation을 담는다. |
+| `complete` | 모든 보호된 descriptor의 `st_nlink == 0`을 확인한 뒤 fsync한다. 두 번째 DB commit 응답이 유실돼도 다음 실행이 파일을 다시 삭제하지 않고 acknowledgement만 복구할 수 있다. |
+| `manual-review` | 마지막 unlink 중 새 hard link가 생긴 것처럼 물리적 결과를 자동 증명할 수 없음을 기록한다. 운영자가 generation을 조사하기 전 자동 완료하지 않는다. |
+
+`complete`와 `manual-review`는 canonical `intent`의 SHA-256에 결합된다.
+손상, 비정규 JSON, 상충 상태, DB 소유 행이 없는 journal, 아직 활성인 행의
+journal은 그대로 보존하고 오류로 보고한다. 오래됐다는 이유로 삭제하지 않으며,
+해당 행의 `file_cleanup_completed_at` commit이 확인된 뒤에만 제거한다.
+
+과거 `.healthmes-unlink-<uuid>-<filename>` 형식은 metadata가 없는 legacy다.
+일반 scanner는 이를 보존하고 경고한다. 단, purge가 이미 commit된
+`StorageObject`의 version 1 identity와 정확히 일치하는 target-specific retry만
+그 파일을 제거하고 identity를 version 2로 올릴 수 있다.
+
+startup과 매시간 maintenance의 순서는 다음과 같다.
+
+```text
+global write-plane fence 획득
+  → self-describing durable-unlink v2 journal 복구
+  → DB가 정확히 증명하는 media/raw staging alias 복구·정리
+  → 나머지 staging bounded scan, 모르는 항목은 보존·보고
+  → 중앙 retention journal bounded scan, 손상·고아·활성 journal 보존·보고
+  → 기존 pending cleanup identity와 재시도 준비
+  → 미등록 raw/media bounded discovery
+  → retention DB tombstone commit
+  → intent fsync
+  → live/staging/quarantine의 증명된 generation만 unlink
+  → 모든 protected inode의 st_nlink == 0 증명 후 complete fsync
+  → cleanup acknowledgement와 PurgeJob 복구 상태 commit
+  → DB commit이 확인된 journal만 제거
+  → journal을 하나라도 제거했으면 directory cursor를 처음부터 재시작
+```
+
+한 maintenance 실행은 아래 세 설정으로 만든 **하나의 shared absolute
+budget**을 전 과정에 같이 사용한다.
+
+| 설정 | 기본값 | 한 실행에서 누적 제한하는 작업 |
+|---|---:|---|
+| `HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS` | 10초 | write-plane fence 안 filesystem 작업의 절대 deadline |
+| `HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES` | 256 MiB | discovery와 identity 검증에서 읽어 hash한 payload bytes |
+| `HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES` | 4,096 | directory scan과 create/link/rename/unlink/rmdir 같은 namespace mutation |
+
+이 budget은 discovery hash, 모든 bounded directory scan, journal publication,
+quarantine, 일반 durable unlink와 그 복구까지 공유한다. 이미 purge된 pending
+cleanup은 새 tombstone보다 먼저 준비하고 처리한다. budget이 소진되면 현재
+미완료 후보와 그 뒤 후보를 pending으로 보존하고, cursor에는 완료한 위치까지만
+남긴 뒤 새 budget을 가진 다음 maintenance 실행이 이어간다.
+
+단, cursor publication과 미리 mutation 수를 예약한 terminal
+`complete`/`manual-review` capsule은 작고 고정된 crash-progress 기록이다. 이미
+destructive durable transition을 시작한 직후 deadline이 지나면 그 한 후보의
+fsync/capsule 또는 cursor publication은 마칠 수 있다. 이것은 deadline 뒤 새
+후보, 추가 hash, 무제한 scan을 허용한다는 뜻이 아니다.
+
+일반 durable-unlink, retention quarantine, 중앙 cleanup journal의 모든 private
+namespace는 미등록 객체 발견과 활성 사용량 측정에서 제외한다. 따라서 복구 대기
+bytes가 디스크에는 남아 있어도 새 `raw_payload`/`media`로 재색인되거나 활성
+사용량에 이중 합산되지 않는다.
+
+특히 `raw_ingest/.healthmes-storage-delete-journal/` 전체 하위 tree를 예약한다.
+현재 schema와 맞지 않는 malformed·unknown·future-version 파일도 일반 raw
+payload로 재분류하거나 retention으로 삭제하지 않고, bounded journal reconciler만
+보존·보고한다. 사용량은 no-follow `lstat` 기준의 내부 regular file만 계산하므로
+외부 파일을 가리키는 symlink target bytes는 quota에 포함하지 않는다.
+
+maintenance API의 주요 숫자는 다음처럼 읽는다.
+
+| 필드 | 의미 |
+|---|---|
+| `candidates` | 현재 새로 purge할 수 있는 활성 `StorageObject` 수 |
+| `records_purged` | 이번 live 실행에서 DB상 접근 불가로 만든 행 수; dry-run은 `0` |
+| `files_deleted` | 증명된 HealthMes 소유 이름을 하나 이상 제거한 객체 cleanup 수 |
+| `file_cleanup_pending` | live 실행 후 아직 cleanup 확인이 없는 전체 purged 행 수; dry-run에서는 실행 전부터 존재한 pending 수 |
+| `deleted` | 하위 호환용 `files_deleted` 별칭이며 DB 행 삭제 수가 아님 |
+| `bytes_reclaimed` | 알려진 모든 이름이 사라지고 unknown hard link도 없음을 확인한 regular-file bytes |
+| `decision_receipt_candidates` | 보존기간이 끝난 compact decision receipt 후보 수 |
+| `decision_receipts_deleted` | live 실행에서 실제 삭제한 compact decision receipt 수; dry-run은 `0` |
+| `budget_exhausted` | shared maintenance budget이 소진됐는지 여부 |
+| `budget_resource` | 소진된 `deadline`, `hash_bytes`, `directory_entries`; 소진되지 않았으면 `null` |
+| `budget_phase` | budget 소진이 발생한 정확한 maintenance phase; 소진되지 않았으면 `null` |
+| `errors` | 이번 실행에서 관찰한 오류; pending 수가 남으면 오류 배열이 비어도 후속 처리가 필요 |
+
+`PurgeJob.detail`에는 대상 object ID, 재시도 수, cleanup 완료·대기 수가 남는다.
+이전 프로세스가 남긴 job을 다음 실행이 복구하면 과거 job은
+`file_cleanup_pending: 0`과 복구 job ID/시각을 함께 기록한다.
+
+자동 복구가 끝나지 않으면 quarantine이나 중앙 journal을 오래됐다는 이유만으로
+지우지 않는다.
+한 개의 최신 HealthMes writer만 실행한 상태에서 dry-run과 live maintenance를
+순서대로 실행하고, 남은 `PurgeJob.detail` object ID와 오류 경로를
+`StorageObject` 및 실제 inode와 대조한다. malformed identity, 교체된 파일,
+unknown hard link, symlink parent, 모르는 legacy quarantine은 blind `rm`이나
+수동 `file_cleanup_completed_at` 갱신이 아니라 별도 보존 후 운영자 조사가
+필요하다.
 
 ### 정책 변경
 

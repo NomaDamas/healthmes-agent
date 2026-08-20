@@ -12,6 +12,10 @@ import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.base import (
     CalendarBackend,
@@ -35,6 +39,7 @@ from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarResult,
 )
 from healthmes.calendars.sleep_source import SleepSummaryReader, read_actual_sleep
+from healthmes.calendars.write_lock import calendar_write_lock
 from healthmes.store import SleepProposalStatus, SleepReconciliationProposal
 
 APPLYING_RECOVERY_DELAY = dt.timedelta(minutes=5)
@@ -112,13 +117,54 @@ def apply_sleep_proposal_from_observation(
 ) -> SleepApplyResult:
     """Apply a proposal using a wearable observation already read."""
 
+    if session.get_bind().dialect.name == "postgresql":
+        with calendar_write_lock(session, calendar.backend.source):
+            with activity_write_lock():
+                return _apply_sleep_proposal_from_observation_locked(
+                    proposal_id=proposal_id,
+                    submitted_token=submitted_token,
+                    local_session_id=local_session_id,
+                    secret=secret,
+                    selected=selected,
+                    session=session,
+                    calendar=calendar,
+                    now=now,
+                )
+    return _apply_sleep_proposal_from_observation_locked(
+        proposal_id=proposal_id,
+        submitted_token=submitted_token,
+        local_session_id=local_session_id,
+        secret=secret,
+        selected=selected,
+        session=session,
+        calendar=calendar,
+        now=now,
+    )
+
+
+def _apply_sleep_proposal_from_observation_locked(
+    *,
+    proposal_id: uuid.UUID,
+    submitted_token: str,
+    local_session_id: str,
+    secret: bytes,
+    selected: ActualSleepObservation | SleepObservationNoOp,
+    session: Session,
+    calendar: ApprovalCalendar,
+    now: dt.datetime | None = None,
+) -> SleepApplyResult:
     backend = calendar.backend
-    proposal = session.scalar(
+    statement = (
         sa.select(SleepReconciliationProposal)
         .where(SleepReconciliationProposal.id == proposal_id)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    if session.get_bind().dialect.name == "postgresql":
+        lock_activity_write_plane(session)
+        proposal = session.scalar(statement)
+    else:
+        proposal = session.scalar(statement)
     if proposal is None:
         return SleepApplyResult(SleepProposalStatus.INVALID, None)
     current_time = now or dt.datetime.now(dt.UTC)
@@ -220,11 +266,30 @@ def decline_sleep_proposal(
     proposal_id: uuid.UUID,
     now: dt.datetime | None = None,
 ) -> SleepApplyResult:
-    proposal = session.get(
-        SleepReconciliationProposal,
-        proposal_id,
-        with_for_update=True,
-    )
+    if session.get_bind().dialect.name == "postgresql":
+        with activity_write_lock():
+            lock_activity_write_plane(session)
+            proposal = session.get(
+                SleepReconciliationProposal,
+                proposal_id,
+                with_for_update=True,
+            )
+            if proposal is None:
+                return SleepApplyResult(SleepProposalStatus.INVALID, None)
+            if proposal.status is not SleepProposalStatus.PENDING:
+                return SleepApplyResult(proposal.status, proposal.receipt)
+            return _close(
+                session,
+                proposal,
+                SleepProposalStatus.DECLINED,
+                now or dt.datetime.now(dt.UTC),
+            )
+    else:
+        proposal = session.get(
+            SleepReconciliationProposal,
+            proposal_id,
+            with_for_update=True,
+        )
     if proposal is None:
         return SleepApplyResult(SleepProposalStatus.INVALID, None)
     if proposal.status is not SleepProposalStatus.PENDING:

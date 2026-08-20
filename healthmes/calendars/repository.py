@@ -9,6 +9,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.store.models import CalendarEventMirror
 
 CALENDAR_RETENTION_CLASS = "calendar_mirror"
@@ -49,5 +53,9 @@ def retained_calendar_event(
         now=now,
     )
     if lock:
+        if session.get_bind().dialect.name == "postgresql":
+            with activity_write_lock():
+                lock_activity_write_plane(session)
+                return session.scalar(statement.with_for_update())
         statement = statement.with_for_update()
     return session.scalar(statement)

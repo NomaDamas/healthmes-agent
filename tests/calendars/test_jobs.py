@@ -818,6 +818,7 @@ class TestJobRun:
         self,
         session,
         fake_backend_factory,
+        monkeypatch,
     ) -> None:
         google_generation = "google-account-a"
         caldav_generation = "caldav-account-b"
@@ -857,6 +858,18 @@ class TestJobRun:
             InMemorySyncStateStore(),
             account_generation=caldav_generation,
         )
+        lock_entries: list[tuple[CalendarSource, ...]] = []
+
+        @contextmanager
+        def capture_lock_plan(waiting_session, sources):
+            assert not waiting_session.in_transaction()
+            lock_entries.append(tuple(sources))
+            yield
+
+        monkeypatch.setattr(
+            "healthmes.calendars.jobs.calendar_write_locks",
+            capture_lock_plan,
+        )
 
         assert push_accepted_proposals(
             service,
@@ -869,6 +882,9 @@ class TestJobRun:
         ) == 1
 
         assert caldav_backend.created_drafts == []
+        assert lock_entries == [
+            (CalendarSource.GOOGLE, CalendarSource.CALDAV)
+        ]
         stored = session.get(ScheduleProposal, proposal.id)
         assert stored.status is ProposalStatus.PUSHED
         assert stored.invalidation_reason is None
@@ -1395,12 +1411,13 @@ class TestJobRun:
         lock_entries: list[bool] = []
 
         @contextmanager
-        def assert_connection_free(waiting_session, _source):
+        def assert_connection_free(waiting_session, sources):
             lock_entries.append(waiting_session.in_transaction())
+            assert tuple(sources) == (CalendarSource.GOOGLE,)
             yield
 
         monkeypatch.setattr(
-            "healthmes.calendars.jobs.calendar_write_lock",
+            "healthmes.calendars.jobs.calendar_write_locks",
             assert_connection_free,
         )
         service = CalendarMirrorService(

@@ -16,6 +16,10 @@ from sqlalchemy import event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
     ConfirmationStatus,
@@ -536,7 +540,8 @@ def _reserve_interaction_analysis(
             }
         return reservation_token
 
-    with Session(bind=bind) as reservation_session:
+    with activity_write_lock(), Session(bind=bind) as reservation_session:
+        lock_activity_write_plane(reservation_session)
         marker = reservation_session.scalar(
             select(WellnessEvent)
             .where(
@@ -634,7 +639,8 @@ def _release_interaction_analysis(
         )
         return
     bind = session.get_bind()
-    with Session(bind=bind) as reservation_session:
+    with activity_write_lock(), Session(bind=bind) as reservation_session:
+        lock_activity_write_plane(reservation_session)
         marker = reservation_session.scalar(
             select(WellnessEvent)
             .where(

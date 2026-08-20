@@ -14,17 +14,28 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
+from alembic.config import Config
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from alembic import command
 from healthmes import __version__
-from healthmes.activity.locking import activity_write_lock
+from healthmes.activity.locking import (
+    activate_runtime_extended_write_fence,
+    activity_write_lock,
+    set_sqlite_busy_timeout_ms,
+    sqlite_busy_timeout_ms,
+    sqlite_runtime_guard,
+)
 from healthmes.activity.maintenance import ACTIVITY_MAINTENANCE_JOB_ID
 from healthmes.app import (
+    DatabaseSchemaError,
     _run_mandatory_decision_receipt_maintenance,
     _run_receipt_maintenance_durably,
     create_app,
@@ -61,6 +72,13 @@ _MCP_INITIALIZE = {
     },
 }
 _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _migration_config(database_url: str) -> Config:
+    config = Config(str(_REPO_ROOT / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    return config
 
 
 def _completed_receipt(
@@ -77,9 +95,7 @@ def _completed_receipt(
         requested_at=now,
         state="completed",
         result_payload=payload,
-        result_expires_at=(
-            result_expires_at or now + timedelta(days=30)
-        ),
+        result_expires_at=(result_expires_at or now + timedelta(days=30)),
         retention_basis_at=basis,
         expires_at=now + timedelta(days=30),
     )
@@ -114,6 +130,88 @@ def test_create_app_without_args_uses_env_settings(monkeypatch) -> None:
 
 
 class TestStoreWiring:
+    def test_empty_file_sqlite_is_initialized_at_alembic_head(
+        self,
+        settings,
+        tmp_path,
+    ) -> None:
+        database_url = f"sqlite+pysqlite:///{tmp_path / 'empty.db'}"
+        configured = settings.model_copy(update={"database_url": database_url})
+
+        with TestClient(create_app(configured)):
+            engine = get_engine()
+            version_table = sa.table(
+                "alembic_version",
+                sa.column("version_num"),
+            )
+            storage_object = sa.table(
+                "storage_object",
+                sa.column("id"),
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(sa.select(version_table.c.version_num)) == "d4e5f6a7b8c9"
+                connection.execute(sa.select(storage_object.c.id).limit(1))
+
+    def test_direct_app_factory_rejects_existing_non_head_database(
+        self,
+        settings,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        import healthmes.app as app_module
+
+        database_url = f"sqlite+pysqlite:///{tmp_path / 'old.db'}"
+        command.upgrade(
+            _migration_config(database_url),
+            "c3d4e5f6a7b8",
+        )
+        configured = settings.model_copy(update={"database_url": database_url})
+        monkeypatch.setattr(app_module, "get_settings", lambda: configured)
+
+        app = app_module.create_app()
+        with pytest.raises(
+            DatabaseSchemaError,
+            match=(
+                r"current: c3d4e5f6a7b8; expected: d4e5f6a7b8c9.*"
+                r"uv run alembic upgrade head"
+            ),
+        ):
+            with TestClient(app):
+                pass
+
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    def test_python_module_serve_rejects_existing_non_head_database(
+        self,
+        settings,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ) -> None:
+        import healthmes.__main__ as cli_module
+
+        database_url = f"sqlite+pysqlite:///{tmp_path / 'old-cli.db'}"
+        command.upgrade(
+            _migration_config(database_url),
+            "c3d4e5f6a7b8",
+        )
+        configured = settings.model_copy(update={"database_url": database_url})
+        monkeypatch.setattr(cli_module, "get_settings", lambda: configured)
+        monkeypatch.setattr(
+            "uvicorn.run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Uvicorn must not start against a stale database"
+            ),
+        )
+
+        assert cli_module.main([]) == 1
+        error = capsys.readouterr().err
+        assert "current: c3d4e5f6a7b8" in error
+        assert "expected: d4e5f6a7b8c9" in error
+        assert "uv run alembic upgrade head" in error
+
     def test_lifespan_binds_engine_to_app_settings_and_serves_rest(self, settings) -> None:
         """init_engine(settings) runs at startup so SessionDep hits the app db."""
         app = create_app(settings)
@@ -124,7 +222,14 @@ class TestStoreWiring:
         ) as client:
             engine = get_engine()  # initialised by the lifespan, not lazily
             assert str(engine.url) == settings.database_url
-            Base.metadata.create_all(engine)
+            with engine.connect() as connection:
+                with pytest.raises(
+                    RuntimeError,
+                    match=r"fenced_core_transaction\(\)",
+                ):
+                    connection.exec_driver_sql(
+                        "CREATE TABLE runtime_schema_bypass (id INTEGER PRIMARY KEY)"
+                    )
 
             created = client.post(
                 "/v1/goals", json={"week_start": "2026-07-06", "title": "Integration"}
@@ -138,6 +243,33 @@ class TestStoreWiring:
         # Shutdown disposes the process-wide engine singleton.
         assert store_session._engine is None
         assert store_session._session_factory is None
+
+    def test_file_sqlite_lifespan_holds_runtime_restore_lock(
+        self,
+        settings,
+        tmp_path,
+    ) -> None:
+        database_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
+        configured = settings.model_copy(update={"database_url": database_url})
+        app = create_app(configured)
+
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ):
+            with pytest.raises(TimeoutError, match="SQLite file lock"):
+                with sqlite_runtime_guard(
+                    database_url,
+                    timeout_seconds=0.1,
+                ):
+                    pytest.fail("runtime restore lock unexpectedly acquired")
+
+        with sqlite_runtime_guard(
+            database_url,
+            timeout_seconds=1,
+        ):
+            pass
 
     def test_startup_failure_releases_mcp_settings_and_database(
         self,
@@ -242,9 +374,7 @@ class TestStoreWiring:
 
             async def astart(self) -> None:
                 self.start_calls += 1
-                raise AssertionError(
-                    "the optional decision runtime must start lazily"
-                )
+                raise AssertionError("the optional decision runtime must start lazily")
 
             async def aclose(self) -> None:
                 self.close_calls += 1
@@ -316,9 +446,7 @@ class TestStoreWiring:
         monkeypatch.setattr(
             app_module,
             "register_energy_job",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("scheduler setup failed")
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scheduler setup failed")),
         )
 
         app = create_app(settings)
@@ -375,9 +503,7 @@ class TestStoreWiring:
         monkeypatch.setattr(
             app_module,
             "shutdown_scheduler",
-            lambda _scheduler: (_ for _ in ()).throw(
-                RuntimeError("scheduler shutdown failed")
-            ),
+            lambda _scheduler: (_ for _ in ()).throw(RuntimeError("scheduler shutdown failed")),
         )
 
         app = create_app(settings)
@@ -479,9 +605,7 @@ class TestStoreWiring:
 
             async def aclose(self) -> None:
                 if self._shutdown_task is None:
-                    self._shutdown_task = asyncio.create_task(
-                        self._shutdown()
-                    )
+                    self._shutdown_task = asyncio.create_task(self._shutdown())
                 await asyncio.shield(self._shutdown_task)
 
         decision_engine = StubDecisionEngine()
@@ -534,11 +658,9 @@ def test_startup_compacts_legacy_and_scrubs_expired_transient_receipts(
     settings,
 ) -> None:
     now = datetime.now(UTC)
-    database_url = (
-        f"sqlite+pysqlite:///{settings.data_dir / 'receipt-startup.db'}"
-    )
+    database_url = f"sqlite+pysqlite:///{settings.data_dir / 'receipt-startup.db'}"
+    command.upgrade(_migration_config(database_url), "head")
     database = create_db_engine(database_url)
-    Base.metadata.create_all(database)
     record_id = uuid.uuid4()
     legacy = _completed_receipt(
         now=now,
@@ -581,9 +703,7 @@ def test_startup_compacts_legacy_and_scrubs_expired_transient_receipts(
         },
     )
     with Session(database) as session:
-        session.add_all(
-            (legacy, expired, malformed, forged_pointer)
-        )
+        session.add_all((legacy, expired, malformed, forged_pointer))
         session.commit()
         legacy_id = legacy.id
         expired_id = expired.id
@@ -591,9 +711,7 @@ def test_startup_compacts_legacy_and_scrubs_expired_transient_receipts(
         forged_pointer_id = forged_pointer.id
     database.dispose()
 
-    configured = settings.model_copy(
-        update={"database_url": database_url}
-    )
+    configured = settings.model_copy(update={"database_url": database_url})
     app = create_app(configured)
     with TestClient(app):
         assert app.state.scheduler is None
@@ -620,9 +738,7 @@ def test_startup_compacts_legacy_and_scrubs_expired_transient_receipts(
                 "kind": "decision_record",
                 "decision_record_id": str(record_id),
             }
-            assert "legacy sensitive answer" not in str(
-                compacted.result_payload
-            )
+            assert "legacy sensitive answer" not in str(compacted.result_payload)
             assert scrubbed is not None
             assert scrubbed.state == "tombstone"
             assert scrubbed.result_payload is None
@@ -650,10 +766,7 @@ def test_recurring_receipt_scrub_runs_with_scheduler_disabled(
     )
     configured = settings.model_copy(
         update={
-            "database_url": (
-                f"sqlite+pysqlite:///"
-                f"{settings.data_dir / 'receipt-recurring.db'}"
-            )
+            "database_url": (f"sqlite+pysqlite:///{settings.data_dir / 'receipt-recurring.db'}")
         }
     )
     app = create_app(configured)
@@ -688,8 +801,7 @@ def test_recurring_receipt_scrub_runs_with_scheduler_disabled(
                 assert stored is not None
                 if (
                     isinstance(stored.result_payload, dict)
-                    and stored.result_payload.get("schema")
-                    == "healthmes.decision-receipt.v2"
+                    and stored.result_payload.get("schema") == "healthmes.decision-receipt.v2"
                 ):
                     stored_payload = dict(stored.result_payload)
                     break
@@ -697,29 +809,21 @@ def test_recurring_receipt_scrub_runs_with_scheduler_disabled(
         else:
             pytest.fail("recurring receipt maintenance did not run")
 
-        assert "recurring sensitive answer" not in str(
-            stored_payload
-        )
+        assert "recurring sensitive answer" not in str(stored_payload)
 
 
 def test_mandatory_receipt_maintenance_commits_bounded_progress(
     settings,
 ) -> None:
     configured = settings.model_copy(
-        update={
-            "database_url": (
-                f"sqlite+pysqlite:///"
-                f"{settings.data_dir / 'receipt-bounded.db'}"
-            )
-        }
+        update={"database_url": (f"sqlite+pysqlite:///{settings.data_dir / 'receipt-bounded.db'}")}
     )
     database = init_engine(configured)
     Base.metadata.create_all(database)
+    activate_runtime_extended_write_fence(database)
     original_busy_timeout_ms = 17_321
     with database.connect() as connection:
-        connection.exec_driver_sql(
-            f"PRAGMA busy_timeout={original_busy_timeout_ms}"
-        )
+        set_sqlite_busy_timeout_ms(connection, original_busy_timeout_ms)
     now = datetime.now(UTC)
     try:
         with store_session.session_scope() as session:
@@ -738,12 +842,10 @@ def test_mandatory_receipt_maintenance_commits_bounded_progress(
                 for index in range(3)
             )
 
-        processed, cursor = (
-            _run_mandatory_decision_receipt_maintenance(
-                now=now,
-                batch_size=1,
-                max_rows=2,
-            )
+        processed, cursor = _run_mandatory_decision_receipt_maintenance(
+            now=now,
+            batch_size=1,
+            max_rows=2,
         )
         assert processed == 2
         assert cursor is not None
@@ -751,42 +853,35 @@ def test_mandatory_receipt_maintenance_commits_bounded_progress(
             remaining = session.scalar(
                 select(DecisionRequestReceipt)
                 .where(
-                    DecisionRequestReceipt.result_payload[
-                        "schema"
-                    ].as_string()
+                    DecisionRequestReceipt.result_payload["schema"].as_string()
                     == "healthmes.decision-receipt.v1"
                 )
                 .limit(1)
             )
             assert remaining is not None
 
-        processed, cursor = (
-            _run_mandatory_decision_receipt_maintenance(
-                now=now,
-                batch_size=1,
-                max_rows=2,
-                after_id=cursor,
-            )
+        processed, cursor = _run_mandatory_decision_receipt_maintenance(
+            now=now,
+            batch_size=1,
+            max_rows=2,
+            after_id=cursor,
         )
         assert processed == 1
         assert cursor is None
         with store_session.session_scope() as session:
-            assert session.scalar(
-                select(DecisionRequestReceipt)
-                .where(
-                    DecisionRequestReceipt.result_payload[
-                        "schema"
-                    ].as_string()
-                    == "healthmes.decision-receipt.v1"
+            assert (
+                session.scalar(
+                    select(DecisionRequestReceipt)
+                    .where(
+                        DecisionRequestReceipt.result_payload["schema"].as_string()
+                        == "healthmes.decision-receipt.v1"
+                    )
+                    .limit(1)
                 )
-                .limit(1)
-            ) is None
+                is None
+            )
         with database.connect() as connection:
-            assert int(
-                connection.exec_driver_sql(
-                    "PRAGMA busy_timeout"
-                ).scalar_one()
-            ) == original_busy_timeout_ms
+            assert sqlite_busy_timeout_ms(connection) == original_busy_timeout_ms
     finally:
         dispose_engine()
 
@@ -796,10 +891,7 @@ def test_mandatory_receipt_maintenance_lock_wait_is_bounded(
 ) -> None:
     configured = settings.model_copy(
         update={
-            "database_url": (
-                f"sqlite+pysqlite:///"
-                f"{settings.data_dir / 'receipt-lock-timeout.db'}"
-            )
+            "database_url": (f"sqlite+pysqlite:///{settings.data_dir / 'receipt-lock-timeout.db'}")
         }
     )
     database = init_engine(configured)
@@ -839,12 +931,7 @@ async def test_cancelled_receipt_maintenance_releases_blocked_worker(
     settings,
 ) -> None:
     configured = settings.model_copy(
-        update={
-            "database_url": (
-                f"sqlite+pysqlite:///"
-                f"{settings.data_dir / 'receipt-cancel.db'}"
-            )
-        }
+        update={"database_url": (f"sqlite+pysqlite:///{settings.data_dir / 'receipt-cancel.db'}")}
     )
     database = init_engine(configured)
     Base.metadata.create_all(database)
@@ -998,9 +1085,7 @@ class TestSchedulerWiring:
             assert google_job.trigger.interval.total_seconds() == 5 * 60
             assert caldav_job.trigger.interval.total_seconds() == 10 * 60
 
-    def test_enabled_activitywatch_registers_one_job_and_shutdown_stops_it(
-        self, settings
-    ) -> None:
+    def test_enabled_activitywatch_registers_one_job_and_shutdown_stops_it(self, settings) -> None:
         enabled = settings.model_copy(
             update={
                 "scheduler_enabled": True,
@@ -1012,11 +1097,7 @@ class TestSchedulerWiring:
         with TestClient(app):
             scheduler = app.state.scheduler
             assert scheduler is not None
-            matches = [
-                job
-                for job in scheduler.get_jobs()
-                if job.id == ACTIVITYWATCH_JOB_ID
-            ]
+            matches = [job for job in scheduler.get_jobs() if job.id == ACTIVITYWATCH_JOB_ID]
             assert len(matches) == 1
             assert matches[0].trigger.interval.total_seconds() == 13 * 60
             assert matches[0].max_instances == 1
@@ -1067,9 +1148,7 @@ class TestSchedulerWiring:
             return real_start(settings_arg, scheduler=scheduler)
 
         monkeypatch.setattr(app_module, "start_scheduler", spying_start)
-        configured = settings.model_copy(
-            update={"activitywatch_enabled": True}
-        )
+        configured = settings.model_copy(update={"activitywatch_enabled": True})
         app = create_app(configured)
         with TestClient(app):
             assert app.state.scheduler is None

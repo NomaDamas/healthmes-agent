@@ -189,6 +189,12 @@ class Settings(BaseSettings):
         description="Local-first data directory (media files, sqlite db, exports, "
         "pidfiles). Only paths are stored in the database.",
     )
+    restore_state_dir: Path | None = Field(
+        default=None,
+        description="Crash-recovery journal directory for snapshot restore. "
+        "None selects a stable backend-specific path outside replaceable "
+        "restore targets; set HEALTHMES_RESTORE_STATE_DIR to pin it explicitly.",
+    )
     port: int = Field(
         default=8100,
         description="TCP port the HealthMes FastAPI service listens on.",
@@ -324,6 +330,25 @@ class Settings(BaseSettings):
         "(POST /v1/media). Uploads beyond the cap are rejected with 413 and "
         "nothing is stored. Default 15 MiB — plenty for phone photos and "
         "voice memos while keeping a LAN peer from filling the disk.",
+    )
+    storage_maintenance_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Absolute cooperative deadline for filesystem work while "
+        "storage maintenance holds the global HealthMes write fence.",
+    )
+    storage_maintenance_max_hash_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1,
+        description="Maximum cumulative payload bytes hashed by one storage "
+        "maintenance run.",
+    )
+    storage_maintenance_max_directory_entries: int = Field(
+        default=4096,
+        ge=1,
+        description="Maximum cumulative directory scan and namespace mutation "
+        "entries consumed by one storage maintenance run.",
     )
     nutrition_ollama_base_url: str = Field(
         default="http://127.0.0.1:11434",
@@ -509,6 +534,65 @@ class Settings(BaseSettings):
         "Empty: `healthmes backup create` errors and the weekly backup job "
         "skips with a warning.",
     )
+    backup_max_encrypted_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum encrypted snapshot envelope accepted or created.",
+    )
+    backup_max_decrypted_bytes: int = Field(
+        default=768 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum decrypted gzip-compressed tar payload held in memory.",
+    )
+    backup_max_archive_members: int = Field(
+        default=100_000,
+        ge=1,
+        le=1_000_000,
+        description="Maximum number of members allowed in one snapshot archive.",
+    )
+    backup_max_member_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum expanded size of one regular archive member.",
+    )
+    backup_max_expanded_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum total expanded regular-file bytes in one snapshot.",
+    )
+    backup_max_identity_depth: int = Field(
+        default=128,
+        ge=1,
+        le=1_024,
+        description="Maximum directory depth traversed while binding a local "
+        "restore generation to its journal identity.",
+    )
+    backup_identity_traversal_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Absolute wall-clock deadline for one local restore "
+        "identity phase, including every file hashed in that phase.",
+    )
+    backup_max_compression_ratio: float = Field(
+        default=100.0,
+        gt=1,
+        le=10_000,
+        description="Maximum expanded-to-compressed archive ratio.",
+    )
+    backup_min_free_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=0,
+        description="Free disk space retained after extraction or local restore staging.",
+    )
+    backup_postgres_tool_timeout_seconds: float = Field(
+        default=1800.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum wall-clock seconds for each PostgreSQL backup or "
+        "restore client operation (pg_dump, pg_restore, or psql). Increase "
+        "this for large databases or slow remote PostgreSQL targets.",
+    )
     ow_database_url: str | None = Field(
         default=None,
         description="Direct SQLAlchemy/postgres URL of the open-wearables database, "
@@ -579,6 +663,7 @@ class Settings(BaseSettings):
         "decision_hermes_runtime_manifest_path",
         "decision_hermes_attestation_key_path",
         "backup_dir",
+        "restore_state_dir",
         "ow_database_url",
         "hermes_home",
         "google_client_secret_file",

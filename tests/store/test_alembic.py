@@ -6,10 +6,12 @@ network, or running database are needed — postgres is exercised via *offline*
 rendering, which never connects.
 """
 
+import hashlib
 import io
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -22,10 +24,12 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
+from healthmes.config import Settings
 from healthmes.schedule_proposals import resolution_token, verify_resolution_token
+from healthmes.storage import run_storage_maintenance
 from healthmes.store import (
     Base,
     DecisionKind,
@@ -33,7 +37,9 @@ from healthmes.store import (
     ProposalStatus,
     RetentionPolicy,
     ScheduleProposal,
+    StorageObject,
     Task,
+    create_db_engine,
     session_scope,
 )
 from healthmes.wearables.provenance import (
@@ -266,6 +272,62 @@ class TestOfflineRender:
         assert "UUID" in rendered  # sa.Uuid became native UUID
         # enums stay portable VARCHAR: no postgres CREATE TYPE
         assert "CREATE TYPE" not in rendered
+
+    def test_storage_cleanup_identity_uses_portable_jsonb(self) -> None:
+        rendered = _render_offline_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert (
+            "ALTER TABLE storage_object ADD COLUMN file_cleanup_identity JSONB"
+            in rendered
+        )
+
+    def test_sqlite_offline_render_executes_cleanup_batch_once(
+        self,
+        tmp_path,
+    ) -> None:
+        rendered = _render_offline_upgrade("sqlite:///offline-render.db")
+        cleanup_sql = rendered.split(
+            "-- Running upgrade c3d4e5f6a7b8 -> d4e5f6a7b8c9",
+            maxsplit=1,
+        )[1]
+
+        assert (
+            "ALTER TABLE storage_object ADD COLUMN file_cleanup_identity"
+            not in cleanup_sql
+        )
+        assert cleanup_sql.count("file_cleanup_identity JSON") == 1
+        assert "storage_object_file_cleanup_consistent" in cleanup_sql
+
+        connection = sqlite3.connect(tmp_path / "offline-render.db")
+        try:
+            connection.executescript(rendered)
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(storage_object)"
+                )
+            }
+            table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'storage_object'"
+            ).fetchone()[0]
+            revisions = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT version_num FROM alembic_version"
+                )
+            }
+        finally:
+            connection.close()
+
+        assert {
+            "file_cleanup_identity",
+            "file_cleanup_completed_at",
+        } <= columns
+        assert "storage_object_file_cleanup_consistent" in table_sql
+        assert "d4e5f6a7b8c9" in revisions
 
     def test_postgres_receipt_hardening_drops_exact_published_constraint(
         self,
@@ -564,6 +626,80 @@ class TestOfflineRender:
 
 
 class TestSqliteUpgrade:
+    def test_supplied_connection_preserves_foreign_keys_during_batch_upgrade(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'supplied-connection.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c4f8a2d91b3e")
+        engine = sa.create_engine(database_url)
+        goal_id = uuid.uuid4()
+        task_id = uuid.uuid4()
+        try:
+            weekly_goal = sa.Table(
+                "weekly_goal",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            task = sa.Table(
+                "task",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            now = datetime(2026, 8, 19, tzinfo=UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    weekly_goal.insert().values(
+                        id=goal_id.hex,
+                        week_start=date(2026, 8, 17),
+                        title="preserve child reference",
+                        priority=1,
+                        status="active",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                connection.execute(
+                    task.insert().values(
+                        id=task_id.hex,
+                        title="must keep goal_id",
+                        goal_id=goal_id.hex,
+                        est_minutes=30,
+                        deadline=None,
+                        energy_demand="med",
+                        status="todo",
+                        source="user",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            with engine.connect() as connection:
+                raw = connection.connection.driver_connection
+                cursor = raw.cursor()
+                try:
+                    cursor.execute("PRAGMA foreign_keys=ON")
+                    cursor.execute("PRAGMA foreign_keys")
+                    assert cursor.fetchone() == (1,)
+                finally:
+                    cursor.close()
+                config.attributes["connection"] = connection
+                command.upgrade(config, "d5e7f3a1c2b9")
+
+                assert connection.scalar(
+                    sa.text("SELECT goal_id FROM task WHERE id = :id"),
+                    {"id": task_id.hex},
+                ) == goal_id.hex
+                assert connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).fetchall() == []
+                assert connection.exec_driver_sql(
+                    "PRAGMA foreign_keys"
+                ).scalar() == 1
+        finally:
+            engine.dispose()
+
     def test_upgrade_creates_schema_and_is_usable(self, tmp_path):
         database_url = f"sqlite:///{tmp_path / 'migrated.db'}"
         command.upgrade(_config(database_url), "head")
@@ -606,6 +742,596 @@ class TestSqliteUpgrade:
                 context = MigrationContext.configure(connection)
                 diff = compare_metadata(context, Base.metadata)
             assert diff == []
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_upgrade_leaves_legacy_purges_pending(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'legacy-purge.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c3d4e5f6a7b8")
+        engine = sa.create_engine(database_url)
+        purged_id = uuid.uuid4().hex
+        active_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 17, 12, tzinfo=UTC)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            common = {
+                "data_class": "raw_payload",
+                "content_type": "application/octet-stream",
+                "size_bytes": 7,
+                "sha256": None,
+                "retention_policy_id": None,
+                "retention_basis_at": purged_at,
+                "expires_at": purged_at,
+                "safe_to_purge": True,
+                "created_at": purged_at,
+                "updated_at": purged_at,
+            }
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert(),
+                    [
+                        {
+                            **common,
+                            "id": purged_id,
+                            "relative_path": "raw_ingest/legacy.bin",
+                            "purged_at": purged_at,
+                        },
+                        {
+                            **common,
+                            "id": active_id,
+                            "relative_path": "raw_ingest/active.bin",
+                            "purged_at": None,
+                        },
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(storage_object).where(
+                            storage_object.c.id.in_(
+                                (purged_id, active_id)
+                            )
+                        )
+                    )
+                }
+            assert rows[purged_id].file_cleanup_completed_at is None
+            assert rows[purged_id].file_cleanup_identity is None
+            assert rows[active_id].file_cleanup_completed_at is None
+            assert rows[active_id].file_cleanup_identity is None
+        finally:
+            engine.dispose()
+
+    def test_migrated_legacy_purge_deletes_only_matching_remaining_file(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = f"sqlite:///{tmp_path / 'legacy-file-purge.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c3d4e5f6a7b8")
+        data_dir = tmp_path / "data"
+        relative_path = "raw_ingest/legacy.bin"
+        payload_path = data_dir / relative_path
+        payload = b"legacy purged payload still on disk"
+        digest = hashlib.sha256(payload).hexdigest()
+        payload_path.parent.mkdir(parents=True)
+        payload_path.write_bytes(payload)
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 17, 12, tzinfo=UTC)
+
+        engine = sa.create_engine(database_url)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert().values(
+                        id=object_id,
+                        data_class="raw_payload",
+                        relative_path=relative_path,
+                        content_type="application/octet-stream",
+                        size_bytes=len(payload),
+                        sha256=digest,
+                        retention_policy_id=None,
+                        retention_basis_at=purged_at,
+                        expires_at=purged_at,
+                        safe_to_purge=True,
+                        purged_at=purged_at,
+                        created_at=purged_at,
+                        updated_at=purged_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        runtime_engine = create_db_engine(database_url)
+        settings = Settings(
+            database_url=database_url,
+            data_dir=data_dir,
+            scheduler_enabled=False,
+            _env_file=None,
+        )
+        try:
+            with Session(runtime_engine) as session:
+                report = run_storage_maintenance(
+                    session,
+                    settings,
+                    now=datetime(2026, 8, 18, 12, tzinfo=UTC),
+                )
+                obj = session.get(StorageObject, uuid.UUID(object_id))
+                assert obj is not None
+                assert report.records_purged == 0
+                assert report.files_deleted == 1
+                assert report.file_cleanup_pending == 0
+                assert report.bytes_reclaimed == len(payload)
+                assert report.errors == ()
+                assert obj.file_cleanup_identity["version"] == 2
+                assert obj.file_cleanup_identity["sha256"] == digest
+                assert obj.file_cleanup_completed_at is not None
+                assert not payload_path.exists()
+        finally:
+            runtime_engine.dispose()
+
+    @pytest.mark.parametrize(
+        "failure_fragment",
+        (
+            "ADD COLUMN file_cleanup_identity",
+            "ADD COLUMN file_cleanup_completed_at",
+            "CREATE INDEX ix_storage_object_file_cleanup_completed_at",
+        ),
+    )
+    def test_storage_cleanup_upgrade_rolls_back_and_retries_after_each_stage(
+        self,
+        tmp_path,
+        failure_fragment,
+    ) -> None:
+        database_url = f"sqlite:///{tmp_path / 'cleanup-atomic.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c3d4e5f6a7b8")
+        injected = False
+
+        def fail_after_stage(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            nonlocal injected
+            if failure_fragment not in " ".join(statement.split()):
+                return
+            injected = True
+            raise RuntimeError(f"injected failure after {failure_fragment}")
+
+        sa.event.listen(
+            sa.engine.Engine,
+            "after_cursor_execute",
+            fail_after_stage,
+        )
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="injected failure after",
+            ):
+                command.upgrade(config, "head")
+        finally:
+            sa.event.remove(
+                sa.engine.Engine,
+                "after_cursor_execute",
+                fail_after_stage,
+            )
+        assert injected is True
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("storage_object")
+            }
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes("storage_object")
+            }
+            assert "file_cleanup_identity" not in columns
+            assert "file_cleanup_completed_at" not in columns
+            assert (
+                "ix_storage_object_file_cleanup_completed_at"
+                not in indexes
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c3d4e5f6a7b8"
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("storage_object")
+            }
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes("storage_object")
+            }
+            assert "file_cleanup_identity" in columns
+            assert "file_cleanup_completed_at" in columns
+            assert (
+                "ix_storage_object_file_cleanup_completed_at"
+                in indexes
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d4e5f6a7b8c9"
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_downgrade_refuses_pending_unlink(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'pending-purge.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 18, 1, tzinfo=UTC)
+        cleanup_identity = {
+            "version": 1,
+            "kind": "regular",
+            "device": 1,
+            "inode": 2,
+            "size": 7,
+            "mtime_ns": 3,
+            "ctime_ns": 4,
+            "nlink": 1,
+            "sha256": "0" * 64,
+        }
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert().values(
+                        id=object_id,
+                        data_class="raw_payload",
+                        relative_path="raw_ingest/pending.bin",
+                        content_type="application/octet-stream",
+                        size_bytes=7,
+                        sha256=None,
+                        retention_policy_id=None,
+                        retention_basis_at=purged_at,
+                        expires_at=purged_at,
+                        safe_to_purge=True,
+                        purged_at=purged_at,
+                        file_cleanup_identity=cleanup_identity,
+                        file_cleanup_completed_at=None,
+                        created_at=purged_at,
+                        updated_at=purged_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="purged payload deletion is still pending",
+        ):
+            command.downgrade(config, "c3d4e5f6a7b8")
+
+        engine = sa.create_engine(database_url)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d4e5f6a7b8c9"
+                assert (
+                    connection.scalar(
+                        sa.select(
+                            storage_object.c.file_cleanup_identity
+                        ).where(storage_object.c.id == object_id)
+                    )
+                    == cleanup_identity
+                )
+                connection.execute(
+                    storage_object.update()
+                    .where(storage_object.c.id == object_id)
+                    .values(file_cleanup_completed_at=purged_at)
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "c3d4e5f6a7b8")
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                column["name"]
+                for column in sa.inspect(engine).get_columns(
+                    "storage_object"
+                )
+            }
+            assert "file_cleanup_completed_at" not in columns
+            assert "file_cleanup_identity" not in columns
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_downgrade_waits_for_sqlite_retention_writer(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'cleanup-race.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(
+            database_url,
+            connect_args={"timeout": 5},
+        )
+        storage_object = sa.Table(
+            "storage_object",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 18, 2, tzinfo=UTC)
+        cleanup_identity = {
+            "version": 1,
+            "kind": "regular",
+            "device": 11,
+            "inode": 22,
+            "size": 7,
+            "mtime_ns": 33,
+            "ctime_ns": 44,
+            "nlink": 1,
+            "sha256": "1" * 64,
+        }
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert().values(
+                        id=object_id,
+                        data_class="raw_payload",
+                        relative_path="raw_ingest/racing-purge.bin",
+                        content_type="application/octet-stream",
+                        size_bytes=7,
+                        sha256=None,
+                        retention_policy_id=None,
+                        retention_basis_at=purged_at,
+                        expires_at=purged_at,
+                        safe_to_purge=True,
+                        purged_at=None,
+                        file_cleanup_identity=None,
+                        file_cleanup_completed_at=None,
+                        created_at=purged_at,
+                        updated_at=purged_at,
+                    )
+                )
+
+            with engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    storage_object.update()
+                    .where(storage_object.c.id == object_id)
+                    .values(
+                        purged_at=purged_at,
+                        file_cleanup_identity=cleanup_identity,
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(database_url),
+                        "c3d4e5f6a7b8",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match="purged payload deletion is still pending",
+                    ):
+                        downgrade.result(timeout=5)
+        finally:
+            engine.dispose()
+
+        engine = sa.create_engine(database_url)
+        try:
+            current_storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d4e5f6a7b8c9"
+                row = connection.execute(
+                    sa.select(current_storage_object).where(
+                        current_storage_object.c.id == object_id
+                    )
+                ).one()
+                assert row.purged_at == purged_at.replace(tzinfo=None)
+                assert row.file_cleanup_identity == cleanup_identity
+                assert row.file_cleanup_completed_at is None
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_downgrade_holds_sqlite_lock_through_ddl(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'cleanup-ddl-race.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(
+            database_url,
+            connect_args={"timeout": 5},
+        )
+        storage_object = sa.Table(
+            "storage_object",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 18, 3, tzinfo=UTC)
+        cleanup_identity = {
+            "version": 1,
+            "kind": "regular",
+            "device": 111,
+            "inode": 222,
+            "size": 7,
+            "mtime_ns": 333,
+            "ctime_ns": 444,
+            "nlink": 1,
+            "sha256": "2" * 64,
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                storage_object.insert().values(
+                    id=object_id,
+                    data_class="raw_payload",
+                    relative_path="raw_ingest/ddl-racing-purge.bin",
+                    content_type="application/octet-stream",
+                    size_bytes=7,
+                    sha256=None,
+                    retention_policy_id=None,
+                    retention_basis_at=purged_at,
+                    expires_at=purged_at,
+                    safe_to_purge=True,
+                    purged_at=None,
+                    file_cleanup_identity=None,
+                    file_cleanup_completed_at=None,
+                    created_at=purged_at,
+                    updated_at=purged_at,
+                )
+            )
+
+        reservation_acquired = threading.Event()
+        release_downgrade = threading.Event()
+        reservation_sql = (
+            "UPDATE storage_object SET updated_at = updated_at WHERE 0"
+        )
+
+        def pause_after_reservation(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if " ".join(statement.split()) != reservation_sql:
+                return
+            reservation_acquired.set()
+            if not release_downgrade.wait(timeout=5):
+                raise TimeoutError("timed out releasing SQLite downgrade")
+
+        def write_pending_cleanup() -> None:
+            writer_engine = sa.create_engine(
+                database_url,
+                connect_args={"timeout": 5},
+            )
+            try:
+                with writer_engine.begin() as connection:
+                    connection.execute(
+                        storage_object.update()
+                        .where(storage_object.c.id == object_id)
+                        .values(
+                            purged_at=purged_at,
+                            file_cleanup_identity=cleanup_identity,
+                        )
+                    )
+            finally:
+                writer_engine.dispose()
+
+        sa.event.listen(
+            sa.engine.Engine,
+            "after_cursor_execute",
+            pause_after_reservation,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                downgrade = pool.submit(
+                    command.downgrade,
+                    _config(database_url),
+                    "c3d4e5f6a7b8",
+                )
+                assert reservation_acquired.wait(timeout=5)
+                writer = pool.submit(write_pending_cleanup)
+                time.sleep(0.2)
+                assert writer.done() is False
+
+                release_downgrade.set()
+                downgrade.result(timeout=5)
+                with pytest.raises(
+                    sa.exc.OperationalError,
+                    match="no such column.*file_cleanup_identity",
+                ):
+                    writer.result(timeout=5)
+        finally:
+            release_downgrade.set()
+            sa.event.remove(
+                sa.engine.Engine,
+                "after_cursor_execute",
+                pause_after_reservation,
+            )
+            engine.dispose()
+
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                column["name"]
+                for column in sa.inspect(engine).get_columns(
+                    "storage_object"
+                )
+            }
+            assert "file_cleanup_completed_at" not in columns
+            assert "file_cleanup_identity" not in columns
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c3d4e5f6a7b8"
+                assert connection.scalar(
+                    sa.select(storage_object.c.purged_at).where(
+                        storage_object.c.id == object_id
+                    )
+                ) is None
         finally:
             engine.dispose()
 
@@ -1002,7 +1728,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "c3d4e5f6a7b8"
+                ) == "d4e5f6a7b8c9"
         finally:
             engine.dispose()
 
@@ -3466,7 +4192,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "c3d4e5f6a7b8"
+                ) == "d4e5f6a7b8c9"
         finally:
             engine.dispose()
 
@@ -3710,6 +4436,67 @@ def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
             match="trigger dispatch leases are forward-only",
         ):
             command.downgrade(config, "a1b2c3d4e5f6")
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_multi_revision_failure_rolls_back_earlier_downgrade() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_atomic_multi_revision_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+
+        command.upgrade(config, "head")
+        with pytest.raises(
+            RuntimeError,
+            match="decision receipt retention bases are forward-only",
+        ):
+            command.downgrade(config, "b2c3d4e5f6a7")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("storage_object")
+            }
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes("storage_object")
+            }
+            assert "file_cleanup_identity" in columns
+            assert "file_cleanup_completed_at" in columns
+            assert (
+                "ix_storage_object_file_cleanup_completed_at"
+                in indexes
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d4e5f6a7b8c9"
+        finally:
+            scoped_engine.dispose()
     finally:
         with admin_engine.begin() as connection:
             connection.execute(
@@ -4914,7 +5701,7 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c3d4e5f6a7b8"
+                ) == "d4e5f6a7b8c9"
         finally:
             scoped_engine.dispose()
     finally:
@@ -5008,7 +5795,7 @@ def test_postgres_receipt_hardening_repairs_nullable_requested_at() -> None:
                 assert row.lease_generation == 1
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c3d4e5f6a7b8"
+                ) == "d4e5f6a7b8c9"
         finally:
             scoped_engine.dispose()
     finally:
@@ -5147,7 +5934,7 @@ def test_postgres_receipt_basis_repairs_future_requested_at() -> None:
                 assert row.expires_at == identity_expires_at
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c3d4e5f6a7b8"
+                ) == "d4e5f6a7b8c9"
         finally:
             scoped_engine.dispose()
     finally:

@@ -33,7 +33,6 @@ from healthmes.api.reports import (
 )
 from healthmes.app import create_app
 from healthmes.store import (
-    Base,
     CognitiveEnergyEstimate,
     DecisionKind,
     DecisionRecord,
@@ -43,7 +42,6 @@ from healthmes.store import (
     Task,
     TriggerEvent,
 )
-from healthmes.store.session import get_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -497,7 +495,6 @@ def _secured_client(settings):
     secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
     application = create_app(secured)
     with TestClient(application) as test_client:
-        Base.metadata.create_all(get_engine())
         yield test_client
 
 

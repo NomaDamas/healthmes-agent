@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# noqa: SIZE_OK — one SQL repository owns the complete atomic transition contract.
+# One SQL repository owns the complete atomic transition contract.
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.calendars.adjustments_types import (
     APPLYING_RECONCILE_DELAY,
     MORNING_NUDGE_RULE_ID,
@@ -366,8 +367,13 @@ class SqlAlchemyAdjustmentRepository:
         )
 
     def _begin_immediate_if_possible(self) -> None:
+        # The daily claim writes TriggerEvent and DecisionRecord rows. Acquire
+        # the global write plane before SQLite's immediate transaction or the
+        # PostgreSQL dedup advisory lock to preserve one canonical lock order.
+        transaction_was_active = self._session.in_transaction()
+        lock_activity_write_plane(self._session)
         bind = self._session.get_bind()
-        if bind.dialect.name != "sqlite" or self._session.in_transaction():
+        if bind.dialect.name != "sqlite" or transaction_was_active:
             return
         self._session.execute(sa.text("BEGIN IMMEDIATE"))
         self.begin_immediate_attempted = True

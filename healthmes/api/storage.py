@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import shutil
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -32,6 +32,7 @@ from healthmes.config import Settings
 from healthmes.storage import (
     RETENTION_PRESETS,
     ensure_default_policies,
+    load_latest_usage_snapshot,
     measure_usage,
     run_storage_maintenance,
     update_retention_policy,
@@ -40,10 +41,67 @@ from healthmes.store import RetentionPolicy, WellnessEvent
 from healthmes.store.session import SessionDep
 
 router = APIRouter(tags=["storage"])
+UsageDeferredReason = Literal["timeout", "permission", "io_error"]
 
 
 def _preset(days: int | None) -> str:
     return next(key for key, value in RETENTION_PRESETS.items() if value == days)
+
+
+def _next_snapshot_scope(settings: Settings) -> dict[str, Any]:
+    """Describe the next attempted snapshot, never infer encrypted history."""
+    locations = resolve_data_locations(settings)
+    statuses = {
+        "healthmes_db": "required",
+        "open_wearables_db": (
+            "included"
+            if locations.ow_database_url
+            else (
+                "omitted_missing_dump_url"
+                if locations.ow_runtime_configured
+                else "not_configured"
+            )
+        ),
+        "media": (
+            "included"
+            if locations.media_dir is not None and locations.media_dir.is_dir()
+            else "source_not_present"
+        ),
+        "raw_ingest": (
+            "included"
+            if (
+                locations.raw_ingest_dir is not None
+                and locations.raw_ingest_dir.is_dir()
+            )
+            else "source_not_present"
+        ),
+        "hermes_home": (
+            "included"
+            if locations.hermes_home is not None and locations.hermes_home.is_dir()
+            else (
+                "not_configured"
+                if locations.hermes_home is None
+                else "source_not_present"
+            )
+        ),
+    }
+    included = [
+        component
+        for component, status in statuses.items()
+        if status in {"required", "included"}
+    ]
+    omitted = [
+        component
+        for component, status in statuses.items()
+        if status not in {"required", "included"}
+    ]
+    return {
+        "basis": "current_configuration_and_source_presence",
+        "describes_latest_snapshot": False,
+        "components": statuses,
+        "included_components": included,
+        "omitted_components": omitted,
+    }
 
 
 class RetentionPolicyOut(BaseModel):
@@ -54,11 +112,19 @@ class RetentionPolicyOut(BaseModel):
     enabled: bool
 
 
+class UsageMeasurementOut(BaseModel):
+    status: Literal["current", "stale", "unavailable"]
+    provider: str
+    measured_on: date | None
+    deferred_reason: UsageDeferredReason | None = None
+
+
 class StorageSettingsOut(BaseModel):
     data_dir: str
     disk_total_bytes: int
     disk_free_bytes: int
     usage: dict[str, dict[str, int]]
+    usage_measurement: UsageMeasurementOut
     policies: list[RetentionPolicyOut]
     backup: dict[str, Any]
 
@@ -98,9 +164,39 @@ class WellnessEventOut(BaseModel):
     payload: dict[str, Any]
 
 
+def _usage_deferred_reason(exc: OSError | TimeoutError) -> UsageDeferredReason:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, PermissionError):
+        return "permission"
+    return "io_error"
+
+
 def _settings_payload(session: SessionDep, settings: Settings) -> StorageSettingsOut:
     policies = ensure_default_policies(session)
-    usage = measure_usage(session, settings)
+    try:
+        usage = measure_usage(session, settings)
+    except (TimeoutError, PermissionError, OSError) as exc:
+        session.rollback()
+        policies = ensure_default_policies(session)
+        snapshot = load_latest_usage_snapshot(session)
+        usage = snapshot.usage
+        usage_measurement = UsageMeasurementOut(
+            status=(
+                "stale"
+                if snapshot.measured_on is not None
+                else "unavailable"
+            ),
+            provider=snapshot.provider,
+            measured_on=snapshot.measured_on,
+            deferred_reason=_usage_deferred_reason(exc),
+        )
+    else:
+        usage_measurement = UsageMeasurementOut(
+            status="current",
+            provider="local",
+            measured_on=date.today(),
+        )
     session.commit()
     disk = shutil.disk_usage(settings.data_dir.resolve().parent)
     backup_dir = resolve_backup_dir(settings)
@@ -111,6 +207,7 @@ def _settings_payload(session: SessionDep, settings: Settings) -> StorageSetting
         disk_total_bytes=disk.total,
         disk_free_bytes=disk.free,
         usage=usage,
+        usage_measurement=usage_measurement,
         policies=[
             RetentionPolicyOut(
                 data_class=row.data_class,
@@ -137,6 +234,7 @@ def _settings_payload(session: SessionDep, settings: Settings) -> StorageSetting
                 backup_locations.ow_database_url
             ),
             "operational_warning": partial_backup_warning(backup_locations),
+            "next_snapshot_scope": _next_snapshot_scope(settings),
         },
     )
 
@@ -167,21 +265,39 @@ def put_retention_policy(
 def maintain_storage(
     request: Request, session: SessionDep, dry_run: bool = False
 ) -> dict[str, Any]:
-    with activity_write_lock():
-        report = run_storage_maintenance(
-            session, request.app.state.settings, dry_run=dry_run
-        )
-        session.commit()
-        return {
-            "job_id": report.job_id,
-            "dry_run": report.dry_run,
-            "candidates": report.candidates,
-            "deleted": report.deleted,
-            "bytes_reclaimed": report.bytes_reclaimed,
-            "decision_candidates": report.decision_candidates,
-            "decisions_deleted": report.decisions_deleted,
-            "errors": list(report.errors),
-        }
+    settings = request.app.state.settings
+    report = run_storage_maintenance(
+        session, settings, dry_run=dry_run
+    )
+    usage_errors: list[str] = []
+    if not dry_run:
+        try:
+            measure_usage(session, settings)
+            session.commit()
+        except (OSError, TimeoutError) as exc:
+            session.rollback()
+            usage_errors.append(
+                "storage usage measurement was deferred: "
+                f"{_usage_deferred_reason(exc)}"
+            )
+    return {
+        "job_id": report.job_id,
+        "dry_run": report.dry_run,
+        "candidates": report.candidates,
+        "records_purged": report.records_purged,
+        "files_deleted": report.files_deleted,
+        "file_cleanup_pending": report.file_cleanup_pending,
+        "deleted": report.deleted,
+        "bytes_reclaimed": report.bytes_reclaimed,
+        "decision_candidates": report.decision_candidates,
+        "decisions_deleted": report.decisions_deleted,
+        "decision_receipt_candidates": report.decision_receipt_candidates,
+        "decision_receipts_deleted": report.decision_receipts_deleted,
+        "budget_exhausted": report.budget_exhausted,
+        "budget_resource": report.budget_resource,
+        "budget_phase": report.budget_phase,
+        "errors": [*report.errors, *usage_errors],
+    }
 
 
 @router.post("/v1/wellness-events", status_code=201)
@@ -358,16 +474,14 @@ async def storage_policy_form(
 
 
 @router.post("/storage/maintenance", include_in_schema=False)
-async def storage_maintenance_form(
+def storage_maintenance_form(
     request: Request,
     session: SessionDep,
     csrf: str = Form(),
     dry_run: bool = Form(default=False),
 ) -> RedirectResponse:
     require_local_session(request, csrf_token=csrf)
-    with activity_write_lock():
-        run_storage_maintenance(
-            session, request.app.state.settings, dry_run=dry_run
-        )
-        session.commit()
+    run_storage_maintenance(
+        session, request.app.state.settings, dry_run=dry_run
+    )
     return RedirectResponse("/storage", status_code=303)

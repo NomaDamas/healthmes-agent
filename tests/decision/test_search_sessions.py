@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -10,6 +11,10 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import healthmes.decision.search as search_module
+from healthmes.activity.locking import (
+    activate_runtime_extended_write_fence,
+)
 from healthmes.decision import (
     AbortedDecisionSearchSessionError,
     ContextAccessLayer,
@@ -165,6 +170,20 @@ class CommitAttemptProvider(SearchProvider):
         raise AssertionError("read-only database transaction allowed commit")
 
 
+class DatabaseSelectProvider(SearchProvider):
+    async def query(self, session, query, *, now):
+        database_value = session.scalar(select(1))
+        result = await super().query(session, query, now=now)
+        return result.model_copy(
+            update={
+                "payload": {
+                    **result.payload,
+                    "value": database_value,
+                }
+            }
+        )
+
+
 class CancellationProvider(SearchProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -199,6 +218,7 @@ class BlockingProvider(SearchProvider):
 def store_factory() -> sessionmaker[Session]:
     engine = create_db_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
+    activate_runtime_extended_write_fence(engine)
     factory = sessionmaker(
         bind=engine,
         autocommit=False,
@@ -336,6 +356,116 @@ async def _search(
     }
     arguments.update(overrides)
     return await service.search(session_id, **arguments)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+async def test_postgres_read_only_control_survives_runtime_fence() -> None:
+    engine = create_db_engine(os.environ["HEALTHMES_TEST_POSTGRES_URL"])
+    activate_runtime_extended_write_fence(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    clock = MutableClock()
+    provider = DatabaseSelectProvider()
+    service = _service(
+        factory,
+        provider,
+        [_policy()],
+        clock,
+    )
+
+    try:
+        handle = service.begin(_request())
+        result = await _search(service, handle.session_id)
+        assert result.status is ContextStatus.PARTIAL
+        assert result.payload["value"] == 1
+        assert len(provider.queries) == 1
+        assert service.finish(handle.session_id).state is (
+            DecisionSearchSessionState.FINISHED
+        )
+    finally:
+        service.close()
+        engine.dispose()
+
+
+async def test_sqlite_query_only_cleanup_failure_discards_pool_connection(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = create_db_engine(
+        f"sqlite:///{tmp_path / 'query-only-cleanup.db'}",
+        pool_size=1,
+        max_overflow=0,
+    )
+    Base.metadata.create_all(engine)
+    activate_runtime_extended_write_fence(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    clock = MutableClock()
+    provider = SearchProvider()
+    service = _service(factory, provider, [_policy()], clock)
+    original_set_query_only = search_module.set_sqlite_query_only
+
+    def fail_query_only_cleanup(connection, *, enabled):
+        if not enabled:
+            raise RuntimeError("injected query_only cleanup failure")
+        return original_set_query_only(connection, enabled=enabled)
+
+    monkeypatch.setattr(
+        search_module,
+        "set_sqlite_query_only",
+        fail_query_only_cleanup,
+    )
+
+    try:
+        handle = service.begin(_request())
+        result = await _search(service, handle.session_id)
+        assert result.status is ContextStatus.DENIED
+        assert result.limitations == ["provider_execution_failed"]
+
+        with factory() as session:
+            session.add(
+                WellnessEvent(
+                    event_type="nutrition.pool-recovered.v1",
+                    schema_version=1,
+                    observed_at=NOW,
+                    recorded_at=NOW,
+                    timezone="UTC",
+                    source_provider="pool-recovery-test",
+                    source_device=None,
+                    source_record_id=str(uuid.uuid4()),
+                    capture_method="test",
+                    quality_flags={},
+                    confidence=1,
+                    coverage=1,
+                    sensitivity="nutrition",
+                    consent_scope="personal",
+                    expires_at=NOW + timedelta(days=1),
+                    payload={},
+                    raw_object_id=None,
+                    derived_from=None,
+                )
+            )
+            session.commit()
+
+        with engine.connect() as connection:
+            assert not search_module.sqlite_query_only_enabled(connection)
+    finally:
+        service.close()
+        engine.dispose()
 
 
 async def test_repeated_calls_share_one_context_access_budget(

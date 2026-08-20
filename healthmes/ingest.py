@@ -27,12 +27,23 @@ import hashlib
 import logging
 import math
 import uuid as uuid_module
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from healthmes.config import Settings
+from healthmes.durable_files import (
+    DurableFileIdentity,
+    DurablePublishError,
+    durable_exclusive_writer,
+    durable_publish_no_clobber,
+    durable_unlink,
+    verify_regular_file,
+    write_all,
+)
 from healthmes.store import RawIngestEvent
 
 logger = logging.getLogger(__name__)
@@ -64,6 +75,15 @@ class IngestForwardError(Exception):
     """open-wearables rejected or never received the forwarded batch."""
 
 
+@dataclass(frozen=True, slots=True)
+class RawIngestPublication:
+    event: RawIngestEvent
+    staged: Path
+    destination: Path
+    identity: DurableFileIdentity
+    destination_durable: bool
+
+
 def _utcnow() -> datetime:
     """Aware UTC — the column is TIMESTAMPTZ; naive values would take the
     postgres session timezone."""
@@ -85,7 +105,7 @@ def store_raw(
     source: str,
     content_type: str | None,
     body: bytes,
-) -> RawIngestEvent:
+) -> RawIngestPublication:
     """Write ``body`` verbatim to the raw store and return the unsaved index row.
 
     The caller adds the row to its session; the file is on disk (0600,
@@ -98,19 +118,82 @@ def store_raw(
         f"{RAW_INGEST_DIRNAME}/{received:%Y}/{received:%m}/{received:%d}"
     )
     filename = f"{received:%H%M%S_%f}-{digest[:12]}{_extension_for(content_type)}"
-    target_dir = settings.data_dir / rel_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / filename
-    target.write_bytes(body)
-    target.chmod(0o600)
+    target = settings.data_dir / rel_dir / filename
+    staged = (
+        settings.data_dir
+        / ".staging"
+        / rel_dir
+        / f"{filename}.part"
+    )
+    try:
+        with durable_exclusive_writer(staged) as output:
+            write_all(output, body)
+    except BaseException:
+        try:
+            durable_unlink(staged, missing_ok=True)
+        except OSError:
+            logger.exception(
+                "failed to durably remove incomplete raw-ingest staging file %s",
+                staged,
+            )
+        raise
+    destination_durable = True
+    try:
+        publication_identity = durable_publish_no_clobber(staged, target)
+    except FileExistsError:
+        try:
+            durable_unlink(staged, missing_ok=True)
+        except OSError:
+            logger.exception(
+                "failed to durably remove collided raw-ingest staging file %s",
+                staged,
+            )
+        raise
+    except DurablePublishError as exc:
+        if not exc.destination_created:
+            try:
+                durable_unlink(staged, missing_ok=True)
+            except OSError:
+                logger.exception(
+                    "failed to durably remove unpublished raw-ingest staging "
+                    "file %s",
+                    staged,
+                )
+            raise
+        if exc.identity is None:
+            raise
+        publication_identity = exc.identity
+        destination_durable = False
+        verify_regular_file(
+            staged,
+            publication_identity,
+            expected_size=len(body),
+            expected_sha256=digest,
+        )
+        logger.warning(
+            "raw-ingest destination durability could not be confirmed; "
+            "continuing from the crash-durable staging generation"
+        )
 
-    return RawIngestEvent(
-        received_at=received,
-        source=source,
-        content_type=(content_type[:255] if content_type else None),
-        path=f"{rel_dir}/{filename}",
-        size_bytes=len(body),
-        sha256=digest,
+    verify_regular_file(
+        target,
+        publication_identity,
+        expected_size=len(body),
+        expected_sha256=digest,
+    )
+    return RawIngestPublication(
+        event=RawIngestEvent(
+            received_at=received,
+            source=source,
+            content_type=(content_type[:255] if content_type else None),
+            path=f"{rel_dir}/{filename}",
+            size_bytes=len(body),
+            sha256=digest,
+        ),
+        staged=staged,
+        destination=target,
+        identity=publication_identity,
+        destination_durable=destination_durable,
     )
 
 

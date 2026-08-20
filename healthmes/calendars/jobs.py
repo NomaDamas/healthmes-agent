@@ -39,6 +39,10 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.calendars import creds
 from healthmes.calendars.base import (
     CalendarAuthError,
@@ -71,7 +75,10 @@ from healthmes.calendars.state import (
     sync_state_coverage,
 )
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
-from healthmes.calendars.write_lock import calendar_write_lock
+from healthmes.calendars.write_lock import (
+    calendar_write_locks,
+    ordered_calendar_write_sources,
+)
 from healthmes.config import Settings, resolve_timezone
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
@@ -189,6 +196,45 @@ def _accepted_proposal_ids(session: Session) -> list[UUID]:
     assert isinstance(bind, Engine)
     with bind.connect() as connection:
         return list(connection.scalars(statement))
+
+
+def _accepted_proposal_lock_plans(
+    session: Session,
+    source: CalendarSource,
+) -> list[tuple[UUID, tuple[CalendarSource, ...]]]:
+    """Read every proposal's complete provider-lock set before waiting."""
+
+    statement = (
+        select(
+            ScheduleProposal.id,
+            ScheduleProposal.intake_calendar_source,
+        )
+        .join(Task, ScheduleProposal.task_id == Task.id)
+        .where(ScheduleProposal.status == ProposalStatus.ACCEPTED)
+        .order_by(ScheduleProposal.proposed_start)
+    )
+    bind = session.get_bind()
+    if isinstance(bind, Connection):
+        rows = bind.execute(statement).all()
+    else:
+        assert isinstance(bind, Engine)
+        with bind.connect() as connection:
+            rows = connection.execute(statement).all()
+
+    plans: list[tuple[UUID, tuple[CalendarSource, ...]]] = []
+    for proposal_id, intake_source in rows:
+        sources = (
+            (source,)
+            if intake_source is None
+            else (source, intake_source)
+        )
+        plans.append(
+            (
+                proposal_id,
+                ordered_calendar_write_sources(sources),
+            )
+        )
+    return plans
 
 
 def _existing_agent_block(
@@ -345,7 +391,12 @@ def _timed_intake_block(
         == proposal.intake_account_generation,
         CalendarEventMirror.external_id == proposal.intake_external_id,
     )
-    row = session.scalar(statement.with_for_update())
+    if session.get_bind().dialect.name == "postgresql":
+        with activity_write_lock():
+            lock_activity_write_plane(session)
+            row = session.scalar(statement.with_for_update())
+    else:
+        row = session.scalar(statement.with_for_update())
     if (
         row is None
         or row.intake_task_id != proposal.task_id
@@ -389,27 +440,39 @@ def push_accepted_proposals(
     # Do not hold a Session read transaction while waiting for the provider
     # write lock. That can deadlock SQLite commits and needlessly consume a
     # PostgreSQL pool connection while the advisory-lock connection waits.
-    proposal_ids = _accepted_proposal_ids(session)
-    for proposal_id in proposal_ids:
+    proposal_lock_plans = _accepted_proposal_lock_plans(session, source)
+    for proposal_id, provider_sources in proposal_lock_plans:
         with ExitStack() as locks:
-            locks.enter_context(calendar_write_lock(session, source))
+            locks.enter_context(
+                calendar_write_locks(session, provider_sources)
+            )
             session.expire_all()
             proposal = session.get(ScheduleProposal, proposal_id)
             if proposal is None or proposal.status is not ProposalStatus.ACCEPTED:
+                session.rollback()
                 continue
-            if (
-                proposal.intake_calendar_source is not None
-                and proposal.intake_calendar_source is not source
-            ):
-                locks.enter_context(
-                    calendar_write_lock(
-                        session,
-                        proposal.intake_calendar_source,
-                    )
+            current_provider_sources = ordered_calendar_write_sources(
+                (source,)
+                if proposal.intake_calendar_source is None
+                else (
+                    source,
+                    proposal.intake_calendar_source,
                 )
+            )
+            if not set(current_provider_sources).issubset(provider_sources):
+                session.rollback()
+                logger.warning(
+                    "Proposal %s changed calendar providers while waiting "
+                    "for write locks; retrying next poll.",
+                    proposal_id,
+                )
+                continue
             task = session.get(Task, proposal.task_id)
             if task is None:
+                session.rollback()
                 continue
+            if session.get_bind().dialect.name == "postgresql":
+                locks.enter_context(activity_write_lock())
             try:
                 intake_row = _timed_intake_block(
                     session,
@@ -477,6 +540,7 @@ def push_accepted_proposals(
                         ),
                     )
             except (CalendarConflictError, OwnershipError):
+                session.rollback()
                 logger.exception(
                     "Proposal %s has a conflicting owned calendar identity; "
                     "leaving it accepted for review.",

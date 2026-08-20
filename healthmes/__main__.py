@@ -39,6 +39,8 @@ import asyncio
 import datetime as dt
 import getpass
 import json
+import shlex
+import shutil
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -101,6 +103,17 @@ def _serve() -> int:
     if error is not None:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    if isinstance(settings, Settings):
+        from healthmes.app import (
+            DatabaseSchemaError,
+            preflight_database_schema,
+        )
+
+        try:
+            preflight_database_schema(settings)
+        except DatabaseSchemaError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     uvicorn.run(
         "healthmes.app:create_app",
         factory=True,
@@ -167,6 +180,27 @@ def _human_size(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
+def _cli_replay_prefix() -> list[str]:
+    """Return a runnable prefix matching console-script or ``python -m`` use."""
+    original = tuple(getattr(sys, "orig_argv", ()))
+    if any(
+        token == "-m" and index + 1 < len(original) and original[index + 1] == "healthmes"
+        for index, token in enumerate(original)
+    ):
+        return [sys.executable or "python", "-m", "healthmes"]
+    argv_zero = Path(sys.argv[0]) if sys.argv else Path()
+    if argv_zero.name == "__main__.py" and argv_zero.parent.name == "healthmes":
+        return [sys.executable or "python", "-m", "healthmes"]
+    launchers = ([sys.argv[0]] if sys.argv else []) + list(original[:2])
+    for launcher in dict.fromkeys(launchers):
+        if Path(launcher).name not in {"healthmes", "healthmes.exe"}:
+            continue
+        available = shutil.which(launcher)
+        if available is not None:
+            return [available]
+    return [sys.executable or "python", "-m", "healthmes"]
+
+
 def _cmd_backup_create(args: argparse.Namespace) -> int:
     settings = _cli_settings()
     provider_name = _selected_provider(args, settings)
@@ -228,12 +262,23 @@ def _cmd_backup_push(args: argparse.Namespace) -> int:
 def _summarize_manifest(manifest: dict) -> list[str]:
     contents = manifest.get("contents", {})
     recovery = manifest.get("recovery") or {}
+    component_order = (
+        "healthmes_db",
+        "open_wearables_db",
+        "media",
+        "raw_ingest",
+        "hermes_home",
+    )
+    included = [name for name in component_order if contents.get(name) is not None]
+    omitted = [name for name in component_order if contents.get(name) is None]
     lines = [
         f"created_at:         {manifest.get('created_at')}",
         f"schema_version:     {manifest.get('schema_version')}",
         f"healthmes_version:  {manifest.get('healthmes_version')}",
         f"recovery scope:     {recovery.get('scope', RECOVERY_SCOPE_PARTIAL_COMPONENT)}",
         "full-node recovery: no",
+        f"included:           {', '.join(included)}",
+        f"not in snapshot:    {', '.join(omitted) if omitted else 'none'}",
     ]
     db_entry = contents.get("healthmes_db") or {}
     lines.append(f"healthmes db:       {db_entry.get('kind', 'missing')}")
@@ -259,16 +304,27 @@ def _summarize_manifest(manifest: dict) -> list[str]:
 
 def _cmd_backup_restore(args: argparse.Namespace) -> int:
     settings = _cli_settings()
-    provider = _provider(args, settings)
-    if _selected_provider(args, settings) == PROVIDER_LOCAL:
+    selected_provider = _selected_provider(args, settings)
+    vault = None
+    if selected_provider == PROVIDER_LOCAL:
+        provider = _provider(args, settings)
         snapshot_path = provider.resolve_snapshot_path(args.snapshot)
     else:
-        # Local-first: an existing local copy wins; otherwise the envelope is
-        # downloaded into the backup dir and the restore path is identical.
         vault = _vault_provider(args, settings)
-        snapshot_path, downloaded = vault.ensure_local_copy(args.snapshot)
-        if downloaded:
-            print(f"downloaded from vault: {vault.object_uri(snapshot_path.name)}")
+        provider = vault.local
+        snapshot_path = (
+            provider.backup_dir / Path(str(args.snapshot)).name
+        )
+        if not args.yes:
+            # Inspection is non-destructive. Applying the restore below uses
+            # RemoteVaultProvider.restore() so the verified generation remains
+            # pinned instead of being reopened by pathname.
+            snapshot_path, downloaded = vault.ensure_local_copy(args.snapshot)
+            if downloaded:
+                print(
+                    "downloaded from vault: "
+                    f"{vault.object_uri(snapshot_path.name)}"
+                )
     if not args.yes:
         passphrase = _passphrase_from(args, settings)
         if passphrase is None:
@@ -276,20 +332,60 @@ def _cmd_backup_restore(args: argparse.Namespace) -> int:
                 "no backup passphrase configured; set HEALTHMES_BACKUP_PASSPHRASE "
                 "or pass --passphrase-file"
             )
-        manifest = read_manifest(snapshot_path, passphrase)
+        manifest = read_manifest(
+            snapshot_path,
+            passphrase,
+            limits=provider.resource_limits,
+        )
         print(f"snapshot: {snapshot_path}")
         for line in _summarize_manifest(manifest):
             print(line)
+        apply_command = [
+            *_cli_replay_prefix(),
+            "backup",
+            "restore",
+            str(args.snapshot),
+            "--provider",
+            "local" if selected_provider == PROVIDER_LOCAL else "remote",
+        ]
+        if args.passphrase_file is not None:
+            apply_command.extend(
+                ["--passphrase-file", str(args.passphrase_file)]
+            )
+        if args.allow_cross_store_partial:
+            apply_command.append("--allow-cross-store-partial")
+        apply_command.append("--yes")
         print(
             "\nrestore REPLACES archived live components: HealthMes database, "
             "media/raw-ingest trees, configured Open Wearables database, and "
             "Hermes state.\n"
-            f"re-run with --yes to apply:  healthmes backup restore {args.snapshot} --yes",
+            f"re-run with --yes to apply:  {shlex.join(apply_command)}",
             file=sys.stderr,
         )
         return 2
-    provider.restore(snapshot_path)
+    if vault is None:
+        result = provider.restore(
+            snapshot_path,
+            allow_cross_store_partial=args.allow_cross_store_partial,
+        )
+    else:
+        result = vault.restore(
+            args.snapshot,
+            allow_cross_store_partial=args.allow_cross_store_partial,
+        )
+        snapshot_path = provider.backup_dir / Path(str(args.snapshot)).name
+        print(f"downloaded from vault: {vault.object_uri(snapshot_path.name)}")
     print(f"restored: {snapshot_path}")
+    print(f"recovery mode: {result.recovery_mode}")
+    print(f"recovered: {', '.join(result.recovered_components)}")
+    print(
+        "not in snapshot: "
+        + (
+            ", ".join(result.skipped_components)
+            if result.skipped_components
+            else "none"
+        )
+    )
     return 0
 
 
@@ -708,6 +804,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually apply the restore (it replaces live data).",
     )
+    restore.add_argument(
+        "--allow-cross-store-partial",
+        action="store_true",
+        help="Explicitly accept that a restore spanning PostgreSQL and another "
+        "component cannot be atomically committed across stores. Without this "
+        "flag such restores fail before mutation.",
+    )
     _add_passphrase_file(restore)
     _add_provider_flag(restore)
     restore.set_defaults(func=_cmd_backup_restore)
@@ -718,6 +821,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(refuses anything that is not an age-encrypted snapshot envelope).",
     )
     push.add_argument("snapshot", help="Snapshot file path, or bare name in the backup dir.")
+    _add_passphrase_file(push)
     push.set_defaults(func=_cmd_backup_push)
 
     connect = subparsers.add_parser(
