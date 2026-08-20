@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
 from fastmcp.exceptions import ToolError
 
+from healthmes import clock
 from healthmes.mcp_server import server as server_module
 from healthmes.nutrition.contracts import (
     Confidence,
@@ -161,7 +162,7 @@ async def test_mcp_transcribes_local_voice_before_nutrition_analysis(
         lambda settings: FakeTranscriber(),
     )
     settings = server_module._active_settings()
-    observed_at = datetime.now(UTC) - timedelta(minutes=1)
+    observed_at = clock.utc_now() - timedelta(minutes=1)
     media_path = "media/2026/08/meal.m4a"
     target = settings.data_dir / media_path
     target.parent.mkdir(parents=True, exist_ok=True)

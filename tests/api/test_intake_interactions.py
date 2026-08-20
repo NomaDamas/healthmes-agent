@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import healthmes.nutrition.intake_service as intake_service_module
+from healthmes import clock
 from healthmes.api.intake_interactions import AnalyzeInteractionInput
 from healthmes.nutrition.contracts import (
     Confidence,
@@ -45,7 +46,7 @@ JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
 
 
 def _recent_utc() -> str:
-    return (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    return (clock.utc_now() - timedelta(minutes=1)).isoformat()
 
 
 class FakeVision:
@@ -953,7 +954,7 @@ def test_analysis_failure_does_not_commit_or_rollback_caller_session(
             source="test",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=clock.utc_now(),
             allow_remote_analysis=False,
             provider=UnavailableAnalysis(),
         )
@@ -988,7 +989,7 @@ def test_analysis_reservation_does_not_commit_flushed_caller_state(
             source="test",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=clock.utc_now(),
             allow_remote_analysis=False,
             provider=UnavailableAnalysis(),
         )
@@ -1048,7 +1049,7 @@ def test_expired_analysis_lease_can_be_reclaimed(client, session):
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1141,7 +1142,7 @@ def test_final_transaction_rollback_releases_analysis_reservation(
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1189,7 +1190,7 @@ def test_savepoint_rollback_keeps_analysis_reservation(client, session):
                         source="test",
                         source_text="I ate lunch",
                         media_path=None,
-                        recorded_at=datetime.now(UTC),
+                        recorded_at=clock.utc_now(),
                         allow_remote_analysis=False,
                         provider=FakeAnalysis(),
                     )
@@ -1211,7 +1212,7 @@ def test_savepoint_rollback_keeps_analysis_reservation(client, session):
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=SavepointRollbackAnalysis(),
     )
@@ -1254,7 +1255,7 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1262,8 +1263,8 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
         WellnessEvent(
             event_type="fixture.conflict",
             schema_version=1,
-            observed_at=datetime.now(UTC),
-            recorded_at=datetime.now(UTC),
+            observed_at=clock.utc_now(),
+            recorded_at=clock.utc_now(),
             timezone="UTC",
             source_provider="nutrition-operation",
             source_device=None,
@@ -1389,7 +1390,7 @@ def test_persisting_sqlite_reservation_cannot_be_reclaimed(
     with intake_service_module._STATIC_ANALYSIS_RESERVATIONS_LOCK:
         intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key][
             "lease_expires_at"
-        ] = datetime.now(UTC) - timedelta(seconds=1)
+        ] = clock.utc_now() - timedelta(seconds=1)
 
     with Session(bind=session.get_bind()) as contender:
         with pytest.raises(IntakeAnalysisInProgress):
@@ -1415,8 +1416,8 @@ def test_persistent_reservation_completion_uses_token_cas(
     marker = WellnessEvent(
         event_type="nutrition.operation.v1",
         schema_version=1,
-        observed_at=datetime.now(UTC),
-        recorded_at=datetime.now(UTC),
+        observed_at=clock.utc_now(),
+        recorded_at=clock.utc_now(),
         timezone=None,
         source_provider="nutrition-operation",
         source_device=None,
@@ -1471,7 +1472,7 @@ def test_persistent_reservation_completion_uses_token_cas(
             SimpleNamespace(
                 interaction_id=operation_id,
                 operation_fingerprint=fingerprint,
-                recorded_at=datetime.now(UTC),
+                recorded_at=clock.utc_now(),
             ),
             reservation_token="owner-a",
         )
@@ -1494,7 +1495,7 @@ def test_session_close_releases_sqlite_analysis_reservation(client, session):
         source="first",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1513,7 +1514,7 @@ def test_session_close_releases_sqlite_analysis_reservation(client, session):
             source="first",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=clock.utc_now(),
             allow_remote_analysis=False,
             provider=FakeAnalysis(),
         )
@@ -2306,7 +2307,7 @@ def test_legacy_warnings_are_migrated_for_the_remaining_raw_ttl(
 ):
     warning = "portion is uncertain"
     item_warning = "milk type is unknown"
-    observed_at = datetime.now(UTC) - timedelta(days=1)
+    observed_at = clock.utc_now() - timedelta(days=1)
     body = _text_interaction(
         observed_at=observed_at.isoformat(),
         timezone="UTC",
@@ -2877,7 +2878,7 @@ def test_maintenance_scrubs_legacy_warnings_from_durable_snapshots(
     run_storage_maintenance(
         session,
         client.app.state.settings,
-        now=datetime.now(UTC),
+        now=clock.utc_now(),
     )
     session.commit()
     session.expire_all()

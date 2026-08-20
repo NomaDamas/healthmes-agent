@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityCapability,
@@ -524,7 +525,7 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
     session,
     monkeypatch,
 ) -> None:
-    current = datetime.now(UTC)
+    current = clock.utc_now()
     target_day = current.date() - timedelta(days=6)
     source_days = [
         target_day - timedelta(days=offset)
@@ -705,7 +706,7 @@ def test_generic_wellness_api_rejects_internal_domain_namespaces(
         "/v1/wellness-events",
         json={
             "event_type": event_type,
-            "observed_at": datetime.now(UTC).isoformat(),
+            "observed_at": clock.utc_now().isoformat(),
             "source_provider": source_provider,
             "source_record_id": "reserved-namespace-attempt",
             "data_class": "normalized",

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
+from healthmes import clock
 from healthmes.nutrition.contracts import (
     Confidence,
     EstimateKind,
@@ -30,7 +31,7 @@ JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
 
 
 def _recent_capture_at() -> str:
-    return (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    return (clock.utc_now() - timedelta(hours=1)).isoformat()
 
 
 class FakeVision:
@@ -567,7 +568,7 @@ def test_photo_raw_evidence_expires_with_media(client, session, settings):
     run_storage_maintenance(
         session,
         settings,
-        now=datetime.now(UTC) + timedelta(days=8),
+        now=clock.utc_now() + timedelta(days=8),
     )
     session.commit()
 

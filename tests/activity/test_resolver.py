@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
+from healthmes import clock
 from healthmes.activity import resolver as resolver_module
 from healthmes.activity.contracts import (
     ActivityBatchIn,
@@ -635,7 +636,7 @@ async def test_resolver_uses_injected_now_for_overwork_expiry(
             now=start + timedelta(hours=13),
         )
 
-    wall_clock_expired_at = datetime.now(UTC) - timedelta(minutes=1)
+    wall_clock_expired_at = clock.utc_now() - timedelta(minutes=1)
     assert wall_clock_expired_at > datetime(2026, 8, 1, 12, tzinfo=UTC)
     daily_rows = list(
         session.scalars(
