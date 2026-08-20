@@ -409,7 +409,13 @@ class _StageBudget:
     expanded_bytes: int = 0
     members: set[str] = field(default_factory=set)
 
-    def discover_source_entry(self, path: str) -> None:
+    def discover_source_entry(self, path: str, *, depth: int) -> None:
+        if depth > self.limits.max_identity_depth:
+            raise BackupError(
+                "snapshot source exceeds the configured "
+                f"{self.limits.max_identity_depth}-level tree depth "
+                f"at {path}"
+            )
         self.discovered_entries += 1
         if self.discovered_entries > self.limits.max_members:
             raise BackupError(
@@ -2360,7 +2366,10 @@ def _scan_anchored_tree_directory(
         for entry in iterator:
             relative = (*relative_parts, entry.name)
             arcname = f"{arcroot}/{'/'.join(relative)}"
-            budget.discover_source_entry(arcname)
+            budget.discover_source_entry(
+                arcname,
+                depth=len(relative),
+            )
             metadata = os.stat(
                 entry.name,
                 dir_fd=directory_descriptor,
@@ -2433,7 +2442,10 @@ def _stage_tree(
                 for entry in iterator:
                     relative = relative_directory / entry.name
                     arcname = f"{arcroot}/{relative.as_posix()}"
-                    effective_budget.discover_source_entry(arcname)
+                    effective_budget.discover_source_entry(
+                        arcname,
+                        depth=len(relative.parts),
+                    )
                     entries.append(
                         (
                             entry.name,
@@ -3553,6 +3565,8 @@ def _enforce_archive_resource_limits(
 def _validate_archive_members(
     tar: tarfile.TarFile,
     layout: _ManifestLayout,
+    *,
+    limits: SnapshotResourceLimits,
 ) -> None:
     seen: set[str] = set()
     archived_payloads: set[str] = set()
@@ -3570,6 +3584,17 @@ def _validate_archive_members(
         if path_text in seen:
             raise SnapshotIntegrityError(f"duplicate archive member: {path_text}")
         seen.add(path_text)
+        for root in tree_roots:
+            if not _under(path, root):
+                continue
+            depth = len(path.parts) - len(root.parts)
+            if depth > limits.max_identity_depth:
+                raise SnapshotIntegrityError(
+                    "snapshot tree exceeds the configured "
+                    f"{limits.max_identity_depth}-level identity depth "
+                    f"at {path_text}"
+                )
+            break
         if path_text == MANIFEST_ARCNAME:
             if not member.isfile():
                 raise SnapshotIntegrityError("manifest.json must be a regular file")
@@ -3722,7 +3747,11 @@ def _read_manifest_data(
             )
             manifest = _manifest_from_tar(tar)
             layout = _validate_manifest_layout(manifest)
-            _validate_archive_members(tar, layout)
+            _validate_archive_members(
+                tar,
+                layout,
+                limits=limits,
+            )
             _require_disk_capacity(
                 extracted,
                 payload_bytes=expanded_bytes,
@@ -4703,8 +4732,17 @@ def _copy_tree_contents_to_descriptor(
     source: Path,
     *,
     destination_descriptor: int,
+    limits: SnapshotResourceLimits,
+    depth: int = 0,
 ) -> None:
     for entry in sorted(os.scandir(source), key=lambda item: item.name):
+        child_depth = depth + 1
+        if child_depth > limits.max_identity_depth:
+            raise BackupError(
+                "restore source tree exceeds the configured "
+                f"{limits.max_identity_depth}-level identity depth "
+                f"at {entry.path}"
+            )
         metadata = entry.stat(follow_symlinks=False)
         if stat.S_ISLNK(metadata.st_mode):
             os.symlink(
@@ -4741,6 +4779,8 @@ def _copy_tree_contents_to_descriptor(
             _copy_tree_contents_to_descriptor(
                 Path(entry.path),
                 destination_descriptor=child_descriptor,
+                limits=limits,
+                depth=child_depth,
             )
             os.fchmod(child_descriptor, stat.S_IMODE(metadata.st_mode))
             os.fsync(child_descriptor)
@@ -4749,7 +4789,11 @@ def _copy_tree_contents_to_descriptor(
     os.fsync(destination_descriptor)
 
 
-def _stage_operation_payload(operation: _SwapOperation) -> None:
+def _stage_operation_payload(
+    operation: _SwapOperation,
+    *,
+    limits: SnapshotResourceLimits,
+) -> None:
     source = operation.source
     staged = operation.staged
     anchor = operation.parent_anchor
@@ -4779,6 +4823,7 @@ def _stage_operation_payload(operation: _SwapOperation) -> None:
             _copy_tree_contents_to_descriptor(
                 source,
                 destination_descriptor=staged_descriptor,
+                limits=limits,
             )
             os.fchmod(
                 staged_descriptor,
@@ -5543,7 +5588,10 @@ def _stage_planned_operation(
             raise BackupError(
                 f"{operation.component} staged target already exists: {staged}"
             )
-        _stage_operation_payload(operation)
+        _stage_operation_payload(
+            operation,
+            limits=limits,
+        )
         staged_metadata = _anchored_metadata(operation, staged)
         anchor = operation.parent_anchor
         if staged_metadata is None or anchor is None:
@@ -7960,7 +8008,11 @@ def _restore_snapshot_admitted(
             )
             manifest = _manifest_from_tar(tar)
             layout = _validate_manifest_layout(manifest)
-            _validate_archive_members(tar, layout)
+            _validate_archive_members(
+                tar,
+                layout,
+                limits=locations.resource_limits,
+            )
             _require_disk_capacity(
                 extracted,
                 payload_bytes=expanded_bytes,

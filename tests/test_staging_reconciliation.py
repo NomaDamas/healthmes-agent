@@ -1,5 +1,6 @@
 import hashlib
 import os
+import stat
 import time
 import uuid
 from datetime import UTC, datetime
@@ -1040,6 +1041,90 @@ def test_staging_restore_charges_hashes_and_namespace_mutations(
     assert budget._remaining_hash_bytes == 0
     assert budget._remaining_directory_entries == 0
     assert (settings.data_dir / relative_path).read_bytes() == payload
+    assert not staged.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor contract")
+def test_staging_restore_preserves_destination_after_unlink_fsync_failure(
+    engine,
+    settings,
+    monkeypatch,
+):
+    payload = b"published payload survives staging fsync failure"
+    filename = "abababababababababababababababab.jpg"
+    relative_path = f"media/2026/08/{filename}"
+    staged = settings.data_dir / ".staging" / relative_path
+    staged = staged.with_name(f"{filename}.part")
+    destination = settings.data_dir / relative_path
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(payload)
+    staged_parent_identity = (
+        staged.parent.stat().st_dev,
+        staged.parent.stat().st_ino,
+    )
+    with Session(engine) as session:
+        register_storage_object(
+            session,
+            settings,
+            relative_path=relative_path,
+            data_class="media",
+            content_type="image/jpeg",
+            size_bytes=len(payload),
+            sha256=_sha(payload),
+            observed_at=datetime(2026, 8, 18, tzinfo=UTC),
+        )
+        session.commit()
+        candidate = staging_service._indexed_candidate(
+            settings,
+            relative_path,
+        )
+        assert candidate is not None
+        real_fsync = staging_service.os.fsync
+        rollback_calls = []
+        real_remove_created_entry = staging_service._remove_created_entry
+
+        def fail_post_unlink_staging_fsync(descriptor):
+            metadata = os.fstat(descriptor)
+            if (
+                stat.S_ISDIR(metadata.st_mode)
+                and (metadata.st_dev, metadata.st_ino)
+                == staged_parent_identity
+                and not staged.exists()
+            ):
+                raise OSError("injected post-unlink staging fsync failure")
+            return real_fsync(descriptor)
+
+        def track_rollback(*args, **kwargs):
+            rollback_calls.append((args, kwargs))
+            return real_remove_created_entry(*args, **kwargs)
+
+        monkeypatch.setattr(
+            staging_service.os,
+            "fsync",
+            fail_post_unlink_staging_fsync,
+        )
+        monkeypatch.setattr(
+            staging_service,
+            "_remove_created_entry",
+            track_rollback,
+        )
+        with (
+            staging_service._open_data_root(settings) as root_descriptor,
+            pytest.raises(
+                OSError,
+                match="injected post-unlink staging fsync failure",
+            ),
+        ):
+            staging_service._reconcile_candidate(
+                session,
+                settings,
+                root_descriptor,
+                candidate,
+                deadline=time.monotonic() + 10,
+            )
+
+    assert rollback_calls == []
+    assert destination.read_bytes() == payload
     assert not staged.exists()
 
 

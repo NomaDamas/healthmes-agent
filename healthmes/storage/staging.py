@@ -402,6 +402,7 @@ def _metadata_generation(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_mode,
         metadata.st_dev,
         metadata.st_ino,
+        metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
@@ -1006,16 +1007,6 @@ def _reconcile_candidate(
                                 expected_generation=destination_generation,
                                 display_path=candidate.staged,
                             )
-                            _unlink_anchored_entry(
-                                staged_parent,
-                                staged_name,
-                                display_path=candidate.staged,
-                                expected=identity,
-                                maintenance_budget=maintenance_budget,
-                                mutation_precharged=True,
-                                descriptor=staged_descriptor,
-                                expected_generation=destination_generation,
-                            )
                     except BaseException:
                         _remove_created_entry(
                             destination_parent,
@@ -1026,6 +1017,20 @@ def _reconcile_candidate(
                             expected_generation=rollback_generation,
                         )
                         raise
+                    # The destination name and contents are durable now. Staging
+                    # cleanup is a separate best-effort transition: if unlink
+                    # succeeds but its directory fsync fails, rolling the
+                    # destination back would remove the payload's only name.
+                    _unlink_anchored_entry(
+                        staged_parent,
+                        staged_name,
+                        display_path=candidate.staged,
+                        expected=identity,
+                        maintenance_budget=maintenance_budget,
+                        mutation_precharged=True,
+                        descriptor=staged_descriptor,
+                        expected_generation=destination_generation,
+                    )
                     return "restored"
 
                 if not identity.matches(destination_metadata):

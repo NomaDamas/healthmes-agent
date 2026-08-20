@@ -1301,6 +1301,150 @@ def test_source_tree_discovery_stops_near_member_limit(
     assert entries_requested == 2
 
 
+def test_create_snapshot_rejects_source_tree_beyond_depth_limit(tmp_path):
+    limits = _limits(max_identity_depth=1)
+    locations = _source_locations(tmp_path / "source", limits=limits)
+    nested = locations.media_dir / "level-one" / "level-two"
+    nested.mkdir(parents=True)
+    (nested / "payload.bin").write_bytes(b"too deep")
+    out_path = tmp_path / "backups" / snapshot_name(CREATED_AT)
+
+    with pytest.raises(
+        BackupError,
+        match="1-level tree depth",
+    ):
+        create_snapshot(
+            locations,
+            passphrase=PASSPHRASE,
+            out_path=out_path,
+            created_at=CREATED_AT,
+        )
+
+    assert not out_path.exists()
+
+
+@pytest.mark.parametrize("surface", ["read", "restore"])
+def test_read_and_restore_reject_deep_tree_before_extraction_or_journal(
+    tmp_path,
+    monkeypatch,
+    surface,
+):
+    source = _source_locations(
+        tmp_path / "source",
+        limits=_limits(max_identity_depth=4),
+    )
+    nested = source.media_dir / "level-one" / "level-two"
+    nested.mkdir(parents=True)
+    (nested / "payload.bin").write_bytes(b"deep snapshot payload")
+    snapshot = _create_snapshot(source, tmp_path)
+    limits = _limits(max_identity_depth=1)
+
+    def unexpected_extract(*_args, **_kwargs):
+        raise AssertionError("deep archive reached extraction")
+
+    def unexpected_journal(*_args, **_kwargs):
+        raise AssertionError("deep archive reached restore journaling")
+
+    monkeypatch.setattr(
+        snapshot_mod.tarfile.TarFile,
+        "extractall",
+        unexpected_extract,
+    )
+    monkeypatch.setattr(
+        snapshot_mod,
+        "write_restore_journal",
+        unexpected_journal,
+    )
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="1-level identity depth",
+    ):
+        if surface == "read":
+            read_manifest(
+                snapshot,
+                PASSPHRASE,
+                limits=limits,
+            )
+        else:
+            restore_snapshot(
+                snapshot,
+                passphrase=PASSPHRASE,
+                locations=_restore_locations(tmp_path / "target", limits),
+            )
+
+
+def test_snapshot_tree_depth_limit_is_inclusive(tmp_path):
+    limits = _limits(max_identity_depth=2)
+    source = _source_locations(tmp_path / "source", limits=limits)
+    nested = source.media_dir / "level-one"
+    nested.mkdir()
+    payload = nested / "payload.bin"
+    payload.write_bytes(b"at the inclusive boundary")
+    snapshot = _create_snapshot(source, tmp_path)
+
+    manifest = read_manifest(
+        snapshot,
+        PASSPHRASE,
+        limits=limits,
+    )
+    target_root = tmp_path / "target"
+    restore_snapshot(
+        snapshot,
+        passphrase=PASSPHRASE,
+        locations=_restore_locations(target_root, limits),
+    )
+
+    assert any(
+        entry["path"] == "media/level-one/payload.bin"
+        for entry in manifest["inventory"]
+    )
+    assert (
+        target_root / "data" / "media" / "level-one" / "payload.bin"
+    ).read_bytes() == b"at the inclusive boundary"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor cleanup contract")
+def test_copy_depth_backstop_removes_partial_stage_and_restore_journal(
+    tmp_path,
+    monkeypatch,
+):
+    source = _source_locations(
+        tmp_path / "source",
+        limits=_limits(max_identity_depth=4),
+    )
+    nested = source.media_dir / "level-one"
+    nested.mkdir()
+    (nested / "payload.bin").write_bytes(b"rejected by copy backstop")
+    snapshot = _create_snapshot(source, tmp_path)
+    limits = _limits(max_identity_depth=1)
+    target_root = tmp_path / "target"
+    target = _restore_locations(target_root, limits)
+
+    monkeypatch.setattr(
+        snapshot_mod,
+        "_validate_archive_members",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(
+        BackupError,
+        match="1-level identity depth",
+    ):
+        restore_snapshot(
+            snapshot,
+            passphrase=PASSPHRASE,
+            locations=target,
+        )
+
+    journal = snapshot_mod.restore_journal_path(target.restore_state_dir)
+    assert not journal.exists()
+    assert list(target_root.rglob("*.healthmes-restore-*.staged")) == []
+    assert list(target_root.rglob("*.healthmes-restore-*.backup")) == []
+    assert not (target_root / "data" / "healthmes.db").exists()
+    assert not (target_root / "data" / "media").exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor traversal contract")
 def test_stage_tree_rejects_source_ancestor_replacement_before_root_open(
     tmp_path,

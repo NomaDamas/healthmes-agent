@@ -1428,7 +1428,11 @@ def test_partial_local_staging_is_removed_when_copy_fails(
             _source,
             *,
             destination_descriptor,
+            limits,
+            depth=0,
         ):
+            assert limits is not None
+            assert depth == 0
             descriptor = os.open(
                 "secret.bin",
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
