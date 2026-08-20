@@ -1373,6 +1373,10 @@ def payload_generation_guard(
                         connection,
                         _PAYLOAD_GENERATION_KEY,
                     )
+                    # A normal False result proves this attempt did not acquire
+                    # the session lock. Keep cleanup armed only while the
+                    # outcome is ambiguous or after a confirmed acquisition.
+                    lock_attempted = acquired_postgres
                     if acquired_postgres:
                         break
                     sleep(

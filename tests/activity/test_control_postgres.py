@@ -559,8 +559,23 @@ def test_postgres_advisory_cleanup_failure_retires_caller_connection(
     assert connection.engine.dispose_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("guard_name", "timeout_message"),
+    (
+        (
+            "postgres_activity_write_plane_guard",
+            "timed out waiting for the activity write plane",
+        ),
+        (
+            "payload_generation_guard",
+            "timed out waiting for the payload-generation lock",
+        ),
+    ),
+)
 def test_postgres_guard_timeout_does_not_unlock_an_unacquired_lock(
     monkeypatch,
+    guard_name,
+    timeout_message,
 ) -> None:
     class FakeEngine:
         url = sa.make_url(
@@ -612,9 +627,10 @@ def test_postgres_guard_timeout_does_not_unlock_an_unacquired_lock(
 
     with pytest.raises(
         TimeoutError,
-        match="timed out waiting for the activity write plane",
+        match=timeout_message,
     ):
-        with locking_module.postgres_activity_write_plane_guard(
+        guard = getattr(locking_module, guard_name)
+        with guard(
             connection,  # type: ignore[arg-type]
             timeout_seconds=0.01,
             poll_seconds=0.001,
