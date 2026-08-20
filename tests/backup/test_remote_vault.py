@@ -460,6 +460,156 @@ class TestExportAndRestore:
         )
         assert list(local.backup_dir.glob("*.tar.gz.age")) == []
 
+    def test_collision_retries_reuse_one_sealed_generation_and_preserve_replacement(
+        self,
+        local_provider,
+    ):
+        replacement = b"unrelated replacement at the original snapshot name"
+
+        class CollidingClient:
+            def __init__(self) -> None:
+                self.uploads: list[tuple[str, bytes]] = []
+                self.current_upload = b""
+
+            def put_object(self, **kwargs):
+                payload = kwargs["Body"].read()
+                self.uploads.append((kwargs["Key"], payload))
+                self.current_upload = payload
+                if len(self.uploads) == 1:
+                    original_path = next(
+                        local_provider.backup_dir.glob("*.tar.gz.age")
+                    )
+                    original_path.unlink()
+                    original_path.write_bytes(replacement)
+                if len(self.uploads) <= 2:
+                    raise ClientError(
+                        {
+                            "Error": {
+                                "Code": "PreconditionFailed",
+                                "Message": "occupied immutable name",
+                            }
+                        },
+                        "PutObject",
+                    )
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v3",
+                }
+
+            def get_object(self, **kwargs):
+                if kwargs.get("VersionId") == "uploaded-v3":
+                    payload = self.current_upload
+                    version_id = "uploaded-v3"
+                else:
+                    payload = b"different existing remote generation"
+                    version_id = "existing-v1"
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "Metadata": {},
+                    "ETag": "existing-etag",
+                    "VersionId": version_id,
+                }
+
+        client = CollidingClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        local_info, remote_info = provider.create_and_replicate()
+
+        assert [Path(key).name for key, _payload in client.uploads] == [
+            "healthmes-backup-20260705T033000Z.tar.gz.age",
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age",
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age",
+        ]
+        uploaded_payloads = [payload for _key, payload in client.uploads]
+        assert len(set(uploaded_payloads)) == 1
+        assert local_info.name == remote_info.name == (
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        assert local_info.path.read_bytes() == uploaded_payloads[0]
+        original_path = local_provider.backup_dir / (
+            "healthmes-backup-20260705T033000Z.tar.gz.age"
+        )
+        assert original_path.read_bytes() == replacement
+        assert not (
+            local_provider.backup_dir
+            / "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        ).exists()
+
+    def test_remote_only_collision_does_not_delete_replaced_original_name(
+        self,
+        local_provider,
+    ):
+        replacement = b"unrelated replacement that remote-only must preserve"
+
+        class OneCollisionClient:
+            def __init__(self) -> None:
+                self.uploads: list[tuple[str, bytes]] = []
+                self.current_upload = b""
+
+            def put_object(self, **kwargs):
+                payload = kwargs["Body"].read()
+                self.uploads.append((kwargs["Key"], payload))
+                self.current_upload = payload
+                if len(self.uploads) == 1:
+                    original_path = next(
+                        local_provider.backup_dir.glob("*.tar.gz.age")
+                    )
+                    original_path.unlink()
+                    original_path.write_bytes(replacement)
+                    raise ClientError(
+                        {
+                            "Error": {
+                                "Code": "PreconditionFailed",
+                                "Message": "occupied immutable name",
+                            }
+                        },
+                        "PutObject",
+                    )
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v2",
+                }
+
+            def get_object(self, **kwargs):
+                if kwargs.get("VersionId") == "uploaded-v2":
+                    payload = self.current_upload
+                    version_id = "uploaded-v2"
+                else:
+                    payload = b"different existing remote generation"
+                    version_id = "existing-v1"
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "Metadata": {},
+                    "ETag": "existing-etag",
+                    "VersionId": version_id,
+                }
+
+        client = OneCollisionClient()
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local_provider,
+            keep_local=False,
+        )
+        provider._s3 = client
+
+        remote_info = provider.export_snapshot()
+
+        assert remote_info.name == (
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        assert len(client.uploads) == 2
+        assert client.uploads[0][1] == client.uploads[1][1]
+        original_path = local_provider.backup_dir / (
+            "healthmes-backup-20260705T033000Z.tar.gz.age"
+        )
+        assert original_path.read_bytes() == replacement
+        assert not (
+            local_provider.backup_dir / remote_info.name
+        ).exists()
+
     def test_push_is_idempotent_for_identical_snapshot(
         self,
         vault,

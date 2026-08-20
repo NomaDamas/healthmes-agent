@@ -19,6 +19,7 @@ import pytest
 from pyrage import passphrase as age_passphrase
 
 from healthmes.backup import filesystem as filesystem_mod
+from healthmes.backup import remote_vault as remote_vault_mod
 from healthmes.backup import snapshot as snapshot_mod
 from healthmes.backup.limits import SnapshotResourceLimits
 from healthmes.backup.local import LocalDirectoryProvider
@@ -1830,6 +1831,66 @@ def test_remote_vault_download_preserves_configured_free_space_reserve(
     assert not destination.exists()
     assert not destination.with_name(destination.name + ".part").exists()
     assert body.closed
+
+
+def test_remote_vault_create_checks_space_before_sealing_generation(
+    source_env,
+    tmp_path,
+    monkeypatch,
+):
+    local = LocalDirectoryProvider(
+        tmp_path / "backups",
+        locations=source_env.locations,
+        passphrase=source_env.passphrase,
+        clock=lambda: CREATED_AT,
+    )
+    vault = RemoteVaultProvider(
+        VaultConfig(
+            bucket="resource-limit-test",
+            access_key_id="testing",
+            secret_access_key="testing",
+            region="us-east-1",
+        ),
+        local=local,
+    )
+    remote_calls = 0
+
+    class NoUploadClient:
+        def put_object(self, **_kwargs):
+            nonlocal remote_calls
+            remote_calls += 1
+            raise AssertionError("vault upload must not start without seal space")
+
+    def reject_sealed_generation(
+        path,
+        *,
+        payload_bytes,
+        limits,
+        label,
+    ):
+        assert path == Path(remote_vault_mod.tempfile.gettempdir())
+        assert payload_bytes > 0
+        assert limits is source_env.locations.resource_limits
+        assert label == "private vault sealed generation"
+        raise BackupError("insufficient disk space for private vault sealed generation")
+
+    vault._s3 = NoUploadClient()
+    monkeypatch.setattr(
+        remote_vault_mod,
+        "_require_disk_capacity",
+        reject_sealed_generation,
+    )
+
+    with pytest.raises(
+        BackupError,
+        match="insufficient disk space for private vault sealed generation",
+    ):
+        vault.create_and_replicate()
+
+    snapshots = list(local.backup_dir.glob("*.tar.gz.age"))
+    assert len(snapshots) == 1
+    assert snapshots[0].stat().st_size > 0
+    assert remote_calls == 0
 
 
 @pytest.mark.parametrize(

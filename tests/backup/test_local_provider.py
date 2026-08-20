@@ -1,6 +1,7 @@
 """LocalDirectoryProvider + weekly job factory tests."""
 
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from time import sleep
 
 import pytest
 
+from healthmes.backup import filesystem as filesystem_mod
 from healthmes.backup import local as local_mod
 from healthmes.backup.filesystem import RegularFileIdentity
 from healthmes.backup.local import LocalDirectoryProvider, build_backup_job
@@ -262,7 +264,7 @@ class TestProvider:
         assert info.path.parent == target.resolve()
         assert (configured / info.name).samefile(info.path)
 
-    def test_collision_relocation_keeps_candidate_after_final_fsync_failure(
+    def test_collision_relocation_keeps_candidate_when_source_retirement_fails(
         self,
         source_env,
         tmp_path,
@@ -286,7 +288,10 @@ class TestProvider:
             fail_second_fsync,
         )
 
-        with pytest.raises(BackupError, match="directory sync could not be confirmed"):
+        with pytest.raises(
+            BackupError,
+            match="could not remove replicated local snapshot",
+        ):
             provider.relocate_snapshot_after_collision(
                 info,
                 minimum_counter=2,
@@ -298,6 +303,48 @@ class TestProvider:
         assert not info.path.exists()
         assert candidate.is_file()
         assert candidate.stat().st_size == info.size_bytes
+
+    def test_collision_relocation_preserves_a_snapshot_if_candidate_fsync_fails(
+        self,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        provider = make_provider(source_env, tmp_path / "backups", clock=lambda: T1)
+        info = provider.export_snapshot()
+        original = info.path.read_bytes()
+        real_fsync = filesystem_mod.os.fsync
+        failed = False
+
+        def fail_first_directory_fsync(descriptor):
+            nonlocal failed
+            if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                failed = True
+                raise OSError("injected candidate directory fsync failure")
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(
+            filesystem_mod.os,
+            "fsync",
+            fail_first_directory_fsync,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="destination was created but durability could not be confirmed",
+        ):
+            provider.relocate_snapshot_after_collision(
+                info,
+                minimum_counter=2,
+            )
+
+        candidate = info.path.with_name(
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        survivors = [path for path in (info.path, candidate) if path.exists()]
+        assert failed is True
+        assert survivors
+        assert all(path.read_bytes() == original for path in survivors)
 
     @pytest.mark.skipif(
         os.name == "nt",

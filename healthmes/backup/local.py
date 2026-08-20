@@ -29,6 +29,7 @@ from typing import BinaryIO
 
 from healthmes.activity.locking import exclusive_file_lock
 from healthmes.backup.filesystem import (
+    PinnedPublishedFile,
     RegularFileIdentity,
     durable_atomic_writer,
     fsync_directory,
@@ -72,6 +73,10 @@ _SNAPSHOT_RECOVERY_MAX_ENTRIES = 256
 _SNAPSHOT_RECOVERY_MAX_SECONDS = 1.0
 _SNAPSHOT_RECOVERY_MAX_DIRECTORY_BATCHES = 64
 _SNAPSHOT_METADATA_MAX_BYTES = 16 * 1024
+
+
+class _SnapshotGenerationChanged(BackupError):
+    """A snapshot name no longer refers to the expected local generation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1259,17 +1264,94 @@ def _recover_snapshot_quarantines_at_boundary(
 def _publish_staged_snapshot(
     staged_path: Path,
     destination: Path,
+    *,
+    pinned: PinnedPublishedFile | None = None,
 ) -> None:
     """Durably publish one staged ciphertext without replacing any entry."""
-    with (
-        open_regular_file(staged_path) as source,
-        durable_atomic_writer(
+    with open_regular_file(staged_path) as source:
+        _publish_open_snapshot(
+            source,
+            destination,
+            pinned=pinned,
+        )
+
+
+def _publish_open_snapshot(
+    source: BinaryIO,
+    destination: Path,
+    *,
+    pinned: PinnedPublishedFile | None = None,
+) -> RegularFileIdentity:
+    """Publish the exact regular-file generation held by ``source``."""
+    expected = RegularFileIdentity.from_descriptor(source.fileno())
+    source.seek(0)
+    copied = 0
+    try:
+        with durable_atomic_writer(
             destination,
             replace_existing=False,
-        ) as output,
-    ):
+            pinned=pinned,
+        ) as output:
+            while chunk := source.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > expected.size:
+                    raise BackupError(
+                        "sealed snapshot generation grew while it was being "
+                        "published"
+                    )
+                output.write(chunk)
+            if (
+                copied != expected.size
+                or RegularFileIdentity.from_descriptor(source.fileno())
+                != expected
+            ):
+                raise BackupError(
+                    "sealed snapshot generation changed while it was being "
+                    "published"
+                )
+    finally:
+        source.seek(0)
+    if pinned is not None:
+        if pinned.identity is None:
+            raise BackupError(
+                "published snapshot generation was not retained"
+            )
+        return pinned.identity
+    return expected
+
+
+def _seal_open_snapshot(
+    source: BinaryIO,
+    sealed: BinaryIO,
+) -> RegularFileIdentity:
+    """Copy one open generation into an anonymous, durable sealed handle."""
+    expected = RegularFileIdentity.from_descriptor(source.fileno())
+    source.seek(0)
+    sealed.seek(0)
+    sealed.truncate()
+    copied = 0
+    try:
         while chunk := source.read(1024 * 1024):
-            output.write(chunk)
+            copied += len(chunk)
+            if copied > expected.size:
+                raise BackupError(
+                    "snapshot generation grew while it was being sealed"
+                )
+            sealed.write(chunk)
+        sealed.flush()
+        os.fsync(sealed.fileno())
+        if (
+            copied != expected.size
+            or RegularFileIdentity.from_descriptor(source.fileno())
+            != expected
+        ):
+            raise BackupError(
+                "snapshot generation changed while it was being sealed"
+            )
+        sealed.seek(0)
+        return expected
+    finally:
+        source.seek(0)
 
 
 class LocalDirectoryProvider:
@@ -1365,7 +1447,11 @@ class LocalDirectoryProvider:
             candidate = backup_dir / f"{stem}-{counter}{SNAPSHOT_SUFFIX}"
             counter += 1
 
-    def export_snapshot(self) -> SnapshotInfo:
+    def export_snapshot(
+        self,
+        *,
+        _pinned: PinnedPublishedFile | None = None,
+    ) -> SnapshotInfo:
         """Create one encrypted snapshot of the live data in the backup dir."""
         passphrase = self._require_passphrase()
         storage_dir = self._storage_dir()
@@ -1391,21 +1477,36 @@ class LocalDirectoryProvider:
                     )
                     while True:
                         out_path = self._unique_out_path(created_at)
+                        publish_pin = _pinned or PinnedPublishedFile()
                         try:
-                            _publish_staged_snapshot(staged_path, out_path)
+                            _publish_staged_snapshot(
+                                staged_path,
+                                out_path,
+                                pinned=publish_pin,
+                            )
                         except FileExistsError:
+                            if _pinned is None:
+                                publish_pin.close()
                             logger.info(
                                 "Snapshot name appeared during publish; retrying "
                                 "with the next collision suffix: %s",
                                 out_path,
                             )
                             continue
-                        return SnapshotInfo(
-                            name=out_path.name,
-                            path=out_path,
-                            created_at=created_at,
-                            size_bytes=out_path.stat().st_size,
-                        )
+                        try:
+                            if publish_pin.identity is None:
+                                raise BackupError(
+                                    "published snapshot generation was not retained"
+                                )
+                            return SnapshotInfo(
+                                name=out_path.name,
+                                path=out_path,
+                                created_at=created_at,
+                                size_bytes=publish_pin.identity.size,
+                            )
+                        finally:
+                            if _pinned is None:
+                                publish_pin.close()
         except BackupError:
             raise
         except OSError as exc:
@@ -1419,13 +1520,59 @@ class LocalDirectoryProvider:
         *,
         minimum_counter: int,
     ) -> SnapshotInfo:
-        """Move a just-created snapshot to an unused collision suffix.
+        """Republish a sealed local snapshot under an unused collision suffix."""
+        source, selected_identity = self._resolve_snapshot_generation(
+            info.path
+        )
+        try:
+            with (
+                open_regular_file(source) as opened,
+                tempfile.TemporaryFile(mode="w+b") as sealed,
+            ):
+                opened_identity = RegularFileIdentity.from_descriptor(
+                    opened.fileno()
+                )
+                if opened_identity != selected_identity:
+                    raise BackupError(
+                        "colliding snapshot changed before it could be sealed: "
+                        f"{source}"
+                    )
+                _seal_open_snapshot(opened, sealed)
+                relocated, _identity = (
+                    self._relocate_sealed_snapshot_after_collision(
+                        info,
+                        minimum_counter=minimum_counter,
+                        sealed=sealed,
+                        expected=opened_identity,
+                    )
+                )
+                return relocated
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupError(
+                f"could not relocate colliding snapshot {source}: {exc}"
+            ) from exc
 
-        The export lock prevents another HealthMes process from claiming the
-        same local name. A hard link provides no-overwrite publication before
-        the old name is removed, so a failed remote collision retry always
-        leaves at least one complete local envelope.
-        """
+    def _relocate_sealed_snapshot_after_collision(
+        self,
+        info: SnapshotInfo,
+        *,
+        minimum_counter: int,
+        sealed: BinaryIO,
+        expected: RegularFileIdentity,
+    ) -> tuple[SnapshotInfo, RegularFileIdentity]:
+        """Publish ``sealed`` first, then safely retire only ``expected``."""
+        if minimum_counter < 1:
+            raise ValueError("snapshot collision counter must be positive")
+        sealed_identity = RegularFileIdentity.from_descriptor(
+            sealed.fileno()
+        )
+        if sealed_identity.size != expected.size:
+            raise BackupError(
+                "sealed collision generation size does not match its local "
+                "snapshot identity"
+            )
         storage_dir = self._storage_dir()
         source = Path(info.path)
         if source.name in {"", ".", ".."}:
@@ -1433,164 +1580,91 @@ class LocalDirectoryProvider:
                 "refusing to relocate a snapshot outside the configured backup directory"
             )
         try:
+            source_parent = source.parent.resolve(strict=True)
+        except OSError as exc:
+            raise BackupError(
+                f"could not verify colliding snapshot parent {source}: {exc}"
+            ) from exc
+        try:
             with open_directory_anchored(storage_dir) as (
                 canonical_storage_dir,
                 parent_descriptor,
             ):
-                if source.parent.resolve(strict=True) != canonical_storage_dir:
+                if source_parent != canonical_storage_dir:
                     raise BackupError(
                         "refusing to relocate a snapshot outside the configured "
                         "backup directory"
                     )
-                source_descriptor = os.open(
-                    source.name,
-                    os.O_RDONLY
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=parent_descriptor,
-                )
-                try:
-                    source_identity = RegularFileIdentity.from_descriptor(
-                        source_descriptor
+                with exclusive_file_lock(
+                    canonical_storage_dir / _EXPORT_LOCK_NAME,
+                    parent_descriptor=parent_descriptor,
+                ):
+                    opened_parent = os.fstat(parent_descriptor)
+                    named_parent = os.stat(
+                        storage_dir,
+                        follow_symlinks=True,
                     )
-                    with exclusive_file_lock(
-                        canonical_storage_dir / _EXPORT_LOCK_NAME,
-                        parent_descriptor=parent_descriptor,
+                    if (
+                        not stat.S_ISDIR(named_parent.st_mode)
+                        or named_parent.st_dev != opened_parent.st_dev
+                        or named_parent.st_ino != opened_parent.st_ino
                     ):
-                        opened_parent = os.fstat(parent_descriptor)
-                        named_parent = os.stat(
-                            storage_dir,
-                            follow_symlinks=True,
+                        raise BackupError(
+                            "backup directory changed while relocating the "
+                            "colliding snapshot"
                         )
-                        if (
-                            not stat.S_ISDIR(named_parent.st_mode)
-                            or named_parent.st_dev != opened_parent.st_dev
-                            or named_parent.st_ino != opened_parent.st_ino
-                        ):
-                            raise BackupError(
-                                "backup directory changed while relocating the "
-                                "colliding snapshot"
-                            )
-                        named_source = os.stat(
-                            source.name,
-                            dir_fd=parent_descriptor,
-                            follow_symlinks=False,
+                    base = snapshot_name(info.created_at)
+                    stem = base[: -len(SNAPSHOT_SUFFIX)]
+                    counter = minimum_counter
+                    while True:
+                        candidate_name = (
+                            base
+                            if counter == 1
+                            else f"{stem}-{counter}{SNAPSHOT_SUFFIX}"
                         )
-                        if not source_identity.matches(named_source):
-                            raise BackupError(
-                                "colliding snapshot changed before it could be "
-                                f"relocated: {source}"
-                            )
-                        base = snapshot_name(info.created_at)
-                        stem = base[: -len(SNAPSHOT_SUFFIX)]
-                        counter = minimum_counter
-                        while True:
-                            candidate_name = (
-                                base
-                                if counter == 1
-                                else f"{stem}-{counter}{SNAPSHOT_SUFFIX}"
-                            )
-                            counter = max(2, counter + 1)
+                        counter = max(2, counter + 1)
+                        candidate = (
+                            canonical_storage_dir / candidate_name
+                        )
+                        with PinnedPublishedFile() as published:
                             try:
-                                os.stat(
-                                    candidate_name,
-                                    dir_fd=parent_descriptor,
-                                    follow_symlinks=False,
-                                )
-                                continue
-                            except FileNotFoundError:
-                                pass
-                            candidate = canonical_storage_dir / candidate_name
-                            linked = False
-                            try:
-                                os.link(
-                                    source.name,
-                                    candidate_name,
-                                    src_dir_fd=parent_descriptor,
-                                    dst_dir_fd=parent_descriptor,
-                                    follow_symlinks=False,
-                                )
-                                linked = True
-                                _fsync_snapshot_directory(
-                                    canonical_storage_dir,
-                                    parent_descriptor,
+                                candidate_identity = (
+                                    _publish_open_snapshot(
+                                        sealed,
+                                        candidate,
+                                        pinned=published,
+                                    )
                                 )
                             except FileExistsError:
                                 continue
-                            except OSError as exc:
-                                if linked:
-                                    try:
-                                        os.unlink(
-                                            candidate_name,
-                                            dir_fd=parent_descriptor,
-                                        )
-                                        _fsync_snapshot_directory(
-                                            canonical_storage_dir,
-                                            parent_descriptor,
-                                        )
-                                    except OSError:
-                                        logger.warning(
-                                            "Could not remove collision-name "
-                                            "staging link %s",
-                                            candidate,
-                                            exc_info=True,
-                                        )
-                                raise BackupError(
-                                    "could not assign a collision-safe snapshot "
-                                    f"name for {source}: {exc}"
-                                ) from exc
-                            break
-                        try:
-                            os.unlink(
-                                source.name,
-                                dir_fd=parent_descriptor,
-                            )
-                        except OSError as exc:
-                            try:
-                                os.unlink(
-                                    candidate_name,
-                                    dir_fd=parent_descriptor,
-                                )
-                                _fsync_snapshot_directory(
-                                    canonical_storage_dir,
-                                    parent_descriptor,
-                                )
-                            except OSError:
-                                logger.warning(
-                                    "Could not remove collision-name rollback "
-                                    "file %s",
-                                    candidate,
-                                    exc_info=True,
-                                )
-                            raise BackupError(
-                                "could not retire colliding snapshot name "
-                                f"{source}: {exc}"
-                            ) from exc
-                        try:
-                            _fsync_snapshot_directory(
-                                canonical_storage_dir,
-                                parent_descriptor,
-                            )
-                        except OSError as exc:
-                            raise BackupError(
-                                "collision-safe snapshot name was published but "
-                                "its directory sync could not be confirmed: "
-                                f"{candidate}: {exc}"
-                            ) from exc
-                        return SnapshotInfo(
-                            name=candidate_name,
-                            path=candidate,
-                            created_at=info.created_at,
-                            size_bytes=info.size_bytes,
-                        )
-                finally:
-                    os.close(source_descriptor)
+                        break
         except BackupError:
             raise
         except OSError as exc:
             raise BackupError(
                 f"could not relocate colliding snapshot {source}: {exc}"
             ) from exc
+
+        try:
+            self.remove_snapshot_if_unchanged(
+                source,
+                expected=expected,
+            )
+        except _SnapshotGenerationChanged:
+            logger.warning(
+                "Colliding snapshot name now belongs to another generation; "
+                "preserving it after publishing %s",
+                candidate,
+            )
+        return (
+            SnapshotInfo(
+                name=candidate_name,
+                path=candidate,
+                created_at=info.created_at,
+                size_bytes=candidate_identity.size,
+            ),
+            candidate_identity,
+        )
 
     def remove_snapshot_if_unchanged(
         self,
@@ -1662,7 +1736,7 @@ class LocalDirectoryProvider:
                     try:
                         metadata = os.fstat(source_descriptor)
                         if not expected.matches(metadata):
-                            raise BackupError(
+                            raise _SnapshotGenerationChanged(
                                 "local snapshot changed after upload; "
                                 f"preserving the current file: {source}"
                             )
@@ -1756,7 +1830,9 @@ class LocalDirectoryProvider:
                                 quarantine_name,
                             )
                         if mismatch_message is not None:
-                            raise BackupError(mismatch_message)
+                            raise _SnapshotGenerationChanged(
+                                mismatch_message
+                            )
                     finally:
                         os.close(source_descriptor)
         except BackupError:
