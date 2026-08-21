@@ -6,6 +6,7 @@ import Combine
 import DeviceActivity
 import FamilyControls
 import ManagedSettings
+import SwiftUI
 #endif
 
 enum ScreenTimeAuthorizationChangeObserverFactory {
