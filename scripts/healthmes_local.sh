@@ -1455,29 +1455,30 @@ release_decision_runtime_lifecycle_lock_on_exit() {
     local status=$? cleanup_status
     trap - EXIT
     # EXIT traps run while bash is still carrying the failing command's
-    # errexit context. Cleanup must make every failure explicit so one
-    # platform cannot skip journal repair or lock release.
+    # errexit context. Run cleanup functions directly after disabling
+    # errexit: invoking them as `if` conditions changes nested function
+    # failure semantics across Bash versions.
     set +e
     if [ "$status" -ne 0 ] \
         && operation_requires_durable_lifecycle_journal \
             "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" \
         && [ "$DECISION_RUNTIME_DURABLE_MUTATION_STARTED" = true ]; then
-        if mark_owned_decision_runtime_lifecycle_repair_required; then
+        mark_owned_decision_runtime_lifecycle_repair_required
+        cleanup_status=$?
+        if [ "$cleanup_status" -eq 0 ]; then
             printf '%s\n' \
                 "[healthmes] decision runtime ${DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION} failed after mutation began; preserving a repair-required lifecycle journal" \
                 >&2
         else
-            cleanup_status=$?
             printf '%s\n' \
                 "[healthmes] failed to mark the interrupted decision runtime transaction repair-required; preserving its existing lifecycle journal" \
                 >&2
         fi
         exit "$status"
     fi
-    if release_decision_runtime_lifecycle_lock; then
-        cleanup_status=0
-    else
-        cleanup_status=$?
+    release_decision_runtime_lifecycle_lock
+    cleanup_status=$?
+    if [ "$cleanup_status" -ne 0 ]; then
         printf '%s\n' \
             "[healthmes] decision runtime lifecycle lock release failed; preserving its diagnostic" \
             >&2

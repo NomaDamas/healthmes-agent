@@ -310,8 +310,12 @@ def test_postgres_pool_checkout_is_bounded_by_calendar_deadline() -> None:
 
         def close(self) -> None:
             self.closed = True
+            connection_closed.set()
 
     created: list[FakeConnection] = []
+    connect_entered = threading.Event()
+    release_connect = threading.Event()
+    connection_closed = threading.Event()
 
     class SlowEngine:
         dialect = FakeDialect()
@@ -319,7 +323,8 @@ def test_postgres_pool_checkout_is_bounded_by_calendar_deadline() -> None:
 
         @staticmethod
         def connect():
-            time.sleep(0.2)
+            connect_entered.set()
+            assert release_connect.wait(timeout=5)
             candidate = FakeConnection()
             created.append(candidate)
             return candidate
@@ -329,20 +334,24 @@ def test_postgres_pool_checkout_is_bounded_by_calendar_deadline() -> None:
         def get_bind():
             return SlowEngine()
 
-    started = time.monotonic()
-    with pytest.raises(
-        TimeoutError,
-        match="PostgreSQL advisory calendar write lock",
-    ):
-        with calendar_write_lock(
-            FakeSession(),  # type: ignore[arg-type]
-            CalendarSource.GOOGLE,
-            timeout_seconds=0.02,
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="PostgreSQL advisory calendar write lock",
         ):
-            pytest.fail("slow pool checkout must not enter the lock")
-    assert time.monotonic() - started < 0.15
+            with calendar_write_lock(
+                FakeSession(),  # type: ignore[arg-type]
+                CalendarSource.GOOGLE,
+                timeout_seconds=0.02,
+            ):
+                pytest.fail("slow pool checkout must not enter the lock")
 
-    time.sleep(0.25)
+        assert connect_entered.wait(timeout=5)
+        assert not created
+    finally:
+        release_connect.set()
+
+    assert connection_closed.wait(timeout=5)
     assert created and all(candidate.closed for candidate in created)
 
 

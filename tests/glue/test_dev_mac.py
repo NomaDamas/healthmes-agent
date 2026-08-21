@@ -4095,11 +4095,16 @@ def test_generic_start_recovers_live_identity_after_ps_is_unknown(
         stopped = _run_local_runtime(
             harness,
             "__test_stop_generic",
+            check=False,
             env_overrides=env_overrides,
             timeout=10,
         )
 
-        assert stopped.returncode == 0
+        assert stopped.returncode == 0, (
+            stopped.returncode,
+            stopped.stdout,
+            stopped.stderr,
+        )
         assert f"{service_name} stopped" in stopped.stdout
         assert not pid_file.exists()
         assert not identity_file.exists()
