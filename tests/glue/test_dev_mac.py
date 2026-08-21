@@ -245,6 +245,63 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         NATIVE_IDENTITY_HELPER,
         scripts / "runtime_native_identity.py",
     )
+    # The production helper must keep its real /proc checks. This wrapper
+    # virtualizes only the fake harness PID state; real child PIDs delegate to
+    # the unmodified native implementation.
+    fake_native_identity = fake_bin / "runtime-native-identity.py"
+    _write_executable(
+        fake_native_identity,
+        """
+        #!/usr/bin/env python3
+        import importlib.util
+        import os
+        import pathlib
+
+        helper_path = pathlib.Path(os.environ["FAKE_NATIVE_IDENTITY_HELPER"])
+        spec = importlib.util.spec_from_file_location(
+            "healthmes_test_runtime_native_identity",
+            helper_path,
+        )
+        if spec is None or spec.loader is None:
+            raise SystemExit(5)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        native_absent_or_zombie = helper._linux_process_is_absent_or_zombie
+        native_existence_state = helper._native_process_existence_state
+
+        def harness_state(pid: int) -> str | None:
+            state = pathlib.Path(os.environ["FAKE_PROCESS_STATE"])
+            managed_pid = (state / "pid").read_text(
+                encoding="ascii"
+            ).strip()
+            if str(pid) == managed_pid:
+                return "live" if (state / "alive").exists() else "gone"
+            absent_pids = os.environ.get(
+                "FAKE_ABSENT_PIDS", ""
+            ).split()
+            if str(pid) in absent_pids:
+                return "gone"
+            return None
+
+        def harness_existence_state(pid: int) -> str:
+            state = harness_state(pid)
+            return state if state is not None else native_existence_state(pid)
+
+        def harness_absent_or_zombie(pid: int) -> bool:
+            state = harness_state(pid)
+            return (
+                state == "gone"
+                if state is not None
+                else native_absent_or_zombie(pid)
+            )
+
+        helper._linux_process_is_absent_or_zombie = (
+            harness_absent_or_zombie
+        )
+        helper._native_process_existence_state = harness_existence_state
+        raise SystemExit(helper.main())
+        """,
+    )
     dev_mac = scripts / "dev_mac.sh"
     _write_executable(
         dev_mac,
@@ -514,8 +571,12 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
     env = {
         "HOME": str(home),
         "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TMPDIR": str(tmp_path),
         "FAKE_EVENT_LOG": str(event_log),
         "FAKE_PROCESS_STATE": str(process_state),
+        "FAKE_NATIVE_IDENTITY_HELPER": str(
+            scripts / "runtime_native_identity.py"
+        ),
         "FAKE_ABSENT_PIDS": "999998 999999",
         "FAKE_SUPERVISOR_STATE": str(supervisor_state),
         "FAKE_STOP_BUDGET": str(
@@ -540,6 +601,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
             fake_bin / "runtime-python"
         ),
         "HEALTHMES_NATIVE_IDENTITY_PYTHON_BIN": sys.executable,
+        "HEALTHMES_NATIVE_IDENTITY_HELPER": str(fake_native_identity),
     }
     return {
         "env": env,
