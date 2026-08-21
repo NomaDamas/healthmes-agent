@@ -2314,15 +2314,15 @@ start_process() {
 }
 
 signal_process_group() {
-    local signal=$1 pid_file=$2 pid status
+    local signal=$1 pid_file=$2 pgid status
     if process_identity_matches "$pid_file"; then
         :
     else
         status=$?
         return "$status"
     fi
-    pid=$PROCESS_PID
-    "$KILL_BIN" -s "$signal" "-$pid"
+    pgid=$PROCESS_PGID
+    "$KILL_BIN" -s "$signal" -- "-$pgid"
 }
 
 load_decision_runtime_stop_bounds() {
@@ -2743,7 +2743,7 @@ stop_decision_launcher_without_budget() {
         *) die "decision runtime launcher identity is unknown before shutdown handoff; preserving metadata" ;;
         esac
     fi
-    "$KILL_BIN" -s TERM "-$launcher_pid" \
+    "$KILL_BIN" -s TERM -- "-$launcher_pid" \
         || die "failed to signal verified decision runtime launcher; preserving metadata"
     local polls=$MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS
     while true; do

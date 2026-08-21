@@ -1536,16 +1536,16 @@ def test_stop_disables_keepalive_before_signaling_verified_process_group(
     bootout = next(
         index for index, event in enumerate(events) if event.startswith("launchctl bootout ")
     )
-    term = events.index(f"kill -s TERM -{FAKE_MANAGED_PID}")
-    hard_kill = events.index(f"kill -s KILL -{FAKE_MANAGED_PID}")
+    term = events.index(f"kill -s TERM -- -{FAKE_MANAGED_PID}")
+    hard_kill = events.index(f"kill -s KILL -- -{FAKE_MANAGED_PID}")
     assert disable < bootout < term < hard_kill
     _assert_identity_check_immediately_before(
         events,
-        f"kill -s TERM -{FAKE_MANAGED_PID}",
+        f"kill -s TERM -- -{FAKE_MANAGED_PID}",
     )
     _assert_identity_check_immediately_before(
         events,
-        f"kill -s KILL -{FAKE_MANAGED_PID}",
+        f"kill -s KILL -- -{FAKE_MANAGED_PID}",
     )
     assert not (Path(harness["runtime"]) / "healthmes.pid").exists()
     assert not (Path(harness["runtime"]) / "healthmes.pid.identity").exists()
@@ -1743,7 +1743,7 @@ def test_decision_stop_rechecks_budget_published_during_startup_stop(
     assert published_budget.read_bytes() == late_budget.read_bytes()
     assert pid_file.exists()
     assert pid_file.with_suffix(".pid.identity").exists()
-    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in _event_lines(harness)
+    assert f"kill -s TERM -- -{FAKE_MANAGED_PID}" in _event_lines(harness)
 
 
 def test_decision_stop_accepts_late_budget_only_after_cleanup_removes_it(
@@ -1798,7 +1798,7 @@ def test_decision_stop_hands_off_budget_published_during_group_probe(
     )
 
     events = _event_lines(harness)
-    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in events
+    assert f"kill -s TERM -- -{FAKE_MANAGED_PID}" in events
     assert any(
         f"--runtime-process-group-pgid {FAKE_MANAGED_PID}" in event
         for event in events
@@ -2367,7 +2367,7 @@ def test_decision_stop_uses_conservative_legacy_compatibility_budget(
 
     assert result.returncode != 0
     assert _event_lines(harness).count("sleep 1") == 317
-    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in _event_lines(harness)
+    assert f"kill -s TERM -- -{FAKE_MANAGED_PID}" in _event_lines(harness)
     assert budget.exists()
 
 
@@ -3941,9 +3941,9 @@ def test_generic_stop_bounds_term_and_post_kill_wait(
     assert result.returncode != 0
     assert events.count("sleep 1") == 3
     assert events.index(
-        f"kill -s TERM -{FAKE_MANAGED_PID}"
+        f"kill -s TERM -- -{FAKE_MANAGED_PID}"
     ) < events.index(
-        f"kill -s KILL -{FAKE_MANAGED_PID}"
+        f"kill -s KILL -- -{FAKE_MANAGED_PID}"
     )
     assert "remained alive 1s after SIGKILL" in result.stderr
     assert pid_file.exists()
@@ -4000,11 +4000,11 @@ def test_pid_reuse_after_term_blocks_followup_kill(tmp_path: Path) -> None:
     _run_local_runtime(harness, "stop", term_behavior="reuse")
 
     events = _event_lines(harness)
-    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in events
-    assert f"kill -s KILL -{FAKE_MANAGED_PID}" not in events
+    assert f"kill -s TERM -- -{FAKE_MANAGED_PID}" in events
+    assert f"kill -s KILL -- -{FAKE_MANAGED_PID}" not in events
     _assert_identity_check_immediately_before(
         events,
-        f"kill -s TERM -{FAKE_MANAGED_PID}",
+        f"kill -s TERM -- -{FAKE_MANAGED_PID}",
     )
 
 
