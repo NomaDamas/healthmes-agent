@@ -69,6 +69,8 @@ def preview_sleep_reconciliation(
     calendar_source: CalendarSource,
     observation: ActualSleepObservation,
     backend: CalendarBackend | None,
+    *,
+    account_generation: str | None = None,
 ) -> SleepPreview:
     children = calendar_observations(observation)
     child_keys = {child.source_key for child in children}
@@ -79,6 +81,7 @@ def preview_sleep_reconciliation(
             session,
             calendar_source,
             child,
+            account_generation=account_generation,
         )
         identity = actual_sleep_identity(child)
         existing = canonical_actual_sleep_mirror(rows, identity)
@@ -116,30 +119,40 @@ def preview_sleep_reconciliation(
         if child_reason is not None:
             reason = child_reason
             break
-    stale_segments = session.scalars(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == calendar_source,
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
-            CalendarEventMirror.sleep_local_date == observation.local_date,
-            CalendarEventMirror.healthmes_source_key.like(
-                f"{observation.source_key}:segment:%"
-            ),
-            CalendarEventMirror.healthmes_source_key.not_in(child_keys),
+    stale_statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == calendar_source,
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind
+        == HealthmesEventKind.ACTUAL_SLEEP.value,
+        CalendarEventMirror.sleep_local_date == observation.local_date,
+        CalendarEventMirror.healthmes_source_key.like(
+            f"{observation.source_key}:segment:%"
+        ),
+        CalendarEventMirror.healthmes_source_key.not_in(child_keys),
+    )
+    if account_generation is not None:
+        stale_statement = stale_statement.where(
+            CalendarEventMirror.connection_generation
+            == account_generation
         )
-    ).all()
+    stale_segments = session.scalars(stale_statement).all()
     action = _combined_action(child_actions, stale_segments, bool(observation.segments))
     if reason is not None:
         action = "blocked"
-    planned = session.scalars(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == calendar_source,
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value,
-            CalendarEventMirror.start_at < ensure_utc(observation.end_at),
-            CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+    planned_statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == calendar_source,
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind
+        == HealthmesEventKind.PLANNED_SLEEP.value,
+        CalendarEventMirror.start_at < ensure_utc(observation.end_at),
+        CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+    )
+    if account_generation is not None:
+        planned_statement = planned_statement.where(
+            CalendarEventMirror.connection_generation
+            == account_generation
         )
-    ).all()
+    planned = session.scalars(planned_statement).all()
     planned_count = 0
     if action != "blocked":
         for row in planned:

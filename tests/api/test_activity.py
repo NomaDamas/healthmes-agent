@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import select
 
 import healthmes.activity.api as activity_api_module
@@ -10,14 +11,54 @@ from healthmes.activity.contracts import ActivityBatchIn
 from healthmes.activity.repository import (
     APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
+    COLLECTION_CONFIG_EVENT,
     DAY_SUMMARY_EVENT,
     DELETION_TOMBSTONE_EVENT,
+    IOS_SNAPSHOT_FENCE_EVENT,
     ActivityWriteConflictError,
 )
 from healthmes.activity.service import ingest_activity_batch
+from healthmes.storage import update_retention_policy
 from healthmes.store import WellnessEvent
 
-pytestmark = pytest.mark.usefixtures("fixture_clock")
+IOS_KEY_FINGERPRINT = "1" * 40
+IOS_KEY_ID = f"ios-key-{IOS_KEY_FINGERPRINT}"
+IOS_APP_TOKEN = f"ios-app-v2-{IOS_KEY_FINGERPRINT}-" + ("a" * 40)
+IOS_PRIVATE_APP_TOKEN = (
+    f"ios-app-v2-{IOS_KEY_FINGERPRINT}-" + ("b" * 40)
+)
+
+
+@pytest.fixture(autouse=True)
+def stable_activity_api_wall_clock(client):
+    """Build FastAPI first, then freeze activity API wall-clock checks."""
+    assert client.get("/v1/activity/devices/clock-prime/collection").status_code == 200
+    with freeze_time("2026-08-14 12:00:00", tick=True, real_asyncio=True):
+        yield
+
+
+def _seed_legacy_ios_exclusion(
+    client,
+    session,
+    device_id: str,
+) -> None:
+    configured = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={
+            "platform": "android",
+            "excluded_apps": ["com.example.private"],
+        },
+    )
+    assert configured.status_code == 200
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == COLLECTION_CONFIG_EVENT,
+            WellnessEvent.source_device == device_id,
+        )
+    )
+    assert event is not None
+    event.payload = {**event.payload, "platform": "ios"}
+    session.commit()
 
 
 def _hour_record(
@@ -64,17 +105,30 @@ def _ios_snapshot(
     start: str = "2026-08-01T10:00:00Z",
     end: str = "2026-08-01T12:00:00Z",
     collected_at: str = "2026-08-01T13:00:00Z",
+    authoritative_bucket_starts: list[str] | None = None,
 ) -> dict:
+    authoritative = (
+        sorted(
+            {
+                str(sample["bucket_start"])
+                for sample in samples
+            }
+        )
+        if authoritative_bucket_starts is None
+        else authoritative_bucket_starts
+    )
     return {
         "device_id": device_id,
         "timezone": "UTC",
         "capability": "aggregate",
         "permission_status": "granted",
+        "pseudonym_key_id": IOS_KEY_ID,
         "collection_revision": 0,
         "collected_at": collected_at,
         "snapshot_sequence": sequence,
         "snapshot_start": start,
         "snapshot_end": end,
+        "authoritative_bucket_starts": authoritative,
         "samples": samples,
     }
 
@@ -91,7 +145,7 @@ def _ios_sample(
         "bucket_start": bucket_start,
         "foreground_seconds": foreground_seconds,
         "category": category,
-        "launches": 1,
+        "opaque_app_token": IOS_APP_TOKEN,
         "coverage_seconds": 3600,
     }
 
@@ -478,6 +532,290 @@ def test_ios_unavailable_is_status_not_fake_zero_activity(client, session) -> No
     assert status.json()["last_collected_at"] is None
 
 
+def test_collection_state_exposes_raw_retention_cutoff(client, session) -> None:
+    before = datetime.now(UTC)
+    update_retention_policy(session, "activity_raw", "1d", now=before)
+    session.commit()
+
+    response = client.get(
+        "/v1/activity/devices/iphone-retention-cutoff/collection"
+    )
+
+    assert response.status_code == 200
+    cutoff = datetime.fromisoformat(response.json()["raw_retention_cutoff"])
+    after = datetime.now(UTC)
+    assert before - timedelta(days=1) <= cutoff
+    assert cutoff <= after - timedelta(days=1)
+
+
+def test_ios_authorization_bootstrap_then_central_disable_is_authoritative(
+    client,
+) -> None:
+    device_id = "ios-collector-v1-" + ("a" * 40)
+    payload = _ios_snapshot(
+        device_id=device_id,
+        sequence=1,
+        samples=[],
+    )
+
+    state = client.get(
+        f"/v1/activity/devices/{device_id}/collection",
+        params={"platform": "ios"},
+    )
+    blocked = client.post("/v1/activity/ios/report", json=payload)
+    revision = client.get(
+        "/v1/inputs/activity.ios-screentime"
+    ).json()["revision"]
+    registered = client.put(
+        "/v1/inputs/activity.ios-screentime/settings",
+        headers={"If-Match": f'"{revision}"'},
+        json={
+            "instance_id": device_id,
+            "platform": "ios",
+            "enabled": True,
+        },
+    )
+    accepted = client.post(
+        "/v1/activity/ios/report",
+        json={**payload, "collection_revision": 1},
+    )
+    latest_revision = client.get(
+        "/v1/inputs/activity.ios-screentime"
+    ).json()["revision"]
+    disabled = client.put(
+        "/v1/inputs/activity.ios-screentime/settings",
+        headers={"If-Match": f'"{latest_revision}"'},
+        json={
+            "instance_id": device_id,
+            "enabled": False,
+        },
+    )
+    later_payload = _ios_snapshot(
+        device_id=device_id,
+        sequence=2,
+        samples=[],
+    )
+    blocked_after_disable = client.post(
+        "/v1/activity/ios/report",
+        json={**later_payload, "collection_revision": 2},
+    )
+
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False
+    assert state.json()["blocked_reason"] == "collection_disabled"
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "activity_collection_blocked"
+    assert registered.status_code == 200
+    assert accepted.status_code == 200
+    assert accepted.json()["accepted"] == 0
+    assert disabled.status_code == 200
+    assert disabled.json()["instances"][0]["enabled"] is False
+    assert blocked_after_disable.status_code == 409
+    assert (
+        blocked_after_disable.json()["error"]["code"]
+        == "activity_collection_blocked"
+    )
+
+
+def test_collection_settings_reject_invalid_ios_exclusion_namespaces(
+    client,
+) -> None:
+    configured = client.put(
+        "/v1/activity/devices/iphone-private-settings/collection",
+        json={"platform": "ios"},
+    )
+    assert configured.status_code == 200
+
+    invalid_sets = (
+        ["com.example.private"],
+        ["ios-app-" + ("a" * 40)],
+        [
+            IOS_APP_TOKEN,
+            "ios-app-v2-" + ("2" * 40) + "-" + ("b" * 40),
+        ],
+    )
+
+    for excluded_apps in invalid_sets:
+        response = client.put(
+            "/v1/activity/devices/iphone-private-settings/collection",
+            json={"excluded_apps": excluded_apps},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_ios_app_token"
+
+
+def test_platform_change_to_ios_requires_clearing_legacy_exclusions(
+    client,
+) -> None:
+    device_id = "phone-platform-transition"
+    android = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={
+            "platform": "android",
+            "excluded_apps": ["com.example.private"],
+        },
+    )
+    assert android.status_code == 200
+
+    rejected = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={"platform": "ios"},
+    )
+    accepted = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={
+            "platform": "ios",
+            "excluded_apps": [],
+        },
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "invalid_ios_app_token"
+    assert accepted.status_code == 200
+    assert accepted.json()["platform"] == "ios"
+    assert accepted.json()["excluded_apps"] == []
+    assert accepted.json()["ios_pseudonym_key_id"] is None
+
+
+def test_legacy_ios_exclusions_allow_only_safe_recovery_controls(
+    client,
+    session,
+) -> None:
+    device_id = "iphone-legacy-exclusion-recovery"
+    _seed_legacy_ios_exclusion(client, session, device_id)
+
+    disabled = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={"enabled": False},
+    )
+    rejected_enable = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={"enabled": True},
+    )
+    paused = client.post(
+        f"/v1/activity/devices/{device_id}/pause",
+        json={
+            "until": (
+                datetime.now(UTC) + timedelta(hours=1)
+            ).isoformat()
+        },
+    )
+    rejected_resume = client.post(
+        f"/v1/activity/devices/{device_id}/resume",
+    )
+    cleared = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={"excluded_apps": []},
+    )
+    resumed = client.post(
+        f"/v1/activity/devices/{device_id}/resume",
+    )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["enabled"] is False
+    assert rejected_enable.status_code == 422
+    assert rejected_enable.json()["error"]["code"] == "invalid_ios_app_token"
+    assert paused.status_code == 200
+    assert paused.json()["blocked_reason"] == "collection_disabled"
+    assert rejected_resume.status_code == 422
+    assert rejected_resume.json()["error"]["code"] == "invalid_ios_app_token"
+    assert cleared.status_code == 200
+    assert cleared.json()["excluded_apps"] == []
+    assert resumed.status_code == 200
+
+
+def test_available_ios_report_rejects_legacy_exclusion_without_key(
+    client,
+    session,
+) -> None:
+    device_id = "iphone-legacy-exclusion-report"
+    _seed_legacy_ios_exclusion(client, session, device_id)
+
+    response = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id=device_id,
+            sequence=1,
+            samples=[],
+        ),
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["error"]["code"]
+        == "ios_exclusion_reapproval_required"
+    )
+
+
+def test_ios_restricted_is_blocked_status_not_fake_zero_activity(
+    client,
+    session,
+) -> None:
+    response = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-restricted-api",
+            "timezone": "Asia/Seoul",
+            "capability": "aggregate",
+            "permission_status": "restricted",
+            "reason": "family_controls_restricted",
+            "samples": [],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == 0
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+        is None
+    )
+    status = client.get(
+        "/v1/activity/devices/iphone-restricted-api/collection"
+    ).json()
+    assert status["capability"] == "aggregate"
+    assert status["permission_status"] == "restricted"
+    assert status["effective_collecting"] is False
+    assert status["blocked_reason"] == "permission_restricted"
+    assert status["last_uploaded_at"] is not None
+    assert status["last_collected_at"] is None
+
+
+def test_ios_restricted_report_rejects_fake_zero_sample(client, session) -> None:
+    response = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-restricted-sample",
+            "timezone": "UTC",
+            "capability": "aggregate",
+            "permission_status": "restricted",
+            "reason": "family_controls_restricted",
+            "samples": [
+                {
+                    "source_record_id": "fake-zero",
+                    "bucket_start": "2026-08-01T10:00:00Z",
+                    "foreground_seconds": 0,
+                    "category": "other",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+        is None
+    )
+
+
 def test_android_permission_status_can_recover_from_revoked_to_granted(client) -> None:
     revoked = client.post(
         "/v1/activity/devices/android-permission-recovery/status",
@@ -517,6 +855,57 @@ def test_android_permission_status_can_recover_from_revoked_to_granted(client) -
     assert granted.json()["status_reason"] is None
     assert granted.json()["effective_collecting"] is True
     assert granted.json()["blocked_reason"] is None
+
+
+def test_ios_permission_status_can_recover_with_new_generation(client) -> None:
+    device_id = "iphone-permission-recovery"
+    denied = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": device_id,
+            "timezone": "UTC",
+            "capability": "unavailable",
+            "permission_status": "denied",
+            "reason": "ios_screen_time_permission_denied",
+            "collected_at": "2026-08-01T12:00:00Z",
+            "collection_revision": 0,
+            "collection_generation": 1,
+            "samples": [],
+        },
+    )
+
+    assert denied.status_code == 200
+    state = client.get(
+        f"/v1/activity/devices/{device_id}/collection"
+    ).json()
+    assert state["permission_status"] == "denied"
+    assert state["collection_generation"] == 1
+    assert state["effective_collecting"] is False
+    assert state["blocked_reason"] == "permission_denied"
+
+    granted = client.post(
+        "/v1/activity/ios/report",
+        json={
+            **_ios_snapshot(
+                device_id=device_id,
+                sequence=1,
+                start="2026-08-01T12:00:00Z",
+                end="2026-08-01T13:00:00Z",
+                collected_at="2026-08-01T13:05:00Z",
+                samples=[],
+            ),
+            "collection_generation": 2,
+        },
+    )
+
+    assert granted.status_code == 200
+    state = client.get(
+        f"/v1/activity/devices/{device_id}/collection"
+    ).json()
+    assert state["permission_status"] == "granted"
+    assert state["collection_generation"] == 2
+    assert state["effective_collecting"] is True
+    assert state["blocked_reason"] is None
 
 
 @pytest.mark.parametrize(
@@ -623,6 +1012,7 @@ def test_ios_aggregate_hour_can_be_revised_without_duplicate_rows(client, sessio
         "timezone": "Asia/Seoul",
         "capability": "aggregate",
         "permission_status": "granted",
+        "pseudonym_key_id": IOS_KEY_ID,
         "collection_revision": 0,
         "samples": [
             {
@@ -630,7 +1020,7 @@ def test_ios_aggregate_hour_can_be_revised_without_duplicate_rows(client, sessio
                 "bucket_start": "2026-08-01T10:00:00Z",
                 "foreground_seconds": 600,
                 "category": "social",
-                "launches": 4,
+                "opaque_app_token": IOS_APP_TOKEN,
                 "coverage_seconds": 3600,
             }
         ],
@@ -656,7 +1046,553 @@ def test_ios_aggregate_hour_can_be_revised_without_duplicate_rows(client, sessio
     )
     assert len(rows) == 1
     assert rows[0].payload["foreground_seconds"] == 900
-    assert rows[0].payload["app_id"] == "category:social"
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
+
+
+def test_ios_missing_launches_remains_unknown_in_storage_summary_and_focus(
+    client,
+    session,
+) -> None:
+    payload = _ios_snapshot(
+        device_id="iphone-launches-unknown",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "screen-time-hour",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 1800,
+                "category": "social",
+                "opaque_app_token": IOS_APP_TOKEN,
+                "coverage_seconds": 3600,
+            }
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 200
+    row = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT,
+            WellnessEvent.source_device == payload["device_id"],
+        )
+    )
+    assert row is not None
+    assert row.payload["launches"] == 0
+    assert row.payload["launches_observed"] is False
+
+    summary = client.get(
+        "/v1/activity/summary",
+        params={"date": "2026-08-13", "timezone": "UTC"},
+    )
+    assert summary.status_code == 200
+    assert summary.json()["app_launches_or_switches"] == 0
+    assert summary.json()["app_launches_or_switches_range"] == {
+        "lower_bound": 0,
+        "upper_bound": None,
+        "precision": "unknown",
+    }
+    assert (
+        "launches_unavailable_for_some_sources"
+        in summary.json()["limitations"]
+    )
+
+    focus = client.get(
+        "/v1/activity/focus-context",
+        params={
+            "start": "2026-08-13T10:00:00Z",
+            "end": "2026-08-13T11:00:00Z",
+            "timezone": "UTC",
+        },
+    )
+    assert focus.status_code == 200
+    assert (
+        focus.json()["metrics"]["launches_or_switches_per_active_hour"]
+        is None
+    )
+    assert (
+        "launches_unavailable_for_some_sources"
+        in focus.json()["limitations"]
+    )
+
+
+def test_ios_coverage_only_hour_records_observed_zero_usage(
+    client,
+    session,
+) -> None:
+    payload = _ios_snapshot(
+        device_id="iphone-zero-usage-hour",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "coverage-only-hour",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 0,
+                "category": None,
+                "opaque_app_token": None,
+                "coverage_seconds": 3600,
+                "coverage_only": True,
+            }
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 200
+    row = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT,
+            WellnessEvent.source_device == payload["device_id"],
+        )
+    )
+    assert row is not None
+    assert row.payload["coverage_only"] is True
+    assert row.payload["app_id"] == "__healthmes_coverage__"
+    summary = client.get(
+        "/v1/activity/summary",
+        params={"date": "2026-08-13", "timezone": "UTC"},
+    )
+    assert summary.status_code == 200
+    assert summary.json()["status"] == "ok"
+    assert summary.json()["total_active_minutes"] == 0
+    assert summary.json()["source_coverage"]["ratio"] > 0
+
+
+def test_ios_coverage_only_sample_rejects_identity_or_activity(client) -> None:
+    payload = _ios_snapshot(
+        device_id="iphone-invalid-coverage-hour",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "invalid-coverage-only-hour",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 1,
+                "category": "social",
+                "opaque_app_token": IOS_APP_TOKEN,
+                "coverage_seconds": 3600,
+                "coverage_only": True,
+            }
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "coverage_fields",
+    (
+        {
+            "coverage_status": "privacy_filtered",
+            "observed_activity_seconds": 600,
+            "represented_app_seconds": 0,
+            "privacy_filtered_seconds": 500,
+            "website_activity_seconds": 0,
+            "unknown_activity_seconds": 0,
+        },
+        {
+            "coverage_status": "website_activity",
+            "observed_activity_seconds": 600,
+            "represented_app_seconds": 0,
+            "privacy_filtered_seconds": 0,
+            "website_activity_seconds": 600,
+        },
+        {
+            "coverage_status": "complete",
+            "observed_activity_seconds": 1,
+            "represented_app_seconds": 1,
+            "privacy_filtered_seconds": 0,
+            "website_activity_seconds": 0,
+            "unknown_activity_seconds": 0,
+        },
+    ),
+)
+def test_ios_coverage_marker_requires_explicit_exact_partition(
+    client,
+    coverage_fields,
+) -> None:
+    sample = {
+        "source_record_id": "invalid-partial-coverage",
+        "bucket_start": "2026-08-13T10:00:00Z",
+        "foreground_seconds": 0,
+        "category": None,
+        "opaque_app_token": None,
+        "coverage_seconds": (
+            3600
+            if coverage_fields["coverage_status"] == "complete"
+            else None
+        ),
+        "coverage_only": True,
+        **coverage_fields,
+    }
+    payload = _ios_snapshot(
+        device_id="iphone-invalid-partial-coverage",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[sample],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_ios_bucket_rejects_inconsistent_coverage_contract(client) -> None:
+    bucket = "2026-08-13T10:00:00Z"
+    app = {
+        **_ios_sample(
+            "allowed-app",
+            bucket_start=bucket,
+            category="productivity",
+            foreground_seconds=600,
+        ),
+        "coverage_seconds": None,
+    }
+    marker = {
+        "source_record_id": "partial-marker",
+        "bucket_start": bucket,
+        "foreground_seconds": 0,
+        "category": None,
+        "opaque_app_token": None,
+        "coverage_seconds": None,
+        "coverage_only": True,
+        "coverage_status": "privacy_filtered",
+        "observed_activity_seconds": 1200,
+        "represented_app_seconds": 500,
+        "privacy_filtered_seconds": 700,
+        "website_activity_seconds": 0,
+        "unknown_activity_seconds": 0,
+    }
+    duplicate_marker = {
+        **marker,
+        "source_record_id": "second-partial-marker",
+    }
+
+    mismatched = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id="iphone-inconsistent-coverage",
+            sequence=1,
+            start=bucket,
+            end="2026-08-13T11:00:00Z",
+            collected_at="2026-08-13T12:00:00Z",
+            samples=[app, marker],
+        ),
+    )
+    duplicate = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id="iphone-duplicate-coverage",
+            sequence=1,
+            start=bucket,
+            end="2026-08-13T11:00:00Z",
+            collected_at="2026-08-13T12:00:00Z",
+            samples=[marker, duplicate_marker],
+        ),
+    )
+    false_full_coverage = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id="iphone-false-full-coverage",
+            sequence=1,
+            start=bucket,
+            end="2026-08-13T11:00:00Z",
+            collected_at="2026-08-13T12:00:00Z",
+            samples=[
+                {**app, "coverage_seconds": 3600},
+                {
+                    **marker,
+                    "represented_app_seconds": 600,
+                    "privacy_filtered_seconds": 600,
+                },
+            ],
+        ),
+    )
+
+    assert mismatched.status_code == 422
+    assert duplicate.status_code == 422
+    assert false_full_coverage.status_code == 422
+
+
+def test_ios_activity_sample_requires_token_when_exclusions_are_configured(
+    client,
+    session,
+) -> None:
+    device_id = "iphone-tokenless-exclusion-bypass"
+    configured = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={
+            "platform": "ios",
+            "excluded_apps": [IOS_APP_TOKEN],
+        },
+    )
+    assert configured.status_code == 200
+    payload = _ios_snapshot(
+        device_id=device_id,
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "tokenless-private-app",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 600,
+                "category": "social",
+                "coverage_seconds": 3600,
+            }
+        ],
+    )
+    payload["collection_revision"] = configured.json()[
+        "config_revision"
+    ]
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT,
+            WellnessEvent.source_device == device_id,
+        )
+    ) is None
+
+
+def test_ios_report_rejects_mixed_pseudonym_key_namespaces(client) -> None:
+    payload = _ios_snapshot(
+        device_id="iphone-mixed-pseudonym-keys",
+        sequence=1,
+        samples=[
+            {
+                **_ios_sample(
+                    "mixed-key-a",
+                    bucket_start="2026-08-01T10:00:00Z",
+                    category="social",
+                    foreground_seconds=600,
+                ),
+                "opaque_app_token": IOS_APP_TOKEN,
+            },
+            {
+                **_ios_sample(
+                    "mixed-key-b",
+                    bucket_start="2026-08-01T11:00:00Z",
+                    category="productivity",
+                    foreground_seconds=600,
+                ),
+                "opaque_app_token": (
+                    "ios-app-v2-" + ("2" * 40) + "-" + ("b" * 40)
+                ),
+            },
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_ios_report_requires_the_configured_exclusion_key_namespace(
+    client,
+) -> None:
+    device_id = "iphone-configured-key-mismatch"
+    configured = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={
+            "platform": "ios",
+            "excluded_apps": [IOS_APP_TOKEN],
+        },
+    )
+    assert configured.status_code == 200
+    other_key_id = "ios-key-" + ("2" * 40)
+
+    payload = _ios_snapshot(
+        device_id=device_id,
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        authoritative_bucket_starts=[
+            "2026-08-13T10:00:00Z",
+        ],
+        samples=[],
+    )
+    payload["collection_revision"] = configured.json()["config_revision"]
+    payload["pseudonym_key_id"] = other_key_id
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 409
+    assert (
+        response.json()["error"]["code"]
+        == "ios_exclusion_reapproval_required"
+    )
+
+
+def test_ios_report_rejects_unobservable_launch_count(client) -> None:
+    payload = _ios_snapshot(
+        device_id="iphone-invalid-launches",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "invalid-launch-count",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 600,
+                "category": "social",
+                "launches": 0,
+                "coverage_seconds": 3600,
+            }
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+@pytest.mark.parametrize(
+    "category",
+    (
+        "com.private.bank.app",
+        "Private Banking",
+        "ios-category-private",
+    ),
+)
+def test_ios_report_rejects_noncanonical_category_identity(
+    client,
+    category: str,
+) -> None:
+    payload = _ios_snapshot(
+        device_id=f"iphone-private-category-{category[:8]}",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "private-category",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 600,
+                "category": category,
+                "coverage_seconds": 3600,
+            }
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_ios_report_accepts_opaque_category_token(client) -> None:
+    payload = _ios_snapshot(
+        device_id="iphone-opaque-category",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[
+            {
+                "source_record_id": "opaque-category",
+                "bucket_start": "2026-08-13T10:00:00Z",
+                "foreground_seconds": 600,
+                "category": "ios-category-" + ("a" * 40),
+                "opaque_app_token": IOS_APP_TOKEN,
+                "coverage_seconds": 3600,
+            }
+        ],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+
+
+def test_ios_snapshot_bounds_align_to_report_timezone_not_utc(client) -> None:
+    response = client.post(
+        "/v1/activity/ios/report",
+        json={
+            **_ios_snapshot(
+                device_id="iphone-local-hour-boundary",
+                sequence=1,
+                start="2026-08-13T04:15:00Z",
+                end="2026-08-13T05:15:00Z",
+                collected_at="2026-08-13T06:00:00Z",
+                samples=[
+                    {
+                        "source_record_id": "local-hour",
+                        "bucket_start": "2026-08-13T04:15:00Z",
+                        "foreground_seconds": 600,
+                        "category": "productivity",
+                        "opaque_app_token": IOS_APP_TOKEN,
+                        "coverage_seconds": 3600,
+                    }
+                ],
+            ),
+            "timezone": "Asia/Kathmandu",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+
+
+def test_ios_snapshot_accepts_lord_howe_half_hour_fallback_bucket(
+    client,
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        "activity_raw",
+        "forever",
+        now=datetime(2026, 8, 14, 12, tzinfo=UTC),
+    )
+    session.commit()
+    response = client.post(
+        "/v1/activity/ios/report",
+        json={
+            **_ios_snapshot(
+                device_id="iphone-lord-howe-fallback",
+                sequence=1,
+                start="2026-04-04T14:30:00Z",
+                end="2026-04-04T15:30:00Z",
+                collected_at="2026-04-04T16:00:00Z",
+                samples=[
+                    {
+                        "source_record_id": "lord-howe-hour",
+                        "bucket_start": "2026-04-04T14:30:00Z",
+                        "foreground_seconds": 600,
+                        "category": "productivity",
+                        "opaque_app_token": IOS_APP_TOKEN,
+                        "coverage_seconds": 3600,
+                    }
+                ],
+            ),
+            "timezone": "Australia/Lord_Howe",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
 
 
 def test_ios_stale_aggregate_cannot_overwrite_newer_snapshot(
@@ -668,6 +1604,7 @@ def test_ios_stale_aggregate_cannot_overwrite_newer_snapshot(
         "timezone": "UTC",
         "capability": "aggregate",
         "permission_status": "granted",
+        "pseudonym_key_id": IOS_KEY_ID,
         "collection_revision": 0,
         "collected_at": "2026-08-01T12:00:00Z",
         "samples": [
@@ -675,8 +1612,8 @@ def test_ios_stale_aggregate_cannot_overwrite_newer_snapshot(
                 "source_record_id": "screen-time-hour-1",
                 "bucket_start": "2026-08-01T10:00:00Z",
                 "foreground_seconds": 900,
-                "launches": 9,
                 "category": "social",
+                "opaque_app_token": IOS_APP_TOKEN,
                 "coverage_seconds": 3600,
             }
         ],
@@ -691,13 +1628,11 @@ def test_ios_stale_aggregate_cannot_overwrite_newer_snapshot(
                 {
                     **payload["samples"][0],
                     "foreground_seconds": 600,
-                    "launches": 6,
                 },
                 {
                     **payload["samples"][0],
                     "source_record_id": "late-new-source",
                     "foreground_seconds": 300,
-                    "launches": 3,
                 },
             ],
         },
@@ -715,7 +1650,8 @@ def test_ios_stale_aggregate_cannot_overwrite_newer_snapshot(
     )
     assert row is not None
     assert row.payload["foreground_seconds"] == 900
-    assert row.payload["launches"] == 9
+    assert row.payload["launches"] == 0
+    assert row.payload["launches_observed"] is False
     assert session.scalar(
         select(WellnessEvent)
         .where(
@@ -753,6 +1689,10 @@ def test_ios_newer_authoritative_snapshot_deletes_missing_rows(
         device_id=device_id,
         sequence=101,
         collected_at="2026-08-01T13:05:00Z",
+        authoritative_bucket_starts=[
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T11:00:00Z",
+        ],
         samples=[first["samples"][0]],
     )
 
@@ -771,7 +1711,191 @@ def test_ios_newer_authoritative_snapshot_deletes_missing_rows(
         )
     )
     assert len(rows) == 1
-    assert rows[0].payload["app_id"] == "category:social"
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
+
+
+def test_ios_post_privacy_authoritative_bucket_removes_private_rows(
+    client,
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        "activity_raw",
+        "forever",
+        now=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    session.commit()
+    device_id = "iphone-post-privacy-replacement"
+    bucket_start = "2026-08-01T10:00:00Z"
+    allowed = _ios_sample(
+        "allowed-hour",
+        bucket_start=bucket_start,
+        category="productivity",
+        foreground_seconds=900,
+    )
+    private = {
+        **_ios_sample(
+            "private-hour",
+            bucket_start=bucket_start,
+            category="social",
+            foreground_seconds=600,
+        ),
+        "opaque_app_token": IOS_PRIVATE_APP_TOKEN,
+    }
+    initial = _ios_snapshot(
+        device_id=device_id,
+        sequence=100,
+        samples=[allowed, private],
+    )
+    filtered_allowed = {
+        **allowed,
+        # The bucket is authoritative after on-device privacy filtering, but
+        # raw Screen Time coverage is intentionally not claimed.
+        "coverage_seconds": None,
+    }
+    partial_coverage = {
+        "source_record_id": "partial-coverage-hour",
+        "bucket_start": bucket_start,
+        "foreground_seconds": 0,
+        "category": None,
+        "opaque_app_token": None,
+        "coverage_seconds": None,
+        "coverage_only": True,
+        "coverage_status": "privacy_filtered",
+        "observed_activity_seconds": 1500,
+        "represented_app_seconds": 900,
+        "privacy_filtered_seconds": 600,
+        "website_activity_seconds": 0,
+        "unknown_activity_seconds": 0,
+    }
+    post_privacy = _ios_snapshot(
+        device_id=device_id,
+        sequence=101,
+        collected_at="2026-08-01T13:05:00Z",
+        authoritative_bucket_starts=[bucket_start],
+        samples=[filtered_allowed, partial_coverage],
+    )
+
+    created = client.post("/v1/activity/ios/report", json=initial)
+    replaced = client.post(
+        "/v1/activity/ios/report",
+        json=post_privacy,
+    )
+
+    assert created.status_code == 200
+    assert created.json()["created"] == 2
+    assert replaced.status_code == 200
+    rows_after_replacement = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+    )
+    assert len(rows_after_replacement) == 2
+    allowed_row = next(
+        row
+        for row in rows_after_replacement
+        if not row.payload.get("coverage_only")
+    )
+    coverage_row = next(
+        row
+        for row in rows_after_replacement
+        if row.payload.get("coverage_only")
+    )
+    assert allowed_row.payload["app_id"] == IOS_APP_TOKEN
+    assert allowed_row.payload["coverage_seconds"] is None
+    assert coverage_row.payload["app_id"] == "__healthmes_coverage__"
+    assert coverage_row.payload["coverage_status"] == "privacy_filtered"
+    assert coverage_row.payload["observed_activity_seconds"] == 1500
+    assert coverage_row.payload["represented_app_seconds"] == 900
+    assert coverage_row.payload["privacy_filtered_seconds"] == 600
+    assert all(
+        row.payload["app_id"] != IOS_PRIVATE_APP_TOKEN
+        for row in rows_after_replacement
+    )
+
+    stale = client.post("/v1/activity/ios/report", json=initial)
+
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "activity_source_conflict"
+    session.expire_all()
+    rows_after_stale = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+    )
+    assert len(rows_after_stale) == 2
+    assert all(
+        row.payload["app_id"] != IOS_PRIVATE_APP_TOKEN
+        for row in rows_after_stale
+    )
+
+
+def test_ios_snapshot_preserves_hours_not_marked_authoritative(
+    client,
+    session,
+) -> None:
+    device_id = "iphone-partial-authoritative"
+    initial = _ios_snapshot(
+        device_id=device_id,
+        sequence=100,
+        samples=[
+            _ios_sample(
+                "first-hour",
+                bucket_start="2026-08-01T10:00:00Z",
+                category="social",
+                foreground_seconds=900,
+            ),
+            _ios_sample(
+                "second-hour",
+                bucket_start="2026-08-01T11:00:00Z",
+                category="productivity",
+                foreground_seconds=1200,
+            ),
+        ],
+    )
+    partial = _ios_snapshot(
+        device_id=device_id,
+        sequence=101,
+        collected_at="2026-08-01T13:05:00Z",
+        authoritative_bucket_starts=[
+            "2026-08-01T10:00:00Z",
+        ],
+        samples=[],
+    )
+
+    assert client.post(
+        "/v1/activity/ios/report",
+        json=initial,
+    ).status_code == 200
+    replaced = client.post(
+        "/v1/activity/ios/report",
+        json=partial,
+    )
+
+    assert replaced.status_code == 200
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].observed_at.replace(tzinfo=UTC) == datetime(
+        2026,
+        8,
+        1,
+        11,
+        tzinfo=UTC,
+    )
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
 
 
 def test_ios_newer_empty_authoritative_snapshot_deletes_range(
@@ -795,6 +1919,9 @@ def test_ios_newer_empty_authoritative_snapshot_deletes_range(
         device_id=device_id,
         sequence=101,
         collected_at="2026-08-01T13:05:00Z",
+        authoritative_bucket_starts=[
+            "2026-08-01T10:00:00Z",
+        ],
         samples=[],
     )
 
@@ -842,6 +1969,10 @@ def test_ios_stale_authoritative_snapshot_cannot_resurrect_deleted_row(
         device_id=device_id,
         sequence=101,
         collected_at="2026-08-01T13:05:00Z",
+        authoritative_bucket_starts=[
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T11:00:00Z",
+        ],
         samples=[original["samples"][0]],
     )
 
@@ -860,7 +1991,7 @@ def test_ios_stale_authoritative_snapshot_cannot_resurrect_deleted_row(
         )
     )
     assert len(rows) == 1
-    assert rows[0].payload["app_id"] == "category:social"
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
 
 
 def test_ios_equal_authoritative_sequence_is_idempotent_only_for_same_content(
@@ -881,7 +2012,7 @@ def test_ios_equal_authoritative_sequence_is_idempotent_only_for_same_content(
         ],
     )
 
-    assert client.post("/v1/activity/ios/report", json=payload).status_code == 200
+    first = client.post("/v1/activity/ios/report", json=payload)
     replay = client.post("/v1/activity/ios/report", json=payload)
     changed = client.post(
         "/v1/activity/ios/report",
@@ -896,8 +2027,9 @@ def test_ios_equal_authoritative_sequence_is_idempotent_only_for_same_content(
         },
     )
 
+    assert first.status_code == 200
     assert replay.status_code == 200
-    assert replay.json()["duplicates"] == 1
+    assert replay.json() == first.json()
     assert changed.status_code == 409
     assert changed.json()["error"]["code"] == "activity_source_conflict"
     row = session.scalar(
@@ -968,10 +2100,16 @@ def test_ios_new_install_requires_authenticated_generation_reset(
     )
 
     assert rejected.status_code == 409
-    assert rejected.json()["error"]["code"] == "activity_source_conflict"
+    assert (
+        rejected.json()["error"]["code"]
+        == "activity_snapshot_fence_reset_required"
+    )
     assert accepted.status_code == 200
     assert stale.status_code == 409
-    assert stale.json()["error"]["code"] == "activity_source_conflict"
+    assert (
+        stale.json()["error"]["code"]
+        == "activity_snapshot_fence_reset_required"
+    )
     rows = list(
         session.scalars(
             select(WellnessEvent).where(
@@ -981,15 +2119,70 @@ def test_ios_new_install_requires_authenticated_generation_reset(
         )
     )
     assert len(rows) == 1
-    assert rows[0].payload["app_id"] == "category:productivity"
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
     state = client.get(
         f"/v1/activity/devices/{device_id}/collection"
     ).json()
     assert state["collection_generation"] == 2
 
 
-def test_ios_legacy_fence_remains_compatible_until_explicit_upgrade(
+def test_ios_successful_fence_reset_replay_precedes_mutable_collection_gate(
     client,
+) -> None:
+    device_id = "iphone-authoritative-reset-replay"
+    original = {
+        **_ios_snapshot(
+            device_id=device_id,
+            sequence=100,
+            samples=[
+                _ios_sample(
+                    "old-install-hour",
+                    bucket_start="2026-08-01T10:00:00Z",
+                    category="social",
+                    foreground_seconds=900,
+                )
+            ],
+        ),
+        "collection_generation": 1,
+    }
+    reset = {
+        **_ios_snapshot(
+            device_id=device_id,
+            sequence=1,
+            collected_at="2026-08-01T13:05:00Z",
+            samples=[
+                _ios_sample(
+                    "new-install-hour",
+                    bucket_start="2026-08-01T10:00:00Z",
+                    category="productivity",
+                    foreground_seconds=1200,
+                )
+            ],
+        ),
+        "collection_generation": 2,
+        "reset_snapshot_fence": True,
+    }
+
+    assert client.post(
+        "/v1/activity/ios/report",
+        json=original,
+    ).status_code == 200
+    accepted = client.post("/v1/activity/ios/report", json=reset)
+    disabled = client.put(
+        f"/v1/activity/devices/{device_id}/collection",
+        json={"platform": "ios", "enabled": False},
+    )
+    replay = client.post("/v1/activity/ios/report", json=reset)
+
+    assert accepted.status_code == 200
+    assert disabled.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == accepted.json()
+
+
+def test_ios_legacy_fence_replay_reports_unavailable_exact_response(
+    client,
+    session,
 ) -> None:
     device_id = "iphone-authoritative-legacy-upgrade"
     legacy = _ios_snapshot(
@@ -1008,7 +2201,26 @@ def test_ios_legacy_fence_remains_compatible_until_explicit_upgrade(
     }
 
     assert client.post("/v1/activity/ios/report", json=legacy).status_code == 200
-    assert client.post("/v1/activity/ios/report", json=legacy).status_code == 200
+    fence = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == IOS_SNAPSHOT_FENCE_EVENT,
+            WellnessEvent.source_device == device_id,
+        )
+    )
+    assert fence is not None
+    fence.payload = {
+        key: value
+        for key, value in fence.payload.items()
+        if key != "accepted_response"
+    }
+    session.commit()
+
+    replay = client.post("/v1/activity/ios/report", json=legacy)
+    assert replay.status_code == 409
+    assert (
+        replay.json()["error"]["code"]
+        == "snapshot_retry_response_unavailable"
+    )
     rejected = client.post("/v1/activity/ios/report", json=upgraded)
     accepted = client.post(
         "/v1/activity/ios/report",
@@ -1037,7 +2249,7 @@ def test_ios_equal_authoritative_replay_does_not_advance_data_freshness(
         ],
     )
 
-    assert client.post("/v1/activity/ios/report", json=payload).status_code == 200
+    first = client.post("/v1/activity/ios/report", json=payload)
     replay = client.post(
         "/v1/activity/ios/report",
         json={
@@ -1049,8 +2261,9 @@ def test_ios_equal_authoritative_replay_does_not_advance_data_freshness(
         f"/v1/activity/devices/{device_id}/collection"
     ).json()
 
+    assert first.status_code == 200
     assert replay.status_code == 200
-    assert replay.json()["duplicates"] == 1
+    assert replay.json() == first.json()
     assert status["last_collected_at"] == "2026-08-01T13:00:00Z"
     assert status["status_observed_at"] == "2026-08-01T13:00:00Z"
 
@@ -1108,7 +2321,7 @@ def test_ios_legacy_samples_cannot_mix_after_authoritative_mode(
         )
     )
     assert len(rows) == 1
-    assert rows[0].payload["app_id"] == "category:social"
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
 
 
 def test_ios_authoritative_write_conflict_rolls_back_entire_range(
@@ -1172,9 +2385,9 @@ def test_ios_authoritative_write_conflict_rolls_back_entire_range(
             )
         )
     )
-    assert sorted(row.payload["app_id"] for row in rows) == [
-        "category:social",
-        "category:video",
+    assert sorted(row.payload["category"] for row in rows) == [
+        "social",
+        "video",
     ]
 
 
@@ -1244,12 +2457,14 @@ def test_ios_samples_require_collection_revision(client) -> None:
             "timezone": "UTC",
             "capability": "aggregate",
             "permission_status": "granted",
+            "pseudonym_key_id": IOS_KEY_ID,
             "samples": [
                 {
                     "source_record_id": "screen-time-hour",
                     "bucket_start": "2026-08-01T10:00:00Z",
                     "foreground_seconds": 600,
                     "category": "social",
+                    "opaque_app_token": IOS_APP_TOKEN,
                 }
             ],
         },
@@ -1267,7 +2482,7 @@ def test_ios_samples_use_caller_revision_instead_of_server_injection(
         "/v1/activity/devices/iphone-stale-revision/collection",
         json={
             "platform": "ios",
-            "excluded_apps": ["private-token"],
+            "excluded_apps": [IOS_APP_TOKEN],
         },
     )
     assert configured.status_code == 200
@@ -1280,6 +2495,7 @@ def test_ios_samples_use_caller_revision_instead_of_server_injection(
             "timezone": "UTC",
             "capability": "aggregate",
             "permission_status": "granted",
+            "pseudonym_key_id": IOS_KEY_ID,
             "collection_revision": 0,
             "samples": [
                 {
@@ -1287,6 +2503,7 @@ def test_ios_samples_use_caller_revision_instead_of_server_injection(
                     "bucket_start": "2026-08-01T10:00:00Z",
                     "foreground_seconds": 600,
                     "category": "social",
+                    "opaque_app_token": IOS_APP_TOKEN,
                 }
             ],
         },

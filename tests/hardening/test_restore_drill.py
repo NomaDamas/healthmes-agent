@@ -4,14 +4,16 @@ Drives the real backup seam end-to-end on a live, migrated, seeded store
 (the ``seeded_store`` fixture): ``LocalDirectoryProvider.export_snapshot()``
 -> destroy the live store -> ``restore()`` -> reopen through the production
 engine machinery -> count rows, check the alembic stamp, verify media bytes
-and that the store accepts new writes. Also drills the §9 encryption
-promise: a wrong passphrase must fail loudly *before* touching live data.
+and raw-ingest bytes, and confirm that the store accepts new writes. Also
+drills the §9 encryption promise: a wrong passphrase must fail loudly
+*before* touching live data.
 
 Everything is offline: sqlite database, local directory provider, pyrage
 age encryption in-process. No pg_dump path is exercised here (needs a live
 postgres); the sqlite path is the mac-native default and the CI path.
 """
 
+import hashlib
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +30,18 @@ from healthmes.backup import (
     LocalDirectoryProvider,
     WrongPassphraseError,
 )
-from healthmes.store import Base, Task, TriggerEvent, create_db_engine, session_scope
+from healthmes.store import (
+    Base,
+    FoodLog,
+    RawIngestEvent,
+    RetentionPolicy,
+    StorageObject,
+    Task,
+    TriggerEvent,
+    WellnessEvent,
+    create_db_engine,
+    session_scope,
+)
 
 # Test modules cannot import from conftest under --import-mode=importlib;
 # the seeded_store fixture (a SeededStore dataclass) comes from conftest.py.
@@ -44,15 +57,17 @@ def make_provider(seeded_store, backup_dir: Path, passphrase: str = PASSPHRASE):
         locations=DataLocations(
             database_url=seeded_store.database_url,
             media_dir=seeded_store.media_dir,
+            raw_ingest_dir=seeded_store.raw_ingest_dir,
         ),
         passphrase=passphrase,
     )
 
 
 def destroy_live_store(seeded_store) -> None:
-    """The 'disaster': remove the database file and the media tree."""
+    """The 'disaster': remove the database, media, and raw-ingest trees."""
     seeded_store.db_path.unlink()
     shutil.rmtree(seeded_store.media_dir)
+    shutil.rmtree(seeded_store.raw_ingest_dir)
 
 
 def count_rows(database_url: str) -> dict[str, int]:
@@ -90,17 +105,22 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
 
     destroy_live_store(seeded_store)
     assert not seeded_store.db_path.exists()
+    assert not seeded_store.media_dir.exists()
+    assert not seeded_store.raw_ingest_dir.exists()
 
     provider.restore(info.path)
 
     # Reopen through the production engine machinery and verify every seeded
-    # table has exactly its expected rows (unseeded domain tables are empty).
+    # table has exactly its expected rows. The wearable-retention migration
+    # intentionally owns one policy row even when the fixture seeds no policy.
     counts = count_rows(seeded_store.database_url)
+    migration_owned_counts = {"retention_policy": 1}
     for table, expected in seeded_store.expected_counts.items():
         assert counts[table] == expected, f"{table}: {counts[table]} != {expected}"
     for table, count in counts.items():
         if table not in seeded_store.expected_counts:
-            assert count == 0, f"unexpected rows in {table}"
+            expected = migration_owned_counts.get(table, 0)
+            assert count == expected, f"{table}: {count} != {expected}"
 
     # The restored database is a *migrated* store stamped at the current head,
     # so future `alembic upgrade head` runs keep working after a restore.
@@ -110,13 +130,69 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
             stamped = connection.execute(
                 sa.text("SELECT version_num FROM alembic_version")
             ).scalar_one()
+            wearable_policy = connection.execute(
+                sa.select(
+                    RetentionPolicy.data_class,
+                    RetentionPolicy.retention_days,
+                    RetentionPolicy.enabled,
+                )
+            ).one()
         assert stamped == alembic_head_revision()
+        assert wearable_policy._mapping == {
+            "data_class": "wearable_normalized",
+            "retention_days": 30,
+            "enabled": True,
+        }
     finally:
         engine.dispose()
 
-    # Media bytes round-trip exactly.
+    # Media and raw-ingest bytes round-trip exactly.
     for relative, content in seeded_store.media_files.items():
         assert (seeded_store.media_dir / relative).read_bytes() == content
+    for relative, content in seeded_store.raw_ingest_files.items():
+        assert (seeded_store.raw_ingest_dir / relative).read_bytes() == content
+
+    # Every raw payload reference is restored as one coherent generation:
+    # RawIngestEvent -> StorageObject -> WellnessEvent -> byte-identical file.
+    engine = create_db_engine(seeded_store.database_url)
+    try:
+        factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        with factory() as session:
+            raw_rows = list(session.scalars(sa.select(RawIngestEvent)))
+            storage_by_path = {
+                row.relative_path: row
+                for row in session.scalars(sa.select(StorageObject))
+            }
+            events_by_source = {
+                (row.source_provider, row.source_record_id): row
+                for row in session.scalars(
+                    sa.select(WellnessEvent).where(
+                        WellnessEvent.event_type == "raw_ingest"
+                    )
+                )
+            }
+            assert len(raw_rows) == len(seeded_store.raw_ingest_files)
+            for raw in raw_rows:
+                file_path = seeded_store.db_path.parent / raw.path
+                payload = file_path.read_bytes()
+                assert raw.size_bytes == len(payload)
+                assert raw.sha256 == hashlib.sha256(payload).hexdigest()
+                storage = storage_by_path[raw.path]
+                assert storage.size_bytes == raw.size_bytes
+                assert storage.sha256 == raw.sha256
+                event = events_by_source[(raw.source, str(raw.id))]
+                assert event.raw_object_id == storage.id
+                assert event.payload["size_bytes"] == raw.size_bytes
+
+            for relative, content in seeded_store.media_files.items():
+                storage = storage_by_path[f"media/{relative}"]
+                assert storage.size_bytes == len(content)
+                assert storage.sha256 == hashlib.sha256(content).hexdigest()
+            food = session.scalars(sa.select(FoodLog)).one()
+            assert food.media_path == "media/food/lunch.jpg"
+            assert (seeded_store.db_path.parent / food.media_path).is_file()
+    finally:
+        engine.dispose()
 
 
 def test_restore_by_bare_snapshot_name(seeded_store, tmp_path: Path) -> None:

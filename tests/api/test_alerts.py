@@ -150,6 +150,7 @@ def test_lists_recent_pushed_alerts_newest_first(client, seeded, parse_utc):
     assert top["summary"] == "Recovery 38 today."
     assert top["proposal"] == "Move the 14:00 block to tomorrow."
     assert top["evidence"] == {"hrv_delta_pct": -18, "baseline_days": 14}
+    assert top["delivery_state"] == "delivered"
     assert parse_utc(top["fired_at"]) == _utc(9, 13, 50)
     assert uuid.UUID(top["id"])  # a real trigger_event id the app can key on
 
@@ -167,7 +168,184 @@ def test_decision_links_use_exact_trigger_correlation(client, seeded):
     assert glance_alerts["top"]["id"] == alerts[0]["id"]
     assert glance_alerts["top"]["rule_id"] == alerts[0]["rule_id"]
     assert glance_alerts["top"]["summary"] == alerts[0]["summary"]
+    assert glance_alerts["top"]["delivery_state"] == "delivered"
+    assert (
+        glance_alerts["top"]["delivery_state"]
+        == alerts[0]["delivery_state"]
+    )
     assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
+
+
+def test_llm_message_is_the_shared_alert_and_glance_display_contract(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "scheduled_briefing.morning",
+        payload={
+            **_payload("Deterministic briefing trigger."),
+            "message": "Your recovery is low; keep the morning light.",
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alert["summary"] == (
+        "Your recovery is low; keep the morning light."
+    )
+    assert glance["top"]["id"] == alert["id"]
+    assert glance["top"]["summary"] == alert["summary"]
+
+
+def test_app_available_result_is_visible_without_claiming_delivery(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "scheduled_briefing.morning",
+        sent=False,
+        payload={
+            **_payload("Deterministic briefing trigger."),
+            "message": "Which coffee size are you considering?",
+            "push": {
+                "sent": False,
+                "state": "app_available",
+                "channel": "app_poll",
+                "status_code": 204,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert event.alert_sent is False
+    assert alert["summary"] == "Which coffee size are you considering?"
+    assert alert["delivery_state"] == "app_available"
+    assert glance["unresolved_count"] == 1
+    assert glance["top"]["id"] == alert["id"]
+    assert glance["top"]["summary"] == alert["summary"]
+    assert glance["top"]["delivery_state"] == "app_available"
+
+
+def test_legacy_native_failure_is_app_available_not_delivered(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "legacy_native_failure",
+        sent=True,
+        payload={
+            **_payload("Legacy native delivery failed."),
+            "message": "Open HealthMes to read this answer.",
+            "push": {
+                "sent": True,
+                "channel": "native",
+                "upstream_ok": False,
+                "status_code": 502,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alert["delivery_state"] == "app_available"
+    assert glance["top"]["delivery_state"] == "app_available"
+
+
+def test_confirmed_native_transport_is_delivered(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "confirmed_native_delivery",
+        sent=True,
+        payload={
+            **_payload("Confirmed native delivery."),
+            "message": "This message reached the native transport.",
+            "push": {
+                "sent": True,
+                "channel": "native",
+                "upstream_ok": True,
+                "status_code": 200,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alert["delivery_state"] == "delivered"
+    assert glance["top"]["delivery_state"] == "delivered"
+
+
+def test_failed_native_transport_without_message_is_not_delivered(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "failed_native_without_message",
+        sent=True,
+        payload={
+            **_payload("Native transport failed before app fallback."),
+            "push": {
+                "sent": True,
+                "channel": "native",
+                "upstream_ok": False,
+                "status_code": 502,
+            },
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        alerts = client.get(ALERTS).json()
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alerts["pagination"]["total_count"] == 0
+    assert alerts["data"] == []
+    assert glance["unresolved_count"] == 0
+    assert glance["top"] is None
+
+
+def test_alert_link_hides_decision_at_exact_expiry(
+    client,
+    session,
+    seeded,
+):
+    top = session.get(DecisionRecord, DECISION_TOP_ID)
+    assert top is not None
+    top.expires_at = datetime(2026, 7, 9, 14, 23, tzinfo=UTC)
+    session.commit()
+
+    with frozen():
+        alerts = client.get(ALERTS).json()["data"]
+
+    by_id = {item["id"]: item for item in alerts}
+    assert by_id[str(EVENT_TOP_ID)]["decision_url"] is None
+    assert by_id[str(EVENT_EARLY_ID)]["decision_url"].endswith(
+        f"/decisions/{DECISION_EARLY_ID}"
+    )
 
 
 def test_proposal_alert_resolves_its_direct_target_beyond_first_page(

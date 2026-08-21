@@ -2,8 +2,8 @@
 
 docs/PLAN.md §9 mandates that medical data never leaves this machine, yet the
 service is designed to be network-reachable (the Android usage collector
-POSTs over LAN, Telegram alert links open in the phone browser). The
-reconciliation is a single shared bearer token (``Settings.api_token``):
+POSTs over LAN and alert links open in a phone browser). The reconciliation
+is a single shared bearer token (``Settings.api_token``):
 
 - When configured, :class:`BearerTokenMiddleware` requires
   ``Authorization: Bearer <token>`` on **every** request — all ``/v1``
@@ -18,7 +18,7 @@ reconciliation is a single shared bearer token (``Settings.api_token``):
   *derived* from the API token (:func:`viewer_token`). Alert/briefing links
   must be tappable from a phone browser, which cannot attach headers —
   embedding the derived read-only credential keeps links working without ever
-  putting the full-access API token into Telegram messages or browser history.
+  putting the full-access API token into channel messages or browser history.
 - Loopback-only Calendar write flows accept a short-lived local session only
   after a full API credential bootstraps it. A loopback proxy connection and
   attacker-controlled ``Host`` header alone never grant that session.
@@ -100,8 +100,8 @@ def viewer_url(settings: Settings, path: str) -> str:
     """Absolute browser-tappable link to a viewer-surface page.
 
     The single construction point for every credentialed viewer link the
-    system emits — decision pages (REST + the MCP ``record_decision`` tool),
-    glance alert deep links, and the weekly report: ``{public_base_url}``
+    system emits — finalizer/internal-command decision pages, glance alert
+    deep links, and the weekly report: ``{public_base_url}``
     ``{path}`` plus ``?token=`` from :func:`viewer_token` when an API token is
     configured. Links open in a phone browser, which cannot attach
     Authorization headers, and must never carry the full-access API token —

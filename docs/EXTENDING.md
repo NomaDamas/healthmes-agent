@@ -1,24 +1,31 @@
 # Extending HealthMes — a guide for domain experts
 
-This project is deliberately split so that **healthcare domain knowledge goes
-into two small, safe extension points** without touching the engine:
+This project is deliberately split so that domain calculation, cross-domain
+reasoning, and runtime presentation do not silently replace one another:
 
 | You want to add… | Extension point | Skill level |
 |---|---|---|
-| A judgment procedure ("when X and Y, advise Z") | A **skill** — one markdown file | No code |
-| A new metric / derived indicator | A **Layer B MCP tool** — one Python function | Python |
+| A channel workflow or presentation convention | A thin **skill** — one markdown file | No code |
+| A deterministic metric or specialist boundary | A **Context Provider / Layer B tool** | Python |
+| A cross-domain reasoning contract | The **HealthMes wellness runtime** contract, Skill catalog, and evals | Python + prompt/eval design |
 | A new correlation report | An **insight template** | Python (SQL-ish) |
 
-The hard rule behind all three (docs/PLAN.md §1.5): **tools state deterministic
-facts, skills hold the judgment**. The LLM never computes a metric; it reads
-interpreted numbers (with confidence) and reasons about them.
+The hard boundary is: domain providers calculate exact facts and specialist
+limits; Hermes owns one autonomous LLM/tool loop; HealthMes owns the product
+ingress, bounded tools, source validation, and conditional finalization.
+Skills only teach the runtime how to use that workflow. A skill file is not an
+authorization, retention, privacy, calculation, or persistence enforcement
+mechanism. See `docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`.
 
-## 1. Adding a skill (no code)
+## 1. Adding a thin skill (no code)
 
 Skills are markdown instruction files the agent loads when planning, capturing,
-or answering. Each lives in `skills/<skill-name>/SKILL.md` and follows the
-vendor format (see the five existing skills as templates —
-`skills/healthmes-planner/SKILL.md` is the richest example).
+or presenting an answer. Each lives in `skills/<skill-name>/SKILL.md` and follows the
+vendor format. Use the five reviewed read-only decision skills as templates:
+`healthmes-wellness-decision`, `healthmes-nutrition-decision`,
+`healthmes-caffeine`, `healthmes-sleep`, and `healthmes-stress`.
+`healthmes-planner` is a separate bounded command-workflow example; it is not
+accepted by the read-only wellness Skill catalog.
 
 ```markdown
 ---
@@ -30,8 +37,9 @@ description: Screen weekly data for sleep-apnea risk markers and advise follow-u
 When the user asks about snoring, daytime sleepiness, or during weekly review.
 
 # Procedure
-1. Call mcp__healthmes__get_health_scores with categories=["SLEEP"] for 14 days.
-2. Call mcp__open_wearables__get_timeseries with types=["spo2", "respiratory_rate"] …
+1. Call mcp__healthmes__search_wearable with metrics=["sleep"] for 14 days.
+2. If the bounded tool reports that SpO2 or respiratory coverage is unavailable,
+   say which source is missing rather than calling Open Wearables directly.
 3. If nightly SpO2 dips below … AND confidence is "high", say …
    If confidence is "low"/"insufficient_data", say the data is too thin — never
    give categorical advice on low confidence.
@@ -39,18 +47,29 @@ When the user asks about snoring, daytime sleepiness, or during weekly review.
 
 Ground rules for skill authors:
 
-- **Reference tools by their registered names**: `mcp__healthmes__<tool>` and
-  `mcp__open_wearables__<tool>` (double underscores).
-- **Never instruct raw REST calls** — data access must go through MCP tools so
-  every decision stays reconstructable in the decision tree.
-- **Always instruct `record_decision`** after a recommendation, so the decision
-  viewer can show *why*.
+- **Do not put mandatory product policy only in a skill.** Authorization,
+  retention, privacy, exact calculations, tool budgets, source-reference
+  validation, and decision persistence belong to HealthMes code.
+- **Reference tools by their registered names**:
+  `mcp__healthmes__<tool>` (double underscores). The product runtime does not
+  expose direct Open Wearables tools.
+- **Never instruct raw REST calls** — decision data access must go through
+  bounded HealthMes MCP tools so returned source references can be validated.
+- Do not instruct the runtime to call a generic decision-record writer.
+  HealthMes stores a compact decision only for behavior-changing actions,
+  material risk warnings, or an explicit `persistence_requested: true`
+  request. A simple source-backed lookup remains unpersisted by default. An
+  actual mutation is audited by its separate command workflow and is not a
+  persistence reason for the read-only wellness finalizer. The runtime's
+  self-reported persistence intent cannot override this server-owned
+  classifier.
 - **Respect confidence**: the tools return `confidence` / `coverage` /
   `insufficient_data` honestly; skills must gate advice on them.
 - Multiple skills are welcome — one file per clinical question keeps them
-  composable. Register a skill for proactive alerts by listing it in the
-  webhook route (`config/hermes-config.yaml.tmpl` → `skills:`) or for
-  briefings in `scripts/bootstrap.py::BRIEFING_JOBS`.
+  composable. Add reviewed skills to the read-only wellness catalog used by
+  the HealthMes decision ingress. Proactive and scheduled requests use the
+  same catalog through the same internal DecisionRequest service; do not
+  create a separate direct-Hermes reasoning path.
 
 Install: `uv run python scripts/bootstrap.py` (idempotent; copies the skill
 into `$HERMES_HOME/skills/` and resyncs on every re-run).
@@ -114,18 +133,24 @@ make mac-run                 # boots API + /mcp on :8100
 open http://localhost:8100/docs         # REST playground (OpenAPI)
 ```
 
-- **Interactive tool QA from the terminal** — the vendor CLI talks to the same
-  MCP tools and skills the Telegram agent uses:
+- **End-to-end wellness reasoning QA** — call the HealthMes product ingress,
+  not the vendor CLI:
 
   ```bash
-  cd vendor/hermes-agent && \
-    HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
-    uv run --frozen --no-dev --extra messaging hermes chat -q \
-    "오늘 무리해도 돼? get_daily_readiness_context로 근거 보여줘"
+  curl -sS http://localhost:8100/v1/wellness-decisions \
+    -H 'Content-Type: application/json' \
+    -H 'Idempotency-Key: expert-qa-20260817-001' \
+    -d '{"question":"오늘 무리해도 돼? 필요한 자료를 찾아 근거와 함께 설명해줘."}'
   ```
 
-  (interactive session: `hermes` with no arguments; switch models with
-  `--model/--provider` or `HERMES_MODEL`/`HERMES_PROVIDER` in `.env`.)
+  `Idempotency-Key` is required. Generate one stable key for each logical
+  request and reuse it for transport retries. Reusing the same key with a
+  different request body returns `409 decision_idempotency_conflict`.
+  Add the configured bearer header when `HEALTHMES_API_TOKEN` is enabled.
+  Direct `hermes` / `hermes chat` remains useful for isolated vendor-runtime
+  diagnostics, but it bypasses the HealthMes decision ingress, source
+  validation, and finalization policy. It must not be used to certify product
+  wellness behavior.
 
 - **Direct tool calls without an LLM** (fastest metric QA):
 
@@ -142,8 +167,12 @@ open http://localhost:8100/docs         # REST playground (OpenAPI)
   PY
   ```
 
-- **Decision audit**: every agent recommendation writes a `decision_record`;
-  open `http://localhost:8100/decisions` to review the tree (inputs → rules →
-  LLM rationale → action) and challenge the judgment.
+- **Decision audit**: HealthMes persists compact DecisionRecords for
+  behavior-changing recommendations, material risk warnings, and explicitly
+  tracked decisions. Simple lookups remain unpersisted by default. Actual
+  mutations keep their audit in the separate command workflow rather than the
+  read-only wellness DecisionRecord classifier. Open
+  `http://localhost:8100/decisions` to review retained decision records and
+  challenge the judgment.
 - **Regression**: `make mac-test` — add one test per metric with a
   hand-computed vector; that is the contract your metric keeps forever.

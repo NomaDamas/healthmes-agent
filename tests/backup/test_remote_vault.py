@@ -6,6 +6,9 @@ copies of the age-encrypted ``*.tar.gz.age`` envelopes; the seam-guard tests
 pin the refusal of anything else (docs/PLAN.md section 9).
 """
 
+import hashlib
+import io
+import os
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,11 +16,14 @@ from types import SimpleNamespace
 
 import boto3
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from moto import mock_aws
 from pydantic import SecretStr
+from pyrage import passphrase as age_passphrase
 
 from healthmes.__main__ import main
+from healthmes.backup import local as local_mod
+from healthmes.backup import remote_vault as remote_vault_mod
 from healthmes.backup.local import LocalDirectoryProvider, build_backup_job
 from healthmes.backup.provider import BackupError, BackupProvider, SnapshotInfo
 from healthmes.backup.remote_vault import (
@@ -87,6 +93,70 @@ def vault_keys(s3) -> list[str]:
     return sorted(obj["Key"] for obj in response.get("Contents", []))
 
 
+def enable_versioning(s3) -> None:
+    s3.put_bucket_versioning(
+        Bucket=BUCKET,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+
+def test_latest_vault_entries_use_is_latest_across_pages_and_array_order():
+    version_key = f"{PREFIX}/versioned"
+    deleted_key = f"{PREFIX}/deleted"
+    latest = remote_vault_mod._latest_vault_entries(
+        iter(
+            [
+                {
+                    "Versions": [
+                        {
+                            "Key": version_key,
+                            "VersionId": "old-v1",
+                            "IsLatest": False,
+                        },
+                        {
+                            "Key": version_key,
+                            "VersionId": "current-v2",
+                            "IsLatest": True,
+                        },
+                        {
+                            "Key": deleted_key,
+                            "VersionId": "historical-v1",
+                            "IsLatest": False,
+                        },
+                    ]
+                },
+                {
+                    "DeleteMarkers": [
+                        {
+                            "Key": deleted_key,
+                            "VersionId": "delete-v2",
+                            "IsLatest": True,
+                        }
+                    ]
+                },
+            ]
+        ),
+        action="test version selection",
+    )
+
+    assert latest[version_key] == (
+        "version",
+        {
+            "Key": version_key,
+            "VersionId": "current-v2",
+            "IsLatest": True,
+        },
+    )
+    assert latest[deleted_key] == (
+        "delete_marker",
+        {
+            "Key": deleted_key,
+            "VersionId": "delete-v2",
+            "IsLatest": True,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # The seam guard: only encrypted snapshot envelopes may leave the machine
 # ---------------------------------------------------------------------------
@@ -128,6 +198,28 @@ class TestSeamGuard:
             vault.push(forged)
         assert vault_keys(s3) == []
 
+    def test_refuses_age_ciphertext_that_is_not_a_healthmes_snapshot_before_vault_call(
+        self,
+        local_provider,
+        tmp_path,
+    ):
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        forged = tmp_path / "healthmes-backup-20260101T000000Z.tar.gz.age"
+        forged.write_bytes(
+            age_passphrase.encrypt(
+                b"not a HealthMes snapshot",
+                local_provider._require_passphrase(),
+            )
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="encrypted payload is not a valid HealthMes snapshot",
+        ):
+            provider.push(forged)
+
+        assert provider._s3 is None
+
     def test_accepts_a_real_age_encrypted_snapshot(self, vault, s3, local_provider):
         """A genuine pyrage-encrypted snapshot passes the structural guard and
         is uploaded byte-identically."""
@@ -163,6 +255,85 @@ class TestPushDownloadList:
         remote_info = vault.push(local_info.name)
         assert vault_keys(s3) == [f"{PREFIX}/{remote_info.name}"]
 
+    def test_push_hashes_and_uploads_the_same_open_file(
+        self,
+        local_provider,
+    ):
+        local_info = local_provider.export_snapshot()
+        original = local_info.path.read_bytes()
+
+        class ReplacingClient:
+            def __init__(self) -> None:
+                self.remote = b""
+
+            def put_object(self, **kwargs):
+                local_info.path.unlink()
+                local_info.path.write_bytes(b"replacement path contents")
+                self.remote = kwargs["Body"].read()
+                return {}
+
+            def get_object(self, **_kwargs):
+                return {
+                    "Body": io.BytesIO(self.remote),
+                    "ContentLength": len(self.remote),
+                    "Metadata": {},
+                    "ETag": "",
+                }
+
+        client = ReplacingClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        with pytest.raises(BackupError, match="changed while it was being uploaded"):
+            provider.push(local_info.path)
+
+        assert client.remote == original
+        assert local_info.path.read_bytes() == b"replacement path contents"
+
+    def test_push_seals_ciphertext_before_same_inode_is_overwritten(
+        self,
+        local_provider,
+    ):
+        local_info = local_provider.export_snapshot()
+        original = local_info.path.read_bytes()
+        plaintext = b"private wellness plaintext" * 100
+
+        class InPlaceReplacingClient:
+            def __init__(self) -> None:
+                self.remote = b""
+
+            def put_object(self, **kwargs):
+                with local_info.path.open("r+b") as raced:
+                    raced.seek(0)
+                    raced.write(plaintext)
+                    raced.truncate()
+                    raced.flush()
+                    os.fsync(raced.fileno())
+                self.remote = kwargs["Body"].read()
+                return {}
+
+            def get_object(self, **_kwargs):
+                return {
+                    "Body": io.BytesIO(self.remote),
+                    "ContentLength": len(self.remote),
+                    "Metadata": {},
+                    "ETag": "",
+                }
+
+        client = InPlaceReplacingClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        with pytest.raises(
+            BackupError,
+            match="changed while it was being uploaded",
+        ):
+            provider.push(local_info.path)
+
+        assert client.remote == original
+        assert client.remote != plaintext
+        assert local_info.path.read_bytes() == plaintext
+
     def test_list_snapshots_newest_first_ignoring_strays(self, vault, s3, local_provider):
         first = vault.push(local_provider.export_snapshot().path)
         second = vault.push(local_provider.export_snapshot().path)
@@ -176,7 +347,7 @@ class TestPushDownloadList:
         assert all(isinstance(info, SnapshotInfo) for info in listed)
         assert listed[0].size_bytes == second.size_bytes
 
-    def test_download_round_trips_bytes_and_trusts_existing_local(
+    def test_download_round_trips_bytes_and_refreshes_existing_local_cache(
         self, vault, local_provider
     ):
         local_info = local_provider.export_snapshot()
@@ -188,10 +359,60 @@ class TestPushDownloadList:
         assert downloaded == local_info.path
         assert downloaded.read_bytes() == original
 
-        # Snapshots are immutable: an existing local file short-circuits the
-        # vault entirely (a dead client proves no call is made).
-        vault._s3 = SimpleNamespace()  # any attribute access would explode
+        downloaded.write_bytes(b"different same-name local cache")
         assert vault.download(local_info.name) == downloaded
+        assert downloaded.read_bytes() == original
+        with pytest.raises(BackupError, match="already exists"):
+            vault.download(local_info.name, overwrite=False)
+
+    def test_latest_delete_marker_hides_bare_name_but_explicit_version_survives(
+        self,
+        vault,
+        s3,
+        local_provider,
+    ):
+        enable_versioning(s3)
+        local_info = local_provider.export_snapshot()
+        original = local_info.path.read_bytes()
+        remote_info = vault.push(local_info.path)
+        assert remote_info.version_id is not None
+        local_info.path.unlink()
+        s3.delete_object(
+            Bucket=BUCKET,
+            Key=f"{PREFIX}/{local_info.name}",
+        )
+
+        with pytest.raises(BackupError, match="snapshot not found in vault"):
+            vault.download(local_info.name)
+
+        assert vault.list_snapshots() == []
+        assert not local_info.path.exists()
+        assert vault.download(remote_info) == local_info.path
+        assert local_info.path.read_bytes() == original
+
+    def test_blank_explicit_version_is_rejected_before_vault_access(
+        self,
+        local_provider,
+    ):
+        class NoReadClient:
+            def get_object(self, **_kwargs):
+                raise AssertionError("invalid version must fail before vault access")
+
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = NoReadClient()
+        invalid = SnapshotInfo(
+            name="healthmes-backup-20260705T033000Z.tar.gz.age",
+            path=Path("unused"),
+            created_at=T1,
+            size_bytes=1,
+            version_id=" ",
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="version_id must identify an immutable vault generation",
+        ):
+            provider.download(invalid)
 
     def test_satisfies_backup_provider_protocol(self, vault):
         assert isinstance(vault, BackupProvider)
@@ -206,12 +427,479 @@ class TestExportAndRestore:
         # ...and the vault holds the byte-identical replica.
         assert vault_keys(s3) == [f"{PREFIX}/{info.name}"]
 
-    def test_export_snapshot_remote_only_removes_local_copy(self, s3, local_provider):
+    def test_export_snapshot_remote_only_removes_local_copy_from_versioned_vault(
+        self,
+        s3,
+        local_provider,
+    ):
+        enable_versioning(s3)
         provider = RemoteVaultProvider(make_config(), local=local_provider, keep_local=False)
         info = provider.export_snapshot()
         assert info.path == Path(f"{PREFIX}/{info.name}")  # remote descriptor
         assert list(local_provider.backup_dir.glob("*.tar.gz.age")) == []
         assert vault_keys(s3) == [f"{PREFIX}/{info.name}"]
+
+    def test_remote_only_quarantine_recovers_on_local_provider_restart(
+        self,
+        s3,
+        source_env,
+        tmp_path,
+        monkeypatch,
+    ):
+        enable_versioning(s3)
+        backup_dir = tmp_path / "remote-only-restart"
+        local = LocalDirectoryProvider(
+            backup_dir,
+            locations=source_env.locations,
+            passphrase=source_env.passphrase,
+            clock=lambda: T1,
+        )
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local,
+            keep_local=False,
+        )
+        real_unlink = local_mod._unlink_snapshot_quarantine_entry
+        failed = False
+
+        def fail_once(quarantine):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("injected quarantine unlink interruption")
+            return real_unlink(quarantine)
+
+        monkeypatch.setattr(
+            local_mod,
+            "_unlink_snapshot_quarantine_entry",
+            fail_once,
+        )
+        with pytest.raises(
+            BackupError,
+            match="quarantine unlink interruption",
+        ):
+            provider.export_snapshot()
+
+        remote_keys = vault_keys(s3)
+        quarantines = list(
+            backup_dir.glob(
+                f"{local_mod._SNAPSHOT_QUARANTINE_PREFIX}*"
+            )
+        )
+        assert len(remote_keys) == 1
+        assert len(quarantines) == 1
+        assert list(backup_dir.glob("*.tar.gz.age")) == []
+
+        monkeypatch.setattr(
+            local_mod,
+            "_unlink_snapshot_quarantine_entry",
+            real_unlink,
+        )
+        LocalDirectoryProvider(
+            backup_dir,
+            locations=source_env.locations,
+            passphrase=source_env.passphrase,
+            clock=lambda: T2,
+        )
+
+        assert not quarantines[0].exists()
+        assert list(backup_dir.glob("*.tar.gz.age")) == []
+        assert vault_keys(s3) == remote_keys
+
+    def test_remote_only_non_versioned_vault_preserves_local_copy(
+        self,
+        s3,
+        local_provider,
+    ):
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local_provider,
+            keep_local=False,
+        )
+
+        with pytest.raises(
+            BackupError,
+            match="remote-only mode requires an immutable vault generation",
+        ):
+            provider.export_snapshot()
+
+        local_snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(local_snapshots) == 1
+        assert vault_keys(s3) == [f"{PREFIX}/{local_snapshots[0].name}"]
+
+    def test_remote_only_same_second_exports_never_overwrite(
+        self,
+        s3,
+        source_env,
+        tmp_path,
+    ):
+        enable_versioning(s3)
+        local = LocalDirectoryProvider(
+            tmp_path / "remote-only-backups",
+            locations=source_env.locations,
+            passphrase=source_env.passphrase,
+            clock=lambda: T1,
+        )
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local,
+            keep_local=False,
+        )
+
+        first = provider.export_snapshot()
+        first_key = f"{PREFIX}/{first.name}"
+        first_payload = s3.get_object(Bucket=BUCKET, Key=first_key)["Body"].read()
+        (source_env.media_dir / "note.txt").write_text(
+            "changed before the same-second retry",
+            encoding="utf-8",
+        )
+        second = provider.export_snapshot()
+
+        assert first.name == "healthmes-backup-20260705T033000Z.tar.gz.age"
+        assert second.name == "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        assert set(vault_keys(s3)) == {
+            f"{PREFIX}/{first.name}",
+            f"{PREFIX}/{second.name}",
+        }
+        assert (
+            s3.get_object(Bucket=BUCKET, Key=first_key)["Body"].read()
+            == first_payload
+        )
+        assert list(local.backup_dir.glob("*.tar.gz.age")) == []
+
+    def test_collision_retries_reuse_one_sealed_generation_and_preserve_replacement(
+        self,
+        local_provider,
+    ):
+        replacement = b"unrelated replacement at the original snapshot name"
+
+        class CollidingClient:
+            def __init__(self) -> None:
+                self.uploads: list[tuple[str, bytes]] = []
+                self.current_upload = b""
+
+            def put_object(self, **kwargs):
+                payload = kwargs["Body"].read()
+                self.uploads.append((kwargs["Key"], payload))
+                self.current_upload = payload
+                if len(self.uploads) == 1:
+                    original_path = next(
+                        local_provider.backup_dir.glob("*.tar.gz.age")
+                    )
+                    original_path.unlink()
+                    original_path.write_bytes(replacement)
+                if len(self.uploads) <= 2:
+                    raise ClientError(
+                        {
+                            "Error": {
+                                "Code": "PreconditionFailed",
+                                "Message": "occupied immutable name",
+                            }
+                        },
+                        "PutObject",
+                    )
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v3",
+                }
+
+            def get_object(self, **kwargs):
+                if kwargs.get("VersionId") == "uploaded-v3":
+                    payload = self.current_upload
+                    version_id = "uploaded-v3"
+                else:
+                    payload = b"different existing remote generation"
+                    version_id = "existing-v1"
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "Metadata": {},
+                    "ETag": "existing-etag",
+                    "VersionId": version_id,
+                }
+
+        client = CollidingClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        local_info, remote_info = provider.create_and_replicate()
+
+        assert [Path(key).name for key, _payload in client.uploads] == [
+            "healthmes-backup-20260705T033000Z.tar.gz.age",
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age",
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age",
+        ]
+        uploaded_payloads = [payload for _key, payload in client.uploads]
+        assert len(set(uploaded_payloads)) == 1
+        assert local_info.name == remote_info.name == (
+            "healthmes-backup-20260705T033000Z-3.tar.gz.age"
+        )
+        assert local_info.path.read_bytes() == uploaded_payloads[0]
+        original_path = local_provider.backup_dir / (
+            "healthmes-backup-20260705T033000Z.tar.gz.age"
+        )
+        assert original_path.read_bytes() == replacement
+        assert not (
+            local_provider.backup_dir
+            / "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        ).exists()
+
+    def test_keep_local_rejects_path_replaced_during_sealed_upload(
+        self,
+        local_provider,
+    ):
+        replacement = b"unrelated file replacing the retained local snapshot"
+
+        class ReplacingClient:
+            def __init__(self) -> None:
+                self.uploaded = b""
+
+            def put_object(self, **kwargs):
+                local_path = next(
+                    local_provider.backup_dir.glob("*.tar.gz.age")
+                )
+                local_path.unlink()
+                local_path.write_bytes(replacement)
+                self.uploaded = kwargs["Body"].read()
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def get_object(self, **kwargs):
+                assert kwargs["VersionId"] == "uploaded-v1"
+                return {
+                    "Body": io.BytesIO(self.uploaded),
+                    "ContentLength": len(self.uploaded),
+                    "Metadata": {},
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+        client = ReplacingClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        with pytest.raises(
+            BackupError,
+            match="local snapshot changed while it was being uploaded",
+        ):
+            provider.create_and_replicate()
+
+        local_snapshots = list(
+            local_provider.backup_dir.glob("*.tar.gz.age")
+        )
+        assert len(local_snapshots) == 1
+        assert local_snapshots[0].read_bytes() == replacement
+        assert client.uploaded
+        assert client.uploaded != replacement
+
+    def test_create_and_replicate_normalizes_sealed_tempfile_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        def fail_temporary_file(*args, **kwargs):
+            raise OSError("injected private temporary storage failure")
+
+        monkeypatch.setattr(
+            remote_vault_mod.tempfile,
+            "TemporaryFile",
+            fail_temporary_file,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not allocate private sealed snapshot generation",
+        ) as excinfo:
+            provider.create_and_replicate()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert list(local_provider.backup_dir.glob("*.tar.gz.age")) == []
+
+    def test_create_and_replicate_normalizes_private_seal_write_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        class FailingSealedFile(io.BytesIO):
+            def write(self, _data):
+                raise OSError("injected private seal write failure")
+
+        monkeypatch.setattr(
+            remote_vault_mod,
+            "_open_private_sealed_snapshot",
+            FailingSealedFile,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not prepare private sealed snapshot generation",
+        ) as excinfo:
+            provider.create_and_replicate()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_size > 0
+
+    def test_create_and_replicate_normalizes_private_seal_fsync_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        real_temporary_file = remote_vault_mod.tempfile.TemporaryFile
+        sealed = real_temporary_file(mode="w+b")
+        sealed_descriptor = sealed.fileno()
+        real_fsync = remote_vault_mod.os.fsync
+
+        def open_sealed():
+            return sealed
+
+        def fail_sealed_fsync(descriptor):
+            if descriptor == sealed_descriptor:
+                raise OSError("injected private seal fsync failure")
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(
+            remote_vault_mod,
+            "_open_private_sealed_snapshot",
+            open_sealed,
+        )
+        monkeypatch.setattr(
+            remote_vault_mod.os,
+            "fsync",
+            fail_sealed_fsync,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not prepare private sealed snapshot generation",
+        ) as excinfo:
+            provider.create_and_replicate()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_size > 0
+
+    def test_push_reports_upload_body_allocation_failure(
+        self,
+        local_provider,
+        monkeypatch,
+    ):
+        info = local_provider.export_snapshot()
+
+        def fail_temporary_file(*args, **kwargs):
+            raise OSError("injected upload body allocation failure")
+
+        monkeypatch.setattr(
+            remote_vault_mod.tempfile,
+            "TemporaryFile",
+            fail_temporary_file,
+        )
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+
+        with pytest.raises(
+            BackupError,
+            match="could not allocate private vault upload generation",
+        ) as excinfo:
+            provider.push(info.path)
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_size > 0
+
+    def test_remote_only_collision_does_not_delete_replaced_original_name(
+        self,
+        local_provider,
+    ):
+        replacement = b"unrelated replacement that remote-only must preserve"
+
+        class OneCollisionClient:
+            def __init__(self) -> None:
+                self.uploads: list[tuple[str, bytes]] = []
+                self.current_upload = b""
+
+            def put_object(self, **kwargs):
+                payload = kwargs["Body"].read()
+                self.uploads.append((kwargs["Key"], payload))
+                self.current_upload = payload
+                if len(self.uploads) == 1:
+                    original_path = next(
+                        local_provider.backup_dir.glob("*.tar.gz.age")
+                    )
+                    original_path.unlink()
+                    original_path.write_bytes(replacement)
+                    raise ClientError(
+                        {
+                            "Error": {
+                                "Code": "PreconditionFailed",
+                                "Message": "occupied immutable name",
+                            }
+                        },
+                        "PutObject",
+                    )
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v2",
+                }
+
+            def get_object(self, **kwargs):
+                if kwargs.get("VersionId") == "uploaded-v2":
+                    payload = self.current_upload
+                    version_id = "uploaded-v2"
+                else:
+                    payload = b"different existing remote generation"
+                    version_id = "existing-v1"
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "Metadata": {},
+                    "ETag": "existing-etag",
+                    "VersionId": version_id,
+                }
+
+        client = OneCollisionClient()
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local_provider,
+            keep_local=False,
+        )
+        provider._s3 = client
+
+        remote_info = provider.export_snapshot()
+
+        assert remote_info.name == (
+            "healthmes-backup-20260705T033000Z-2.tar.gz.age"
+        )
+        assert len(client.uploads) == 2
+        assert client.uploads[0][1] == client.uploads[1][1]
+        original_path = local_provider.backup_dir / (
+            "healthmes-backup-20260705T033000Z.tar.gz.age"
+        )
+        assert original_path.read_bytes() == replacement
+        assert not (
+            local_provider.backup_dir / remote_info.name
+        ).exists()
+
+    def test_push_is_idempotent_for_identical_snapshot(
+        self,
+        vault,
+        s3,
+        local_provider,
+    ):
+        local_info = local_provider.export_snapshot()
+
+        first = vault.push(local_info.path)
+        second = vault.push(local_info.path)
+
+        assert second == first
+        assert vault_keys(s3) == [f"{PREFIX}/{local_info.name}"]
 
     def test_restore_downloads_when_not_local(
         self, vault, source_env, fresh_locations, tmp_path, sqlite_dump
@@ -228,12 +916,96 @@ class TestExportAndRestore:
                 passphrase=source_env.passphrase,
             ),
         )
-        restorer.restore(exported.name)
+        result = restorer.restore(exported.name)
         assert sqlite_dump(target_root / "data" / "healthmes.db") == sqlite_dump(
             source_env.db_path
         )
-        # The envelope was materialized locally on the way (local-first cache).
+        assert result.recovery_mode == "recoverable_local_swaps"
+        assert result.recovered_components == (
+            "healthmes_db",
+            "media",
+            "hermes_home",
+        )
+        # The authoritative envelope was materialized as a verified local cache.
         assert (restorer.local.backup_dir / exported.name).is_file()
+
+    def test_restore_remote_snapshot_replaces_different_valid_local_snapshot(
+        self,
+        vault,
+        source_env,
+        local_provider,
+    ):
+        original_note = (source_env.media_dir / "note.txt").read_bytes()
+        remote = vault.export_snapshot()
+        remote_bytes = remote.path.read_bytes()
+
+        (source_env.media_dir / "note.txt").write_text(
+            "different local snapshot",
+            encoding="utf-8",
+        )
+        different = local_provider.export_snapshot()
+        assert different.path.read_bytes() != remote_bytes
+        different.path.replace(remote.path)
+
+        vault.restore(remote.name)
+
+        assert remote.path.read_bytes() == remote_bytes
+        assert (source_env.media_dir / "note.txt").read_bytes() == original_note
+
+    def test_restore_uses_pinned_download_if_cache_name_is_replaced(
+        self,
+        vault,
+        source_env,
+        local_provider,
+        monkeypatch,
+    ):
+        original_note = (source_env.media_dir / "note.txt").read_bytes()
+        remote = vault.export_snapshot()
+        (source_env.media_dir / "note.txt").write_text(
+            "live data changed after snapshot",
+            encoding="utf-8",
+        )
+        raced_cache = b"untrusted replacement cache generation"
+        real_restore = local_provider.restore_open_snapshot
+
+        def replace_cache_before_restore(
+            path,
+            handle,
+            *,
+            allow_cross_store_partial=False,
+        ):
+            replacement = path.with_name(f".{path.name}.replacement")
+            replacement.write_bytes(raced_cache)
+            os.replace(replacement, path)
+            return real_restore(
+                path,
+                handle,
+                allow_cross_store_partial=allow_cross_store_partial,
+            )
+
+        monkeypatch.setattr(
+            local_provider,
+            "restore_open_snapshot",
+            replace_cache_before_restore,
+        )
+
+        vault.restore(remote.name)
+
+        assert remote.path.read_bytes() == raced_cache
+        assert (source_env.media_dir / "note.txt").read_bytes() == original_note
+
+    def test_restore_remote_never_falls_back_to_same_name_local_snapshot(
+        self,
+        vault,
+        local_provider,
+    ):
+        local_only = local_provider.export_snapshot()
+        local_bytes = local_only.path.read_bytes()
+
+        with pytest.raises(BackupError, match="snapshot not found in vault"):
+            vault.restore(local_only.name)
+
+        assert local_only.path.read_bytes() == local_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +1101,66 @@ class TestCliRoundTrip:
         assert (source.media_dir / "note.txt").read_bytes() == original_note
         assert sqlite_dump(source.db_path) == reference_db
 
+    def test_remote_cli_restore_uses_the_pinned_download_generation(
+        self,
+        cli_vault_env,
+        s3,
+        capsys,
+        monkeypatch,
+    ):
+        source = cli_vault_env.source
+        original_note = (source.media_dir / "note.txt").read_bytes()
+        path = Path(create_snapshot_via_cli(capsys, "--provider", "remote"))
+        name = path.name
+        (source.media_dir / "note.txt").write_text(
+            "mutated after remote snapshot",
+            encoding="utf-8",
+        )
+        raced_cache = b"replacement cache generation"
+        real_restore = LocalDirectoryProvider.restore_open_snapshot
+
+        def replace_cache_before_restore(
+            provider,
+            snapshot_path,
+            handle,
+            *,
+            allow_cross_store_partial=False,
+        ):
+            replacement = snapshot_path.with_name(
+                f".{snapshot_path.name}.replacement"
+            )
+            replacement.write_bytes(raced_cache)
+            os.replace(replacement, snapshot_path)
+            return real_restore(
+                provider,
+                snapshot_path,
+                handle,
+                allow_cross_store_partial=allow_cross_store_partial,
+            )
+
+        monkeypatch.setattr(
+            LocalDirectoryProvider,
+            "restore_open_snapshot",
+            replace_cache_before_restore,
+        )
+
+        assert (
+            main(
+                [
+                    "backup",
+                    "restore",
+                    name,
+                    "--provider",
+                    "remote",
+                    "--yes",
+                ]
+            )
+            == 0
+        )
+
+        assert path.read_bytes() == raced_cache
+        assert (source.media_dir / "note.txt").read_bytes() == original_note
+
     def test_create_provider_remote_writes_local_then_uploads(
         self, cli_vault_env, s3, capsys
     ):
@@ -339,6 +1171,7 @@ class TestCliRoundTrip:
         assert vault_keys(s3) == [f"{PREFIX}/{name}"]
 
     def test_create_remote_only_removes_local_copy(self, cli_vault_env, s3, capsys):
+        enable_versioning(s3)
         assert main(["backup", "create", "--provider", "remote", "--remote-only"]) == 0
         captured = capsys.readouterr()
         assert "uploaded to vault:" in captured.out
@@ -383,6 +1216,25 @@ class TestCliRoundTrip:
         assert "downloaded from vault:" in captured.out
         assert "healthmes db:       sqlite_file" in captured.out
         assert "re-run with --yes" in captured.err
+
+    def test_restore_download_local_io_failure_is_clean(
+        self,
+        cli_vault_env,
+        capsys,
+    ):
+        path = Path(create_snapshot_via_cli(capsys, "--provider", "remote"))
+        name = path.name
+        shutil.rmtree(cli_vault_env.backup_dir)
+        cli_vault_env.backup_dir.write_text(
+            "not a directory",
+            encoding="utf-8",
+        )
+
+        assert main(["backup", "restore", name, "--provider", "remote"]) == 1
+
+        captured = capsys.readouterr()
+        assert "error: could not write vault snapshot" in captured.err
+        assert "Traceback" not in captured.err
 
     def test_selector_env_var_routes_create_to_vault(self, cli_vault_env, s3, capsys, monkeypatch):
         monkeypatch.setenv("HEALTHMES_BACKUP_PROVIDER", "remote_vault")
@@ -431,7 +1283,59 @@ class _WrongCredentialsClient:
         )
 
 
+class _CloseFailingBody:
+    def __init__(self, payload: bytes, leaked_message: str) -> None:
+        self._stream = io.BytesIO(payload)
+        self._leaked_message = leaked_message
+        self.close_calls = 0
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError(self._leaked_message)
+
+
 class TestErrorPaths:
+    def test_endpoint_connection_error_redacts_all_url_credentials(
+        self,
+        local_provider,
+    ):
+        provider = RemoteVaultProvider(
+            make_config(
+                endpoint_url=(
+                    "https://alice:supersecret@example.invalid:9443/"
+                    "private/path?token=signed-secret#credential-fragment"
+                )
+            ),
+            local=local_provider,
+        )
+
+        with pytest.raises(BackupError) as excinfo:
+            with provider._vault_call("list snapshots"):
+                raise EndpointConnectionError(
+                    endpoint_url=(
+                        "https://alice:supersecret@example.invalid:9443/"
+                        "private/path?token=signed-secret#credential-fragment"
+                    )
+                )
+
+        assert str(excinfo.value) == (
+            "cannot reach the vault endpoint to list snapshots "
+            "(https://example.invalid:9443): check HEALTHMES_VAULT_ENDPOINT"
+        )
+        rendered = str(excinfo.value)
+        for secret in (
+            "alice",
+            "supersecret",
+            "private/path",
+            "signed-secret",
+            "credential-fragment",
+        ):
+            assert secret not in rendered
+        assert excinfo.value.__cause__ is None
+
     def test_wrong_credentials_error_is_clean_via_cli(
         self, source_env, tmp_path, monkeypatch, capsys
     ):
@@ -455,6 +1359,85 @@ class TestErrorPaths:
         assert "Traceback" not in captured.err
         assert "\n" not in captured.err.strip()  # single line
 
+    def test_unknown_client_error_suppresses_provider_message(
+        self,
+        local_provider,
+    ):
+        provider = RemoteVaultProvider(
+            make_config(
+                endpoint_url=(
+                    "https://alice:configured-password@example.invalid/"
+                    "private?token=configured-token"
+                ),
+                access_key_id="CONFIGURED-ACCESS-KEY",
+                secret_access_key="CONFIGURED-SECRET-KEY",
+            ),
+            local=local_provider,
+        )
+        leaked = (
+            "https://bob:TOP-SECRET-CREDENTIAL@example.invalid/private"
+            "?token=LEAKED-TOKEN#LEAKED-FRAGMENT\nsecond line"
+        )
+
+        with pytest.raises(BackupError) as excinfo:
+            with provider._vault_call("list snapshots"):
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "InternalError",
+                            "Message": leaked,
+                        }
+                    },
+                    "ListObjectsV2",
+                )
+
+        rendered = str(excinfo.value)
+        assert rendered == (
+            "vault list snapshots failed (InternalError); check "
+            "HEALTHMES_VAULT_ENDPOINT, HEALTHMES_VAULT_BUCKET, and "
+            "provider status"
+        )
+        for secret in (
+            leaked,
+            "TOP-SECRET-CREDENTIAL",
+            "LEAKED-TOKEN",
+            "LEAKED-FRAGMENT",
+            "configured-password",
+            "configured-token",
+            "CONFIGURED-ACCESS-KEY",
+            "CONFIGURED-SECRET-KEY",
+        ):
+            assert secret not in rendered
+        assert "\n" not in rendered
+
+    def test_generic_vault_exception_suppresses_secret_text(
+        self,
+        local_provider,
+        caplog,
+    ):
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        leaked = (
+            "https://alice:TOP-SECRET-CREDENTIAL@example.invalid/"
+            "private?token=LEAKED-TOKEN\nsecond line"
+        )
+
+        with pytest.raises(BackupError) as excinfo:
+            with provider._vault_call("download snapshot"):
+                raise RuntimeError(leaked)
+
+        rendered = str(excinfo.value)
+        assert rendered == (
+            "vault download snapshot failed; check "
+            "HEALTHMES_VAULT_ENDPOINT, HEALTHMES_VAULT_BUCKET, and "
+            "provider status"
+        )
+        assert "TOP-SECRET-CREDENTIAL" not in rendered
+        assert "LEAKED-TOKEN" not in rendered
+        assert "\n" not in rendered
+        assert "RuntimeError" in caplog.text
+        assert "TOP-SECRET-CREDENTIAL" not in caplog.text
+        assert "LEAKED-TOKEN" not in caplog.text
+
     def test_missing_bucket_error_is_actionable(self, s3, local_provider):
         provider = RemoteVaultProvider(make_config(bucket="no-such-vault"), local=local_provider)
         info = provider.local.export_snapshot()
@@ -471,18 +1454,378 @@ class TestErrorPaths:
         with pytest.raises(BackupError, match="HEALTHMES_VAULT_BUCKET"):
             RemoteVaultProvider.from_settings(settings)
 
-    def test_upload_integrity_mismatch_deletes_and_raises(self, local_provider):
-        deleted: list[str] = []
+    def test_upload_integrity_mismatch_deletes_only_exact_put_generation(
+        self,
+        local_provider,
+    ):
+        deleted: list[dict[str, str]] = []
+        reads: list[dict[str, str]] = []
+        info = local_provider.export_snapshot()
+        corrupt = b"x" * info.size_bytes
+
+        def get_object(**kwargs):
+            reads.append(kwargs)
+            return {
+                "Body": io.BytesIO(corrupt),
+                "ContentLength": len(corrupt),
+                "Metadata": {},
+                "ETag": "uploaded-etag",
+                "VersionId": "uploaded-v1",
+            }
+
         fake = SimpleNamespace(
-            put_object=lambda **kw: {"ETag": '"' + "0" * 32 + '"'},
-            delete_object=lambda **kw: deleted.append(kw["Key"]),
+            put_object=lambda **kw: {
+                "ETag": "uploaded-etag",
+                "VersionId": "uploaded-v1",
+            },
+            get_object=get_object,
+            delete_object=lambda **kw: deleted.append(kw),
         )
         provider = RemoteVaultProvider(make_config(), local=local_provider)
         provider._s3 = fake  # bypass boto3 construction; verify our own check
-        info = local_provider.export_snapshot()
         with pytest.raises(BackupError, match="integrity check failed"):
             provider.push(info.path)
-        assert deleted == [f"{PREFIX}/{info.name}"]
+        assert reads == [
+            {
+                "Bucket": BUCKET,
+                "Key": f"{PREFIX}/{info.name}",
+                "VersionId": "uploaded-v1",
+            }
+        ]
+        assert deleted == [
+            {
+                "Bucket": BUCKET,
+                "Key": f"{PREFIX}/{info.name}",
+                "VersionId": "uploaded-v1",
+            }
+        ]
+
+    def test_corrupt_generation_delete_cleanup_redacts_secrets(
+        self,
+        local_provider,
+        caplog,
+    ):
+        info = local_provider.export_snapshot()
+        corrupt = b"x" * info.size_bytes
+        leaked = (
+            "https://alice:DELETE-SECRET@example.invalid/private?token="
+            "DELETE-TOKEN\nsecond line"
+        )
+
+        class DeleteFailingClient:
+            def put_object(self, **_kwargs):
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def get_object(self, **_kwargs):
+                return {
+                    "Body": io.BytesIO(corrupt),
+                    "ContentLength": len(corrupt),
+                    "Metadata": {},
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def delete_object(self, **_kwargs):
+                raise RuntimeError(leaked)
+
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = DeleteFailingClient()
+
+        with (
+            caplog.at_level(
+                "WARNING",
+                logger="healthmes.backup.remote_vault",
+            ),
+            pytest.raises(BackupError, match="integrity check failed") as excinfo,
+        ):
+            provider.push(info.path)
+
+        assert "cleanup of the exact uploaded generation failed" in str(excinfo.value)
+        assert "action=delete corrupt vault object generation" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "provider_detail=suppressed" in caplog.text
+        for secret in ("DELETE-SECRET", "DELETE-TOKEN", leaked):
+            assert secret not in caplog.text
+            assert secret not in str(excinfo.value)
+
+    def test_verification_body_close_failure_is_redacted_and_push_succeeds(
+        self,
+        local_provider,
+        caplog,
+    ):
+        info = local_provider.export_snapshot()
+        original = info.path.read_bytes()
+        leaked = (
+            "https://alice:VERIFY-CLOSE-SECRET@example.invalid/private?token="
+            "VERIFY-CLOSE-TOKEN"
+        )
+
+        class CloseFailingVerificationClient:
+            def __init__(self) -> None:
+                self.uploaded = b""
+                self.body: _CloseFailingBody | None = None
+
+            def put_object(self, **kwargs):
+                self.uploaded = kwargs["Body"].read()
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def get_object(self, **_kwargs):
+                self.body = _CloseFailingBody(self.uploaded, leaked)
+                return {
+                    "Body": self.body,
+                    "ContentLength": len(self.uploaded),
+                    "Metadata": {},
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+        client = CloseFailingVerificationClient()
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = client
+
+        with caplog.at_level(
+            "WARNING",
+            logger="healthmes.backup.remote_vault",
+        ):
+            pushed = provider.push(info.path)
+
+        assert pushed.name == info.name
+        assert client.uploaded == original
+        assert client.body is not None
+        assert client.body.close_calls == 1
+        assert "action=close vault verification body" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "provider_detail=suppressed" in caplog.text
+        for secret in ("VERIFY-CLOSE-SECRET", "VERIFY-CLOSE-TOKEN", leaked):
+            assert secret not in caplog.text
+
+    def test_download_body_close_failure_is_redacted_and_download_succeeds(
+        self,
+        local_provider,
+        caplog,
+    ):
+        info = local_provider.export_snapshot()
+        payload = info.path.read_bytes()
+        info.path.unlink()
+        leaked = (
+            "https://alice:DOWNLOAD-CLOSE-SECRET@example.invalid/private?token="
+            "DOWNLOAD-CLOSE-TOKEN"
+        )
+        body = _CloseFailingBody(payload, leaked)
+        provider = RemoteVaultProvider(make_config(), local=local_provider)
+        provider._s3 = SimpleNamespace(
+            get_object=lambda **_kwargs: {
+                "Body": body,
+                "ContentLength": len(payload),
+                "Metadata": {"healthmes-sha256": hashlib.sha256(payload).hexdigest()},
+                "ETag": "",
+            }
+        )
+
+        with caplog.at_level(
+            "WARNING",
+            logger="healthmes.backup.remote_vault",
+        ):
+            downloaded = provider.download(info.name)
+
+        assert downloaded == info.path
+        assert downloaded.read_bytes() == payload
+        assert body.close_calls == 1
+        assert "action=close vault download body" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "provider_detail=suppressed" in caplog.text
+        for secret in (
+            "DOWNLOAD-CLOSE-SECRET",
+            "DOWNLOAD-CLOSE-TOKEN",
+            leaked,
+        ):
+            assert secret not in caplog.text
+
+    def test_non_versioned_corruption_keeps_local_and_deletes_nothing(
+        self,
+        source_env,
+        tmp_path,
+    ):
+        class CorruptingClient:
+            def __init__(self) -> None:
+                self.remote = b""
+                self.deleted: list[str] = []
+
+            def put_object(self, **kwargs):
+                original = kwargs["Body"].read()
+                self.remote = bytes([original[0] ^ 1]) + original[1:]
+                return {
+                    "ETag": "multipart-etag",
+                    "VersionId": "null",
+                }
+
+            def get_object(self, **_kwargs):
+                return {
+                    "Body": io.BytesIO(self.remote),
+                    "ContentLength": len(self.remote),
+                    "Metadata": {},
+                    "ETag": "multipart-etag",
+                    "VersionId": "null",
+                }
+
+            def delete_object(self, **kwargs):
+                self.deleted.append(kwargs["Key"])
+
+        local = LocalDirectoryProvider(
+            tmp_path / "remote-only-corruption",
+            locations=source_env.locations,
+            passphrase=source_env.passphrase,
+            clock=lambda: T1,
+        )
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local,
+            keep_local=False,
+        )
+        client = CorruptingClient()
+        provider._s3 = client
+
+        with pytest.raises(BackupError, match="integrity check failed"):
+            provider.export_snapshot()
+
+        local_snapshots = list(local.backup_dir.glob("*.tar.gz.age"))
+        assert len(local_snapshots) == 1
+        assert local_snapshots[0].stat().st_size == len(client.remote)
+        assert client.deleted == []
+
+    def test_remote_only_verifies_and_removes_using_exact_put_generation(
+        self,
+        local_provider,
+    ):
+        class RacingVersionedClient:
+            def __init__(self) -> None:
+                self.uploaded = b""
+                self.current = b"newer unrelated generation"
+                self.reads: list[dict[str, str]] = []
+
+            def put_object(self, **kwargs):
+                self.uploaded = kwargs["Body"].read()
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def get_object(self, **kwargs):
+                self.reads.append(kwargs)
+                assert self.current != self.uploaded
+                return {
+                    "Body": io.BytesIO(self.uploaded),
+                    "ContentLength": len(self.uploaded),
+                    "Metadata": {},
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+        client = RacingVersionedClient()
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local_provider,
+            keep_local=False,
+        )
+        provider._s3 = client
+
+        info = provider.export_snapshot()
+
+        assert info.version_id == "uploaded-v1"
+        assert client.reads == [
+            {
+                "Bucket": BUCKET,
+                "Key": f"{PREFIX}/{info.name}",
+                "VersionId": "uploaded-v1",
+            }
+        ]
+        assert list(local_provider.backup_dir.glob("*.tar.gz.age")) == []
+        assert client.current == b"newer unrelated generation"
+
+    def test_remote_only_rejects_get_that_is_not_bound_to_put_generation(
+        self,
+        local_provider,
+    ):
+        deleted: list[dict[str, str]] = []
+
+        class MisbindingClient:
+            def __init__(self) -> None:
+                self.uploaded = b""
+
+            def put_object(self, **kwargs):
+                self.uploaded = kwargs["Body"].read()
+                return {
+                    "ETag": "uploaded-etag",
+                    "VersionId": "uploaded-v1",
+                }
+
+            def get_object(self, **kwargs):
+                assert kwargs["VersionId"] == "uploaded-v1"
+                return {
+                    "Body": io.BytesIO(self.uploaded),
+                    "ContentLength": len(self.uploaded),
+                    "Metadata": {},
+                    "ETag": "newer-etag",
+                    "VersionId": "newer-v2",
+                }
+
+            def delete_object(self, **kwargs):
+                deleted.append(kwargs)
+
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local_provider,
+            keep_local=False,
+        )
+        provider._s3 = MisbindingClient()
+
+        with pytest.raises(
+            BackupError,
+            match="did not return the exact uploaded object generation",
+        ):
+            provider.export_snapshot()
+
+        assert len(list(local_provider.backup_dir.glob("*.tar.gz.age"))) == 1
+        assert deleted == []
+
+    def test_remote_only_preserves_a_file_replaced_after_upload(
+        self,
+        s3,
+        local_provider,
+        monkeypatch,
+    ):
+        enable_versioning(s3)
+        provider = RemoteVaultProvider(
+            make_config(),
+            local=local_provider,
+            keep_local=False,
+        )
+        real_remove = local_provider.remove_snapshot_if_unchanged
+
+        def replace_before_remove(path, *, expected):
+            path.unlink()
+            path.write_bytes(b"new file at the old snapshot path")
+            return real_remove(path, expected=expected)
+
+        monkeypatch.setattr(
+            local_provider,
+            "remove_snapshot_if_unchanged",
+            replace_before_remove,
+        )
+
+        with pytest.raises(BackupError, match="changed after upload"):
+            provider.export_snapshot()
+
+        local_snapshots = list(local_provider.backup_dir.glob("*.tar.gz.age"))
+        assert len(local_snapshots) == 1
+        assert local_snapshots[0].read_bytes() == b"new file at the old snapshot path"
+        assert vault_keys(s3) == [f"{PREFIX}/{local_snapshots[0].name}"]
 
 
 # ---------------------------------------------------------------------------

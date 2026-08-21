@@ -22,8 +22,10 @@ from the mirror the same way, which keeps the mirror bounded to the active
 scheduling horizon.
 """
 
+import hashlib
 import json
 import logging
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -51,6 +53,16 @@ from healthmes.calendars.base import (
     parse_calendar_identity,
     parse_event_kind,
     parse_task_id,
+)
+from healthmes.calendars.creds import (
+    GOOGLE_ACCOUNT_GENERATION_KEY,
+    calendar_credential_file_lock,
+    write_owner_only_json,
+)
+from healthmes.calendars.state import (
+    SyncCoverageKind,
+    sync_state_coverage,
+    with_sync_state_coverage,
 )
 from healthmes.store.enums import CalendarSource
 
@@ -86,14 +98,75 @@ def google_client_secret_path(data_dir: Path) -> Path:
     return Path(data_dir) / "google" / "client_secret.json"
 
 
-def save_credentials(credentials: Any, token_file: Path) -> None:
+def save_credentials(
+    credentials: Any,
+    token_file: Path,
+    *,
+    account_generation: str | None = None,
+) -> None:
     """Persist authorized-user credentials as JSON, owner-readable only."""
     token_file = Path(token_file)
-    token_file.parent.mkdir(parents=True, exist_ok=True)
     payload = json.loads(credentials.to_json())
+    if not isinstance(payload, dict):
+        raise ValueError("Google credentials must serialize to an object")
     payload.setdefault("type", "authorized_user")
-    token_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    token_file.chmod(0o600)
+    payload[GOOGLE_ACCOUNT_GENERATION_KEY] = (
+        account_generation or uuid.uuid4().hex
+    )
+    with calendar_credential_file_lock(token_file):
+        write_owner_only_json(token_file, payload)
+
+
+def _token_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _save_refreshed_credentials(
+    credentials: Any,
+    token_file: Path,
+    *,
+    expected_digest: str,
+) -> bool:
+    """Persist a refresh only when the authorization file is unchanged."""
+
+    with calendar_credential_file_lock(token_file):
+        try:
+            current = token_file.read_bytes()
+        except FileNotFoundError:
+            return False
+        if _token_digest(current) != expected_digest:
+            return False
+        payload = json.loads(credentials.to_json())
+        if not isinstance(payload, dict):
+            raise ValueError("Google credentials must serialize to an object")
+        payload.setdefault("type", "authorized_user")
+        try:
+            current_payload = json.loads(current.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(current_payload, dict):
+            return False
+        account_generation = current_payload.get(
+            GOOGLE_ACCOUNT_GENERATION_KEY
+        )
+        if not isinstance(account_generation, str) or not account_generation:
+            refresh_token = str(
+                current_payload.get("refresh_token") or ""
+            )
+            client_id = str(current_payload.get("client_id") or "")
+            account_generation = hashlib.sha256(
+                "\x1f".join(
+                    (
+                        "healthmes-calendar-account-v1",
+                        CalendarSource.GOOGLE.value,
+                        refresh_token,
+                        client_id,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+        payload[GOOGLE_ACCOUNT_GENERATION_KEY] = account_generation
+        write_owner_only_json(token_file, payload)
+        return True
 
 
 def load_credentials(token_file: Path, scopes: Sequence[str] = GOOGLE_SCOPES) -> Any | None:
@@ -103,22 +176,50 @@ def load_credentials(token_file: Path, scopes: Sequence[str] = GOOGLE_SCOPES) ->
     file, or invalid without a refresh token). Never interactive.
     """
     token_file = Path(token_file)
-    if not token_file.exists():
-        return None
-
     from google.oauth2.credentials import Credentials
 
-    try:
-        credentials = Credentials.from_authorized_user_file(str(token_file), list(scopes))
-    except ValueError:
-        logger.warning("unreadable google token file %s; re-auth required", token_file)
-        return None
+    with calendar_credential_file_lock(token_file):
+        try:
+            raw = token_file.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            authorized_user_info = dict(payload)
+            authorized_user_info.pop(
+                GOOGLE_ACCOUNT_GENERATION_KEY,
+                None,
+            )
+            credentials = Credentials.from_authorized_user_info(
+                authorized_user_info,
+                list(scopes),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            logger.warning(
+                "unreadable google token file %s; re-auth required",
+                token_file,
+            )
+            return None
 
     if credentials.expired and credentials.refresh_token:
         from google.auth.transport.requests import Request
 
+        expected_digest = _token_digest(raw)
+        # Refresh is remote I/O. Disconnect and reconnect must not wait for it;
+        # the compare-and-swap below rejects a result from stale credentials.
         credentials.refresh(Request())
-        save_credentials(credentials, token_file)
+        if not _save_refreshed_credentials(
+            credentials,
+            token_file,
+            expected_digest=expected_digest,
+        ):
+            logger.info(
+                "google token changed during refresh; discarding stale "
+                "authorization"
+            )
+            return None
 
     return credentials if credentials.valid else None
 
@@ -129,6 +230,7 @@ def run_installed_app_flow(
     scopes: Sequence[str] = GOOGLE_SCOPES,
     *,
     port: int = 0,
+    persist: bool = True,
 ) -> Any:
     """Run the interactive installed-app OAuth flow and persist the token.
 
@@ -139,7 +241,8 @@ def run_installed_app_flow(
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_file), list(scopes))
     credentials = flow.run_local_server(port=port)
-    save_credentials(credentials, token_file)
+    if persist:
+        save_credentials(credentials, token_file)
     return credentials
 
 
@@ -252,10 +355,18 @@ class GoogleCalendarBackend:
         previous = dict(sync_state or {})
         sync_token = previous.get("sync_token")
         known_ids: dict[str, str] = dict(previous.get("known_ids") or {})
+        coverage_kind, _, _ = sync_state_coverage(previous)
 
-        if sync_token:
+        if (
+            sync_token
+            and coverage_kind is SyncCoverageKind.BOUNDED_WINDOW
+        ):
             try:
-                return self._incremental_sync(str(sync_token), known_ids)
+                return self._incremental_sync(
+                    str(sync_token),
+                    known_ids,
+                    previous,
+                )
             except Exception as exc:  # noqa: BLE001 - status-based dispatch
                 if _http_status(exc) != 410:
                     raise
@@ -266,7 +377,10 @@ class GoogleCalendarBackend:
         return self._full_sync(known_ids)
 
     def _incremental_sync(
-        self, sync_token: str, known_ids: dict[str, str]
+        self,
+        sync_token: str,
+        known_ids: dict[str, str],
+        previous_state: SyncState,
     ) -> tuple[list[ExternalEvent], SyncState]:
         items, next_token = self._list_pages({"syncToken": sync_token})
         events = [self._parse_api_event(item) for item in items]
@@ -276,14 +390,30 @@ class GoogleCalendarBackend:
                 new_known.pop(event.external_id, None)
             else:
                 new_known[event.external_id] = event.etag or ""
-        return events, {"sync_token": next_token, "known_ids": new_known}
+        state: SyncState = {
+            "sync_token": next_token,
+            "known_ids": new_known,
+        }
+        coverage_kind, coverage_start, coverage_end = sync_state_coverage(
+            previous_state
+        )
+        if coverage_kind is SyncCoverageKind.BOUNDED_WINDOW:
+            return events, with_sync_state_coverage(
+                state,
+                kind=coverage_kind,
+                start=coverage_start,
+                end=coverage_end,
+            )
+        return events, state
 
     def _full_sync(self, known_ids: dict[str, str]) -> tuple[list[ExternalEvent], SyncState]:
         now = datetime.now(UTC)
+        coverage_start = now - timedelta(days=self._lookback_days)
+        coverage_end = now + timedelta(days=self._horizon_days)
         params = {
             "singleEvents": True,
-            "timeMin": _rfc3339(now - timedelta(days=self._lookback_days)),
-            "timeMax": _rfc3339(now + timedelta(days=self._horizon_days)),
+            "timeMin": _rfc3339(coverage_start),
+            "timeMax": _rfc3339(coverage_end),
         }
         items, next_token = self._list_pages(params)
         events = [self._parse_api_event(item) for item in items]
@@ -294,7 +424,12 @@ class GoogleCalendarBackend:
             for event_id in known_ids
             if event_id not in current_ids
         ]
-        return events + deletions, {"sync_token": next_token, "known_ids": current_ids}
+        return events + deletions, with_sync_state_coverage(
+            {"sync_token": next_token, "known_ids": current_ids},
+            kind=SyncCoverageKind.BOUNDED_WINDOW,
+            start=coverage_start,
+            end=coverage_end,
+        )
 
     def _list_pages(self, base_params: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
         """Drain ``events.list`` pagination; return (items, nextSyncToken)."""

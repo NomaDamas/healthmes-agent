@@ -79,7 +79,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
@@ -87,6 +87,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.activity.repository import legacy_app_usage_cutoff
+from healthmes.calendars.repository import retained_calendar_statement
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    read_visible_calendar,
+    require_calendar_visibility_current,
+)
 from healthmes.config import Settings
 from healthmes.mcp_server import interpret
 from healthmes.store.models import (
@@ -228,10 +234,6 @@ CARRYOVER_FREE_MINUTES = 240.0
 CARRYOVER_FULL_MINUTES = 540.0
 MEETING_SWITCH_WEIGHT = 0.3
 MEETING_MAX_SWITCHES_PER_WINDOW = 3
-# The calendar signal exists only while the mirror is actively synced: any
-# mirrored event within this many days around the target day counts as active.
-CALENDAR_ACTIVE_LOOKAROUND_DAYS = 7
-
 # Fragmentation: distracting-app launches in the trailing hour;
 # 12+ launches/hour = maximal fragmentation. The category vocabulary is
 # whatever the Android usage collector emits — the distracting subset of
@@ -374,6 +376,7 @@ class EnergyEstimate:
     score_exact: float | None  # sum of all component contributions
     components: tuple[dict[str, Any], ...]
     inputs_snapshot: dict[str, Any]
+    calendar_visibility: CalendarVisibility | None = None
 
     def components_payload(self) -> dict[str, Any]:
         """The JSONB dict stored in ``cognitive_energy_estimate.components``."""
@@ -1371,45 +1374,57 @@ class StoreDayContext:
     previous_day_events: tuple[tuple[datetime, datetime], ...]
     calendar_active: bool
     usage: tuple[UsageBucket, ...]
+    calendar_visibility: CalendarVisibility
 
 
-def load_store_day_context(session: Session, day: date) -> StoreDayContext:
-    """Prefetch one (UTC) day's calendar events and app-usage buckets."""
+def load_store_day_context(
+    session: Session,
+    settings: Settings,
+    day: date,
+) -> StoreDayContext:
+    """Prefetch one day's visible Calendar rows and independent usage data."""
     day_start = datetime.combine(day, time.min, tzinfo=UTC)
     day_end = day_start + timedelta(days=1)
     prev_start = day_start - timedelta(days=1)
 
-    event_rows = session.scalars(
-        select(CalendarEventMirror)
-        .where(
-            CalendarEventMirror.start_at < day_end,
-            CalendarEventMirror.end_at > prev_start,
-        )
-        .order_by(CalendarEventMirror.start_at)
-    ).all()
-    events = tuple(
-        (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
-        for row in event_rows
-        if _ensure_utc(row.start_at) < day_end and _ensure_utc(row.end_at) > day_start
-    )
-    previous_day_events = tuple(
-        (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
-        for row in event_rows
-        if _ensure_utc(row.start_at) < day_start and _ensure_utc(row.end_at) > prev_start
-    )
-
-    active_start = day_start - timedelta(days=CALENDAR_ACTIVE_LOOKAROUND_DAYS)
-    active_end = day_end + timedelta(days=CALENDAR_ACTIVE_LOOKAROUND_DAYS)
-    calendar_active = (
-        session.scalar(
-            select(CalendarEventMirror.id)
+    def read_events(
+        visibility: CalendarVisibility,
+    ) -> tuple[
+        tuple[tuple[datetime, datetime], ...],
+        tuple[tuple[datetime, datetime], ...],
+    ]:
+        event_statement = retained_calendar_statement(
+            session,
+            select(CalendarEventMirror)
             .where(
-                CalendarEventMirror.start_at < active_end,
-                CalendarEventMirror.end_at > active_start,
+                visibility.predicate(),
+                CalendarEventMirror.start_at < day_end,
+                CalendarEventMirror.end_at > prev_start,
             )
-            .limit(1)
+            .order_by(CalendarEventMirror.start_at),
         )
-        is not None
+        event_rows = session.scalars(event_statement).all()
+        events = tuple(
+            (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
+            for row in event_rows
+            if _ensure_utc(row.start_at) < day_end
+            and _ensure_utc(row.end_at) > day_start
+        )
+        previous_day_events = tuple(
+            (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
+            for row in event_rows
+            if _ensure_utc(row.start_at) < day_start
+            and _ensure_utc(row.end_at) > prev_start
+        )
+        return events, previous_day_events
+
+    (
+        (events, previous_day_events),
+        visibility,
+    ) = read_visible_calendar(
+        session,
+        settings,
+        read_events,
     )
 
     usage_start = day_start - timedelta(
@@ -1439,8 +1454,9 @@ def load_store_day_context(session: Session, day: date) -> StoreDayContext:
     return StoreDayContext(
         events=events,
         previous_day_events=previous_day_events,
-        calendar_active=calendar_active,
+        calendar_active=visibility.available,
         usage=usage,
+        calendar_visibility=visibility,
     )
 
 
@@ -1674,7 +1690,7 @@ class CognitiveEnergyEngine:
             cycle_rows=ow.cycle_rows,
         )
         with session_scope(self._session_factory) as session:
-            ctx = load_store_day_context(session, day)
+            ctx = load_store_day_context(session, self._settings, day)
         return self._estimate_window(digest, ow, ctx, start, end, now)
 
     def persist_current_window(self) -> EnergyEstimate:
@@ -1692,6 +1708,11 @@ class CognitiveEnergyEngine:
             )
             return estimate
         with session_scope(self._session_factory) as session:
+            assert estimate.calendar_visibility is not None
+            require_calendar_visibility_current(
+                self._settings,
+                estimate.calendar_visibility,
+            )
             self._upsert(session, estimate)
         logger.info(
             "Energy window %s persisted with score %s",
@@ -1733,7 +1754,7 @@ class CognitiveEnergyEngine:
                     score_exact=payload.get("score_exact"),
                     components=tuple(payload.get("items", ())),
                 )
-            ctx = load_store_day_context(session, day)
+            ctx = load_store_day_context(session, self._settings, day)
 
         windows = [
             (day_start + timedelta(hours=hour), day_start + timedelta(hours=hour + 1))
@@ -1878,13 +1899,16 @@ class CognitiveEnergyEngine:
                 "usage_buckets_seen": len(ctx.usage),
             },
         }
-        return compute_estimate(
-            window_start,
-            window_end,
-            signals,
-            missing,
-            generated_at=now,
-            snapshot_extra=snapshot_extra,
+        return replace(
+            compute_estimate(
+                window_start,
+                window_end,
+                signals,
+                missing,
+                generated_at=now,
+                snapshot_extra=snapshot_extra,
+            ),
+            calendar_visibility=ctx.calendar_visibility,
         )
 
     def _upsert(self, session: Session, estimate: EnergyEstimate) -> None:

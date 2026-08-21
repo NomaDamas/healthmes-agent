@@ -15,9 +15,10 @@ import logging
 import zoneinfo
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
+from urllib.parse import urlparse
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from healthmes.timezones import parse_timezone
@@ -57,16 +58,126 @@ class Settings(BaseSettings):
         "to auto-discovery via GET /api/v1/users (works only when the API key "
         "sees exactly one user).",
     )
-    hermes_webhook_url: str = Field(
-        default="http://localhost:8644/webhooks/healthmes-alerts",
-        description="Hermes gateway webhook route URL for proactive alert pushes. "
-        "Port 8644 is DEFAULT_PORT in vendor/hermes-agent/gateway/platforms/"
-        "webhook.py; the path is /webhooks/{route_name} with route "
-        "'healthmes-alerts' (config/hermes-config.yaml.tmpl).",
+    decision_hermes_base_url: str | None = Field(
+        default=None,
+        max_length=2_048,
+        description="Dedicated Hermes API-server origin exposing POST "
+        "/v1/responses for one complete autonomous HealthMes decision turn. "
+        "None keeps the decision REST entrypoint fail-closed.",
     )
-    hermes_webhook_secret: SecretStr = Field(
+    decision_hermes_api_key: SecretStr = Field(
         default=SecretStr(""),
-        description="HMAC secret shared with the Hermes webhook route.",
+        description="Bearer credential for the dedicated Hermes decision "
+        "runtime. Production HTTP composition requires it; bootstrap creates "
+        "the matching profile credential.",
+    )
+    decision_correlation_secret: SecretStr = Field(
+        default=SecretStr(""),
+        description="Stable owner secret used to authenticate decision "
+        "request fingerprints and derive wearable cursor signatures. Keep "
+        "it unchanged when rotating the Hermes runtime credential; bootstrap "
+        "generates it independently.",
+    )
+    decision_hermes_model: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Exact model identity requested from and expected in the "
+        "single Hermes Responses result. Required together with "
+        "decision_hermes_provider and decision_hermes_base_url.",
+    )
+    decision_hermes_provider: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Provider identity recorded for the dedicated Hermes "
+        "Responses runtime. Required together with decision_hermes_model and "
+        "decision_hermes_base_url.",
+    )
+    decision_hermes_profile_path: Path | None = Field(
+        default=None,
+        description="Rendered dedicated Hermes decision config validated "
+        "before the HTTP runtime starts. Production HTTP composition requires "
+        "this artifact; injected test transports may omit it.",
+    )
+    decision_hermes_runtime_manifest_path: Path | None = Field(
+        default=None,
+        description="Content-bound manifest emitted by bootstrap for the "
+        "dedicated Hermes supervisor. Production HTTP composition requires "
+        "this artifact.",
+    )
+    decision_hermes_attestation_key_path: Path | None = Field(
+        default=None,
+        description="Owner-only key shared by HealthMes and its dedicated "
+        "Hermes supervisor for nonce-bound runtime attestation.",
+    )
+    decision_hermes_allow_attested_private_http: bool = Field(
+        default=False,
+        description="Allow cleartext HTTP only for a private/container Hermes "
+        "origin that passes runtime attestation immediately before execution. "
+        "Public remote origins still require HTTPS.",
+    )
+    decision_hermes_discovery_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description="Timeout for authenticated Hermes tool-profile and "
+        "session-maintenance probes.",
+    )
+    decision_hermes_max_iteration_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        le=300,
+        description="Backward-compatible setting name for the upper bound on "
+        "one complete Hermes POST /v1/responses turn.",
+    )
+    decision_hermes_session_ttl_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        le=86_400,
+        description="Maximum age of a transcript in the dedicated Hermes "
+        "decision state before bounded maintenance deletes it.",
+    )
+    decision_hermes_session_purge_interval_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=3_600,
+        description="Interval for purging expired sessions from the dedicated "
+        "Hermes decision state.",
+    )
+    decision_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=300,
+        description="Wall-clock deadline for one complete Hermes autonomous "
+        "decision turn, including its MCP context calls.",
+    )
+    decision_finalization_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description="Maximum time allowed for atomic source revalidation "
+        "and DecisionRecord persistence after model reasoning completes. "
+        "Bounds process, SQLite file, and PostgreSQL transaction waits so "
+        "accepted requests can drain during shutdown.",
+    )
+    decision_execution_scope: Literal["local", "hosted"] = Field(
+        default="local",
+        description="Where decision prompts and aggregate context are "
+        "processed. Local requires a loopback Hermes origin. Operators must "
+        "explicitly select hosted when loopback Hermes proxies a cloud model.",
+    )
+    decision_max_pending_requests: int = Field(
+        default=8,
+        ge=1,
+        le=128,
+        description="Maximum accepted Decision Agent requests, including the "
+        "one currently executing. Additional requests fail fast with 429.",
+    )
+    decision_owner_principal_id: str = Field(
+        default="owner",
+        min_length=1,
+        max_length=255,
+        description="Server-owned identity of the single local HealthMes "
+        "owner. Decision clients cannot supply or override this value.",
     )
     public_base_url: str = Field(
         default="http://localhost:8100",
@@ -77,6 +188,12 @@ class Settings(BaseSettings):
         default=Path("data"),
         description="Local-first data directory (media files, sqlite db, exports, "
         "pidfiles). Only paths are stored in the database.",
+    )
+    restore_state_dir: Path | None = Field(
+        default=None,
+        description="Crash-recovery journal directory for snapshot restore. "
+        "None selects a stable backend-specific path outside replaceable "
+        "restore targets; set HEALTHMES_RESTORE_STATE_DIR to pin it explicitly.",
     )
     port: int = Field(
         default=8100,
@@ -116,8 +233,63 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = Field(
         default=False,
         description="Enable the in-process APScheduler loops (10-minute trigger "
-        "sweep, hourly cognitive-energy persist, weekly backup). Keep disabled "
-        "in tests and one-off tooling.",
+        "sweep, hourly cognitive-energy persist, weekly backup, and enabled "
+        "provider collectors). Keep disabled in tests and one-off tooling.",
+    )
+    activitywatch_enabled: bool = Field(
+        default=False,
+        description="Enable periodic import from the loopback ActivityWatch "
+        "server. The global scheduler_enabled gate must also be enabled.",
+    )
+    activitywatch_interval_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=24 * 60,
+        description="Minutes between ActivityWatch imports.",
+    )
+    activitywatch_device_id: str = Field(
+        default="activitywatch-desktop",
+        min_length=1,
+        max_length=255,
+        description="Stable HealthMes device identifier for this ActivityWatch collector. "
+        "Set a unique value on every computer that syncs to one HealthMes store.",
+    )
+    activitywatch_platform: Literal["macos", "windows", "linux"] = Field(
+        default="macos",
+        description="Desktop platform represented by this ActivityWatch collector.",
+    )
+    activitywatch_timezone: str | None = Field(
+        default=None,
+        max_length=64,
+        description="IANA timezone or UTC fixed offset used to bucket ActivityWatch "
+        "events. None inherits the HealthMes user timezone.",
+    )
+    activitywatch_base_url: str = Field(
+        default="http://127.0.0.1:5600",
+        description="Loopback-only ActivityWatch REST API base URL.",
+    )
+    activitywatch_window_minutes: int = Field(
+        default=24 * 60,
+        ge=1,
+        le=7 * 24 * 60,
+        description="Initial ActivityWatch lookback when no cursor exists. "
+        "Later runs resume incrementally from the stored cursor.",
+    )
+    activitywatch_timeout_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        le=300,
+        description="Bounded timeout for each ActivityWatch HTTP operation.",
+    )
+    activitywatch_window_bucket_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional explicit ActivityWatch current-window bucket id.",
+    )
+    activitywatch_afk_bucket_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional explicit ActivityWatch AFK-status bucket id.",
     )
     timezone: str | None = Field(
         default=None,
@@ -128,19 +300,17 @@ class Settings(BaseSettings):
         "containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
     )
 
-    # Delivery: proactive alerts reach the user through the Hermes webhook
-    # (phone+watch via Telegram) AND/OR the native companion apps, which poll
-    # /v1/alerts + /v1/briefing/glance. With native delivery on, a fired
-    # trigger is surfaced to the apps even when no Hermes webhook is
-    # configured or its push fails — so the phone gets alerts without Telegram.
+    # Delivery: proactive decisions are written to the durable alert stream
+    # consumed by native companion apps through /v1/alerts and
+    # /v1/briefing/glance. A later bounded delivery adapter may relay the same
+    # result to another channel without creating a second reasoning path.
     native_alert_delivery: bool = Field(
         default=True,
-        description="Surface fired triggers to the native companion apps "
-        "(/v1/alerts + glance) regardless of the Hermes webhook outcome — "
-        "enables phone/watch alerts without Telegram. Alert hygiene (quiet "
-        "hours, cooldown, daily budget, dedup) still applies. On by default "
-        "(PLAN §13: alerts must work with zero setup); set false to make "
-        "Telegram the only channel.",
+        description="Surface completed proactive decisions to the native "
+        "companion apps (/v1/alerts + glance). Alert hygiene (quiet hours, "
+        "cooldown, daily budget, dedup) still applies. On by default "
+        "(PLAN §13: alerts must work with zero setup); set false only when "
+        "another bounded delivery adapter owns display.",
     )
 
     # Raw-first ingest receiver (PLAN §13; healthmes/api/ingest.py). Bridge
@@ -160,6 +330,25 @@ class Settings(BaseSettings):
         "(POST /v1/media). Uploads beyond the cap are rejected with 413 and "
         "nothing is stored. Default 15 MiB — plenty for phone photos and "
         "voice memos while keeping a LAN peer from filling the disk.",
+    )
+    storage_maintenance_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Absolute cooperative deadline for filesystem work while "
+        "storage maintenance holds the global HealthMes write fence.",
+    )
+    storage_maintenance_max_hash_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1,
+        description="Maximum cumulative payload bytes hashed by one storage "
+        "maintenance run.",
+    )
+    storage_maintenance_max_directory_entries: int = Field(
+        default=4096,
+        ge=1,
+        description="Maximum cumulative directory scan and namespace mutation "
+        "entries consumed by one storage maintenance run.",
     )
     nutrition_ollama_base_url: str = Field(
         default="http://127.0.0.1:11434",
@@ -255,7 +444,7 @@ class Settings(BaseSettings):
     )
 
     # Alert hygiene (docs/PLAN.md §11: a noisy assistant gets muted within a
-    # week). Consumed by healthmes/engine/triggers.py before any webhook push.
+    # week). Consumed by healthmes/engine/triggers.py before decision dispatch.
     quiet_hours_start: datetime.time = Field(
         default=datetime.time(22, 30),
         description="Start of the do-not-disturb window (local time, e.g. '22:30'). "
@@ -345,6 +534,65 @@ class Settings(BaseSettings):
         "Empty: `healthmes backup create` errors and the weekly backup job "
         "skips with a warning.",
     )
+    backup_max_encrypted_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum encrypted snapshot envelope accepted or created.",
+    )
+    backup_max_decrypted_bytes: int = Field(
+        default=768 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum decrypted gzip-compressed tar payload held in memory.",
+    )
+    backup_max_archive_members: int = Field(
+        default=100_000,
+        ge=1,
+        le=1_000_000,
+        description="Maximum number of members allowed in one snapshot archive.",
+    )
+    backup_max_member_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum expanded size of one regular archive member.",
+    )
+    backup_max_expanded_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum total expanded regular-file bytes in one snapshot.",
+    )
+    backup_max_identity_depth: int = Field(
+        default=128,
+        ge=1,
+        le=1_024,
+        description="Maximum directory depth traversed while binding a local "
+        "restore generation to its journal identity.",
+    )
+    backup_identity_traversal_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Absolute wall-clock deadline for one local restore "
+        "identity phase, including every file hashed in that phase.",
+    )
+    backup_max_compression_ratio: float = Field(
+        default=100.0,
+        gt=1,
+        le=10_000,
+        description="Maximum expanded-to-compressed archive ratio.",
+    )
+    backup_min_free_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=0,
+        description="Free disk space retained after extraction or local restore staging.",
+    )
+    backup_postgres_tool_timeout_seconds: float = Field(
+        default=1800.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum wall-clock seconds for each PostgreSQL backup or "
+        "restore client operation (pg_dump, pg_restore, or psql). Increase "
+        "this for large databases or slow remote PostgreSQL targets.",
+    )
     ow_database_url: str | None = Field(
         default=None,
         description="Direct SQLAlchemy/postgres URL of the open-wearables database, "
@@ -405,7 +653,17 @@ class Settings(BaseSettings):
     @field_validator(
         "ow_user_id",
         "timezone",
+        "activitywatch_timezone",
+        "activitywatch_window_bucket_id",
+        "activitywatch_afk_bucket_id",
+        "decision_hermes_base_url",
+        "decision_hermes_model",
+        "decision_hermes_provider",
+        "decision_hermes_profile_path",
+        "decision_hermes_runtime_manifest_path",
+        "decision_hermes_attestation_key_path",
         "backup_dir",
+        "restore_state_dir",
         "ow_database_url",
         "hermes_home",
         "google_client_secret_file",
@@ -428,6 +686,136 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator(
+        "decision_hermes_model",
+        "decision_hermes_provider",
+    )
+    @classmethod
+    def _strip_decision_runtime_identity(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("decision runtime identity must not be blank")
+        return cleaned
+
+    @field_validator("decision_owner_principal_id")
+    @classmethod
+    def _strip_decision_owner_principal_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(
+                "decision owner principal ID must not be blank"
+            )
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_decision_runtime_bundle(self) -> Self:
+        configured = (
+            self.decision_hermes_base_url,
+            self.decision_hermes_model,
+            self.decision_hermes_provider,
+        )
+        if any(value is not None for value in configured) and not all(
+            value is not None for value in configured
+        ):
+            raise ValueError(
+                "decision_hermes_base_url, decision_hermes_model, and "
+                "decision_hermes_provider must be configured together"
+            )
+        if (
+            self.decision_execution_scope == "local"
+            and self.decision_hermes_base_url is not None
+        ):
+            parsed = urlparse(self.decision_hermes_base_url)
+            if (
+                parsed.hostname is not None
+                and not is_loopback_host(parsed.hostname)
+                and not self.decision_hermes_allow_attested_private_http
+            ):
+                raise ValueError(
+                    "local decision execution requires a loopback Hermes "
+                    "origin or an explicitly attested private runtime; set "
+                    "decision_execution_scope='hosted' for remote or cloud "
+                    "processing"
+                )
+        if (
+            self.decision_hermes_session_ttl_seconds
+            <= self.decision_timeout_seconds
+        ):
+            raise ValueError(
+                "decision Hermes session TTL must exceed the decision timeout"
+            )
+        if (
+            self.decision_hermes_session_purge_interval_seconds
+            > self.decision_hermes_session_ttl_seconds
+        ):
+            raise ValueError(
+                "decision Hermes session purge interval must not exceed "
+                "the session TTL"
+            )
+        return self
+
+    @field_validator("activitywatch_device_id")
+    @classmethod
+    def _validate_activitywatch_device_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("activitywatch_device_id must not be blank")
+        return value
+
+    @field_validator(
+        "activitywatch_window_bucket_id",
+        "activitywatch_afk_bucket_id",
+    )
+    @classmethod
+    def _validate_activitywatch_bucket_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or value in {".", ".."}:
+            raise ValueError("ActivityWatch bucket IDs must be non-dot path segments")
+        return value
+
+    @field_validator("activitywatch_timezone")
+    @classmethod
+    def _validate_activitywatch_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parse_timezone(value)
+        except ValueError as exc:
+            raise ValueError(
+                "activitywatch_timezone must be a valid IANA name or UTC offset"
+            ) from exc
+        return value
+
+    @field_validator("activitywatch_base_url")
+    @classmethod
+    def _validate_activitywatch_base_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme != "http" or parsed.hostname is None:
+            raise ValueError("activitywatch_base_url must use loopback HTTP")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("activitywatch_base_url must not contain credentials")
+        host = parsed.hostname
+        if host != "localhost":
+            try:
+                if not ipaddress.ip_address(host).is_loopback:
+                    raise ValueError(
+                        "activitywatch_base_url must be loopback-only"
+                    )
+            except ValueError as exc:
+                if "loopback-only" in str(exc):
+                    raise
+                raise ValueError(
+                    "activitywatch_base_url must be loopback-only"
+                ) from exc
+        return value.rstrip("/")
 
 
 @lru_cache(maxsize=1)

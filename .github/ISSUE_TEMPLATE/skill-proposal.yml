@@ -15,7 +15,7 @@ body:
     id: tools
     attributes:
       label: Tools it reads
-      description: Which existing MCP tools supply the facts (mcp__healthmes__* / mcp__open_wearables__*)? If a needed fact has no tool yet, file a Metric proposal first and link it here.
+      description: Which existing HealthMes MCP tools supply the facts (mcp__healthmes__*)? Wearable facts must also be requested through HealthMes. If a needed fact has no tool yet, file a Metric proposal first and link it here.
     validations:
       required: true
   - type: textarea

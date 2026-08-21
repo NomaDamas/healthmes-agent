@@ -17,6 +17,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from healthmes import clock
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
     ConfirmationStatus,
@@ -62,6 +66,7 @@ from healthmes.nutrition.schema import (
 from healthmes.nutrition.transcription import NutritionTranscriber
 from healthmes.nutrition.vision import VisionProvider
 from healthmes.storage import classify_storage_object, ensure_default_policies
+from healthmes.storage.service import DEFAULT_RETENTION, RETENTION_PRESETS
 from healthmes.store import RetentionPolicy, WellnessEvent
 
 INTERACTION_EVENT = "nutrition.interaction.v1"
@@ -262,13 +267,38 @@ def _stored_as_utc(value: datetime) -> datetime:
 
 
 def _policy(session: Session, data_class: str) -> RetentionPolicy:
-    ensure_default_policies(session)
     policy = session.scalar(
-        select(RetentionPolicy).where(RetentionPolicy.data_class == data_class)
+        select(RetentionPolicy)
+        .where(RetentionPolicy.data_class == data_class)
+        .execution_options(populate_existing=True)
     )
     if policy is None:  # pragma: no cover - defaults own this invariant
         raise IntakeInteractionError(f"missing retention policy: {data_class}")
     return policy
+
+
+def _read_retention_expiry(
+    session: Session,
+    data_class: str,
+    observed_at: datetime,
+) -> datetime | None:
+    """Read retention without bootstrapping or mutating a search session."""
+    policy = session.scalar(
+        select(RetentionPolicy)
+        .where(RetentionPolicy.data_class == data_class)
+        .execution_options(populate_existing=True)
+    )
+    if policy is not None:
+        return _expiry(policy, observed_at)
+    preset = DEFAULT_RETENTION.get(data_class)
+    if preset is None:
+        return None
+    days = RETENTION_PRESETS[preset]
+    return (
+        None
+        if days is None
+        else observed_at + timedelta(days=days)
+    )
 
 
 def _expiry(policy: RetentionPolicy, observed_at: datetime) -> datetime | None:
@@ -281,10 +311,12 @@ def _event_by_source_record(
     session: Session, source_provider: str, source_record_id: str
 ) -> WellnessEvent | None:
     return session.scalar(
-        select(WellnessEvent).where(
+        select(WellnessEvent)
+        .where(
             WellnessEvent.source_provider == source_provider,
             WellnessEvent.source_record_id == source_record_id,
         )
+        .execution_options(populate_existing=True)
     )
 
 
@@ -411,7 +443,7 @@ def _persist_interaction_operation_marker(
         if state == "processing":
             if existing.payload.get("reservation_token") != reservation_token:
                 raise IntakeAnalysisInProgress(
-                    "intake interaction analysis is already in progress"
+                    "intake interaction analysis reservation is stale"
                 )
             completed_payload = {
                 "operation_kind": "intake_interaction",
@@ -537,7 +569,8 @@ def _reserve_interaction_analysis(
             }
         return reservation_token
 
-    with Session(bind=bind) as reservation_session:
+    with activity_write_lock(), Session(bind=bind) as reservation_session:
+        lock_activity_write_plane(reservation_session)
         marker = reservation_session.scalar(
             select(WellnessEvent)
             .where(
@@ -635,7 +668,8 @@ def _release_interaction_analysis(
         )
         return
     bind = session.get_bind()
-    with Session(bind=bind) as reservation_session:
+    with activity_write_lock(), Session(bind=bind) as reservation_session:
+        lock_activity_write_plane(reservation_session)
         marker = reservation_session.scalar(
             select(WellnessEvent)
             .where(
@@ -1064,6 +1098,8 @@ def create_interaction(
     *,
     reservation_token: str | None = None,
 ) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     _validate_operation_fingerprint(interaction.operation_fingerprint)
     if (
         reservation_token is not None
@@ -1406,8 +1442,11 @@ def get_interaction(
             ),
         )
     else:
-        raw_policy = _policy(session, "nutrition_raw_capture")
-        raw_expiry = _expiry(raw_policy, _as_utc(interaction.observed_at))
+        raw_expiry = _read_retention_expiry(
+            session,
+            "nutrition_raw_capture",
+            _as_utc(interaction.observed_at),
+        )
         if (
             raw is not None
             or (
@@ -1454,7 +1493,13 @@ def _existing_interaction_operation(
         operation_name="intake interaction",
     )
     if existing is not None:
-        return get_interaction(session, interaction_id)
+        stored = get_interaction(session, interaction_id)
+        if stored is None:
+            _reject_expired_idempotent(
+                existing,
+                operation_name="intake interaction",
+            )
+        return stored
     if marker is not None:
         if marker.payload.get("operation_state") == "processing":
             if allow_processing:
@@ -1482,6 +1527,11 @@ def create_photo_interaction(
     recorded_at: datetime,
     source_text: str | None = None,
 ) -> IntakeInteraction:
+    # Read the observation and its latest review under the same retention
+    # generation that will be used by create_interaction(). Model analysis is
+    # performed by the caller before this function, so this fence covers only
+    # the short database read/write section.
+    lock_activity_write_plane(session)
     existing = _existing_interaction_operation(
         session,
         interaction_id=operation_id,
@@ -1524,6 +1574,8 @@ def create_photo_interaction(
 
 
 def persist_outcome(session: Session, outcome: IntakeOutcome) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     _validate_operation_fingerprint(outcome.operation_fingerprint)
     existing = _idempotent_existing(
         _event_by_source_record(
@@ -1724,6 +1776,8 @@ def list_interactions(
 def persist_decision_request(
     session: Session, request: IntakeDecisionRequest
 ) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     _validate_operation_fingerprint(request.operation_fingerprint)
     existing = _idempotent_existing(
         _event_by_source_record(
@@ -1846,6 +1900,8 @@ def get_decision_request(
 
 
 def persist_decision(session: Session, decision: IntakeDecision) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     _validate_operation_fingerprint(decision.operation_fingerprint)
     existing = _idempotent_existing(
         _event_by_source_record(

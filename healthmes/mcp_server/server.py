@@ -3,8 +3,8 @@
 Design (docs/PLAN.md 1.5): MCP tools return deterministic facts — lookups and
 *interpreted* deltas with confidence/coverage — never raw series dumps and
 never LLM judgment. Health tools read the open-wearables REST API through
-:class:`healthmes.mcp_server.ow_client.OWClient`; task/schedule/food/decision
-tools use the healthmes domain store. All numeric interpretation lives in
+:class:`healthmes.mcp_server.ow_client.OWClient`; task/schedule/food tools use
+the healthmes domain store. All numeric interpretation lives in
 :mod:`healthmes.mcp_server.interpret`.
 
 The server is exposed over Streamable HTTP for mounting at ``/mcp`` on the
@@ -16,7 +16,7 @@ Tranche-1 tools:
   ``get_personal_baselines`` (open-wearables interpreted reads)
 - ``list_tasks`` / ``upsert_task`` / ``get_schedule`` /
   ``propose_schedule_blocks`` (schedule domain, propose-then-confirm gate)
-- ``log_food`` / ``record_decision`` (capture + explainability)
+- ``log_food`` (bounded capture command)
 
 Tranche-2 tools (docs/PLAN.md Phase 2, Layer B second tranche):
 - ``get_cognitive_energy_forecast`` — persisted ``cognitive_energy_estimate``
@@ -45,6 +45,7 @@ import functools
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
@@ -53,13 +54,15 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import schedule_proposals
 from healthmes.activity.mcp import register_activity_tools
 from healthmes.activity.repository import legacy_app_usage_cutoff
+from healthmes.calendars import creds
 from healthmes.calendars.adjustments import (
+    CalendarAccountGenerationChanged,
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
@@ -67,8 +70,13 @@ from healthmes.calendars.adjustments import (
     issue_reply_handle,
 )
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.connection import CalendarBackendFence
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.calendars.intake import intake_revision
+from healthmes.calendars.repository import (
+    retained_calendar_event,
+    retained_calendar_statement,
+)
 from healthmes.calendars.sleep_context import (
     actual_sleep_context_with_source_ref,
     actual_sleep_observation_context,
@@ -78,7 +86,19 @@ from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.calendars.sleep_source import (
     select_actual_sleep_rows_with_source,
 )
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+    require_calendar_visibility_current,
+)
 from healthmes.config import Settings, get_settings, system_timezone
+from healthmes.decision.composition import (
+    build_decision_context_search_session_service,
+)
+from healthmes.decision.search import (
+    DecisionContextSearchSessionService,
+)
 from healthmes.mcp_server import (
     adjustment_tools,
     arousal,
@@ -92,7 +112,15 @@ from healthmes.mcp_server.caffeine_contract import (
     CaffeineProductForm,
     SupportedPopulationStatus,
 )
+from healthmes.mcp_server.domain_search import (
+    register_domain_search_tools,
+)
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
+from healthmes.mcp_server.wellness_skills import (
+    WellnessSkillCatalogError,
+    list_reviewed_wellness_skills,
+    read_reviewed_wellness_skill,
+)
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
     ConfirmationStatus,
@@ -152,6 +180,7 @@ from healthmes.nutrition.vision import (
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
+    CalendarSource,
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
@@ -163,8 +192,8 @@ from healthmes.store import (
     ScheduleProposal,
     Task,
     TaskSource,
-    TriggerEvent,
     WeeklyGoal,
+    get_session_factory,
     session_scope,
 )
 from healthmes.store import enums as store_enums
@@ -209,9 +238,6 @@ MEDICAL_HEALTH_CONTEXT_KEY = "health"
 MEDICAL_CAPTURE_CONTEXT_KEY = "capture"
 MAX_MEDICAL_RANGE_DAYS = 365
 MAX_MEDICAL_LIST_LIMIT = 500
-DECISION_TREE_NODE_TYPES = frozenset({"input", "rule", "llm_step", "option", "action"})
-MAX_TREE_DEPTH = 12
-MAX_TREE_NODES = 500
 SCHEDULE_PROPOSAL_TTL = dt.timedelta(hours=24)
 
 _RANGE_PATTERN = re.compile(r"^(\d{1,3})d$")
@@ -224,7 +250,7 @@ mcp: FastMCP = FastMCP(
     instructions=(
         "HealthMes Layer B tools: deterministic, pre-interpreted health context "
         "(baselines, deltas, confidence/coverage — never raw series) plus the "
-        "task/schedule/food/decision domain of the HealthMes assistant. "
+        "task/schedule/food domain of the HealthMes assistant. "
         "Health tools may honestly return status=insufficient_data; treat low "
         "confidence as a reason to avoid categorical advice. For planning use "
         "get_cognitive_energy_forecast (hourly local-day energy windows), "
@@ -232,14 +258,37 @@ mcp: FastMCP = FastMCP(
         "calendar and app context), and compare_impact (before/after deltas "
         "around a factor; associations, not causation). Schedule writes go "
         "through propose_schedule_blocks (propose-then-confirm; proposals are "
-        "not calendar events yet). Always call record_decision after making or "
-        "proposing a decision so it can be explained in the decision viewer. "
+        "not calendar events yet). The filtered wellness decision runtime "
+        "uses the reviewed read-only Skill catalog and domain search tools; "
+        "HealthMes validates sources and conditionally persists a compact "
+        "DecisionRecord after the runtime returns. "
         "Medical-lite capture (create_medical_record / list_medical_records) "
         "is strictly local: records, media and transcripts never leave this "
         "machine — after capture only the structured description text may "
         "re-enter the model context."
     ),
 )
+
+
+@mcp.tool
+def list_wellness_skills() -> dict[str, Any]:
+    """List reviewed read-only guidance available to wellness decisions."""
+
+    try:
+        return list_reviewed_wellness_skills()
+    except WellnessSkillCatalogError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+def read_wellness_skill(name: str) -> dict[str, Any]:
+    """Read one exact reviewed wellness skill by allowlisted name."""
+
+    try:
+        return read_reviewed_wellness_skill(name)
+    except WellnessSkillCatalogError as exc:
+        raise ToolError(str(exc)) from exc
+
 
 # ---------------------------------------------------------------------------
 # Runtime state (overridable for tests and for app-lifespan wiring)
@@ -253,6 +302,14 @@ _discovered_user_id: str | None = None
 _timezone_override: dt.tzinfo | None = None
 _energy_engine_override: Any | None = None
 _calendar_adjustment_writer_override: CalendarAdjustmentWriter | None = None
+_decision_search_service_override: (
+    DecisionContextSearchSessionService | None
+) = None
+_decision_search_service_cached: (
+    DecisionContextSearchSessionService | None
+) = None
+_decision_search_service_lock = threading.Lock()
+_ACCOUNT_GENERATION_UNCHECKED = object()
 
 
 def set_settings(settings: Settings | None) -> None:
@@ -262,6 +319,7 @@ def set_settings(settings: Settings | None) -> None:
     different ``ow_user_id``.
     """
     global _settings_override, _discovered_user_id
+    _clear_decision_search_session_service()
     _settings_override = settings
     _discovered_user_id = None
 
@@ -275,6 +333,7 @@ def set_ow_client(client: OWClient | None) -> None:
 def set_session_factory(factory: sessionmaker[Session] | None) -> None:
     """Override the store session factory (None restores the process-wide one)."""
     global _session_factory_override
+    _clear_decision_search_session_service()
     _session_factory_override = factory
 
 
@@ -304,6 +363,56 @@ def set_calendar_adjustment_writer(writer: CalendarAdjustmentWriter | None) -> N
     _calendar_adjustment_writer_override = writer
 
 
+def set_decision_search_session_service(
+    service: DecisionContextSearchSessionService | None,
+) -> None:
+    """Override the request-scoped decision search service."""
+
+    global _decision_search_service_override
+    _clear_decision_search_session_service()
+    _decision_search_service_override = service
+
+
+def _clear_decision_search_session_service() -> None:
+    global _decision_search_service_cached, _decision_search_service_override
+    with _decision_search_service_lock:
+        services = {
+            service
+            for service in (
+                _decision_search_service_cached,
+                _decision_search_service_override,
+            )
+            if service is not None
+        }
+        _decision_search_service_cached = None
+        _decision_search_service_override = None
+    for service in services:
+        service.close()
+
+
+def get_decision_search_session_service(
+) -> DecisionContextSearchSessionService:
+    """Return the process service shared by #169 and all four MCP tools."""
+
+    global _decision_search_service_cached
+    with _decision_search_service_lock:
+        if _decision_search_service_override is not None:
+            return _decision_search_service_override
+        if _decision_search_service_cached is None:
+            factory = (
+                _session_factory_override
+                if _session_factory_override is not None
+                else get_session_factory()
+            )
+            _decision_search_service_cached = (
+                build_decision_context_search_session_service(
+                    settings=_active_settings(),
+                    session_factory=factory,
+                )
+            )
+        return _decision_search_service_cached
+
+
 def reset_runtime_state() -> None:
     """Clear every override and cache (test teardown)."""
     global _discovered_user_id
@@ -319,6 +428,66 @@ def reset_runtime_state() -> None:
 
 def _active_settings() -> Settings:
     return _settings_override if _settings_override is not None else get_settings()
+
+
+def _calendar_account_generations() -> dict[CalendarSource, str]:
+    return creds.calendar_account_generations(_active_settings())
+
+
+def _read_visible_calendar_rows(
+    session: Session,
+    statement: Any,
+) -> tuple[list[CalendarEventMirror], CalendarVisibility]:
+    """Read mirror rows from one stable, successfully synced account set."""
+
+    retained_statement = retained_calendar_statement(session, statement)
+    try:
+        return read_visible_calendar(
+            session,
+            _active_settings(),
+            lambda visibility: list(
+                session.scalars(
+                    retained_statement.where(visibility.predicate())
+                ).all()
+            ),
+        )
+    except CalendarVisibilityChanged as exc:
+        raise ToolError(
+            "calendar visibility changed during the request; retry"
+        ) from exc
+
+
+def _read_visible_calendar_event(
+    session: Session,
+    event_id: uuid.UUID,
+) -> tuple[CalendarEventMirror | None, CalendarVisibility]:
+    rows, visibility = _read_visible_calendar_rows(
+        session,
+        select(CalendarEventMirror).where(
+            CalendarEventMirror.id == event_id
+        ),
+    )
+    return (rows[0] if rows else None), visibility
+
+
+def _calendar_limitations(
+    visibility: CalendarVisibility,
+) -> list[str]:
+    return list(visibility.limitations)
+
+
+def _require_calendar_visibility_snapshot(
+    visibility: CalendarVisibility,
+) -> None:
+    try:
+        require_calendar_visibility_current(
+            _active_settings(),
+            visibility,
+        )
+    except CalendarVisibilityChanged as exc:
+        raise ToolError(
+            "calendar visibility changed during the request; retry"
+        ) from exc
 
 
 def get_ow_client() -> OWClient:
@@ -402,30 +571,73 @@ def _build_energy_engine() -> Any:
 
 
 class _LazyGoogleAdjustmentWriter:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        expected_account_generation: str | None | object = (
+            _ACCOUNT_GENERATION_UNCHECKED
+        ),
+    ) -> None:
         self._settings = settings
-        self._backend: GoogleCalendarBackend | None = None
-
-    def _writer(self) -> GoogleCalendarBackend:
-        if self._backend is None:
-            self._backend = GoogleCalendarBackend.from_data_dir(
+        self._expected_account_generation = expected_account_generation
+        self._backend_fence = CalendarBackendFence(
+            source=CalendarSource.GOOGLE,
+            backend_factory=lambda: GoogleCalendarBackend.from_data_dir(
                 self._settings.data_dir,
                 calendar_id=self._settings.google_calendar_id,
                 interactive=False,
+            ),
+            generation_resolver=lambda: (
+                creds.calendar_connection_generation(
+                    self._settings,
+                    CalendarSource.GOOGLE,
+                )
+            ),
+        )
+
+    def _assert_expected_account_generation(self) -> None:
+        if (
+            self._expected_account_generation
+            is _ACCOUNT_GENERATION_UNCHECKED
+        ):
+            return
+        current = creds.calendar_account_generation(
+            self._settings,
+            CalendarSource.GOOGLE,
+        )
+        if current != self._expected_account_generation:
+            raise CalendarAccountGenerationChanged(
+                "calendar account changed after proposal creation"
             )
-        return self._backend
 
     def apply_confirmed_external_time_change(self, change):
-        return self._writer().apply_confirmed_external_time_change(change)
+        with _store_session() as session:
+            with self._backend_fence.use(session) as backend:
+                self._assert_expected_account_generation()
+                writer: CalendarAdjustmentWriter = backend
+                return writer.apply_confirmed_external_time_change(change)
 
     def read_event(self, external_id: str):
-        return self._writer().read_event(external_id)
+        with _store_session() as session:
+            with self._backend_fence.use(session) as backend:
+                self._assert_expected_account_generation()
+                writer: CalendarAdjustmentWriter = backend
+                return writer.read_event(external_id)
 
 
-def _calendar_adjustment_writer() -> CalendarAdjustmentWriter:
+def _calendar_adjustment_writer(
+    source: CalendarSource,
+    account_generation: str | None,
+) -> CalendarAdjustmentWriter | None:
+    if source is not CalendarSource.GOOGLE:
+        return None
     if _calendar_adjustment_writer_override is not None:
         return _calendar_adjustment_writer_override
-    return _LazyGoogleAdjustmentWriter(_active_settings())
+    return _LazyGoogleAdjustmentWriter(
+        _active_settings(),
+        expected_account_generation=account_generation,
+    )
 
 
 def _adjustment_handle_secret(settings: Settings | None = None) -> str:
@@ -990,7 +1202,12 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         (
             actual_sleep_block,
             actual_sleep_source_ref,
-        ) = actual_sleep_context_with_source_ref(session, as_of, tz)
+        ) = actual_sleep_context_with_source_ref(
+            session,
+            as_of,
+            tz,
+            account_generations=_calendar_account_generations(),
+        )
     fresh_sleep: ActualSleepObservation | None = None
     fresh_sleep_source_row: Mapping[str, Any] | None = None
     if actual_sleep_block["status"] != interpret.STATUS_OK:
@@ -1749,14 +1966,15 @@ async def _arousal_hints_for(
 
     with _store_session() as session:
         usage_cutoff = legacy_app_usage_cutoff(session)
-        event_rows = session.scalars(
+        event_rows, calendar_visibility = _read_visible_calendar_rows(
+            session,
             select(CalendarEventMirror)
             .where(
                 CalendarEventMirror.start_at < end_utc,
                 CalendarEventMirror.end_at > start_utc,
             )
-            .order_by(CalendarEventMirror.start_at)
-        ).all()
+            .order_by(CalendarEventMirror.start_at),
+        )
         usage_statement = select(AppUsageSample).where(
             AppUsageSample.bucket_start
             >= start_utc - dt.timedelta(minutes=60),
@@ -1798,7 +2016,7 @@ async def _arousal_hints_for(
             for row in meal_rows
         ]
 
-    return arousal.build_arousal_hints(
+    result = arousal.build_arousal_hints(
         day=day,
         tz=tz,
         hr_samples=[(at.astimezone(tz), value) for at, value in hr_utc],
@@ -1809,6 +2027,8 @@ async def _arousal_hints_for(
         context_for=lambda start, end: timeline.attach_context(start, end, events, usage),
         meals=meals,
     )
+    _require_calendar_visibility_snapshot(calendar_visibility)
+    return result
 
 
 @mcp.tool
@@ -1930,14 +2150,15 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
 
     with _store_session() as session:
         usage_cutoff = legacy_app_usage_cutoff(session)
-        event_rows = session.scalars(
+        event_rows, calendar_visibility = _read_visible_calendar_rows(
+            session,
             select(CalendarEventMirror)
             .where(
                 CalendarEventMirror.start_at < end_utc,
                 CalendarEventMirror.end_at > start_utc,
             )
-            .order_by(CalendarEventMirror.start_at)
-        ).all()
+            .order_by(CalendarEventMirror.start_at),
+        )
         usage_statement = select(AppUsageSample).where(
             AppUsageSample.bucket_start
             >= start_utc - dt.timedelta(minutes=60),
@@ -1997,6 +2218,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         response["arousal_hints"] = await _arousal_hints_for(
             client, user_id, day, tz, start_utc, end_utc
         )
+    _require_calendar_visibility_snapshot(calendar_visibility)
     return response
 
 
@@ -2046,7 +2268,11 @@ IMPACT_MAX_EXAMPLES = 3
 
 def _collect_store_occurrences(
     factor: str, start_utc: dt.datetime, end_utc: dt.datetime
-) -> tuple[list[impact.Occurrence], dict[str, int]]:
+) -> tuple[
+    list[impact.Occurrence],
+    dict[str, int],
+    CalendarVisibility,
+]:
     """Factor occurrences from the healthmes store (food / calendar / done tasks)."""
     occurrences: list[impact.Occurrence] = []
     counts = {"food_log": 0, "calendar": 0, "task": 0}
@@ -2058,12 +2284,14 @@ def _collect_store_occurrences(
                 at = _ensure_utc_dt(row.logged_at)
                 occurrences.append(impact.Occurrence("food_log", row.description[:80], at, at))
                 counts["food_log"] += 1
-        for row in session.scalars(
+        calendar_rows, calendar_visibility = _read_visible_calendar_rows(
+            session,
             select(CalendarEventMirror).where(
                 CalendarEventMirror.start_at >= start_utc,
                 CalendarEventMirror.start_at < end_utc,
-            )
-        ):
+            ),
+        )
+        for row in calendar_rows:
             if impact.matches(factor, row.summary):
                 occurrences.append(
                     impact.Occurrence(
@@ -2085,7 +2313,7 @@ def _collect_store_occurrences(
                 at = _ensure_utc_dt(row.updated_at)
                 occurrences.append(impact.Occurrence("task", row.title[:80], at, at))
                 counts["task"] += 1
-    return occurrences, counts
+    return occurrences, counts, calendar_visibility
 
 
 async def _collect_workout_occurrences(
@@ -2241,7 +2469,11 @@ async def compare_impact(
     user_id = await _resolve_user_id()
     client = get_ow_client()
 
-    occurrences, counts = _collect_store_occurrences(factor, start_utc, end_utc)
+    occurrences, counts, calendar_visibility = _collect_store_occurrences(
+        factor,
+        start_utc,
+        end_utc,
+    )
     workout_occurrences = await _collect_workout_occurrences(
         client, user_id, factor, start_utc, end_utc
     )
@@ -2294,6 +2526,7 @@ async def compare_impact(
             "truncated": truncated,
         },
     }
+    _require_calendar_visibility_snapshot(calendar_visibility)
     if stats["n"] < impact.MIN_PAIRED_OBSERVATIONS:
         return {
             "status": interpret.STATUS_INSUFFICIENT,
@@ -2665,12 +2898,14 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
     end = start + dt.timedelta(days=days)
 
     with _store_session() as session:
-        events = list(
-            session.scalars(
-                select(CalendarEventMirror)
-                .where(CalendarEventMirror.start_at < end, CalendarEventMirror.end_at > start)
-                .order_by(CalendarEventMirror.start_at)
+        events, visibility = _read_visible_calendar_rows(
+            session,
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.start_at < end,
+                CalendarEventMirror.end_at > start,
             )
+            .order_by(CalendarEventMirror.start_at),
         )
         proposals = list(
             session.scalars(
@@ -2715,11 +2950,13 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
             }
             for proposal in proposals
         ]
+        _require_calendar_visibility_snapshot(visibility)
     return {
         "status": "ok",
         "window": {"start": _iso_utc(start), "end": _iso_utc(end), "days": days},
         "events": event_payload,
         "proposals": proposal_payload,
+        "calendar_limitations": _calendar_limitations(visibility),
     }
 
 
@@ -2739,12 +2976,14 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
     with _store_session() as write_session:
         repository = SqlAlchemyAdjustmentRepository(write_session)
         repository.begin_evaluation_boundary()
-        candidates = list(
-            write_session.scalars(
-                select(CalendarEventMirror)
-                .where(CalendarEventMirror.start_at < end, CalendarEventMirror.end_at > start)
-                .order_by(CalendarEventMirror.start_at)
+        candidates, visibility = _read_visible_calendar_rows(
+            write_session,
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.start_at < end,
+                CalendarEventMirror.end_at > start,
             )
+            .order_by(CalendarEventMirror.start_at),
         )
         afternoon_busy = _afternoon_busy_minutes(candidates, local_date, tz)
         candidate_payload = [_mirror_to_adjustment_candidate(event) for event in candidates]
@@ -2762,7 +3001,10 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
         )
         proposal = repository.get_proposal(result.proposal_id) if result.proposal_id else None
         mirror = (
-            write_session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            retained_calendar_event(
+                write_session,
+                proposal.snapshot.mirror_event_id,
+            )
             if proposal is not None
             else None
         )
@@ -2777,6 +3019,7 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
             if proposal is not None
             else None
         )
+        _require_calendar_visibility_snapshot(visibility)
         decision_url = (
             display["viewer_url"]
             if display is not None
@@ -2842,13 +3085,23 @@ def resolve_calendar_adjustment(
         if proposal is None:
             raise ToolError("reply_handle is invalid, expired, or already consumed")
 
-        writer = _calendar_adjustment_writer()
+        current_account_generation = creds.calendar_account_generation(
+            _active_settings(),
+            proposal.snapshot.calendar_source,
+        )
+        writer = _calendar_adjustment_writer(
+            proposal.snapshot.calendar_source,
+            proposal.snapshot.account_generation,
+        )
         service = CalendarAdjustmentService(
             repository,
             handle_secret=_adjustment_handle_secret(),
         )
         mirror_snapshot = (
-            session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            retained_calendar_event(
+                session,
+                proposal.snapshot.mirror_event_id,
+            )
             if proposal.snapshot.mirror_event_id is not None
             else None
         )
@@ -2859,6 +3112,7 @@ def resolve_calendar_adjustment(
             writer=writer,
             response_channel="telegram",
             mirror_snapshot=mirror_snapshot,
+            current_account_generation=current_account_generation,
         )
         current = repository.get_proposal(proposal.id)
         outcome_url = (
@@ -2874,14 +3128,21 @@ def resolve_calendar_adjustment(
 
 
 def expire_and_reconcile_calendar_adjustments() -> list[dict[str, Any]]:
-    writer = _calendar_adjustment_writer()
     with _store_session() as session:
         repository = SqlAlchemyAdjustmentRepository(session)
         service = CalendarAdjustmentService(
             repository,
             handle_secret=_adjustment_handle_secret(),
         )
-        results = service.expire_and_reconcile_adjustments(writer)
+        results = service.expire_and_reconcile_adjustments(
+            writer_resolver=_calendar_adjustment_writer,
+            account_generation_resolver=lambda source: (
+                creds.calendar_account_generation(
+                    _active_settings(),
+                    source,
+                )
+            ),
+        )
         return [
             {"status": _enum_value(result.status), "receipt": result.receipt} for result in results
         ]
@@ -2936,7 +3197,10 @@ async def get_caffeine_proposal(
     )
     event_uuid = _parse_uuid(event_id, "event_id")
     with _store_session() as session:
-        event = session.get(CalendarEventMirror, event_uuid)
+        event, calendar_visibility = _read_visible_calendar_event(
+            session,
+            event_uuid,
+        )
         event_snapshot = (
             {
                 "id": str(event.id),
@@ -2999,12 +3263,14 @@ async def get_caffeine_proposal(
         contraindications=contraindications,
         product_form=product_form,
     )
-    return caffeine_adapter.serialize_proposal(
+    result = caffeine_adapter.serialize_proposal(
         request,
         target_event=target_event,
         sleep_adapter_reason=sleep_adapter_reason,
         caffeine_intake=caffeine_intake,
     )
+    _require_calendar_visibility_snapshot(calendar_visibility)
+    return result
 
 
 class ScheduleBlockIn(BaseModel):
@@ -3030,6 +3296,32 @@ class ScheduleBlockIn(BaseModel):
     end: str = Field(description="Block end, ISO-8601, after start")
 
 
+def _create_schedule_proposal_decision(
+    session: Session,
+    *,
+    proposal_count: int,
+) -> uuid.UUID:
+    """Create the bounded audit record owned by schedule proposal creation."""
+    row = DecisionRecord(
+        kind=DecisionKind.SCHEDULE_CHANGE,
+        summary="Schedule proposals awaiting confirmation",
+        tree={
+            "type": "action",
+            "label": "Schedule proposals created",
+            "detail": {
+                "proposal_count": proposal_count,
+                "confirmation_required": True,
+            },
+            "children": [],
+        },
+        llm_model=None,
+        tokens=None,
+    )
+    session.add(row)
+    session.flush()
+    return row.id
+
+
 @mcp.tool
 def propose_schedule_blocks(
     blocks: list[ScheduleBlockIn],
@@ -3041,8 +3333,10 @@ def propose_schedule_blocks(
     auto-created) — use `title` to propose a whole plan without pre-creating
     tasks. Creates proposals in `proposed` state; nothing is written to any
     calendar until the user confirms. Each returned block lists overlapping
-    mirrored calendar events as `conflicts`. Optionally link the
-    decision_record_id of the reasoning that produced the plan.
+    mirrored calendar events as `conflicts`. Every proposal is linked to one
+    bounded internal schedule-change DecisionRecord. A trusted caller may
+    supply an existing `decision_record_id`; otherwise this command creates a
+    compact deterministic record itself.
     """
     if not blocks:
         raise ToolError("blocks must not be empty")
@@ -3080,10 +3374,22 @@ def propose_schedule_blocks(
     with _store_session() as session:
         handle_secret = _adjustment_handle_secret()
         now = dt.datetime.now(dt.UTC)
+        calendar_visibility_snapshots: list[CalendarVisibility] = []
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
+        if decision_uuid is None:
+            decision_uuid = _create_schedule_proposal_decision(
+                session,
+                proposal_count=len(parsed),
+            )
         for index, (_, start, end) in enumerate(parsed):
-            violation = actual_sleep_violation(session, start, end, _local_timezone())
+            violation = actual_sleep_violation(
+                session,
+                start,
+                end,
+                _local_timezone(),
+                account_generations=_calendar_account_generations(),
+            )
             if violation is not None:
                 raise ToolError(f"blocks[{index}]: {violation}")
         created: list[dict[str, Any]] = []
@@ -3102,6 +3408,26 @@ def propose_schedule_blocks(
                 )
                 session.add(task)
                 session.flush()
+            visible_events, visibility = _read_visible_calendar_rows(
+                session,
+                select(CalendarEventMirror).where(
+                    or_(
+                        (
+                            CalendarEventMirror.start_at < end
+                        )
+                        & (
+                            CalendarEventMirror.end_at > start
+                        ),
+                        (
+                            CalendarEventMirror.intake_task_id
+                            == task.id
+                        )
+                        & CalendarEventMirror.is_agent_created.is_(False)
+                        & CalendarEventMirror.is_all_day.is_(False),
+                    )
+                ),
+            )
+            calendar_visibility_snapshots.append(visibility)
             conflicts = [
                 {
                     "summary": event.summary,
@@ -3109,18 +3435,13 @@ def propose_schedule_blocks(
                     "end": _iso_utc(event.end_at),
                     "is_agent_created": event.is_agent_created,
                 }
-                for event in session.scalars(
-                    select(CalendarEventMirror)
-                    .where(
-                        CalendarEventMirror.start_at < end,
-                        CalendarEventMirror.end_at > start,
-                        or_(
-                            CalendarEventMirror.intake_task_id.is_(None),
-                            CalendarEventMirror.intake_task_id != task.id,
-                        ),
-                    )
-                    .order_by(CalendarEventMirror.start_at)
+                for event in sorted(
+                    visible_events,
+                    key=lambda item: item.start_at,
                 )
+                if _ensure_utc_dt(event.start_at) < end
+                and _ensure_utc_dt(event.end_at) > start
+                and event.intake_task_id != task.id
             ]
             proposal = ScheduleProposal(
                 task_id=task.id,
@@ -3132,13 +3453,10 @@ def propose_schedule_blocks(
             )
             intake_matches = [
                 event
-                for event in session.scalars(
-                    select(CalendarEventMirror).where(
-                        CalendarEventMirror.intake_task_id == task.id,
-                        CalendarEventMirror.is_agent_created.is_(False),
-                        CalendarEventMirror.is_all_day.is_(False),
-                    )
-                )
+                for event in visible_events
+                if event.intake_task_id == task.id
+                and not event.is_agent_created
+                and not event.is_all_day
                 if _ensure_utc_dt(event.start_at) == start
                 and _ensure_utc_dt(event.end_at) == end
             ]
@@ -3149,6 +3467,9 @@ def propose_schedule_blocks(
             if intake_matches:
                 intake_event = intake_matches[0]
                 proposal.intake_calendar_source = intake_event.calendar_source
+                proposal.intake_account_generation = (
+                    intake_event.connection_generation
+                )
                 proposal.intake_external_id = intake_event.external_id
                 proposal.intake_revision = intake_revision(intake_event)
             handle = issue_reply_handle(handle_secret)
@@ -3170,7 +3491,14 @@ def propose_schedule_blocks(
                     "conflicts": conflicts,
                 }
             )
-    return {"status": "ok", "proposals": created}
+        for visibility in calendar_visibility_snapshots:
+            _require_calendar_visibility_snapshot(visibility)
+    return {
+        "status": "ok",
+        "decision_record_id": str(decision_uuid),
+        "decision_url": _decision_viewer_url(decision_uuid),
+        "proposals": created,
+    }
 
 
 @mcp.tool
@@ -3221,6 +3549,7 @@ def resolve_schedule_proposal(
                 proposal.proposed_start,
                 proposal.proposed_end,
                 _local_timezone(),
+                account_generations=_calendar_account_generations(),
             )
             if violation is not None:
                 try:
@@ -4274,162 +4603,17 @@ def list_medical_records(
     }
 
 
-def _validate_tree(node: Any, depth: int = 0, count: int = 0) -> int:
-    """Validate a decision-tree node recursively; returns the node count."""
-    if depth > MAX_TREE_DEPTH:
-        raise ToolError(f"decision tree exceeds max depth {MAX_TREE_DEPTH}")
-    if not isinstance(node, dict):
-        raise ToolError("every decision tree node must be an object")
-    node_type = node.get("type")
-    if node_type not in DECISION_TREE_NODE_TYPES:
-        raise ToolError(
-            f"node type must be one of {sorted(DECISION_TREE_NODE_TYPES)}, got {node_type!r}"
-        )
-    label = node.get("label")
-    if not isinstance(label, str) or not label.strip():
-        raise ToolError("every decision tree node needs a non-empty 'label'")
-    count += 1
-    if count > MAX_TREE_NODES:
-        raise ToolError(f"decision tree exceeds max node count {MAX_TREE_NODES}")
-    children = node.get("children", [])
-    if children is None:
-        children = []
-    if not isinstance(children, list):
-        raise ToolError("'children' must be a list of nodes")
-    for child in children:
-        count = _validate_tree(child, depth + 1, count)
-    return count
-
-
-def _claim_schedule_proposals(
-    session: Session,
-    proposals: list[tuple[str, uuid.UUID]],
-    decision_record_id: uuid.UUID,
-) -> None:
-    """Atomically attach pending proposals to one decision record."""
-    for proposal_id, proposal_uuid in proposals:
-        claimed = session.execute(
-            update(ScheduleProposal)
-            .where(
-                ScheduleProposal.id == proposal_uuid,
-                ScheduleProposal.status == ProposalStatus.PROPOSED,
-                ScheduleProposal.decision_record_id.is_(None),
-            )
-            .values(decision_record_id=decision_record_id)
-        )
-        if claimed.rowcount == 1:
-            continue
-        proposal = session.get(
-            ScheduleProposal,
-            proposal_uuid,
-            populate_existing=True,
-        )
-        if proposal is None:
-            raise ToolError(f"schedule_proposal {proposal_id} not found")
-        if proposal.status != ProposalStatus.PROPOSED:
-            raise ToolError(f"schedule_proposal {proposal_id} is not pending")
-        raise ToolError(
-            f"schedule_proposal {proposal_id} already has a decision record"
-        )
-
-
-@mcp.tool
-def record_decision(
-    kind: str,
-    summary: str,
-    tree: dict[str, Any],
-    llm_model: str | None = None,
-    tokens: int | None = None,
-    trigger_event_id: str | None = None,
-    schedule_proposal_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    """Persist an explainable decision record and get its viewer link.
-
-    `kind` is schedule_change / alert / insight / capture. `tree` is the
-    recursive node structure {id?, type: input|rule|llm_step|option|action,
-    label, detail?, children[]} — deterministic layers pre-fill input/rule
-    nodes; append your own llm_step/option/action nodes honestly (never
-    rewrite pre-filled ones). Webhook alerts must pass their trusted
-    trigger_event_id unchanged so native clients can resolve the exact
-    decision and proposal. When proposals were created before this call, pass
-    their returned ids as schedule_proposal_ids; they are linked to this
-    decision atomically. Returns the decision viewer URL to attach to any alert
-    or message about this decision.
-    """
-    if kind not in {k.value for k in DecisionKind}:
-        raise ToolError(
-            f"kind must be one of {sorted(k.value for k in DecisionKind)}, got {kind!r}"
-        )
-    if not summary.strip():
-        raise ToolError("summary must not be empty")
-    _validate_tree(tree)
-    trigger_uuid = (
-        _parse_uuid(trigger_event_id, "trigger_event_id")
-        if trigger_event_id is not None
-        else None
-    )
-    if trigger_uuid is not None and kind != DecisionKind.ALERT.value:
-        raise ToolError("trigger_event_id is valid only for kind='alert'")
-    proposal_uuids = [
-        _parse_uuid(value, f"schedule_proposal_ids[{index}]")
-        for index, value in enumerate(schedule_proposal_ids or [])
-    ]
-    if len(set(proposal_uuids)) != len(proposal_uuids):
-        raise ToolError("schedule_proposal_ids must not contain duplicates")
-    with _store_session() as session:
-        if trigger_uuid is not None:
-            if session.get(TriggerEvent, trigger_uuid) is None:
-                raise ToolError(f"trigger_event {trigger_event_id} not found")
-            existing = session.scalar(
-                select(DecisionRecord.id)
-                .where(DecisionRecord.trigger_event_id == trigger_uuid)
-                .limit(1)
-            )
-            if existing is not None:
-                raise ToolError(
-                    f"trigger_event {trigger_event_id} already has a decision record"
-                )
-        row = DecisionRecord(
-            kind=DecisionKind(kind),
-            tree=tree,
-            summary=summary,
-            llm_model=llm_model,
-            tokens=tokens,
-            trigger_event_id=trigger_uuid,
-        )
-        session.add(row)
-        session.flush()
-        _claim_schedule_proposals(
-            session,
-            list(
-                zip(
-                    schedule_proposal_ids or [],
-                    proposal_uuids,
-                    strict=True,
-                )
-            ),
-            row.id,
-        )
-        decision_id = str(row.id)
-    # Viewer pages are opened from the phone browser (no headers); the shared
-    # construction point embeds the derived read-only credential — never the
-    # API token itself. (Function-local import keeps healthmes.api off this
-    # module's import path.)
-    from healthmes.api.auth import viewer_url
-
-    return {
-        "status": "ok",
-        "decision_id": decision_id,
-        "schedule_proposal_ids": [str(value) for value in proposal_uuids],
-        "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
-    }
-
+register_domain_search_tools(
+    mcp,
+    service_resolver=get_decision_search_session_service,
+)
 
 register_activity_tools(
     mcp,
     store_session_factory=_store_session,
     timezone_resolver=_local_timezone,
     readiness_reader=get_daily_readiness_context,
+    settings_resolver=_active_settings,
 )
 
 

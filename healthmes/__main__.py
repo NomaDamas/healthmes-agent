@@ -39,15 +39,21 @@ import asyncio
 import datetime as dt
 import getpass
 import json
+import shlex
+import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from sqlalchemy.orm import Session
 
 from healthmes.backup.local import LocalDirectoryProvider
 from healthmes.backup.provider import BackupError
 from healthmes.backup.snapshot import (
     PROVIDER_LOCAL,
     PROVIDER_REMOTE_VAULT,
+    RECOVERY_SCOPE_PARTIAL_COMPONENT,
     read_manifest,
     resolve_backup_provider_name,
     resolve_passphrase,
@@ -59,7 +65,12 @@ from healthmes.calendars.sleep_job import (
     preview_recent_sleep,
 )
 from healthmes.config import Settings, get_settings, is_loopback_host
-from healthmes.store import dispose_engine, init_engine
+from healthmes.store import (
+    CalendarSource,
+    create_db_engine,
+    dispose_engine,
+    init_engine,
+)
 
 if TYPE_CHECKING:  # pragma: no cover — typing only; runtime import stays lazy
     from healthmes.backup.remote_vault import RemoteVaultProvider
@@ -92,6 +103,17 @@ def _serve() -> int:
     if error is not None:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    if isinstance(settings, Settings):
+        from healthmes.app import (
+            DatabaseSchemaError,
+            preflight_database_schema,
+        )
+
+        try:
+            preflight_database_schema(settings)
+        except DatabaseSchemaError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     uvicorn.run(
         "healthmes.app:create_app",
         factory=True,
@@ -158,6 +180,27 @@ def _human_size(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
+def _cli_replay_prefix() -> list[str]:
+    """Return a runnable prefix matching console-script or ``python -m`` use."""
+    original = tuple(getattr(sys, "orig_argv", ()))
+    if any(
+        token == "-m" and index + 1 < len(original) and original[index + 1] == "healthmes"
+        for index, token in enumerate(original)
+    ):
+        return [sys.executable or "python", "-m", "healthmes"]
+    argv_zero = Path(sys.argv[0]) if sys.argv else Path()
+    if argv_zero.name == "__main__.py" and argv_zero.parent.name == "healthmes":
+        return [sys.executable or "python", "-m", "healthmes"]
+    launchers = ([sys.argv[0]] if sys.argv else []) + list(original[:2])
+    for launcher in dict.fromkeys(launchers):
+        if Path(launcher).name not in {"healthmes", "healthmes.exe"}:
+            continue
+        available = shutil.which(launcher)
+        if available is not None:
+            return [available]
+    return [sys.executable or "python", "-m", "healthmes"]
+
+
 def _cmd_backup_create(args: argparse.Namespace) -> int:
     settings = _cli_settings()
     provider_name = _selected_provider(args, settings)
@@ -218,16 +261,34 @@ def _cmd_backup_push(args: argparse.Namespace) -> int:
 
 def _summarize_manifest(manifest: dict) -> list[str]:
     contents = manifest.get("contents", {})
+    recovery = manifest.get("recovery") or {}
+    component_order = (
+        "healthmes_db",
+        "open_wearables_db",
+        "media",
+        "raw_ingest",
+        "hermes_home",
+    )
+    included = [name for name in component_order if contents.get(name) is not None]
+    omitted = [name for name in component_order if contents.get(name) is None]
     lines = [
         f"created_at:         {manifest.get('created_at')}",
         f"schema_version:     {manifest.get('schema_version')}",
         f"healthmes_version:  {manifest.get('healthmes_version')}",
+        f"recovery scope:     {recovery.get('scope', RECOVERY_SCOPE_PARTIAL_COMPONENT)}",
+        "full-node recovery: no",
+        f"included:           {', '.join(included)}",
+        f"not in snapshot:    {', '.join(omitted) if omitted else 'none'}",
     ]
     db_entry = contents.get("healthmes_db") or {}
     lines.append(f"healthmes db:       {db_entry.get('kind', 'missing')}")
     ow_entry = contents.get("open_wearables_db")
     lines.append(f"open-wearables db:  {ow_entry['kind'] if ow_entry else 'not included'}")
-    for label, key in (("media", "media"), ("hermes state", "hermes_home")):
+    for label, key in (
+        ("media", "media"),
+        ("raw ingest", "raw_ingest"),
+        ("hermes state", "hermes_home"),
+    ):
         entry = contents.get(key)
         if entry:
             lines.append(
@@ -236,21 +297,34 @@ def _summarize_manifest(manifest: dict) -> list[str]:
             )
         else:
             lines.append(f"{label + ':':<20}not included")
+    for warning in recovery.get("operational_warnings", []):
+        lines.append(f"warning:             {warning}")
     return lines
 
 
 def _cmd_backup_restore(args: argparse.Namespace) -> int:
     settings = _cli_settings()
-    provider = _provider(args, settings)
-    if _selected_provider(args, settings) == PROVIDER_LOCAL:
+    selected_provider = _selected_provider(args, settings)
+    vault = None
+    if selected_provider == PROVIDER_LOCAL:
+        provider = _provider(args, settings)
         snapshot_path = provider.resolve_snapshot_path(args.snapshot)
     else:
-        # Local-first: an existing local copy wins; otherwise the envelope is
-        # downloaded into the backup dir and the restore path is identical.
         vault = _vault_provider(args, settings)
-        snapshot_path, downloaded = vault.ensure_local_copy(args.snapshot)
-        if downloaded:
-            print(f"downloaded from vault: {vault.object_uri(snapshot_path.name)}")
+        provider = vault.local
+        snapshot_path = (
+            provider.backup_dir / Path(str(args.snapshot)).name
+        )
+        if not args.yes:
+            # Inspection is non-destructive. Applying the restore below uses
+            # RemoteVaultProvider.restore() so the verified generation remains
+            # pinned instead of being reopened by pathname.
+            snapshot_path, downloaded = vault.ensure_local_copy(args.snapshot)
+            if downloaded:
+                print(
+                    "downloaded from vault: "
+                    f"{vault.object_uri(snapshot_path.name)}"
+                )
     if not args.yes:
         passphrase = _passphrase_from(args, settings)
         if passphrase is None:
@@ -258,18 +332,60 @@ def _cmd_backup_restore(args: argparse.Namespace) -> int:
                 "no backup passphrase configured; set HEALTHMES_BACKUP_PASSPHRASE "
                 "or pass --passphrase-file"
             )
-        manifest = read_manifest(snapshot_path, passphrase)
+        manifest = read_manifest(
+            snapshot_path,
+            passphrase,
+            limits=provider.resource_limits,
+        )
         print(f"snapshot: {snapshot_path}")
         for line in _summarize_manifest(manifest):
             print(line)
+        apply_command = [
+            *_cli_replay_prefix(),
+            "backup",
+            "restore",
+            str(args.snapshot),
+            "--provider",
+            "local" if selected_provider == PROVIDER_LOCAL else "remote",
+        ]
+        if args.passphrase_file is not None:
+            apply_command.extend(
+                ["--passphrase-file", str(args.passphrase_file)]
+            )
+        if args.allow_cross_store_partial:
+            apply_command.append("--allow-cross-store-partial")
+        apply_command.append("--yes")
         print(
-            "\nrestore REPLACES the live database, media tree and Hermes state.\n"
-            f"re-run with --yes to apply:  healthmes backup restore {args.snapshot} --yes",
+            "\nrestore REPLACES archived live components: HealthMes database, "
+            "media/raw-ingest trees, configured Open Wearables database, and "
+            "Hermes state.\n"
+            f"re-run with --yes to apply:  {shlex.join(apply_command)}",
             file=sys.stderr,
         )
         return 2
-    provider.restore(snapshot_path)
+    if vault is None:
+        result = provider.restore(
+            snapshot_path,
+            allow_cross_store_partial=args.allow_cross_store_partial,
+        )
+    else:
+        result = vault.restore(
+            args.snapshot,
+            allow_cross_store_partial=args.allow_cross_store_partial,
+        )
+        snapshot_path = provider.backup_dir / Path(str(args.snapshot)).name
+        print(f"downloaded from vault: {vault.object_uri(snapshot_path.name)}")
     print(f"restored: {snapshot_path}")
+    print(f"recovery mode: {result.recovery_mode}")
+    print(f"recovered: {', '.join(result.recovered_components)}")
+    print(
+        "not in snapshot: "
+        + (
+            ", ".join(result.skipped_components)
+            if result.skipped_components
+            else "none"
+        )
+    )
     return 0
 
 
@@ -332,12 +448,39 @@ def _google_identity(google_calendar, credentials, calendar_id: str) -> str | No
         return None
 
 
+@contextmanager
+def _calendar_connection_write(
+    settings: Settings,
+    source: CalendarSource,
+):
+    """Use the shared calendar/Decision write fence without global DB state."""
+
+    engine = create_db_engine(settings.database_url)
+    try:
+        with Session(engine) as session:
+            with calendar_creds.calendar_connection_write(
+                session,
+                source,
+            ):
+                yield
+    finally:
+        engine.dispose()
+
+
 def _cmd_connect_google(args: argparse.Namespace) -> int:
     settings = _cli_settings()
     from healthmes.calendars import google as google_calendar
 
     token_path = google_calendar.google_token_path(settings.data_dir)
-    if calendar_creds.google_connection_state(settings.data_dir) == "connected":
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.GOOGLE,
+    ):
+        already_connected = (
+            calendar_creds.google_connection_state(settings.data_dir)
+            == "connected"
+        )
+    if already_connected:
         print(f"Google Calendar is already connected (token at {token_path}).")
         print("To re-authorize, run `healthmes connect disconnect google` first.")
         return 0
@@ -353,9 +496,29 @@ def _cmd_connect_google(args: argparse.Namespace) -> int:
         return 1
 
     print("Opening your browser for Google login + consent ...")
-    credentials = google_calendar.run_installed_app_flow(
-        client_secret, token_path, port=args.port
+    operation_id = calendar_creds.begin_calendar_connection_operation(
+        settings.data_dir,
+        CalendarSource.GOOGLE,
     )
+    credentials = google_calendar.run_installed_app_flow(
+        client_secret,
+        token_path,
+        port=args.port,
+        persist=False,
+    )
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.GOOGLE,
+    ):
+        calendar_creds.complete_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.GOOGLE,
+            operation_id,
+            lambda: google_calendar.save_credentials(
+                credentials,
+                token_path,
+            ),
+        )
     identity = _google_identity(google_calendar, credentials, settings.google_calendar_id)
     if identity:
         print(f"connected as {identity}")
@@ -373,6 +536,14 @@ def _cmd_connect_google(args: argparse.Namespace) -> int:
 
 def _cmd_connect_icloud(args: argparse.Namespace) -> int:
     settings = _cli_settings()
+    if calendar_creds.caldav_environment_managed(settings):
+        print(
+            "error: iCloud/CalDAV is managed by "
+            "HEALTHMES_CALDAV_USERNAME and HEALTHMES_CALDAV_APP_PASSWORD; "
+            "clear those settings before using CLI-managed credentials",
+            file=sys.stderr,
+        )
+        return 1
     username = args.username.strip()
     if not username:
         print("error: --username must be a non-empty Apple ID email", file=sys.stderr)
@@ -386,12 +557,28 @@ def _cmd_connect_icloud(args: argparse.Namespace) -> int:
         return 1
 
     print(f"validating CalDAV connection to {url} as {username} ...")
+    operation_id = calendar_creds.begin_calendar_connection_operation(
+        settings.data_dir,
+        CalendarSource.CALDAV,
+    )
     summary = calendar_creds.validate_caldav_connection(
         username=username, app_password=app_password, url=url
     )
-    path = calendar_creds.save_caldav_credentials(
-        settings.data_dir, username=username, app_password=app_password, url=url
-    )
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.CALDAV,
+    ):
+        path = calendar_creds.complete_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.CALDAV,
+            operation_id,
+            lambda: calendar_creds.save_caldav_credentials(
+                settings.data_dir,
+                username=username,
+                app_password=app_password,
+                url=url,
+            ),
+        )
     print(f"connected as {username} — {summary}")
     print(f"credentials saved to {path} (owner-only, mode 600)")
     print(
@@ -452,7 +639,17 @@ def _cmd_connect_disconnect(args: argparse.Namespace) -> int:
     if args.target == "google":
         from healthmes.calendars import google as google_calendar
 
-        removed = calendar_creds.delete_google_token(settings.data_dir)
+        with _calendar_connection_write(
+            settings,
+            CalendarSource.GOOGLE,
+        ):
+            removed = calendar_creds.invalidate_calendar_connection_operation(
+                settings.data_dir,
+                CalendarSource.GOOGLE,
+                lambda: calendar_creds.delete_google_token(
+                    settings.data_dir
+                ),
+            )
         token_path = google_calendar.google_token_path(settings.data_dir)
         print(f"removed {token_path}" if removed else "nothing to remove (no stored token)")
         if settings.google_calendar_enabled:
@@ -461,15 +658,27 @@ def _cmd_connect_disconnect(args: argparse.Namespace) -> int:
                 "poll job on; unset it to fully disable"
             )
         return 0
-    removed = calendar_creds.delete_caldav_credentials(settings.data_dir)
+    if calendar_creds.caldav_environment_managed(settings):
+        print(
+            "error: iCloud/CalDAV is managed by "
+            "HEALTHMES_CALDAV_USERNAME and HEALTHMES_CALDAV_APP_PASSWORD; "
+            "clear those settings to disconnect it",
+            file=sys.stderr,
+        )
+        return 1
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.CALDAV,
+    ):
+        removed = calendar_creds.invalidate_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.CALDAV,
+            lambda: calendar_creds.delete_caldav_credentials(
+                settings.data_dir
+            ),
+        )
     creds_path = calendar_creds.caldav_credentials_path(settings.data_dir)
     print(f"removed {creds_path}" if removed else "nothing to remove (no stored credentials)")
-    if settings.caldav_username.strip() and settings.caldav_app_password.get_secret_value():
-        print(
-            "note: HEALTHMES_CALDAV_USERNAME/HEALTHMES_CALDAV_APP_PASSWORD are "
-            "still set in the environment/.env and keep the connection alive; "
-            "clear them to fully disconnect"
-        )
     return 0
 
 
@@ -565,7 +774,9 @@ def build_parser() -> argparse.ArgumentParser:
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
 
     create = backup_sub.add_parser(
-        "create", help="Snapshot databases + media + Hermes state into an age-encrypted archive."
+        "create",
+        help="Snapshot HealthMes DB/media/raw_ingest plus configured "
+        "Open Wearables/Hermes state into an age-encrypted archive.",
     )
     _add_passphrase_file(create)
     _add_provider_flag(create)
@@ -593,6 +804,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually apply the restore (it replaces live data).",
     )
+    restore.add_argument(
+        "--allow-cross-store-partial",
+        action="store_true",
+        help="Explicitly accept that a restore spanning PostgreSQL and another "
+        "component cannot be atomically committed across stores. Without this "
+        "flag such restores fail before mutation.",
+    )
     _add_passphrase_file(restore)
     _add_provider_flag(restore)
     restore.set_defaults(func=_cmd_backup_restore)
@@ -603,6 +821,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(refuses anything that is not an age-encrypted snapshot envelope).",
     )
     push.add_argument("snapshot", help="Snapshot file path, or bare name in the backup dir.")
+    _add_passphrase_file(push)
     push.set_defaults(func=_cmd_backup_push)
 
     connect = subparsers.add_parser(

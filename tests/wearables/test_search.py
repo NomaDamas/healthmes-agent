@@ -1,0 +1,2371 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from healthmes.wearables.search import (
+    MAX_WEARABLE_SEARCH_PAGES,
+    MAX_WEARABLE_SEARCH_PAYLOAD_BYTES,
+    MAX_WEARABLE_SEARCH_ROWS,
+    BoundedOpenWearablesSearch,
+    WearableSearchRequest,
+    normalize_retained_wearable_timeseries,
+    normalize_retained_wearable_workouts,
+    validate_wearable_search_request,
+)
+
+START = datetime(2026, 8, 10, tzinfo=UTC)
+END = START + timedelta(days=1)
+
+
+def test_retained_timeseries_exact_boundary_remains_unattributed() -> None:
+    fetched = normalize_retained_wearable_timeseries(
+        (
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 10,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+                "device": "Private Watch A",
+            },
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 20,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+                "device": "Private Watch B",
+            },
+        ),
+        series_type="steps",
+        resolution="1hour",
+        start=START,
+        end=END,
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T08:00:00+00:00",
+        "2026-08-10T08:00:00+00:00",
+    ]
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "Private Watch" not in encoded
+    assert "_healthmes_stream_key" not in encoded
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+
+
+def test_retained_timeseries_preserves_verified_attribution_status() -> None:
+    fetched = normalize_retained_wearable_timeseries(
+        (
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 10,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+            },
+        ),
+        series_type="steps",
+        resolution="1hour",
+        start=START,
+        end=END,
+        stream_attribution_verified=True,
+    )
+
+    assert fetched.records[0]["timestamp"] == (
+        "2026-08-10T08:00:00+00:00"
+    )
+    assert fetched.limitations == ()
+
+
+def _request(
+    capability: str,
+    *,
+    start: datetime = START,
+    end: datetime = END,
+    retained_after: datetime | None = None,
+    **parameters: str,
+) -> WearableSearchRequest:
+    return WearableSearchRequest(
+        capability=capability,
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters=parameters,
+        retained_after=retained_after,
+    )
+
+
+class SanitizingClient:
+    async def get_health_scores(self, user_id, **_kwargs):
+        assert user_id == "private-user-id"
+        return {
+            "data": [
+                {
+                    "id": "raw-score-id",
+                    "user_id": user_id,
+                    "data_source_id": "private-data-source",
+                    "authorization": "Bearer secret-value",
+                    "category": "stress",
+                    "provider": "garmin",
+                    "recorded_at": "2026-08-10T08:00:00Z",
+                    "value": 42,
+                    "qualifier": "balanced",
+                    "components": {
+                        "signal": {
+                            "value": 41,
+                            "qualifier": "normal",
+                        },
+                        "access_token": {
+                            "value": 99,
+                            "qualifier": "secret-value",
+                        },
+                    },
+                }
+            ],
+            "pagination": {"has_more": False},
+        }
+
+    async def get_workouts(self, user_id, *_args, **_kwargs):
+        assert user_id == "private-user-id"
+        return {
+            "data": [
+                {
+                    "id": "raw-workout-id",
+                    "user_id": user_id,
+                    "name": "Private route name",
+                    "route": [{"latitude": 37.5, "longitude": 127.0}],
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "duration_seconds": 1800,
+                    "source": {
+                        "provider": "garmin",
+                        "device": "Private device name",
+                    },
+                    "distance_meters": 5000,
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_timeseries(self, user_id, *_args, **_kwargs):
+        assert user_id == "private-user-id"
+        return {
+            "data": [
+                {
+                    "id": "raw-series-id",
+                    "user_id": user_id,
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "source": {
+                        "provider": "apple_health",
+                        "device": "Private Watch",
+                    },
+                    "latitude": 37.5,
+                    "longitude": 127.0,
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_search_sanitizes_identity_secrets_raw_ids_and_gps() -> None:
+    search = BoundedOpenWearablesSearch(
+        SanitizingClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    scores = await search(_request("wearable.health-scores"))
+    workouts = await search(_request("wearable.workouts"))
+    timeseries = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert scores.records == (
+        {
+            "category": "stress",
+            "recorded_at": "2026-08-10T08:00:00+00:00",
+            "provider": "garmin",
+            "provider_attribution": "declared",
+            "value": 42,
+            "qualifier": "balanced",
+            "components": [
+                {
+                    "component": "signal",
+                    "value": 41,
+                    "qualifier": "normal",
+                }
+            ],
+        },
+    )
+    assert workouts.records == (
+        {
+            "workout_type": "running",
+            "start_time": "2026-08-10T09:00:00+00:00",
+            "end_time": "2026-08-10T09:30:00+00:00",
+            "provider": "garmin",
+            "provider_attribution": "source_exact_alias",
+            "duration_seconds": 1800,
+            "distance_meters": 5000,
+        },
+    )
+    assert timeseries.records == (
+        {
+            "timestamp": "2026-08-10T10:00:00+00:00",
+            "series_type": "heart_rate",
+            "value": 72,
+            "unit": "bpm",
+            "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
+        },
+    )
+    assert timeseries.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+    encoded = json.dumps(
+        {
+            "scores": scores.records,
+            "workouts": workouts.records,
+            "timeseries": timeseries.records,
+        },
+        sort_keys=True,
+    )
+    for forbidden in (
+        "private-user-id",
+        "private-data-source",
+        "secret-value",
+        "raw-score-id",
+        "raw-workout-id",
+        "raw-series-id",
+        "Private route name",
+        "Private device name",
+        "Private Watch",
+        "latitude",
+        "longitude",
+        "route",
+    ):
+        assert forbidden not in encoded
+
+
+class RawResolutionClient:
+    async def get_timeseries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "heart_rate",
+                    "value": 70,
+                    "unit": "bpm",
+                    "data_source_id": "apple-heart-rate-stream",
+                    "source": {"provider": "apple_health"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:55Z",
+                    "type": "heart_rate",
+                    "value": 80,
+                    "unit": "bpm",
+                    "data_source_id": "apple-heart-rate-stream",
+                    "source": {"provider": "apple_health"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:05Z",
+                    "type": "heart_rate",
+                    "value": 76,
+                    "unit": "bpm",
+                    "data_source_id": "apple-heart-rate-stream",
+                    "source": {"provider": "apple_health"},
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_timeseries_enforces_requested_resolution_locally() -> None:
+    search = BoundedOpenWearablesSearch(
+        RawResolutionClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    result = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=10),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert result.records == (
+        {
+            "timestamp": "2026-08-10T10:00:00+00:00",
+            "series_type": "heart_rate",
+            "value": 75,
+            "unit": "bpm",
+            "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
+        },
+        {
+            "timestamp": "2026-08-10T10:01:00+00:00",
+            "series_type": "heart_rate",
+            "value": 76,
+            "unit": "bpm",
+            "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
+        },
+    )
+
+
+class RetentionBoundaryClient:
+    async def get_timeseries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:01Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_retention_cutoff_is_exclusive_without_epsilon_shift() -> None:
+    cutoff = START + timedelta(hours=10)
+    fetched = await BoundedOpenWearablesSearch(
+        RetentionBoundaryClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=cutoff,
+            end=cutoff + timedelta(hours=1),
+            retained_after=cutoff,
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T10:00:01+00:00",
+            "series_type": "steps",
+            "value": 20,
+            "unit": "count",
+            "provider": "apple_health",
+            "provider_attribution": "declared",
+        },
+    )
+    assert fetched.discarded_rows == 1
+
+
+class SummableResolutionClient:
+    async def get_timeseries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "data_source_id": "apple-steps-stream",
+                    "source": {"provider": "apple_health"},
+                    "is_daily_total": False,
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:25Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "data_source_id": "apple-steps-stream",
+                    "source": {"provider": "apple_health"},
+                    "is_daily_total": False,
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:45Z",
+                    "type": "steps",
+                    "value": 1000,
+                    "unit": "count",
+                    "data_source_id": "garmin-steps-stream",
+                    "source": {"provider": "garmin"},
+                    "is_daily_total": True,
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:50Z",
+                    "type": "steps",
+                    "value": 900,
+                    "unit": "count",
+                    "data_source_id": "garmin-steps-stream",
+                    "source": {"provider": "garmin"},
+                    "is_daily_total": True,
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_timeseries_uses_sum_and_prefers_daily_totals_per_provider() -> None:
+    search = BoundedOpenWearablesSearch(
+        SummableResolutionClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    result = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=10),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1min",
+        )
+    )
+
+    by_provider = {
+        record["provider"]: record
+        for record in result.records
+    }
+    assert by_provider == {
+        "apple_health": {
+            "timestamp": "2026-08-10T10:00:00+00:00",
+            "series_type": "steps",
+            "value": 30,
+            "unit": "count",
+            "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
+        },
+        "garmin": {
+            "timestamp": "2026-08-10T10:00:00+00:00",
+            "series_type": "steps",
+            "value": 1000,
+            "unit": "count",
+            "provider": "garmin",
+            "provider_attribution": "source_exact_alias",
+            "is_daily_total": True,
+        },
+    }
+
+
+class SummaryClient:
+    async def get_activity_summaries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "date": "2026-08-10",
+                    "source": {
+                        "provider": "apple_health",
+                        "device": "Private phone",
+                    },
+                    "steps": 8000,
+                    "active_minutes": 60,
+                    "heart_rate": {
+                        "avg_bpm": 74,
+                        "max_bpm": 130,
+                        "device_id": "private-device",
+                    },
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_sleep_summaries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "date": "2026-08-10",
+                    "source": {"provider": "oura"},
+                    "start_time": "2026-08-09T23:00:00Z",
+                    "end_time": "2026-08-10T07:00:00Z",
+                    "duration_minutes": 420,
+                    "sessions": [{"id": "raw-session-id"}],
+                    "stages": {
+                        "deep_minutes": 80,
+                        "rem_minutes": 90,
+                    },
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_recovery_summaries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "date": "2026-08-10",
+                    "source": {"provider": "whoop"},
+                    "recovery_score": 83,
+                    "resting_heart_rate_bpm": 54,
+                    "connection_id": "private-connection",
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+@pytest.mark.parametrize(
+    ("summary_kind", "expected"),
+    (
+        (
+            "activity",
+            {
+                "summary_kind": "activity",
+                "date": "2026-08-10",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+                "steps": 8000,
+                "active_minutes": 60,
+                "heart_rate": {
+                    "avg_bpm": 74,
+                    "max_bpm": 130,
+                },
+            },
+        ),
+        (
+            "sleep",
+            {
+                "summary_kind": "sleep",
+                "date": "2026-08-10",
+                "provider": "oura",
+                "provider_attribution": "source_exact_alias",
+                "start_time": "2026-08-09T23:00:00+00:00",
+                "end_time": "2026-08-10T07:00:00+00:00",
+                "duration_minutes": 420,
+                "stages": {
+                    "deep_minutes": 80,
+                    "rem_minutes": 90,
+                },
+            },
+        ),
+        (
+            "recovery",
+            {
+                "summary_kind": "recovery",
+                "date": "2026-08-10",
+                "provider": "whoop",
+                "provider_attribution": "source_exact_alias",
+                "resting_heart_rate_bpm": 54,
+                "recovery_score": 83,
+            },
+        ),
+    ),
+)
+async def test_search_supports_allowlisted_daily_summaries(
+    summary_kind: str,
+    expected: dict,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        SummaryClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.summaries",
+            summary_kind=summary_kind,
+        )
+    )
+
+    assert fetched.records == (expected,)
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "Private phone" not in encoded
+    assert "private-device" not in encoded
+    assert "raw-session-id" not in encoded
+    assert "private-connection" not in encoded
+
+
+async def test_daily_summary_requires_the_full_local_day() -> None:
+    search = BoundedOpenWearablesSearch(
+        SummaryClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.summaries",
+            start=START + timedelta(hours=8),
+            end=START + timedelta(hours=9),
+            summary_kind="sleep",
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.limitations == (
+        "wearable_rows_discarded",
+        "wearable_summary_window_partial",
+    )
+
+
+class PagedHealthScoreClient:
+    def __init__(self, *, verbose: bool = False) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self.verbose = verbose
+
+    async def get_health_scores(
+        self,
+        _user_id,
+        *,
+        limit: int,
+        offset: int,
+        **_kwargs,
+    ):
+        self.calls.append((limit, offset))
+        rows = []
+        for index in range(offset, offset + limit):
+            row = {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (
+                    START + timedelta(minutes=index)
+                ).isoformat(),
+                "value": index,
+            }
+            if self.verbose:
+                row["components"] = {
+                    f"component_{component:02d}_" + "x" * 40: {
+                        "value": component,
+                        "qualifier": "q" * 64,
+                    }
+                    for component in range(16)
+                }
+            rows.append(row)
+        return {
+            "data": rows,
+            "pagination": {"has_more": True},
+        }
+
+
+async def test_search_stops_at_three_pages_and_250_rows() -> None:
+    client = PagedHealthScoreClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.health-scores"))
+
+    assert len(client.calls) == MAX_WEARABLE_SEARCH_PAGES
+    assert client.calls == [(100, 0), (100, 100), (51, 200)]
+    assert len(fetched.records) == MAX_WEARABLE_SEARCH_ROWS
+    assert fetched.upstream_truncated is True
+    assert fetched.limitations == (
+        "wearable_upstream_page_limit_reached",
+    )
+
+
+class MalformedOffsetPaginationClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self.rows: list[object] = [
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (START + timedelta(minutes=0)).isoformat(),
+                "value": 0,
+            },
+            "malformed-row-1",
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (START + timedelta(minutes=2)).isoformat(),
+                "value": 2,
+            },
+            17,
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (START + timedelta(minutes=4)).isoformat(),
+                "value": 4,
+            },
+        ]
+
+    async def get_health_scores(
+        self,
+        _user_id,
+        *,
+        limit: int,
+        offset: int,
+        **_kwargs,
+    ):
+        self.calls.append((limit, offset))
+        page = self.rows[offset : offset + min(limit, 2)]
+        return {
+            "data": page,
+            "pagination": {
+                "has_more": offset + len(page) < len(self.rows),
+            },
+        }
+
+
+async def test_offset_pagination_advances_by_raw_page_cardinality() -> None:
+    client = MalformedOffsetPaginationClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.health-scores"))
+
+    assert client.calls == [(100, 0), (100, 2), (100, 4)]
+    assert [record["value"] for record in fetched.records] == [0, 2, 4]
+    assert fetched.upstream_truncated is False
+    assert fetched.discarded_rows == 2
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+class FullyMalformedCursorPageClient:
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        self.calls.append(cursor)
+        if cursor is None:
+            return {
+                "data": ["malformed-row", 17],
+                "pagination": {
+                    "next_cursor": "page-2",
+                    "has_more": True,
+                },
+            }
+        assert cursor == "page-2"
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                }
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+            },
+        }
+
+
+async def test_cursor_pagination_continues_after_fully_malformed_page() -> None:
+    client = FullyMalformedCursorPageClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.workouts"))
+
+    assert client.calls == [None, "page-2"]
+    assert [record["workout_type"] for record in fetched.records] == [
+        "running"
+    ]
+    assert fetched.upstream_truncated is False
+    assert fetched.discarded_rows == 2
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+class RepeatingCursorTimeseriesClient:
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        self.calls.append(cursor)
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                }
+            ],
+            "pagination": {
+                "next_cursor": "repeated-page",
+                "has_more": True,
+            },
+        }
+
+
+async def test_cursor_cycle_does_not_aggregate_repeated_page() -> None:
+    client = RepeatingCursorTimeseriesClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert client.calls == [None, "repeated-page"]
+    assert [record["value"] for record in fetched.records] == [10]
+    assert fetched.upstream_truncated is True
+    assert fetched.limitations == (
+        "wearable_upstream_page_limit_reached",
+    )
+
+
+class OverlappingCursorTimeseriesClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.calls: list[str | None] = []
+        self.conflicting = conflicting
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        self.calls.append(cursor)
+        value = 20 if cursor == "page-2" and self.conflicting else 10
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "steps",
+                    "value": value,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+async def test_distinct_cursor_pages_deduplicate_the_same_sample() -> None:
+    client = OverlappingCursorTimeseriesClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert client.calls == [None, "page-2"]
+    assert [record["value"] for record in fetched.records] == [10]
+    assert fetched.upstream_truncated is False
+    assert fetched.limitations == ()
+
+
+class VendorDisplayAliasCursorClient:
+    def __init__(
+        self,
+        *,
+        canonical_provider: str,
+        display_provider: str,
+    ) -> None:
+        self.canonical_provider = canonical_provider
+        self.display_provider = display_provider
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        return {
+            "data": [
+                {
+                    "id": "vendor-stable-sample",
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "data_source_id": "vendor-stable-stream",
+                    "source": {
+                        "provider": (
+                            self.display_provider
+                            if cursor is not None
+                            else self.canonical_provider
+                        )
+                    },
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("canonical_provider", "display_provider", "expected_provider"),
+    (
+        ("garmin", "Garmin Connect", "garmin"),
+        ("polar", "Polar Flow", "polar"),
+        ("suunto", "Suunto App", "suunto"),
+    ),
+)
+async def test_vendor_display_aliases_deduplicate_with_canonical_names(
+    canonical_provider: str,
+    display_provider: str,
+    expected_provider: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        VendorDisplayAliasCursorClient(
+            canonical_provider=canonical_provider,
+            display_provider=display_provider,
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["provider"] == expected_provider
+    assert fetched.records[0]["provider_attribution"] == (
+        "source_exact_alias"
+    )
+    assert fetched.limitations == ()
+
+
+async def test_conflicting_cursor_duplicates_remain_visible_and_partial() -> None:
+    client = OverlappingCursorTimeseriesClient(conflicting=True)
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert fetched.limitations == (
+        "wearable_conflicting_duplicate_rows",
+        "wearable_stream_attribution_unavailable",
+    )
+
+
+class OverlappingCursorSummaryClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.conflicting = conflicting
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        steps = 9000 if cursor == "page-2" and self.conflicting else 8000
+        return {
+            "data": [
+                {
+                    "id": "private-summary-id",
+                    "date": "2026-08-10",
+                    "provider": "garmin",
+                    "steps": steps,
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("conflicting", "expected_steps", "expected_limitations"),
+    (
+        (False, [8000], ()),
+        (
+            True,
+            [8000, 9000],
+            ("wearable_conflicting_duplicate_rows",),
+        ),
+    ),
+)
+async def test_summary_cursor_overlap_uses_private_provider_identity(
+    conflicting: bool,
+    expected_steps: list[int],
+    expected_limitations: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        OverlappingCursorSummaryClient(
+            conflicting=conflicting
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.summaries",
+            summary_kind="activity",
+        )
+    )
+
+    assert [record["steps"] for record in fetched.records] == expected_steps
+    assert fetched.limitations == expected_limitations
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-summary-id" not in encoded
+    assert "_healthmes_row_identity" not in encoded
+
+
+class OverlappingCursorWorkoutClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.conflicting = conflicting
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        distance = 6000 if cursor == "page-2" and self.conflicting else 5000
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                    "distance_meters": distance,
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("conflicting", "expected_distances", "expected_limitations"),
+    (
+        (False, [5000], ()),
+        (
+            True,
+            [5000, 6000],
+            ("wearable_conflicting_duplicate_rows",),
+        ),
+    ),
+)
+async def test_workout_cursor_overlap_uses_structural_identity(
+    conflicting: bool,
+    expected_distances: list[int],
+    expected_limitations: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        OverlappingCursorWorkoutClient(
+            conflicting=conflicting
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_request("wearable.workouts"))
+
+    assert [
+        record["distance_meters"] for record in fetched.records
+    ] == expected_distances
+    assert fetched.limitations == expected_limitations
+
+
+class UnattributedOverlappingTimeseriesClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.conflicting = conflicting
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        value = 20 if cursor == "page-2" and self.conflicting else 10
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "steps",
+                    "value": value,
+                    "unit": "count",
+                    "provider": "apple",
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("conflicting", "expected_values", "expected_limitations"),
+    (
+        (
+            False,
+            [10],
+            ("wearable_stream_attribution_unavailable",),
+        ),
+        (
+            True,
+            [10, 20],
+            (
+                "wearable_conflicting_duplicate_rows",
+                "wearable_stream_attribution_unavailable",
+            ),
+        ),
+    ),
+)
+async def test_unattributed_timeseries_cursor_overlap_is_not_summed(
+    conflicting: bool,
+    expected_values: list[int],
+    expected_limitations: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        UnattributedOverlappingTimeseriesClient(
+            conflicting=conflicting
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == expected_values
+    assert fetched.limitations == expected_limitations
+
+
+def _overlap_row(
+    capability: str,
+    *,
+    provider: str,
+    conflicting: bool,
+    include_id: bool,
+) -> dict:
+    row: dict = {"provider": provider}
+    if include_id:
+        row["id"] = "private-provider-row-id"
+    if capability == "wearable.health-scores":
+        row.update(
+            {
+                "category": "stress",
+                "recorded_at": "2026-08-10T08:00:00Z",
+                "value": 43 if conflicting else 42,
+            }
+        )
+    elif capability == "wearable.summaries":
+        row.update(
+            {
+                "date": "2026-08-10",
+                "steps": 9000 if conflicting else 8000,
+            }
+        )
+    elif capability == "wearable.workouts":
+        row.update(
+            {
+                "type": "running",
+                "start_time": "2026-08-10T09:00:00Z",
+                "end_time": "2026-08-10T09:30:00Z",
+                "distance_meters": 6000 if conflicting else 5000,
+            }
+        )
+    else:
+        row.update(
+            {
+                "timestamp": "2026-08-10T10:10:00Z",
+                "type": "steps",
+                "value": 20 if conflicting else 10,
+                "unit": "count",
+            }
+        )
+        if include_id:
+            row["data_source_id"] = "private-provider-stream-id"
+    return row
+
+
+def _overlap_request(capability: str) -> WearableSearchRequest:
+    if capability == "wearable.summaries":
+        return _request(capability, summary_kind="activity")
+    if capability == "wearable.timeseries":
+        return _request(
+            capability,
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    return _request(capability)
+
+
+def _overlap_values(
+    capability: str,
+    records: tuple[dict[str, object], ...],
+) -> list[int | float]:
+    field = {
+        "wearable.health-scores": "value",
+        "wearable.summaries": "steps",
+        "wearable.workouts": "distance_meters",
+        "wearable.timeseries": "value",
+    }[capability]
+    return [record[field] for record in records]  # type: ignore[misc]
+
+
+class ProviderAliasOverlapClient:
+    def __init__(self, capability: str, *, conflicting: bool) -> None:
+        self.capability = capability
+        self.conflicting = conflicting
+
+    def _page(self, *, second: bool) -> dict:
+        return _overlap_row(
+            self.capability,
+            provider="apple_health" if second else "apple",
+            conflicting=second and self.conflicting,
+            include_id=True,
+        )
+
+    async def get_health_scores(self, _user_id, *, offset: int, **_kwargs):
+        second = offset > 0
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {"has_more": not second},
+        }
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": [self._page(second=second)],
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+@pytest.mark.parametrize("conflicting", (False, True))
+async def test_provider_aliases_share_cross_page_row_identity(
+    capability: str,
+    conflicting: bool,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        ProviderAliasOverlapClient(
+            capability,
+            conflicting=conflicting,
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    expected = [42, 43] if conflicting else [42]
+    if capability == "wearable.summaries":
+        expected = [8000, 9000] if conflicting else [8000]
+    elif capability == "wearable.workouts":
+        expected = [5000, 6000] if conflicting else [5000]
+    elif capability == "wearable.timeseries":
+        expected = [10, 20] if conflicting else [10]
+    assert _overlap_values(capability, fetched.records) == expected
+    assert (
+        "wearable_conflicting_duplicate_rows" in fetched.limitations
+    ) is conflicting
+    assert all(
+        record["provider"] == "apple_health"
+        for record in fetched.records
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-provider-row-id" not in encoded
+    assert "private-provider-stream-id" not in encoded
+
+
+class SamePageDuplicateClient:
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+
+    def _rows(self) -> list[dict]:
+        row = _overlap_row(
+            self.capability,
+            provider="apple",
+            conflicting=False,
+            include_id=False,
+        )
+        return [dict(row), dict(row)]
+
+    async def get_health_scores(self, _user_id, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"has_more": False},
+        }
+
+    async def get_activity_summaries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": self._rows(),
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+async def test_same_page_identical_rows_without_ids_remain_distinct(
+    capability: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        SamePageDuplicateClient(capability),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    assert len(fetched.records) == 2
+    assert "wearable_conflicting_duplicate_rows" not in fetched.limitations
+
+
+class SamePageStableIdClient(SamePageDuplicateClient):
+    def __init__(
+        self,
+        capability: str,
+        *,
+        conflicting: bool,
+    ) -> None:
+        super().__init__(capability)
+        self.conflicting = conflicting
+
+    def _rows(self) -> list[dict]:
+        baseline = _overlap_row(
+            self.capability,
+            provider="apple",
+            conflicting=False,
+            include_id=True,
+        )
+        duplicate = _overlap_row(
+            self.capability,
+            provider="apple_health",
+            conflicting=self.conflicting,
+            include_id=True,
+        )
+        return [baseline, duplicate]
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+@pytest.mark.parametrize("conflicting", (False, True))
+async def test_same_page_stable_ids_deduplicate_or_surface_conflicts(
+    capability: str,
+    conflicting: bool,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        SamePageStableIdClient(
+            capability,
+            conflicting=conflicting,
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    assert len(fetched.records) == (2 if conflicting else 1)
+    assert (
+        "wearable_conflicting_duplicate_rows" in fetched.limitations
+    ) is conflicting
+    if capability == "wearable.timeseries":
+        assert [record["value"] for record in fetched.records] == (
+            [10, 20] if conflicting else [10]
+        )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-provider-row-id" not in encoded
+    assert "private-provider-stream-id" not in encoded
+
+
+class ExactOverlapAfterPriorVariantClient:
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+
+    def _rows(self, *, second: bool) -> list[dict]:
+        baseline = _overlap_row(
+            self.capability,
+            provider="apple",
+            conflicting=False,
+            include_id=True,
+        )
+        if second:
+            return [baseline]
+        return [
+            baseline,
+            _overlap_row(
+                self.capability,
+                provider="apple_health",
+                conflicting=True,
+                include_id=True,
+            ),
+        ]
+
+    async def get_health_scores(self, _user_id, *, offset: int, **_kwargs):
+        second = offset > 0
+        return {
+            "data": self._rows(second=second),
+            "pagination": {"has_more": not second},
+        }
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": self._rows(second=second),
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": self._rows(second=second),
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        second = cursor is not None
+        return {
+            "data": self._rows(second=second),
+            "pagination": {
+                "next_cursor": None if second else "page-2",
+                "has_more": not second,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.workouts",
+        "wearable.timeseries",
+    ),
+)
+async def test_exact_overlap_cannot_hide_cross_page_conflict(
+    capability: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        ExactOverlapAfterPriorVariantClient(
+            capability
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_overlap_request(capability))
+
+    assert len(fetched.records) == 2
+    assert (
+        "wearable_conflicting_duplicate_rows" in fetched.limitations
+    )
+
+
+def test_retained_workouts_require_the_complete_interval() -> None:
+    retained_after = START + timedelta(hours=8)
+    fetched = normalize_retained_wearable_workouts(
+        (
+            {
+                "workout_type": "running",
+                "start_time": "2026-08-10T09:00:00+00:00",
+                "end_time": END.isoformat(),
+                "provider": "apple_health",
+                "provider_attribution": "declared",
+            },
+            {
+                "workout_type": "running",
+                "start_time": retained_after.isoformat(),
+                "end_time": "2026-08-10T09:00:00+00:00",
+                "provider": "apple_health",
+                "provider_attribution": "declared",
+            },
+            {
+                "workout_type": "running",
+                "start_time": "2026-08-10T09:00:00+00:00",
+                "end_time": (END + timedelta(seconds=1)).isoformat(),
+                "provider": "apple_health",
+                "provider_attribution": "declared",
+            },
+        ),
+        start=START,
+        end=END,
+        retained_after=retained_after,
+    )
+
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["end_time"] == END.isoformat()
+    assert fetched.discarded_rows == 2
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+class MissingOffsetPaginationClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self.rows = [
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (
+                    START + timedelta(minutes=index)
+                ).isoformat(),
+                "value": index,
+            }
+            for index in range(101)
+        ]
+
+    async def get_health_scores(
+        self,
+        _user_id,
+        *,
+        limit: int,
+        offset: int,
+        **_kwargs,
+    ):
+        self.calls.append((limit, offset))
+        return {"data": self.rows[offset : offset + limit]}
+
+
+async def test_offset_pagination_rejects_missing_pagination_metadata() -> None:
+    client = MissingOffsetPaginationClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="pagination"):
+        await search(_request("wearable.health-scores"))
+
+    assert client.calls == [(100, 0)]
+
+
+class NonMappingCursorPaginationClient:
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                }
+            ],
+            "pagination": [],
+        }
+
+
+async def test_cursor_pagination_rejects_non_mapping_metadata() -> None:
+    search = BoundedOpenWearablesSearch(
+        NonMappingCursorPaginationClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="pagination"):
+        await search(_request("wearable.workouts"))
+
+
+class InvalidCursorPaginationClient:
+    def __init__(self, pagination: object) -> None:
+        self.pagination = pagination
+
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                }
+            ],
+            "pagination": self.pagination,
+        }
+
+
+@pytest.mark.parametrize(
+    "pagination",
+    (
+        {"next_cursor": None},
+        {"has_more": False},
+        {"next_cursor": None, "has_more": True},
+        {"next_cursor": "page-2", "has_more": False},
+        {"next_cursor": "", "has_more": True},
+        {"next_cursor": None, "has_more": "false"},
+    ),
+)
+async def test_cursor_pagination_rejects_incomplete_or_contradictory_contract(
+    pagination: object,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        InvalidCursorPaginationClient(  # type: ignore[arg-type]
+            pagination
+        ),
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="cursor pagination"):
+        await search(_request("wearable.workouts"))
+
+
+class OversizedPageClient:
+    async def get_health_scores(self, _user_id, *, limit, **_kwargs):
+        return {
+            "data": [{} for _ in range(limit + 1)],
+            "pagination": {"has_more": False},
+        }
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        limit,
+        **_kwargs,
+    ):
+        return {
+            "data": [{} for _ in range(limit + 1)],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    ("wearable.health-scores", "wearable.workouts"),
+)
+async def test_search_rejects_page_larger_than_requested_limit(
+    capability: str,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        OversizedPageClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="requested row limit"):
+        await search(_request(capability))
+
+
+async def test_search_trims_sanitized_payload_to_180kb() -> None:
+    client = PagedHealthScoreClient(verbose=True)
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.health-scores"))
+
+    encoded = json.dumps(
+        {"records": fetched.records},
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    assert fetched.payload_trimmed is True
+    assert len(fetched.records) < MAX_WEARABLE_SEARCH_ROWS
+    assert len(encoded) <= MAX_WEARABLE_SEARCH_PAYLOAD_BYTES
+    assert "wearable_payload_limit_reached" in fetched.limitations
+
+
+@pytest.mark.parametrize(
+    "wearable_request",
+    (
+        _request(
+            "wearable.timeseries",
+            end=START + timedelta(hours=1),
+            series_type="heart_rate",
+            resolution="raw",
+        ),
+        _request(
+            "wearable.timeseries",
+            end=START + timedelta(hours=1),
+            series_type="latitude",
+            resolution="1min",
+        ),
+        _request(
+            "wearable.timeseries",
+            end=START + timedelta(hours=6, seconds=1),
+            series_type="heart_rate",
+            resolution="1min",
+        ),
+        _request(
+            "wearable.health-scores",
+            end=START + timedelta(days=30, seconds=1),
+        ),
+    ),
+)
+def test_search_rejects_raw_gps_and_oversized_windows(
+    wearable_request: WearableSearchRequest,
+) -> None:
+    with pytest.raises(ValueError):
+        validate_wearable_search_request(wearable_request)
+
+
+@pytest.mark.parametrize(
+    "wearable_request",
+    (
+        _request(
+            "wearable.health-scores",
+            category="not-a-score",
+        ),
+        _request(
+            "wearable.summaries",
+            summary_kind="body",
+        ),
+        _request(
+            "wearable.workouts",
+            unexpected="value",
+        ),
+    ),
+)
+async def test_search_rejects_invalid_contract_before_user_resolution(
+    wearable_request: WearableSearchRequest,
+) -> None:
+    resolver_calls = 0
+
+    def resolve_user() -> str:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return "private-user-id"
+
+    search = BoundedOpenWearablesSearch(
+        SanitizingClient(),  # type: ignore[arg-type]
+        resolve_user,
+    )
+
+    with pytest.raises(ValueError):
+        await search(wearable_request)
+
+    assert resolver_calls == 0
+
+
+class UserIdEchoClient:
+    async def get_health_scores(self, user_id, **_kwargs):
+        return {
+            "data": [
+                {
+                    "category": "stress",
+                    "provider": f"source-for-{user_id}",
+                    "recorded_at": "2026-08-10T08:00:00Z",
+                    "value": 42,
+                }
+            ],
+            "pagination": {"has_more": False},
+        }
+
+
+async def test_search_redacts_user_id_echoed_in_provider_text() -> None:
+    search = BoundedOpenWearablesSearch(
+        UserIdEchoClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.health-scores"))
+
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["provider"] == "unknown"
+    assert fetched.records[0]["provider_attribution"] == (
+        "declared_unclassified"
+    )
+    assert "private-user-id" not in json.dumps(fetched.records)
+    assert fetched.discarded_rows == 0
+    assert fetched.limitations == (
+        "wearable_provider_attribution_unavailable",
+    )
+
+
+class SourceProviderPrivacyClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "source": {
+                        "provider":
+                            "com.apple.health."
+                            "ED447642-08FD-4E45-AF20-633C02C83170"
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 74,
+                    "unit": "bpm",
+                    "source": {"provider": "com.pineapple.health"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 76,
+                    "unit": "bpm",
+                    "source": {"provider": "notgarmin-device"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:03:00Z",
+                    "type": "heart_rate",
+                    "value": 78,
+                    "unit": "bpm",
+                    "source": {"provider": "org.googleless.fit"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:04:00Z",
+                    "type": "heart_rate",
+                    "value": 80,
+                    "unit": "bpm",
+                    "source": {"provider": "unknown"},
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_search_does_not_guess_provider_from_source_identifiers() -> None:
+    search = BoundedOpenWearablesSearch(
+        SourceProviderPrivacyClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert [record["provider"] for record in fetched.records] == [
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+    ]
+    assert {
+        record["provider_attribution"]
+        for record in fetched.records
+    } == {"source_unclassified"}
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "com.apple.health" not in encoded
+    assert "ED447642" not in encoded
+    assert "pineapple" not in encoded
+    assert "notgarmin" not in encoded
+    assert "googleless" not in encoded
+    assert fetched.discarded_rows == 0
+
+
+class ProviderPrecedenceClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                    "source": {"provider": "apple"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 73,
+                    "unit": "bpm",
+                    "source": {"provider": "apple"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 74,
+                    "unit": "bpm",
+                    "source": {"provider": "google"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:03:00Z",
+                    "type": "heart_rate",
+                    "value": 75,
+                    "unit": "bpm",
+                    "source": {"provider": "samsung"},
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_search_uses_declared_provider_and_exact_legacy_aliases() -> None:
+    search = BoundedOpenWearablesSearch(
+        ProviderPrecedenceClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert [
+        (
+            record["provider"],
+            record["provider_attribution"],
+        )
+        for record in fetched.records
+    ] == [
+        ("garmin", "declared"),
+        ("apple_health", "source_exact_alias"),
+        ("google_health_connect", "source_exact_alias"),
+        ("samsung_health", "source_exact_alias"),
+    ]
+
+
+class RealOpenWearablesTimeseriesClient:
+    async def get_timeseries(
+        self,
+        _user_id,
+        _start,
+        _end,
+        series_types,
+        *,
+        resolution,
+        **_kwargs,
+    ):
+        assert series_types == ["steps"]
+        assert resolution == "1hour"
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:05:00Z",
+                    "zone_offset": "+00:00",
+                    "type": "steps",
+                    "value": 10.0,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple_health_sdk",
+                        "device": "Watch7,1",
+                    },
+                    "is_daily_total": False,
+                },
+                {
+                    "timestamp": "2026-08-10T10:25:00Z",
+                    "zone_offset": "+00:00",
+                    "type": "steps",
+                    "value": 20.0,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple_health_sdk",
+                        "device": "Watch7,1",
+                    },
+                    "is_daily_total": False,
+                },
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "previous_cursor": None,
+                "has_more": False,
+                "total_count": 2,
+            },
+            "metadata": {
+                "sample_count": 2,
+                "start_time": "2026-08-10T09:00:00Z",
+                "end_time": "2026-08-10T11:00:00Z",
+            },
+        }
+
+
+async def test_real_open_wearables_timeseries_schema_is_supported() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        RealOpenWearablesTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T10:00:00+00:00",
+        "2026-08-10T10:00:00+00:00",
+    ]
+    assert all(
+        record["provider"] == "apple_health"
+        and record["provider_attribution"] == "source_exact_alias"
+        for record in fetched.records
+    )
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "Watch7,1" not in encoded
+    assert "data_source_id" not in encoded
+
+
+class DistinctSensorStreamsClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "device-A",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:25Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "device-B",
+                    },
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_timeseries_never_sums_distinct_sensor_streams() -> None:
+    search = BoundedOpenWearablesSearch(
+        DistinctSensorStreamsClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T10:00:00+00:00",
+        "2026-08-10T10:00:00+00:00",
+    ]
+    assert all(
+        record["provider"] == "apple_health"
+        and record["provider_attribution"] == "source_exact_alias"
+        for record in fetched.records
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "device-A" not in encoded
+    assert "device-B" not in encoded
+    assert "_healthmes_stream_key" not in encoded
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+
+
+class AmbiguousSensorStreamClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "same-public-label",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:25Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "same-public-label",
+                    },
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_timeseries_does_not_sum_ambiguous_matching_sources() -> None:
+    search = BoundedOpenWearablesSearch(
+        AmbiguousSensorStreamClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1min",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T10:00:00+00:00",
+        "2026-08-10T10:00:00+00:00",
+    ]
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "same-public-label" not in encoded
+    assert "_healthmes_stream_key" not in encoded
+
+
+class MissingProviderClient:
+    async def get_health_scores(self, _user_id, **_kwargs):
+        return {
+            "data": [
+                {
+                    "category": "stress",
+                    "recorded_at": "2026-08-10T08:00:00Z",
+                    "value": 42,
+                }
+            ],
+            "pagination": {"has_more": False},
+        }
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        **_kwargs,
+    ):
+        return {
+            "data": [{"date": "2026-08-10", "steps": 8000}],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                }
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+@pytest.mark.parametrize(
+    "wearable_request",
+    (
+        _request("wearable.health-scores"),
+        _request(
+            "wearable.summaries",
+            summary_kind="activity",
+        ),
+        _request("wearable.workouts"),
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        ),
+    ),
+)
+async def test_search_retains_rows_without_provider_as_unknown(
+    wearable_request: WearableSearchRequest,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        MissingProviderClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(wearable_request)
+
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["provider"] == "unknown"
+    assert fetched.records[0]["provider_attribution"] == "missing"
+    assert fetched.discarded_rows == 0
+    expected_limitations = {
+        "wearable_provider_attribution_unavailable",
+    }
+    if wearable_request.capability == "wearable.timeseries":
+        expected_limitations.add(
+            "wearable_stream_attribution_unavailable"
+        )
+    assert set(fetched.limitations) == expected_limitations

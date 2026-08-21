@@ -1,34 +1,34 @@
 ---
 name: healthmes-capture
-description: "Turn Telegram photos/voice notes into structured health logs: food (log_food) and medical-lite medication/symptom captures (create_medical_record), stored locally."
+description: "Turn channel-neutral photo, voice, or text captures into structured local food and medical-lite records."
 version: 1.1.0
 author: HealthMes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [Health, Food, Medical, Capture, Logging, Telegram, Vision]
+    tags: [Health, Food, Medical, Capture, Logging, Channel, Vision]
     related_skills: [doctor-visit-summary]
 ---
 
 # HealthMes Capture
 
-The Telegram bot IS the capture app: there is no separate UI. When the user
-sends a photo or a voice note (from phone; the watch contributes voice quick
-replies), you classify it, produce a structured description, and persist it
-through the HealthMes MCP tools. Capture must feel instant: one message in,
-one confirmation out, one tap to correct.
+This is a bounded capture workflow, not a free-form wellness reasoning
+ingress. A future app or channel wrapper may supply a photo, local media path,
+voice transcript, or text capture. Classify it, produce a structured
+description, and persist only the domain record through HealthMes tools.
+The wrapper owns its UI; this Skill does not install Telegram, mobile, or web
+inbound behavior.
 
 ## Data access rules (non-negotiable)
 
 - Persist ONLY via MCP tools on the `healthmes` server (registered as
   `mcp__healthmes__<tool>` with double underscores, e.g.
   `mcp__healthmes__log_food` — vendor/hermes-agent/tools/mcp_tool.py).
-  Never call REST APIs directly — bypassing MCP breaks the decision-record
-  chain.
-- Store the media by its LOCAL file path. Inbound Telegram media is already
-  saved to disk by the Hermes gateway and referenced in the message (e.g. a
-  `MEDIA:<path>` tag or attachment path) — pass that path through; never
-  re-upload, never inline image bytes into the database.
+  Never call REST APIs directly — bypassing MCP breaks the product data,
+  retention, and provenance boundary.
+- Store media only by the LOCAL file path supplied by the trusted capture
+  wrapper (for example a `MEDIA:<path>` tag or attachment path). Pass that
+  path through; never re-upload or inline image bytes into the database.
 - Raw media never leaves the machine except for the model call that
   describes it. Summarize, then persist.
 
@@ -39,7 +39,6 @@ one confirmation out, one tap to correct.
 | `log_food` | Persist a food log: structured description, media path, timestamp, meal type |
 | `create_medical_record` | Persist a medication/symptom capture (Step 3); the tool attaches the health-context snapshot itself; pass `record_id` for one-tap corrections |
 | `get_daily_readiness_context` | Health-context snapshot to attach at food-log time |
-| `record_decision` | Record non-obvious capture decisions (kind: `capture`) |
 
 ## When to use
 
@@ -106,7 +105,7 @@ short question rather than guessing.
    Reply 1 to fix the description, 2 to change meal type/time, 3 to delete.
    ```
 
-   Use a Telegram inline keyboard when available; the numbered plain-text
+   A channel wrapper may render native actions; the numbered plain-text
    fallback must always be present. Apply a correction reply immediately by
    updating the same food-log entry (call `log_food` in its correction/update
    form for the entry you just created — keep the original media path), then
@@ -130,7 +129,7 @@ only that description text may ever re-enter the model context (e.g. when
 - The media file and the voice transcript stay on local disk / in the local
   database. Never re-upload, re-describe, or quote a transcript later.
 - Never include medical content (drug names, symptoms) in proactive
-  messages, cron briefings, webhook replies, or `record_decision` trees —
+  messages, scheduled briefings, or compact wellness decision records —
   refer to "your medical log" generically unless the user is the one asking
   about it in this conversation.
 - Never route medical content to any non-medical skill, external API, or
@@ -158,7 +157,7 @@ only that description text may ever re-enter the model context (e.g. when
 3. **Persist.** Call `create_medical_record` with `kind`, the structured
    `description`, `media_path` (the local path from the inbound message,
    passed through), `transcript` (voice captures), and `context` with
-   capture metadata only (e.g. `{"source": "telegram-photo",
+   capture metadata only (e.g. `{"source": "channel-photo",
    "captured_at": "<message time ISO>", "user_stated_time": "since
    lunch"}`). Do NOT fetch or pass health data yourself: the tool
    deterministically snapshots today's readiness context server-side and
@@ -181,11 +180,10 @@ only that description text may ever re-enter the model context (e.g. when
    symptom, no "you should see a doctor" unless the user asks. If they want
    a briefing for an appointment, that is the `doctor-visit-summary` skill.
 
-## Decision records
+## Storage boundary
 
-Routine successful captures do not need a `record_decision`. Record one
-(kind: `capture`) when you made a judgment worth auditing: ambiguous
-classification, a rejected capture, or a correction that changed meaning.
-For medical captures, keep decision-tree labels generic ("medical capture:
-classification ambiguous, user confirmed medication") — never put drug
-names, symptoms, or description text into a decision record.
+Routine capture and correction write only their domain record. They never
+create a DecisionRecord, and this command profile has no generic
+decision-record writer. If the user asks a separate wellness question about
+the capture, send that question through the canonical HealthMes decision
+ingress; its finalizer alone decides whether a compact record is warranted.

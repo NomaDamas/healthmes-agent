@@ -109,8 +109,8 @@ class InMemoryAdjustmentRepository:
 
     def update_mirror_after_apply(
         self, proposal: StoredAdjustmentProposal, event: ExternalEvent
-    ) -> None:
-        return None
+    ) -> bool:
+        return True
 
     def compare_and_mark_applying(
         self,

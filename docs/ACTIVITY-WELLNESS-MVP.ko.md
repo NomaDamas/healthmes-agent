@@ -21,7 +21,8 @@ Android activity collector ───────────┐
                                       │
 macOS/Windows/Linux ActivityWatch ────┼─> HealthMes Activity Ingest
                                       │
-iOS capability-limited adapter ───────┘
+iPhone Screen Time contract ──────────┘
+(일반 빌드: unavailable)
                                              |
                                              v
                                   activity.* WellnessEvent
@@ -37,6 +38,10 @@ iOS capability-limited adapter ───────┘
 Open Wearables 데이터는 Activity Ingest로 들어오지 않는다. 이들은 각자의
 기존 입력 경로를 유지하고 HealthMes의 상위 context/decision 계층에서만
 activity context와 결합한다.
+
+서버의 iOS ingest·저장·보존·집계 계약과 iPhone의 contract/sync-service seam은
+구현됐다. 그러나 일반 저장소 빌드는 unavailable adapter만 사용하므로 실제
+Screen Time 데이터를 수집하지 않는다.
 
 휴대전화만 사용하는 사용자를 위해 전체 HealthMes 에이전트를 휴대전화에
 상주시켜 구현하지 않는다. 휴대전화 단독 사용은 미래
@@ -54,7 +59,7 @@ HealthMes
   +-- WellnessEvent storage
   +-- activity/nutrition/wearable/calendar engines
   +-- Context Access Layer
-  +-- HealthMes Decision Agent contract
+  +-- HealthMes wellness request/result contract
   +-- decision policies
   +-- REST/MCP/skill contracts
   |
@@ -63,10 +68,10 @@ HealthMes
         +-- Hermes adaptation (future)
 ```
 
-Hermes는 HealthMes와 동등한 데이터·판단 계층이 아니다. 향후 HealthMes
-Decision Agent 계약과 MCP 도구를 실행하는 교체 가능한 agent/channel runtime
-adapter다. Skill은 핵심 판단 로직이 아니라 이 runtime을 연결하는 얇은 설명이다.
-이번 MVP는 Hermes 코드나 `vendor/hermes-agent/`를 변경하지 않는다.
+Hermes는 HealthMes와 동등한 데이터·판단 계층이 아니다. HealthMes의 공식
+ingress가 호출하는 단일 autonomous LLM/tool runtime이다. Skill은 핵심 판단
+로직이 아니라 이 runtime을 연결하는 얇은 설명이다. 이번 MVP는 Hermes 코드나
+`vendor/hermes-agent/`를 변경하지 않는다.
 
 ## 2. 실행 위치와 저장 결정
 
@@ -146,11 +151,44 @@ active activity interval
 ### iPhone과 iPad
 
 - Android와 같은 상세 foreground 앱 timeline을 제품 전제로 약속하지 않는다.
-- OS와 entitlement가 허용하는 aggregate 또는 threshold만 adapter를 통해
-  받을 수 있다.
+- 조건부 gate-enabled·entitled 빌드가 제공될 때만 완료된 local-hour별 앱
+  사용시간과 category aggregate를 adapter로 받을 수 있다.
+- 최초 승인 직후와 timezone 변경 직후에는 과거 활동을 소급 수집하지 않고 최신
+  완료 local-hour 1개만 읽는다. 이후 같은 timezone에서 실행되는 sync는 그
+  동의 경계 이후를 최근 완료 48시간과 retention cutoff 안에서 authoritative
+  snapshot으로 다시 읽어 OS의 늦은 집계와 수정을 반영하도록 설계됐다.
+- denied/unavailable 결과는 동의 경계를 저장하지 않는다. 나중에 처음 승인되면
+  거부 시점이 아니라 승인 시점의 최신 완료 local-hour 1개에서 시작한다.
+- bundle ID는 기기 Keychain의 device-only HMAC key로 가명화한 뒤 업로드하고,
+  서버 exclude list도 같은 opaque token을 사용한다.
+- collector ID도 같은 Keychain key에서 `ios-collector-v1-*`로 안정적으로
+  파생한다. 새 ID는 서버가 기본적으로 fail closed하고, 명시적 Apple authorization
+  성공 뒤에만 UI-neutral runtime이 absent instance를 통합 input 설정 CAS로
+  enable한다. 기존 disabled/paused instance나 private-app 제외를 자동으로
+  덮어쓰지 않으므로 재설치나 key 손실이 기존 privacy 설정을 우회하지 않는다.
+- HMAC key가 바뀌면 `collection_generation`을 증가시키고, 현재 key와 정확한
+  제외 token 집합의 digest를 명시적으로 재승인하기 전에는 Screen Time을 읽지
+  않는다. 목록을 잠시 비웠다가 되돌리는 방식으로는 승인되지 않으므로 과거
+  token이 무효화된 상태에서 private 앱 수집이 조용히 재개되지 않는다.
+- 제외 앱이나 bundle ID를 얻지 못한 앱이 허용 앱과 같은 시간에 섞이면 허용
+  사용시간은 보존하되 해당 hour의 coverage는 unknown으로 남긴다. private
+  activity만 있던 시간을 실제 0분으로 만들지 않는다.
+- Screen Time pickup은 app launch와 의미가 다르므로 launch count로 보내지
+  않는다. summary는 lower bound `0`, upper bound `null`,
+  precision `unknown`과 `launches_unavailable_for_some_sources` limitation을
+  반환한다.
 - 지원되지 않는 환경은 사용시간 `0`으로 저장하지 않고
   `capability=unavailable`로 표시한다.
 - private API, 화면 캡처 또는 접근성 우회로 상세 활동을 만들지 않는다.
+- 실제 Apple export 경로는 지원 SDK/OS, App & Website Usage entitlement,
+  데이터 접근 사용자 승인과 Apple의 제공 조건이 필요하다. 일반 빌드는
+  unavailable adapter로 fail closed한다.
+- report contract, transport와 주입 가능한 sync-service core는 구현·테스트됐다.
+  실제 Apple collector 경로는 현재 SDK에서 컴파일되지 않았다. 권한 승인 직후
+  sync, foreground catch-up, Screen Time용 best-effort background task와
+  persistent outbox 재전송은 UI가 아니라 PR #138 Issue #168이 소유하는
+  lifecycle 엔진 범위다. compile condition, Apple entitlement 승인, 권한 설명
+  UI, distribution signing과 실기기 검증만 device-team 또는 외부 조건이다.
 
 ## 4. 시간대별 집계 기준
 
@@ -205,7 +243,11 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
 3. pause until a time or manual resume
 ```
 
-- 제외 규칙은 source device에서 event 생성 전에 적용한다.
+- Android 제외 목록은 UsageStats package name, ActivityWatch 제외 목록은 window
+  event의 `data.app` 값(bucket ID나 title이 아님), iPhone 제외 목록은 동일
+  기기가 생성한 `ios-app-v2-<key fingerprint>-<app HMAC>` token을 사용한다.
+- Android와 iPhone은 업로드 전에 제외하고, ActivityWatch는 localhost event를
+  읽은 뒤 HealthMes 저장 전에 제외한다.
 - 수집기는 OS 활동을 읽기 전에 서버의 최신 collection config를 조회하고,
   응답의 `config_revision`을 ingest payload의 `collection_revision`으로 넣는다.
   `enabled`, `effective_collecting`, `blocked_reason`, `excluded_apps`,
@@ -287,6 +329,10 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
 - 설정, runtime status와 adapter cursor는 서로 덮어쓰지 않는 독립
   `WellnessEvent`로 저장하고 하나의 read contract로 합쳐 반환한다.
 - 설정 화면, 권한 버튼과 플랫폼 UI는 별도 device-team branch가 소유한다.
+- 모든 입력을 한 화면에서 다룰 UI는 별도 설정 저장소를 만들지 않고
+  `GET /v1/inputs`와 `PUT /v1/inputs/{source_id}/settings` 계약을 사용한다.
+  상세 scope와 action metadata는
+  [`INPUT-CONTROL-PLANE.ko.md`](INPUT-CONTROL-PLANE.ko.md)에 정의한다.
 
 ## 7. 최소 파생 activity context
 
@@ -343,17 +389,17 @@ HealthMes MCP/context contract
 HealthMes Context Access Layer
         |
         v
-HealthMes Decision Agent
+Hermes autonomous decision turn
         |
         v
-runtime adaptation, including Hermes
+HealthMes source validation and conditional finalization
 ```
 
 현재 `resolve_wellness_context(question_kind, ...)`와
 `healthmes-activity-wellness` 계약은 구현 호환용 preset이다. 목표 구조에서는 LLM
-Decision Agent가 필요한 도구를 자율적으로 선택하고, Context Access Layer는
+Hermes LLM이 필요한 도구를 자율적으로 선택하고, Context Access Layer는
 권한·retention·privacy와 source reference만 강제한다. 상세 개선안은
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 를 따른다.
 
 ## 9. 교차 영역 질문
@@ -383,7 +429,7 @@ HealthMes decision
 ```
 
 Activity policy가 카페인 용량을 계산하지 않고, caffeine policy가 집중도를
-추측하지 않는다. HealthMes Decision Agent의 LLM이 필요한 전문 도구를 선택하고
+추측하지 않는다. Hermes의 단일 LLM turn이 필요한 전문 도구를 선택하고
 각 정책 결과의 경계를 유지한 채 최종 설명을 결합한다. Context Access Layer는
 선택된 자료의 권한, freshness, coverage와 source reference를 검사한다.
 
@@ -436,12 +482,21 @@ table과 canonical store에 원자적으로 투영한다.
 
 완료 조건: macOS, Windows와 Linux fixture가 같은 activity schema를 만든다.
 
-**`ACT-MVP-06 iOS Capability Adapter`**
+**`ACT-MVP-06 iOS Screen Time Aggregate Adapter`**
 
-- supported aggregate 입력 계약
+- 서버 ingest/storage 계약과 완료된 local-hour sync-service seam
+- source-side 제외와 keyed app pseudonym
+- 최초·timezone 변경 시 1시간 경계, 이후 최대 48시간 authoritative snapshot과
+  generation/sequence fence
 - unsupported/permission denied 상태
 
-완료 조건: 지원하지 않는 환경에서 상세 timeline이나 가짜 0분을 만들지 않는다.
+2026-08-16 PR #138 완료 조건: 조건부 collector가 제출할 aggregate를 같은
+canonical activity 저장소에 쓰고, 일반 빌드는 상세 timeline이나 가짜 0분을
+만들지 않는다. Issue #168의 UI-neutral lifecycle은 권한 승인 성공 후 첫 sync,
+foreground catch-up, Screen Time 전용 best-effort background task와 bounded
+persistent outbox 재전송을 연결한다. compile flag와 Apple entitlement 승인,
+권한 설명 UI, distribution signing과 실기기 검증은 device-team 또는 외부
+조건으로 남는다.
 
 ### Stage 4 - HealthMes processing
 
@@ -535,23 +590,40 @@ tests/api/ and tests/mcp_server/
 
 구현은 공통 `WellnessEvent` 저장소를 사용하며 별도 activity silo를 만들지 않는다.
 기존 Android hourly collector는 compatibility table을 유지하면서 같은 입력을
-canonical activity event로 투영한다. ActivityWatch와 iOS capability adapter도
-같은 envelope를 사용한다.
+canonical activity event로 투영한다. ActivityWatch와 iPhone Screen Time
+aggregate adapter도 같은 envelope를 사용한다.
 
 현재 고정 `question_kind` 호출자와의 호환 계약은
 [`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
-에 남긴다. 목표 자연어 판단, 자율 tool selection, Hermes adapter와 자동
-DecisionRecord 저장은
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+에 남긴다. 목표 자연어 판단, 자율 tool selection, Hermes adapter와 선택적
+compact DecisionRecord 저장은
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 를 canonical target으로 사용한다. 실제 UI와 device dogfood는 이 엔진 구현과
 분리된 후속 작업이다.
 
 ## 14. 엔진 구현 상태
 
-2026-08-10 기준으로 UI를 제외한 이 문서의 MVP 엔진 범위는 구현되어 있다.
+2026-08-14 기준으로 서버 activity data plane과 조건부 iOS 연동 seam은
+구현되어 있다. production iPhone Screen Time 수집까지 완료됐다는 뜻은 아니다.
 
-- Android, ActivityWatch와 iOS capability 입력은 같은 `WellnessEvent` 저장소를
-  사용한다.
+- Android와 ActivityWatch 입력은 같은 `WellnessEvent` 저장소를 사용한다.
+  서버는 조건부 iPhone collector가 제출할 Screen Time aggregate도 같은 저장소에
+  수용한다.
+- iPhone companion에는 최초·timezone 변경 시 최신 완료 1시간에서 시작하고,
+  이후 최대 최근 48시간까지 서버 collection revision, retention cutoff와
+  exclude list를 적용하는 UI 독립 sync-service core가 있다.
+  현재 일반 build는 실제 export capability를 활성화하지 않고 unavailable만
+  보고한다.
+- iPhone에서 제공하지 않는 app launch는 관찰된 0으로 저장하지 않는다. raw,
+  hourly/daily summary, focus context와 Decision Agent provider까지
+  `launches_unavailable_for_some_sources`를 보존한다.
+- iPhone HMAC key 변경은 generation 경계이며, 현재 key와 정확한 제외 token
+  집합의 digest를 device-team UI가 `approveExcludedApps(_:)` seam으로 승인하기
+  전 수집을 fail closed한다. 제외·식별 불가 활동이 섞인 hour는 full coverage를
+  주장하지 않는다.
+- 성공한 iPhone authoritative snapshot의 manifest와 최초 응답은 같은 fence에
+  저장된다. 동일 snapshot 재시도는 이후 config/pause/exclude/tombstone
+  변경보다 먼저 최초 응답을 재생하고, 같은 sequence의 다른 내용은 거부한다.
 - 기본 보존은 raw 14일, hourly summary 90일, daily summary 무기한이며 기존
   `1/7/14/30/90일/무기한` storage setting으로 변경할 수 있다.
 - hourly와 daily summary의 provenance는 raw ID 전체를 복제하지 않고
@@ -581,6 +653,10 @@ DecisionRecord 저장은
   process-local write lock을 사용하고, REST·웹·scheduler 경로는 database
   commit이 끝날 때까지 lock을 유지한다. 정책 변경 직전의 규칙으로 뒤늦게
   activity row가 commit되는 경쟁을 막는다.
+- calendar mirror sync도 같은 cross-process write fence에서 현재
+  `calendar_mirror` cutoff를 다시 읽는다. cutoff 이전에 끝난 provider event는
+  다시 삽입하지 않으며 Decision Agent calendar provider도 maintenance 실행
+  여부와 무관하게 같은 cutoff보다 오래된 row를 조회하지 않는다.
 - PostgreSQL에서는 process-local lock에 더해 device별 transaction advisory
   lock을 사용한다. config, permission/status, cursor writer와 모든 canonical
   ingest가 같은 key를 사용하므로 아직 control row가 하나도 없는 최초
@@ -828,7 +904,7 @@ DecisionRecord 저장은
   `status=known`인 specialist ledger의 유한한 0 이상
   `confirmed_caffeine_mg`, 완료 확인된 당일 섭취 boundary가 모두 있을 때만
   `candidate_ledger_complete=true`를 반환한다. 이 resolver는 context 전용이므로
-  HealthMes Decision Agent가 최종 종합·기록하기 전에는 항상
+  Hermes가 최종 종합하고 HealthMes가 source를 검증하기 전에는 항상
   `decision_ready=false`다.
 
 실제 iOS/Android/macOS/Watch 화면, 디바이스 dogfood, 실시간 동기화와 Hermes

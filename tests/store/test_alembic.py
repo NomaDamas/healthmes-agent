@@ -6,10 +6,16 @@ network, or running database are needed — postgres is exercised via *offline*
 rendering, which never connects.
 """
 
+import hashlib
 import io
 import logging
+import os
+import sqlite3
+import threading
+import time
 import uuid
-from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,18 +24,26 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
+from healthmes.config import Settings
 from healthmes.schedule_proposals import resolution_token, verify_resolution_token
+from healthmes.storage import run_storage_maintenance
 from healthmes.store import (
     Base,
     DecisionKind,
     DecisionRecord,
     ProposalStatus,
+    RetentionPolicy,
     ScheduleProposal,
+    StorageObject,
     Task,
+    create_db_engine,
     session_scope,
+)
+from healthmes.wearables.provenance import (
+    persist_open_wearables_observation,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +59,8 @@ EXPECTED_TABLES = {
     "app_usage_sample",
     "cognitive_energy_estimate",
     "decision_record",
+    "decision_request_receipt",
+    "decision_domain_policy",
     "insight",
     "medical_record",
     "trigger_event",
@@ -102,6 +118,150 @@ def _render_offline_app_usage_snapshot_downgrade(database_url: str) -> str:
     return buffer.getvalue()
 
 
+def _render_offline_decision_agent_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "f4a5b6c7d8e9:e3f4a5b6c7d8",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_policy_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "a5b6c7d8e9f0:f4a5b6c7d8e9",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_policy_constraint_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "d4e5f6a7b8c9:e5f6a7b8c9d0",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_policy_constraint_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "e5f6a7b8c9d0:d4e5f6a7b8c9",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_calendar_generation_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "b6c7d8e9f0a1:a5b6c7d8e9f0",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_wearable_retention_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "c7d8e9f0a1b2:d8e9f0a1b2c3",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_wearable_retention_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "d8e9f0a1b2c3:c7d8e9f0a1b2",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_retention_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "d8e9f0a1b2c3:e9f0a1b2c3d4",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_retention_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "e9f0a1b2c3d4:d8e9f0a1b2c3",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_receipt_hardening_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "f0a1b2c3d4e5:a1b2c3d4e5f6",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_trigger_dispatch_lease_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "a1b2c3d4e5f6:b2c3d4e5f6a7",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_receipt_basis_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "b2c3d4e5f6a7:c3d4e5f6a7b8",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
@@ -136,6 +296,382 @@ class TestOfflineRender:
         assert "UUID" in rendered  # sa.Uuid became native UUID
         # enums stay portable VARCHAR: no postgres CREATE TYPE
         assert "CREATE TYPE" not in rendered
+
+    def test_storage_cleanup_identity_uses_portable_jsonb(self) -> None:
+        rendered = _render_offline_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert (
+            "ALTER TABLE storage_object ADD COLUMN file_cleanup_identity JSONB"
+            in rendered
+        )
+
+    def test_sqlite_offline_render_executes_cleanup_batch_once(
+        self,
+        tmp_path,
+    ) -> None:
+        rendered = _render_offline_upgrade("sqlite:///offline-render.db")
+        cleanup_sql = rendered.split(
+            "-- Running upgrade c3d4e5f6a7b8 -> d4e5f6a7b8c9",
+            maxsplit=1,
+        )[1]
+
+        assert (
+            "ALTER TABLE storage_object ADD COLUMN file_cleanup_identity"
+            not in cleanup_sql
+        )
+        assert cleanup_sql.count("file_cleanup_identity JSON") == 1
+        assert "storage_object_file_cleanup_consistent" in cleanup_sql
+
+        connection = sqlite3.connect(tmp_path / "offline-render.db")
+        try:
+            connection.executescript(rendered)
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(storage_object)"
+                )
+            }
+            table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'storage_object'"
+            ).fetchone()[0]
+            revisions = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT version_num FROM alembic_version"
+                )
+            }
+        finally:
+            connection.close()
+
+        assert {
+            "file_cleanup_identity",
+            "file_cleanup_completed_at",
+        } <= columns
+        assert "storage_object_file_cleanup_consistent" in table_sql
+        assert "e5f6a7b8c9d0" in revisions
+
+    def test_decision_policy_constraint_normalization_renders_for_sqlite(
+        self,
+    ) -> None:
+        upgrade = _render_offline_decision_policy_constraint_upgrade(
+            "sqlite:///offline-render.db"
+        )
+        downgrade = _render_offline_decision_policy_constraint_downgrade(
+            "sqlite:///offline-render.db"
+        )
+
+        assert "CREATE TABLE _alembic_tmp_decision_domain_policy" in upgrade
+        assert (
+            "CONSTRAINT ck_decision_domain_policy_revision_positive "
+            "CHECK (revision >= 1)"
+        ) in upgrade
+        assert (
+            "INSERT INTO _alembic_tmp_decision_domain_policy"
+            in upgrade
+        )
+        assert (
+            "CREATE INDEX "
+            "ix_decision_domain_policy_owner_principal_id"
+            in upgrade
+        )
+        assert "CREATE INDEX ix_decision_domain_policy_domain" in upgrade
+
+        assert (
+            "CREATE TABLE _alembic_tmp_decision_domain_policy"
+            in downgrade
+        )
+        assert (
+            "CONSTRAINT ck_decision_domain_policy_"
+            "ck_decision_domain_policy_revision_positive "
+            "CHECK (revision >= 1)"
+        ) in downgrade
+        assert (
+            "INSERT INTO _alembic_tmp_decision_domain_policy"
+            in downgrade
+        )
+
+    def test_decision_policy_constraint_normalization_renders_for_postgres(
+        self,
+    ) -> None:
+        database_url = (
+            "postgresql+psycopg://"
+            "healthmes:healthmes@localhost:5432/healthmes"
+        )
+        upgrade = _render_offline_decision_policy_constraint_upgrade(
+            database_url
+        )
+        downgrade = _render_offline_decision_policy_constraint_downgrade(
+            database_url
+        )
+        legacy = (
+            "ck_decision_domain_policy_"
+            "ck_decision_domain_policy_rev_2495"
+        )
+        canonical = "ck_decision_domain_policy_revision_positive"
+
+        assert (
+            f"RENAME CONSTRAINT {legacy} TO {canonical}"
+            in upgrade
+        )
+        assert (
+            f"RENAME CONSTRAINT {canonical} TO {legacy}"
+            in downgrade
+        )
+
+    def test_postgres_receipt_hardening_drops_exact_published_constraint(
+        self,
+    ) -> None:
+        rendered = _render_offline_decision_receipt_hardening_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert (
+            "DROP CONSTRAINT "
+            "ck_decision_request_receipt_state_payload_consistent"
+            in rendered
+        )
+        assert (
+            "ck_decision_request_receipt_"
+            "ck_decision_request_receipt_state_payload_consistent"
+            not in rendered
+        )
+        assert "ALTER COLUMN requested_at SET NOT NULL" in rendered
+
+    def test_postgres_trigger_dispatch_lease_renders_exact_names(
+        self,
+    ) -> None:
+        rendered = _render_offline_trigger_dispatch_lease_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert (
+            "ck_trigger_event_dispatch_lease_consistent"
+            in rendered
+        )
+        assert (
+            "ck_trigger_event_dispatch_generation_nonnegative"
+            in rendered
+        )
+        assert (
+            "ix_trigger_event_dispatch_lease_expires_at"
+            in rendered
+        )
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_receipt_basis_upgrade_uses_server_created_at(
+        self,
+        database_url,
+    ) -> None:
+        rendered = _render_offline_decision_receipt_basis_upgrade(
+            database_url
+        )
+
+        assert "retention_basis_at" in rendered
+        assert "SET retention_basis_at = created_at" in rendered
+        assert (
+            "ix_decision_request_receipt_retention_basis_at"
+            in rendered
+        )
+        assert "requested_at +" not in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_retention_upgrade_renders_legacy_cleanup(
+        self,
+        database_url,
+    ):
+        upgrade = _render_offline_decision_retention_upgrade(
+            database_url
+        )
+
+        assert "retention_basis_at" in upgrade
+        assert "expires_at" in upgrade
+        assert "retention_policy.data_class = 'decision'" in upgrade
+        assert "decision_request_id IS NOT NULL" in upgrade
+        assert "ix_decision_record_retention_basis_at" in upgrade
+        assert "ix_decision_record_expires_at" in upgrade
+        assert "healthmes.decision-private.v1" in upgrade
+        assert "healthmes.decision-private.v2" in upgrade
+        assert "UPDATE schedule_proposal" in upgrade
+        assert "UPDATE calendar_mutation_proposal" in upgrade
+        assert "DELETE FROM decision_record" in upgrade
+        if database_url.startswith("postgresql"):
+            assert "decision_payload ->> 'schema'" in upgrade
+        else:
+            assert "json_extract(decision_payload, '$.schema')" in upgrade
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_retention_offline_downgrade_is_refused(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="offline downgrade cannot verify decision retention",
+        ):
+            _render_offline_decision_retention_downgrade(
+                database_url
+            )
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_agent_offline_render_keeps_correlation_invariant(
+        self,
+        database_url,
+    ):
+        rendered = _render_offline_upgrade(database_url)
+
+        assert (
+            "decision_agent_correlation_complete"
+            in rendered
+        )
+        assert "decision_payload_digest" in rendered
+        if database_url.startswith("sqlite"):
+            assert "_alembic_tmp_decision_record" in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_agent_offline_downgrade_is_refused(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="offline downgrade cannot verify Decision Agent records",
+        ):
+            _render_offline_decision_agent_downgrade(database_url)
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_policy_offline_downgrade_is_refused(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "offline downgrade cannot verify Decision Agent "
+                "domain consent"
+            ),
+        ):
+            _render_offline_decision_policy_downgrade(database_url)
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_calendar_generation_offline_downgrade_is_refused_before_ddl(
+        self,
+        database_url,
+    ):
+        buffer = io.StringIO()
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "offline downgrade cannot verify Calendar "
+                "account-generation safety"
+            ),
+        ):
+            command.downgrade(
+                _config(database_url, buffer=buffer),
+                "b6c7d8e9f0a1:a5b6c7d8e9f0",
+                sql=True,
+            )
+        rendered = buffer.getvalue()
+        assert "DROP COLUMN" not in rendered
+        assert "DROP TABLE" not in rendered
+        assert "ALTER TABLE calendar_" not in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_calendar_generation_offline_upgrade_renders_safety_contract(
+        self,
+        database_url,
+    ):
+        rendered = _render_offline_upgrade(database_url)
+
+        assert "connection_generation" in rendered
+        assert "__legacy_unbound__" in rendered
+        assert "ck_calendar_mutation_proposal_active_generation" in rendered
+        if database_url.startswith("sqlite"):
+            assert "_alembic_tmp_calendar_event_mirror" in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_wearable_retention_offline_downgrade_requires_online_check(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "offline downgrade cannot verify wearable "
+                "retention policy"
+            ),
+        ):
+            _render_offline_wearable_retention_downgrade(
+                database_url
+            )
+
+    def test_wearable_retention_offline_uuid_matches_each_dialect(self):
+        sqlite_sql = _render_offline_wearable_retention_upgrade(
+            "sqlite:///offline-render.db"
+        )
+        postgres_sql = _render_offline_wearable_retention_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert "d8e9f0a1b2c34d5e8f90a1b2c3d4e5f6" in sqlite_sql
+        assert "d8e9f0a1-b2c3-4d5e-8f90-a1b2c3d4e5f6" not in sqlite_sql
+        assert "d8e9f0a1-b2c3-4d5e-8f90-a1b2c3d4e5f6" in postgres_sql
 
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
@@ -182,6 +718,80 @@ class TestOfflineRender:
 
 
 class TestSqliteUpgrade:
+    def test_supplied_connection_preserves_foreign_keys_during_batch_upgrade(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'supplied-connection.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c4f8a2d91b3e")
+        engine = sa.create_engine(database_url)
+        goal_id = uuid.uuid4()
+        task_id = uuid.uuid4()
+        try:
+            weekly_goal = sa.Table(
+                "weekly_goal",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            task = sa.Table(
+                "task",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            now = datetime(2026, 8, 19, tzinfo=UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    weekly_goal.insert().values(
+                        id=goal_id.hex,
+                        week_start=date(2026, 8, 17),
+                        title="preserve child reference",
+                        priority=1,
+                        status="active",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                connection.execute(
+                    task.insert().values(
+                        id=task_id.hex,
+                        title="must keep goal_id",
+                        goal_id=goal_id.hex,
+                        est_minutes=30,
+                        deadline=None,
+                        energy_demand="med",
+                        status="todo",
+                        source="user",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            with engine.connect() as connection:
+                raw = connection.connection.driver_connection
+                cursor = raw.cursor()
+                try:
+                    cursor.execute("PRAGMA foreign_keys=ON")
+                    cursor.execute("PRAGMA foreign_keys")
+                    assert cursor.fetchone() == (1,)
+                finally:
+                    cursor.close()
+                config.attributes["connection"] = connection
+                command.upgrade(config, "d5e7f3a1c2b9")
+
+                assert connection.scalar(
+                    sa.text("SELECT goal_id FROM task WHERE id = :id"),
+                    {"id": task_id.hex},
+                ) == goal_id.hex
+                assert connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).fetchall() == []
+                assert connection.exec_driver_sql(
+                    "PRAGMA foreign_keys"
+                ).scalar() == 1
+        finally:
+            engine.dispose()
+
     def test_upgrade_creates_schema_and_is_usable(self, tmp_path):
         database_url = f"sqlite:///{tmp_path / 'migrated.db'}"
         command.upgrade(_config(database_url), "head")
@@ -227,16 +837,2914 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    def test_storage_cleanup_upgrade_leaves_legacy_purges_pending(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'legacy-purge.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c3d4e5f6a7b8")
+        engine = sa.create_engine(database_url)
+        purged_id = uuid.uuid4().hex
+        active_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 17, 12, tzinfo=UTC)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            common = {
+                "data_class": "raw_payload",
+                "content_type": "application/octet-stream",
+                "size_bytes": 7,
+                "sha256": None,
+                "retention_policy_id": None,
+                "retention_basis_at": purged_at,
+                "expires_at": purged_at,
+                "safe_to_purge": True,
+                "created_at": purged_at,
+                "updated_at": purged_at,
+            }
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert(),
+                    [
+                        {
+                            **common,
+                            "id": purged_id,
+                            "relative_path": "raw_ingest/legacy.bin",
+                            "purged_at": purged_at,
+                        },
+                        {
+                            **common,
+                            "id": active_id,
+                            "relative_path": "raw_ingest/active.bin",
+                            "purged_at": None,
+                        },
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(storage_object).where(
+                            storage_object.c.id.in_(
+                                (purged_id, active_id)
+                            )
+                        )
+                    )
+                }
+            assert rows[purged_id].file_cleanup_completed_at is None
+            assert rows[purged_id].file_cleanup_identity is None
+            assert rows[active_id].file_cleanup_completed_at is None
+            assert rows[active_id].file_cleanup_identity is None
+        finally:
+            engine.dispose()
+
+    def test_migrated_legacy_purge_deletes_only_matching_remaining_file(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = f"sqlite:///{tmp_path / 'legacy-file-purge.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c3d4e5f6a7b8")
+        data_dir = tmp_path / "data"
+        relative_path = "raw_ingest/legacy.bin"
+        payload_path = data_dir / relative_path
+        payload = b"legacy purged payload still on disk"
+        digest = hashlib.sha256(payload).hexdigest()
+        payload_path.parent.mkdir(parents=True)
+        payload_path.write_bytes(payload)
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 17, 12, tzinfo=UTC)
+
+        engine = sa.create_engine(database_url)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert().values(
+                        id=object_id,
+                        data_class="raw_payload",
+                        relative_path=relative_path,
+                        content_type="application/octet-stream",
+                        size_bytes=len(payload),
+                        sha256=digest,
+                        retention_policy_id=None,
+                        retention_basis_at=purged_at,
+                        expires_at=purged_at,
+                        safe_to_purge=True,
+                        purged_at=purged_at,
+                        created_at=purged_at,
+                        updated_at=purged_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        runtime_engine = create_db_engine(database_url)
+        settings = Settings(
+            database_url=database_url,
+            data_dir=data_dir,
+            scheduler_enabled=False,
+            _env_file=None,
+        )
+        try:
+            with Session(runtime_engine) as session:
+                report = run_storage_maintenance(
+                    session,
+                    settings,
+                    now=datetime(2026, 8, 18, 12, tzinfo=UTC),
+                )
+                obj = session.get(StorageObject, uuid.UUID(object_id))
+                assert obj is not None
+                assert report.records_purged == 0
+                assert report.files_deleted == 1
+                assert report.file_cleanup_pending == 0
+                assert report.bytes_reclaimed == len(payload)
+                assert report.errors == ()
+                assert obj.file_cleanup_identity["version"] == 2
+                assert obj.file_cleanup_identity["sha256"] == digest
+                assert obj.file_cleanup_completed_at is not None
+                assert not payload_path.exists()
+        finally:
+            runtime_engine.dispose()
+
+    @pytest.mark.parametrize(
+        "failure_fragment",
+        (
+            "ADD COLUMN file_cleanup_identity",
+            "ADD COLUMN file_cleanup_completed_at",
+            "CREATE INDEX ix_storage_object_file_cleanup_completed_at",
+        ),
+    )
+    def test_storage_cleanup_upgrade_rolls_back_and_retries_after_each_stage(
+        self,
+        tmp_path,
+        failure_fragment,
+    ) -> None:
+        database_url = f"sqlite:///{tmp_path / 'cleanup-atomic.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c3d4e5f6a7b8")
+        injected = False
+
+        def fail_after_stage(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            nonlocal injected
+            if failure_fragment not in " ".join(statement.split()):
+                return
+            injected = True
+            raise RuntimeError(f"injected failure after {failure_fragment}")
+
+        sa.event.listen(
+            sa.engine.Engine,
+            "after_cursor_execute",
+            fail_after_stage,
+        )
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="injected failure after",
+            ):
+                command.upgrade(config, "head")
+        finally:
+            sa.event.remove(
+                sa.engine.Engine,
+                "after_cursor_execute",
+                fail_after_stage,
+            )
+        assert injected is True
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("storage_object")
+            }
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes("storage_object")
+            }
+            assert "file_cleanup_identity" not in columns
+            assert "file_cleanup_completed_at" not in columns
+            assert (
+                "ix_storage_object_file_cleanup_completed_at"
+                not in indexes
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c3d4e5f6a7b8"
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("storage_object")
+            }
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes("storage_object")
+            }
+            assert "file_cleanup_identity" in columns
+            assert "file_cleanup_completed_at" in columns
+            assert (
+                "ix_storage_object_file_cleanup_completed_at"
+                in indexes
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_downgrade_refuses_pending_unlink(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'pending-purge.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 18, 1, tzinfo=UTC)
+        cleanup_identity = {
+            "version": 1,
+            "kind": "regular",
+            "device": 1,
+            "inode": 2,
+            "size": 7,
+            "mtime_ns": 3,
+            "ctime_ns": 4,
+            "nlink": 1,
+            "sha256": "0" * 64,
+        }
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert().values(
+                        id=object_id,
+                        data_class="raw_payload",
+                        relative_path="raw_ingest/pending.bin",
+                        content_type="application/octet-stream",
+                        size_bytes=7,
+                        sha256=None,
+                        retention_policy_id=None,
+                        retention_basis_at=purged_at,
+                        expires_at=purged_at,
+                        safe_to_purge=True,
+                        purged_at=purged_at,
+                        file_cleanup_identity=cleanup_identity,
+                        file_cleanup_completed_at=None,
+                        created_at=purged_at,
+                        updated_at=purged_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="purged payload deletion is still pending",
+        ):
+            command.downgrade(config, "c3d4e5f6a7b8")
+
+        engine = sa.create_engine(database_url)
+        try:
+            storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+                assert (
+                    connection.scalar(
+                        sa.select(
+                            storage_object.c.file_cleanup_identity
+                        ).where(storage_object.c.id == object_id)
+                    )
+                    == cleanup_identity
+                )
+                connection.execute(
+                    storage_object.update()
+                    .where(storage_object.c.id == object_id)
+                    .values(file_cleanup_completed_at=purged_at)
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "c3d4e5f6a7b8")
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                column["name"]
+                for column in sa.inspect(engine).get_columns(
+                    "storage_object"
+                )
+            }
+            assert "file_cleanup_completed_at" not in columns
+            assert "file_cleanup_identity" not in columns
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_downgrade_waits_for_sqlite_retention_writer(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'cleanup-race.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(
+            database_url,
+            connect_args={"timeout": 5},
+        )
+        storage_object = sa.Table(
+            "storage_object",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 18, 2, tzinfo=UTC)
+        cleanup_identity = {
+            "version": 1,
+            "kind": "regular",
+            "device": 11,
+            "inode": 22,
+            "size": 7,
+            "mtime_ns": 33,
+            "ctime_ns": 44,
+            "nlink": 1,
+            "sha256": "1" * 64,
+        }
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    storage_object.insert().values(
+                        id=object_id,
+                        data_class="raw_payload",
+                        relative_path="raw_ingest/racing-purge.bin",
+                        content_type="application/octet-stream",
+                        size_bytes=7,
+                        sha256=None,
+                        retention_policy_id=None,
+                        retention_basis_at=purged_at,
+                        expires_at=purged_at,
+                        safe_to_purge=True,
+                        purged_at=None,
+                        file_cleanup_identity=None,
+                        file_cleanup_completed_at=None,
+                        created_at=purged_at,
+                        updated_at=purged_at,
+                    )
+                )
+
+            with engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    storage_object.update()
+                    .where(storage_object.c.id == object_id)
+                    .values(
+                        purged_at=purged_at,
+                        file_cleanup_identity=cleanup_identity,
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(database_url),
+                        "c3d4e5f6a7b8",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match="purged payload deletion is still pending",
+                    ):
+                        downgrade.result(timeout=5)
+        finally:
+            engine.dispose()
+
+        engine = sa.create_engine(database_url)
+        try:
+            current_storage_object = sa.Table(
+                "storage_object",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+                row = connection.execute(
+                    sa.select(current_storage_object).where(
+                        current_storage_object.c.id == object_id
+                    )
+                ).one()
+                assert row.purged_at == purged_at.replace(tzinfo=None)
+                assert row.file_cleanup_identity == cleanup_identity
+                assert row.file_cleanup_completed_at is None
+        finally:
+            engine.dispose()
+
+    def test_storage_cleanup_downgrade_holds_sqlite_lock_through_ddl(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'cleanup-ddl-race.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(
+            database_url,
+            connect_args={"timeout": 5},
+        )
+        storage_object = sa.Table(
+            "storage_object",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        object_id = uuid.uuid4().hex
+        purged_at = datetime(2026, 8, 18, 3, tzinfo=UTC)
+        cleanup_identity = {
+            "version": 1,
+            "kind": "regular",
+            "device": 111,
+            "inode": 222,
+            "size": 7,
+            "mtime_ns": 333,
+            "ctime_ns": 444,
+            "nlink": 1,
+            "sha256": "2" * 64,
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                storage_object.insert().values(
+                    id=object_id,
+                    data_class="raw_payload",
+                    relative_path="raw_ingest/ddl-racing-purge.bin",
+                    content_type="application/octet-stream",
+                    size_bytes=7,
+                    sha256=None,
+                    retention_policy_id=None,
+                    retention_basis_at=purged_at,
+                    expires_at=purged_at,
+                    safe_to_purge=True,
+                    purged_at=None,
+                    file_cleanup_identity=None,
+                    file_cleanup_completed_at=None,
+                    created_at=purged_at,
+                    updated_at=purged_at,
+                )
+            )
+
+        reservation_acquired = threading.Event()
+        release_downgrade = threading.Event()
+        reservation_sql = (
+            "UPDATE storage_object SET updated_at = updated_at WHERE 0"
+        )
+
+        def pause_after_reservation(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if " ".join(statement.split()) != reservation_sql:
+                return
+            reservation_acquired.set()
+            if not release_downgrade.wait(timeout=5):
+                raise TimeoutError("timed out releasing SQLite downgrade")
+
+        def write_pending_cleanup() -> None:
+            writer_engine = sa.create_engine(
+                database_url,
+                connect_args={"timeout": 5},
+            )
+            try:
+                with writer_engine.begin() as connection:
+                    connection.execute(
+                        storage_object.update()
+                        .where(storage_object.c.id == object_id)
+                        .values(
+                            purged_at=purged_at,
+                            file_cleanup_identity=cleanup_identity,
+                        )
+                    )
+            finally:
+                writer_engine.dispose()
+
+        sa.event.listen(
+            sa.engine.Engine,
+            "after_cursor_execute",
+            pause_after_reservation,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                downgrade = pool.submit(
+                    command.downgrade,
+                    _config(database_url),
+                    "c3d4e5f6a7b8",
+                )
+                assert reservation_acquired.wait(timeout=5)
+                writer = pool.submit(write_pending_cleanup)
+                time.sleep(0.2)
+                assert writer.done() is False
+
+                release_downgrade.set()
+                downgrade.result(timeout=5)
+                with pytest.raises(
+                    sa.exc.OperationalError,
+                    match="no such column.*file_cleanup_identity",
+                ):
+                    writer.result(timeout=5)
+        finally:
+            release_downgrade.set()
+            sa.event.remove(
+                sa.engine.Engine,
+                "after_cursor_execute",
+                pause_after_reservation,
+            )
+            engine.dispose()
+
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                column["name"]
+                for column in sa.inspect(engine).get_columns(
+                    "storage_object"
+                )
+            }
+            assert "file_cleanup_completed_at" not in columns
+            assert "file_cleanup_identity" not in columns
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c3d4e5f6a7b8"
+                assert connection.scalar(
+                    sa.select(storage_object.c.purged_at).where(
+                        storage_object.c.id == object_id
+                    )
+                ) is None
+        finally:
+            engine.dispose()
+
+    def test_published_decision_receipt_revision_is_immutable_and_protected(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'published-receipt.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e9f0a1b2c3d4")
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert not sa.inspect(engine).has_table(
+                "decision_request_receipt"
+            )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert inspector.has_table("decision_request_receipt")
+            columns = {
+                item["name"]
+                for item in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+            }
+            assert "requested_at" not in columns
+            assert "lease_generation" not in columns
+            assert "result_expires_at" not in columns
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                "ck_decision_request_receipt_state_payload_consistent"
+            }
+            assert {
+                item["name"]
+                for item in inspector.get_unique_constraints(
+                    "decision_request_receipt"
+                )
+            } == {"uq_decision_request_receipt_request_id"}
+            assert {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "decision_request_receipt"
+                )
+            } == {
+                "ix_decision_request_receipt_expires_at",
+                "ix_decision_request_receipt_lease_expires_at",
+                "ix_decision_request_receipt_owner_token",
+                "ix_decision_request_receipt_request_id",
+                "ix_decision_request_receipt_state",
+            }
+
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            now = datetime(2099, 8, 16, 9, tzinfo=UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=uuid.uuid4().hex,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="a" * 64,
+                        state="pending",
+                        owner_token=uuid.uuid4().hex,
+                        lease_expires_at=now + timedelta(minutes=5),
+                        expires_at=now + timedelta(days=30),
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=uuid.uuid4().hex,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="b" * 64,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"status": "completed"},
+                        },
+                        expires_at=now + timedelta(days=30),
+                    )
+                )
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(receipt)
+                ) == 2
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade decision_request_receipt without "
+                "losing durable idempotency results"
+            ),
+        ):
+            command.downgrade(config, "e9f0a1b2c3d4")
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert sa.inspect(engine).has_table(
+                "decision_request_receipt"
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(receipt)
+                ) == 2
+                connection.execute(receipt.delete())
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "e9f0a1b2c3d4")
+        engine = sa.create_engine(database_url)
+        try:
+            assert not sa.inspect(engine).has_table(
+                "decision_request_receipt"
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e9f0a1b2c3d4"
+        finally:
+            engine.dispose()
+
+    def test_decision_receipt_hardening_upgrades_published_f0(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'hardened-receipt.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "f0a1b2c3d4e5")
+        engine = sa.create_engine(database_url)
+        pending_id = uuid.uuid4().hex
+        completed_id = uuid.uuid4().hex
+        created_at = datetime(2099, 8, 16, 9, tzinfo=UTC)
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=pending_id,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="a" * 64,
+                        state="pending",
+                        owner_token=uuid.uuid4().hex,
+                        lease_expires_at=(
+                            created_at + timedelta(minutes=5)
+                        ),
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=completed_id,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="b" * 64,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": (
+                                "healthmes.decision-receipt.v1"
+                            ),
+                            "result": {"status": "completed"},
+                        },
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "a1b2c3d4e5f6")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                "requested_at",
+                "lease_generation",
+                "result_expires_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+            }
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                (
+                    "ck_decision_request_receipt_"
+                    "lease_generation_positive"
+                ),
+                (
+                    "ck_decision_request_receipt_"
+                    "state_payload_consistent"
+                ),
+            }
+            assert (
+                "ix_decision_request_receipt_result_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(receipt)
+                    )
+                }
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT version_num FROM alembic_version"
+                    )
+                ) == "a1b2c3d4e5f6"
+            assert rows[pending_id].requested_at == created_at.replace(
+                tzinfo=None
+            )
+            assert rows[pending_id].lease_generation == 1
+            assert rows[pending_id].result_expires_at is None
+            assert rows[completed_id].requested_at == (
+                created_at.replace(tzinfo=None)
+            )
+            assert rows[completed_id].lease_generation == 1
+            assert rows[completed_id].result_expires_at is not None
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="decision receipt hardening is forward-only",
+        ):
+            command.downgrade(config, "f0a1b2c3d4e5")
+
+    def test_decision_receipt_hardening_accepts_mutated_stamped_f0(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'mutated-f0.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "f0a1b2c3d4e5")
+        engine = sa.create_engine(database_url)
+        receipt_id = uuid.uuid4().hex
+        null_receipt_id = uuid.uuid4().hex
+        requested_at = datetime(2099, 8, 16, 8, tzinfo=UTC)
+        created_at = requested_at + timedelta(hours=1)
+        null_created_at = created_at + timedelta(hours=1)
+        original_result_expires_at = requested_at + timedelta(hours=12)
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_request_receipt "
+                        "ADD COLUMN requested_at DATETIME"
+                    )
+                )
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_request_receipt "
+                        "ADD COLUMN result_expires_at DATETIME"
+                    )
+                )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="c" * 64,
+                        requested_at=requested_at,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"status": "completed"},
+                        },
+                        result_expires_at=original_result_expires_at,
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=null_receipt_id,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="d" * 64,
+                        requested_at=None,
+                        state="pending",
+                        owner_token=uuid.uuid4().hex,
+                        lease_expires_at=(
+                            null_created_at + timedelta(minutes=5)
+                        ),
+                        expires_at=null_created_at + timedelta(days=30),
+                        created_at=null_created_at,
+                        updated_at=null_created_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            requested_at_column = next(
+                column
+                for column in sa.inspect(engine).get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "requested_at"
+            )
+            assert requested_at_column["nullable"] is False
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(receipt).where(
+                            receipt.c.id.in_(
+                                (receipt_id, null_receipt_id)
+                            )
+                        )
+                    )
+                }
+                assert rows[receipt_id].requested_at == requested_at.replace(
+                    tzinfo=None
+                )
+                assert rows[receipt_id].retention_basis_at == (
+                    created_at.replace(tzinfo=None)
+                )
+                assert rows[receipt_id].lease_generation == 1
+                assert (
+                    rows[receipt_id].result_expires_at
+                    == original_result_expires_at.replace(tzinfo=None)
+                )
+                assert rows[null_receipt_id].requested_at == (
+                    null_created_at.replace(tzinfo=None)
+                )
+                assert rows[null_receipt_id].retention_basis_at == (
+                    null_created_at.replace(tzinfo=None)
+                )
+                assert rows[null_receipt_id].lease_generation == 1
+                assert rows[null_receipt_id].result_expires_at is None
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT version_num FROM alembic_version"
+                    )
+                ) == "e5f6a7b8c9d0"
+        finally:
+            engine.dispose()
+
+    def test_decision_receipt_hardening_tombstones_expired_f0_result(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'expired-f0-receipt.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "f0a1b2c3d4e5")
+        engine = sa.create_engine(database_url)
+        receipt_id = uuid.uuid4().hex
+        request_id = uuid.uuid4().hex
+        fingerprint = "d" * 64
+        requested_at = datetime(2000, 1, 1, tzinfo=UTC)
+        identity_expires_at = datetime(2099, 1, 1, tzinfo=UTC)
+        try:
+            metadata = sa.MetaData()
+            receipt = sa.Table(
+                "decision_request_receipt",
+                metadata,
+                autoload_with=engine,
+            )
+            retention_policy = sa.Table(
+                "retention_policy",
+                metadata,
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                existing_policy = connection.execute(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                ).first()
+                if existing_policy is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4().hex,
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(
+                            retention_policy.c.id
+                            == existing_policy.id
+                        )
+                        .values(retention_days=1, enabled=True)
+                    )
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=request_id,
+                        request_fingerprint=fingerprint,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {
+                                "answer": "sensitive expired answer"
+                            },
+                        },
+                        expires_at=identity_expires_at,
+                        created_at=requested_at,
+                        updated_at=requested_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(
+                        receipt.c.id == receipt_id
+                    )
+                ).one()
+                assert row.state == "tombstone"
+                assert row.result_payload is None
+                assert row.result_expires_at is None
+                assert row.owner_token is None
+                assert row.lease_expires_at is None
+                assert row.request_id == request_id
+                assert row.request_fingerprint == fingerprint
+                assert row.requested_at == requested_at.replace(
+                    tzinfo=None
+                )
+                assert row.retention_basis_at == requested_at.replace(
+                    tzinfo=None
+                )
+                assert row.expires_at == identity_expires_at.replace(
+                    tzinfo=None
+                )
+        finally:
+            engine.dispose()
+
+    def test_decision_retention_removes_malformed_payload_before_sqlite_ddl(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'decision-retention-malformed.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        record_id = uuid.uuid4().hex
+        try:
+            decision_record = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            created_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    decision_record.insert().values(
+                        id=record_id,
+                        kind="insight",
+                        tree={"id": "malformed", "children": []},
+                        summary="Unreadable historical decision",
+                        decision_request_id=uuid.uuid4().hex,
+                        decision_turn_id=uuid.uuid4().hex,
+                        decision_request_fingerprint="a" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v3"
+                        },
+                        decision_payload_digest="b" * 64,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+                connection.execute(
+                    sa.text(
+                        "UPDATE decision_record "
+                        "SET decision_payload = '{bad' "
+                        "WHERE id = :record_id"
+                    ),
+                    {"record_id": record_id},
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        # A second invocation proves the first run did not leave SQLite at the
+        # prior Alembic revision with only part of the DDL applied.
+        command.upgrade(config, "f0a1b2c3d4e5")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT COUNT(*) FROM decision_record "
+                        "WHERE id = :record_id"
+                    ),
+                    {"record_id": record_id},
+                ) == 0
+            assert {"retention_basis_at", "expires_at"} <= columns
+        finally:
+            engine.dispose()
+
+    def test_decision_retention_migration_round_trip(self, tmp_path):
+        database_url = (
+            f"sqlite:///{tmp_path / 'decision-retention.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        decision_record = sa.Table(
+            "decision_record",
+            metadata,
+            autoload_with=engine,
+        )
+        task = sa.Table(
+            "task",
+            metadata,
+            autoload_with=engine,
+        )
+        schedule_proposal = sa.Table(
+            "schedule_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        policy_id = uuid.uuid4().hex
+        v1_id = uuid.uuid4().hex
+        v2_id = uuid.uuid4().hex
+        v3_id = uuid.uuid4().hex
+        legacy_id = uuid.uuid4().hex
+        task_id = uuid.uuid4().hex
+        proposal_id = uuid.uuid4().hex
+        created_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        private_marker = (
+            "legacy-private-question-caller-transcript-tool"
+        )
+        v1_payload = {
+            "schema": "healthmes.decision-private.v1",
+            "request": {
+                "question": private_marker,
+                "caller": private_marker,
+            },
+            "tool_trace": [{"payload": private_marker}],
+        }
+        v2_payload = {
+            "schema": "healthmes.decision-private.v2",
+            "result": {"answer": private_marker},
+            "source_attestations": [
+                {
+                    "query": {
+                        "parameters": {
+                            "transcript": private_marker,
+                        }
+                    }
+                }
+            ],
+        }
+        v3_payload = {
+            "schema": "healthmes.decision-private.v3",
+            "outcome": {
+                "summary": (
+                    "A wellness decision was explicitly tracked."
+                )
+            },
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=policy_id,
+                    data_class="decision",
+                    retention_days=7,
+                    enabled=True,
+                )
+            )
+            for index, (record_id, payload) in enumerate(
+                (
+                    (v1_id, v1_payload),
+                    (v2_id, v2_payload),
+                    (v3_id, v3_payload),
+                )
+            ):
+                connection.execute(
+                    decision_record.insert().values(
+                        id=record_id,
+                        kind="insight",
+                        tree={
+                            "id": f"healthmes-decision-{index}",
+                            "children": [],
+                        },
+                        summary=(
+                            f"Historical wellness decision {index}"
+                        ),
+                        decision_request_id=uuid.uuid4().hex,
+                        decision_turn_id=uuid.uuid4().hex,
+                        decision_request_fingerprint=(
+                            f"{index + 1:064x}"
+                        ),
+                        decision_payload=payload,
+                        decision_payload_digest=f"{index + 4:064x}",
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+            connection.execute(
+                decision_record.insert().values(
+                    id=legacy_id,
+                    kind="schedule_change",
+                    tree={"id": "legacy", "children": []},
+                    summary="Historical non-wellness decision",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            connection.execute(
+                task.insert().values(
+                    id=task_id,
+                    title="Legacy decision proposal",
+                    energy_demand="med",
+                    status="todo",
+                    source="user",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            connection.execute(
+                schedule_proposal.insert().values(
+                    id=proposal_id,
+                    task_id=task_id,
+                    proposed_start=created_at + timedelta(hours=1),
+                    proposed_end=created_at + timedelta(hours=2),
+                    status="proposed",
+                    decision_record_id=v1_id,
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "e9f0a1b2c3d4")
+
+        engine = sa.create_engine(database_url)
+        migrated = sa.Table(
+            "decision_record",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        migrated_proposal = sa.Table(
+            "schedule_proposal",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.connect() as connection:
+            rows = {
+                row.id: row
+                for row in connection.execute(sa.select(migrated))
+            }
+            wellness = rows[v3_id]
+            legacy = rows[legacy_id]
+            assert set(rows) == {v3_id, legacy_id}
+            assert wellness.retention_basis_at == (
+                created_at.replace(tzinfo=None)
+            )
+            assert wellness.expires_at == (
+                created_at + timedelta(days=7)
+            ).replace(tzinfo=None)
+            assert legacy.retention_basis_at is None
+            assert legacy.expires_at is None
+            assert wellness.decision_payload == v3_payload
+            assert private_marker not in str(
+                [row.decision_payload for row in rows.values()]
+            )
+            proposal = connection.execute(
+                sa.select(migrated_proposal).where(
+                    migrated_proposal.c.id == proposal_id
+                )
+            ).one()
+            assert proposal.decision_record_id is None
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade decision retention while a finite "
+                "decision policy or finite-retention DecisionRecord exists"
+            ),
+        ):
+            command.downgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "e9f0a1b2c3d4"
+            current_policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            current_decisions = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            connection.execute(
+                current_policy.update()
+                .where(current_policy.c.data_class == "decision")
+                .values(retention_days=None)
+            )
+            connection.execute(
+                current_decisions.update()
+                .where(current_decisions.c.id == v3_id)
+                .values(expires_at=None)
+            )
+        engine.dispose()
+
+        command.downgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            assert "retention_basis_at" not in columns
+            assert "expires_at" not in columns
+            restored = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(sa.select(restored))
+                }
+                assert set(rows) == {v3_id, legacy_id}
+                assert (
+                    rows[v3_id].decision_payload
+                    == v3_payload
+                )
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT version_num FROM alembic_version"
+                    )
+                ) == "d8e9f0a1b2c3"
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_offline_sql_supports_orm_writes(
+        self,
+        tmp_path,
+    ):
+        database_path = tmp_path / "wearable-retention-offline.db"
+        database_url = f"sqlite:///{database_path}"
+        command.upgrade(_config(database_url), "c7d8e9f0a1b2")
+        rendered = _render_offline_wearable_retention_upgrade(
+            database_url
+        )
+
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(rendered)
+            assert connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall() == []
+        finally:
+            connection.close()
+
+        engine = sa.create_engine(database_url)
+        factory = sessionmaker(
+            bind=engine,
+            autocommit=False,
+            autoflush=False,
+        )
+        try:
+            with factory() as session:
+                snapshot = persist_open_wearables_observation(
+                    session,
+                    normalized_context={
+                        "date": "2026-08-14",
+                        "status": "ok",
+                    },
+                    local_day=date(2026, 8, 14),
+                    timezone="UTC",
+                    collected_at=datetime(
+                        2026,
+                        8,
+                        14,
+                        12,
+                        tzinfo=UTC,
+                    ),
+                    now=datetime(
+                        2026,
+                        8,
+                        14,
+                        12,
+                        tzinfo=UTC,
+                    ),
+                )
+                session.commit()
+                policy = session.scalar(
+                    sa.select(RetentionPolicy).where(
+                        RetentionPolicy.data_class
+                        == "wearable_normalized"
+                    )
+                )
+                assert policy is not None
+                assert snapshot.content_event_id is not None
+                assert policy.id.hex == (
+                    "d8e9f0a1b2c34d5e8f90a1b2c3d4e5f6"
+                )
+            with engine.connect() as connection:
+                assert connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).all() == []
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_migration_round_trip(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'wearable-retention.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        generic_policy_id = uuid.uuid4().hex
+        wearable_event_id = uuid.uuid4().hex
+        generic_event_id = uuid.uuid4().hex
+        observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        # The migration must never resurrect data by extending an existing
+        # shorter expiry to the new policy duration.
+        original_expiry = observed_at + timedelta(days=3)
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=generic_policy_id,
+                    data_class="normalized",
+                    retention_days=14,
+                    enabled=True,
+                )
+            )
+            base_event = {
+                "schema_version": 1,
+                "observed_at": observed_at,
+                "recorded_at": observed_at,
+                "timezone": "UTC",
+                "source_device": None,
+                "capture_method": "import",
+                "sensitivity": "wellness",
+                "consent_scope": "personal",
+                "retention_policy_id": generic_policy_id,
+                "expires_at": original_expiry,
+                "payload": {},
+            }
+            connection.execute(
+                wellness_event.insert(),
+                [
+                    {
+                        **base_event,
+                        "id": wearable_event_id,
+                        "event_type": "wearable.sleep.v1",
+                        "source_provider": (
+                            "healthmes-open-wearables-mirror"
+                        ),
+                        "source_record_id": "wearable:sleep:1",
+                    },
+                    {
+                        **base_event,
+                        "id": generic_event_id,
+                        "event_type": "nutrition.meal.v1",
+                        "source_provider": "healthmes-nutrition",
+                        "source_record_id": "nutrition:meal:1",
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        migrated_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        migrated_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        with engine.connect() as connection:
+            policies = {
+                row.data_class: row
+                for row in connection.execute(sa.select(migrated_policy))
+            }
+            wearable_policy = policies["wearable_normalized"]
+            assert wearable_policy.retention_days == 14
+            assert wearable_policy.enabled is True
+
+            events = {
+                row.id: row
+                for row in connection.execute(sa.select(migrated_event))
+            }
+            wearable = events[wearable_event_id]
+            generic = events[generic_event_id]
+            assert wearable.retention_policy_id == wearable_policy.id
+            assert wearable.expires_at == original_expiry.replace(tzinfo=None)
+            assert generic.retention_policy_id == generic_policy_id
+            assert generic.expires_at == original_expiry.replace(tzinfo=None)
+        engine.dispose()
+
+        command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        restored_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        restored_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(restored_policy)
+                    .where(
+                        restored_policy.c.data_class
+                        == "wearable_normalized"
+                    )
+                ) == 0
+                restored = connection.execute(
+                    sa.select(restored_event).where(
+                        restored_event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert restored.retention_policy_id == generic_policy_id
+                assert restored.expires_at == original_expiry.replace(
+                    tzinfo=None
+                )
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_downgrade_recreates_missing_generic_policy(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'wearable-retention-no-generic.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        legacy_policy_id = uuid.uuid4().hex
+        wearable_event_id = uuid.uuid4().hex
+        observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=legacy_policy_id,
+                    data_class="legacy_wearable",
+                    retention_days=3,
+                    enabled=True,
+                )
+            )
+            connection.execute(
+                wellness_event.insert().values(
+                    id=wearable_event_id,
+                    event_type="wearable.sleep.v1",
+                    schema_version=1,
+                    observed_at=observed_at,
+                    recorded_at=observed_at,
+                    timezone="UTC",
+                    source_provider="healthmes-open-wearables-mirror",
+                    source_device=None,
+                    source_record_id="wearable:sleep:no-generic",
+                    capture_method="import",
+                    sensitivity="wellness",
+                    consent_scope="personal",
+                    retention_policy_id=legacy_policy_id,
+                    expires_at=observed_at + timedelta(days=3),
+                    payload={},
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "d8e9f0a1b2c3")
+        command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        restored_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        restored_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                policies = {
+                    row.data_class: row
+                    for row in connection.execute(
+                        sa.select(restored_policy)
+                    )
+                }
+                assert "wearable_normalized" not in policies
+                generic = policies["normalized"]
+                assert generic.retention_days == 30
+                assert generic.enabled is True
+                event = connection.execute(
+                    sa.select(restored_event).where(
+                        restored_event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert event.retention_policy_id == generic.id
+                assert event.expires_at == (
+                    observed_at + timedelta(days=3)
+                ).replace(tzinfo=None)
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_downgrade_refuses_preexisting_policy_loss(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'wearable-retention-existing.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        retention_policy = sa.Table(
+            "retention_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        generic_policy_id = uuid.uuid4().hex
+        wearable_policy_id = uuid.uuid4().hex
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert(),
+                [
+                    {
+                        "id": generic_policy_id,
+                        "data_class": "normalized",
+                        "retention_days": 30,
+                        "enabled": True,
+                    },
+                    {
+                        "id": wearable_policy_id,
+                        "data_class": "wearable_normalized",
+                        "retention_days": 1,
+                        "enabled": True,
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "d8e9f0a1b2c3")
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade wearable retention without losing "
+                "its dedicated retention policy"
+            ),
+        ):
+            command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        restored_policy = sa.Table(
+            "retention_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                wearable = connection.execute(
+                    sa.select(restored_policy).where(
+                        restored_policy.c.data_class
+                        == "wearable_normalized"
+                    )
+                ).one()
+                assert wearable.id == wearable_policy_id
+                assert wearable.retention_days == 1
+                assert wearable.enabled is True
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d8e9f0a1b2c3"
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_downgrade_refuses_changed_owned_policy(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'wearable-retention-no-extension.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        generic_policy_id = uuid.uuid4().hex
+        wearable_event_id = uuid.uuid4().hex
+        observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=generic_policy_id,
+                    data_class="normalized",
+                    retention_days=30,
+                    enabled=True,
+                )
+            )
+            connection.execute(
+                wellness_event.insert().values(
+                    id=wearable_event_id,
+                    event_type="wearable.sleep.v1",
+                    schema_version=1,
+                    observed_at=observed_at,
+                    recorded_at=observed_at,
+                    timezone="UTC",
+                    source_provider="healthmes-open-wearables-mirror",
+                    source_device=None,
+                    source_record_id="wearable:sleep:short-expiry",
+                    capture_method="import",
+                    sensitivity="wellness",
+                    consent_scope="personal",
+                    retention_policy_id=generic_policy_id,
+                    expires_at=observed_at + timedelta(days=30),
+                    payload={},
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        short_expiry = observed_at + timedelta(days=1)
+        with engine.begin() as connection:
+            wearable_policy_id = connection.scalar(
+                sa.select(retention_policy.c.id).where(
+                    retention_policy.c.data_class
+                    == "wearable_normalized"
+                )
+            )
+            connection.execute(
+                retention_policy.update()
+                .where(retention_policy.c.id == wearable_policy_id)
+                .values(retention_days=1)
+            )
+            connection.execute(
+                wellness_event.update()
+                .where(wellness_event.c.id == wearable_event_id)
+                .values(expires_at=short_expiry)
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade wearable retention without losing "
+                "its dedicated retention policy"
+            ),
+        ):
+            command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        restored_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                event = connection.execute(
+                    sa.select(restored_event).where(
+                        restored_event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert event.retention_policy_id == wearable_policy_id
+                assert event.expires_at == short_expiry.replace(tzinfo=None)
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d8e9f0a1b2c3"
+        finally:
+            engine.dispose()
+
+    def test_calendar_generation_upgrade_quarantines_legacy_rows(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'calendar-generation.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "a5b6c7d8e9f0")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        proposal = sa.Table(
+            "calendar_mutation_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        mirror_id = uuid.uuid4().hex
+        start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+        end_at = start_at + timedelta(hours=1)
+        base_proposal = {
+            "calendar_source": "google",
+            "mirror_event_id": mirror_id,
+            "external_event_id": "legacy-event",
+            "operation": "shorten",
+            "original_start_at": start_at,
+            "original_end_at": end_at,
+            "proposed_start_at": start_at,
+            "proposed_end_at": end_at - timedelta(minutes=15),
+            "expected_etag": '"legacy-etag"',
+            "protected_fingerprint": "legacy-fingerprint",
+            "reply_handle_digest": "legacy-reply",
+            "expires_at": end_at,
+        }
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    mirror.insert().values(
+                        id=mirror_id,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        summary="Legacy event",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+                connection.execute(
+                    proposal.insert(),
+                    [
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4().hex,
+                            "status": "pending",
+                            "dedup_key": "legacy-pending",
+                        },
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4().hex,
+                            "status": "applying",
+                            "dedup_key": "legacy-applying",
+                        },
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4().hex,
+                            "status": "applied",
+                            "dedup_key": "legacy-applied",
+                        },
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "b6c7d8e9f0a1")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            mirror_columns = {
+                item["name"]: item
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert mirror_columns["connection_generation"]["nullable"] is False
+            assert "ck_calendar_mutation_proposal_active_generation" in checks
+
+            migrated_mirror = sa.Table(
+                "calendar_event_mirror",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            migrated_proposal = sa.Table(
+                "calendar_mutation_proposal",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.select(migrated_mirror.c.connection_generation)
+                    .where(migrated_mirror.c.id == mirror_id)
+                ) == "__legacy_unbound__"
+                statuses = {
+                    row.dedup_key: row.status
+                    for row in connection.execute(
+                        sa.select(
+                            migrated_proposal.c.dedup_key,
+                            migrated_proposal.c.status,
+                        )
+                    )
+                }
+                assert statuses == {
+                    "legacy-pending": "conflicted",
+                    "legacy-applying": "unknown",
+                    "legacy-applied": "applied",
+                }
+                with connection.begin_nested():
+                    with pytest.raises(sa.exc.IntegrityError):
+                        connection.execute(
+                            migrated_mirror.insert().values(
+                                id=uuid.uuid4().hex,
+                                external_id="legacy-event",
+                                calendar_source="google",
+                                start_at=start_at,
+                                end_at=end_at,
+                                is_agent_created=False,
+                            )
+                        )
+
+            with engine.begin() as connection:
+                connection.execute(
+                    migrated_mirror.insert().values(
+                        id=uuid.uuid4().hex,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        connection_generation="reconnected-account",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+    def test_schedule_intake_generation_upgrade_binds_or_invalidates_legacy_rows(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'schedule-intake-generation.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "b6c7d8e9f0a1")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        task = sa.Table("task", metadata, autoload_with=engine)
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        proposal = sa.Table(
+            "schedule_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        start_at = datetime(2026, 8, 13, 9, tzinfo=UTC)
+        end_at = start_at + timedelta(hours=1)
+        task_ids = {
+            name: uuid.uuid4().hex
+            for name in ("bound", "ambiguous", "incomplete")
+        }
+        proposal_ids = {
+            name: uuid.uuid4().hex
+            for name in task_ids
+        }
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    task.insert(),
+                    [
+                        {
+                            "id": task_id,
+                            "title": name,
+                            "status": "todo",
+                            "source": "user",
+                            "energy_demand": "med",
+                        }
+                        for name, task_id in task_ids.items()
+                    ],
+                )
+                connection.execute(
+                    mirror.insert(),
+                    [
+                        {
+                            "id": uuid.uuid4().hex,
+                            "external_id": "bound-event",
+                            "calendar_source": "google",
+                            "connection_generation": "google-account-a",
+                            "start_at": start_at,
+                            "end_at": end_at,
+                            "is_agent_created": False,
+                        },
+                        *[
+                            {
+                                "id": uuid.uuid4().hex,
+                                "external_id": "ambiguous-event",
+                                "calendar_source": "google",
+                                "connection_generation": generation,
+                                "start_at": start_at,
+                                "end_at": end_at,
+                                "is_agent_created": False,
+                            }
+                            for generation in (
+                                "google-account-a",
+                                "google-account-b",
+                            )
+                        ],
+                    ],
+                )
+                connection.execute(
+                    proposal.insert(),
+                    [
+                        {
+                            "id": proposal_ids["bound"],
+                            "task_id": task_ids["bound"],
+                            "proposed_start": start_at,
+                            "proposed_end": end_at,
+                            "status": "proposed",
+                            "intake_calendar_source": "google",
+                            "intake_external_id": "bound-event",
+                            "intake_revision": "revision-bound",
+                        },
+                        {
+                            "id": proposal_ids["ambiguous"],
+                            "task_id": task_ids["ambiguous"],
+                            "proposed_start": start_at,
+                            "proposed_end": end_at,
+                            "status": "accepted",
+                            "intake_calendar_source": "google",
+                            "intake_external_id": "ambiguous-event",
+                            "intake_revision": "revision-ambiguous",
+                        },
+                        {
+                            "id": proposal_ids["incomplete"],
+                            "task_id": task_ids["incomplete"],
+                            "proposed_start": start_at,
+                            "proposed_end": end_at,
+                            "status": "proposed",
+                            "intake_calendar_source": None,
+                            "intake_external_id": "missing-source",
+                            "intake_revision": None,
+                        },
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        try:
+            migrated = sa.Table(
+                "schedule_proposal",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(migrated).where(
+                            migrated.c.id.in_(proposal_ids.values())
+                        )
+                    )
+                }
+                bound = rows[proposal_ids["bound"]]
+                assert bound.intake_account_generation == "google-account-a"
+                assert bound.status == "proposed"
+                assert bound.invalidation_reason is None
+                for name in ("ambiguous", "incomplete"):
+                    unresolved = rows[proposal_ids[name]]
+                    assert unresolved.intake_account_generation is None
+                    assert unresolved.status == "invalidated"
+                    assert (
+                        unresolved.invalidation_reason
+                        == "calendar_intake_generation_unresolved"
+                    )
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "b6c7d8e9f0a1")
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                item["name"]
+                for item in sa.inspect(engine).get_columns(
+                    "schedule_proposal"
+                )
+            }
+            assert "intake_account_generation" not in columns
+            assert "invalidation_reason" not in columns
+        finally:
+            engine.dispose()
+
+    def test_calendar_generation_downgrade_failure_preserves_state(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'calendar-downgrade.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "b6c7d8e9f0a1")
+
+        engine = sa.create_engine(database_url)
+        proposal = sa.Table(
+            "calendar_mutation_proposal",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        proposal_id = uuid.uuid4().hex
+        start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    proposal.insert().values(
+                        id=proposal_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="active-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=start_at + timedelta(hours=1),
+                        proposed_start_at=start_at,
+                        proposed_end_at=start_at + timedelta(minutes=45),
+                        expected_etag='"etag"',
+                        protected_fingerprint="fingerprint",
+                        reply_handle_digest="reply",
+                        expires_at=start_at + timedelta(hours=1),
+                        status="pending",
+                        dedup_key="active-proposal",
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="calendar mutation proposals are still active",
+        ):
+            command.downgrade(config, "a5b6c7d8e9f0")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "account_generation" in {
+                item["name"]
+                for item in inspector.get_columns(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert "connection_generation" in {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                assert connection.scalar(
+                    sa.select(proposal.c.status).where(
+                        proposal.c.id == proposal_id
+                    )
+                ) == "pending"
+                connection.execute(
+                    proposal.update()
+                    .where(proposal.c.id == proposal_id)
+                    .values(status="conflicted")
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "a5b6c7d8e9f0")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "account_generation" not in {
+                item["name"]
+                for item in inspector.get_columns(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert "connection_generation" not in {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT status FROM calendar_mutation_proposal "
+                        "WHERE id = :id"
+                    ),
+                    {"id": proposal_id},
+                ) == "conflicted"
+        finally:
+            engine.dispose()
+
+    def test_calendar_generation_downgrade_waits_for_sqlite_writer(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'calendar-race.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "b6c7d8e9f0a1")
+
+        engine = sa.create_engine(
+            database_url,
+            connect_args={"timeout": 5},
+        )
+        proposal = sa.Table(
+            "calendar_mutation_proposal",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        proposal_id = uuid.uuid4().hex
+        start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+        try:
+            with engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    proposal.insert().values(
+                        id=proposal_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="racing-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=start_at + timedelta(hours=1),
+                        proposed_start_at=start_at,
+                        proposed_end_at=start_at + timedelta(minutes=45),
+                        expected_etag='"etag"',
+                        protected_fingerprint="fingerprint",
+                        reply_handle_digest="reply-race",
+                        expires_at=start_at + timedelta(hours=1),
+                        status="pending",
+                        dedup_key="racing-proposal",
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(database_url),
+                        "a5b6c7d8e9f0",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match="calendar mutation proposals are still active",
+                    ):
+                        downgrade.result(timeout=5)
+        finally:
+            engine.dispose()
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT status FROM calendar_mutation_proposal "
+                        "WHERE id = :id"
+                    ),
+                    {"id": proposal_id},
+                ) == "pending"
+        finally:
+            engine.dispose()
+
+    def test_decision_agent_migration_preserves_legacy_rows_and_constraints(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'decision-agent.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e3f4a5b6c7d8")
+
+        engine = sa.create_engine(database_url)
+        legacy_id = uuid.uuid4().hex
+        legacy = sa.Table(
+            "decision_record",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                legacy.insert().values(
+                    id=legacy_id,
+                    kind="insight",
+                    tree={
+                        "id": "legacy",
+                        "type": "llm_step",
+                        "label": "legacy decision",
+                        "children": [],
+                    },
+                    summary="legacy decision",
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "f4a5b6c7d8e9")
+
+        engine = sa.create_engine(database_url)
+        correlated_id = uuid.uuid4().hex
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            indexes = {
+                item["name"]: item
+                for item in inspector.get_indexes("decision_record")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_record"
+                )
+            }
+            assert {
+                "decision_request_id",
+                "decision_turn_id",
+                "decision_request_fingerprint",
+                "decision_payload",
+                "decision_payload_digest",
+            } <= columns
+            assert indexes[
+                "ux_decision_record_decision_request_id"
+            ]["unique"]
+            assert indexes[
+                "ux_decision_record_decision_turn_id"
+            ]["unique"]
+            assert (
+                "ck_decision_record_decision_agent_correlation_complete"
+                in checks
+            )
+
+            migrated = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                preserved = connection.execute(
+                    sa.select(migrated).where(
+                        migrated.c.id == legacy_id
+                    )
+                ).one()
+                assert preserved.decision_request_id is None
+                assert preserved.decision_turn_id is None
+                assert preserved.decision_request_fingerprint is None
+                assert preserved.decision_payload is None
+                assert preserved.decision_payload_digest is None
+
+                request_id = uuid.uuid4().hex
+                turn_id = uuid.uuid4().hex
+                connection.execute(
+                    migrated.insert().values(
+                        id=correlated_id,
+                        kind="insight",
+                        tree={
+                            "id": "new",
+                            "type": "llm_step",
+                            "label": "new decision",
+                            "children": [],
+                        },
+                        summary="new decision",
+                        decision_request_id=request_id,
+                        decision_turn_id=turn_id,
+                        decision_request_fingerprint="f" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v1"
+                        },
+                        decision_payload_digest="d" * 64,
+                    )
+                )
+
+            with pytest.raises(sa.exc.IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        migrated.insert().values(
+                            id=uuid.uuid4().hex,
+                            kind="insight",
+                            tree={
+                                "id": "partial",
+                                "type": "llm_step",
+                                "label": "invalid partial correlation",
+                                "children": [],
+                            },
+                            summary="invalid partial correlation",
+                        decision_request_id=uuid.uuid4().hex,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Decision Agent audit and idempotency data",
+        ):
+            command.downgrade(config, "e3f4a5b6c7d8")
+
+        engine = sa.create_engine(database_url)
+        try:
+            preserved = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(preserved)
+                    .where(preserved.c.id == correlated_id)
+                ) == 1
+                connection.execute(
+                    preserved.delete().where(
+                        preserved.c.id == correlated_id
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "e3f4a5b6c7d8")
+
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                item["name"]
+                for item in sa.inspect(engine).get_columns(
+                    "decision_record"
+                )
+            }
+            assert "decision_request_id" not in columns
+            legacy = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(legacy)
+                    .where(legacy.c.id == legacy_id)
+                ) == 1
+        finally:
+            engine.dispose()
+
     def test_downgrade_base_drops_all_tables(self, tmp_path):
         database_url = f"sqlite:///{tmp_path / 'down.db'}"
         config = _config(database_url)
-        command.upgrade(config, "head")
+        command.upgrade(config, "f0a1b2c3d4e5")
         command.downgrade(config, "base")
 
         engine = sa.create_engine(database_url)
         try:
             tables = set(sa.inspect(engine).get_table_names())
             assert tables & EXPECTED_TABLES == set()
+        finally:
+            engine.dispose()
+
+    def test_decision_policy_downgrade_preserves_disabled_consent(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'decision-policy.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "a5b6c7d8e9f0")
+
+        engine = sa.create_engine(database_url)
+        table = sa.Table(
+            "decision_domain_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        policy_id = uuid.uuid4().hex
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        id=policy_id,
+                        owner_principal_id="owner",
+                        domain="calendar",
+                        enabled=False,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing disabled Decision Agent domain consent",
+        ):
+            command.downgrade(config, "f4a5b6c7d8e9")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.select(table.c.enabled).where(
+                        table.c.id == policy_id
+                    )
+                ) is False
+                connection.execute(
+                    table.update()
+                    .where(table.c.id == policy_id)
+                    .values(enabled=True)
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "f4a5b6c7d8e9")
+        command.upgrade(config, "a5b6c7d8e9f0")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "decision_domain_policy" in inspector.get_table_names()
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(
+                        sa.Table(
+                            "decision_domain_policy",
+                            sa.MetaData(),
+                            autoload_with=connection,
+                        )
+                    )
+                ) == 0
+        finally:
+            engine.dispose()
+
+    def test_decision_policy_constraint_normalization_preserves_schema_data(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'decision-policy-constraint.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "d4e5f6a7b8c9")
+        engine = sa.create_engine(database_url)
+        policy_id = uuid.uuid4().hex
+        legacy = (
+            "ck_decision_domain_policy_"
+            "ck_decision_domain_policy_revision_positive"
+        )
+        canonical = "ck_decision_domain_policy_revision_positive"
+        expected_indexes = {
+            "ix_decision_domain_policy_domain": ("domain",),
+            "ix_decision_domain_policy_owner_principal_id": (
+                "owner_principal_id",
+            ),
+        }
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=policy_id,
+                        owner_principal_id="migration-owner",
+                        domain="nutrition",
+                        enabled=False,
+                        revision=7,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(policy).where(policy.c.id == policy_id)
+                ).one()
+                assert row.owner_principal_id == "migration-owner"
+                assert row.domain == "nutrition"
+                assert row.enabled is False
+                assert row.revision == 7
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "d4e5f6a7b8c9")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 7
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d4e5f6a7b8c9"
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            assert {
+                item["name"]
+                for item in sa.inspect(engine).get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 7
+        finally:
+            engine.dispose()
+
+    def test_decision_policy_constraint_normalization_accepts_canonical_db(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'canonical-decision-policy.db'}"
+        )
+        engine = sa.create_engine(database_url)
+        Base.metadata.create_all(engine)
+        config = _config(database_url)
+        command.stamp(config, "d4e5f6a7b8c9")
+        policy_id = uuid.uuid4().hex
+        policy = sa.Table(
+            "decision_domain_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                policy.insert().values(
+                    id=policy_id,
+                    owner_principal_id="canonical-owner",
+                    domain="activity",
+                    enabled=True,
+                    revision=3,
+                )
+            )
+        engine.dispose()
+
+        statements: list[str] = []
+
+        def capture_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            statements.append(statement)
+
+        sa.event.listen(
+            sa.engine.Engine,
+            "before_cursor_execute",
+            capture_statement,
+        )
+        try:
+            command.upgrade(config, "head")
+        finally:
+            sa.event.remove(
+                sa.engine.Engine,
+                "before_cursor_execute",
+                capture_statement,
+            )
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert not any(
+                "_alembic_tmp_decision_domain_policy" in statement
+                for statement in statements
+            )
+            assert {
+                item["name"]
+                for item in sa.inspect(engine).get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {"ck_decision_domain_policy_revision_positive"}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 3
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
         finally:
             engine.dispose()
 
@@ -275,7 +3783,7 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "e3f4a5b6c7d8")
 
         engine = sa.create_engine(database_url)
         metadata = sa.MetaData()
@@ -361,7 +3869,7 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "e3f4a5b6c7d8")
 
         engine = sa.create_engine(database_url)
         metadata = sa.MetaData()
@@ -621,7 +4129,7 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "f0a1b2c3d4e5")
 
         engine = sa.create_engine(database_url)
         try:
@@ -653,7 +4161,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e3f4a5b6c7d8"
+                ) == "f0a1b2c3d4e5"
         finally:
             engine.dispose()
 
@@ -710,7 +4218,7 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "f0a1b2c3d4e5")
 
         engine = sa.create_engine(database_url)
         try:
@@ -779,7 +4287,7 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "d8e9f0a1b2c3")
 
         engine = sa.create_engine(database_url)
         try:
@@ -812,7 +4320,7 @@ class TestSqliteUpgrade:
     ):
         database_url = f"sqlite:///{tmp_path / 'legacy-cleanup-downgrade.db'}"
         config = _config(database_url)
-        command.upgrade(config, "head")
+        command.upgrade(config, "f0a1b2c3d4e5")
         engine = sa.create_engine(database_url)
         metadata = sa.MetaData()
         mirror = sa.Table(
@@ -885,3 +4393,2452 @@ class TestSqliteUpgrade:
             assert "ux_calendar_event_mirror_source_healthmes_source_key" in indexes
         finally:
             engine.dispose()
+
+    def test_receipt_retention_basis_upgrades_stamped_b2(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'receipt-retention-basis.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "b2c3d4e5f6a7")
+        engine = sa.create_engine(database_url)
+        receipt_id = uuid.uuid4().hex
+        created_at = datetime(2099, 8, 17, 9, tzinfo=UTC)
+        requested_at = created_at + timedelta(days=365)
+        identity_expires_at = created_at + timedelta(days=30)
+        try:
+            metadata = sa.MetaData()
+            receipt = sa.Table(
+                "decision_request_receipt",
+                metadata,
+                autoload_with=engine,
+            )
+            retention_policy = sa.Table(
+                "retention_policy",
+                metadata,
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                policy_id = connection.scalar(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                )
+                if policy_id is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4().hex,
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(retention_policy.c.id == policy_id)
+                        .values(retention_days=1, enabled=True)
+                    )
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4().hex,
+                        request_fingerprint="a" * 64,
+                        requested_at=requested_at,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"answer": "sensitive answer"},
+                        },
+                        result_expires_at=identity_expires_at,
+                        expires_at=identity_expires_at,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            basis_column = next(
+                column
+                for column in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "retention_basis_at"
+            )
+            assert basis_column["nullable"] is False
+            assert (
+                "ix_decision_request_receipt_retention_basis_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(
+                        receipt.c.id == receipt_id
+                    )
+                ).one()
+                assert row.requested_at == requested_at.replace(
+                    tzinfo=None
+                )
+                assert row.retention_basis_at == created_at.replace(
+                    tzinfo=None
+                )
+                assert row.result_expires_at == (
+                    created_at + timedelta(days=1)
+                ).replace(tzinfo=None)
+                assert row.expires_at == identity_expires_at.replace(
+                    tzinfo=None
+                )
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT version_num FROM alembic_version"
+                    )
+                ) == "e5f6a7b8c9d0"
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="decision receipt retention bases are forward-only",
+        ):
+            command.downgrade(config, "b2c3d4e5f6a7")
+
+    def test_trigger_dispatch_lease_upgrades_stamped_a1_without_row_loss(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = f"sqlite:///{tmp_path / 'trigger-dispatch-lease.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "a1b2c3d4e5f6")
+        engine = sa.create_engine(database_url)
+        event_id = uuid.uuid4().hex
+        fired_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+        original_payload = {
+            "summary": "Retain this pending outbox row.",
+            "trigger": {
+                "summary": "Nested observation.",
+                "proposal": "Keep the nested structure intact.",
+                "evidence": {
+                    "domains": ["activity", "wearable"],
+                    "metrics": {"focus_minutes": 42, "recovery": 0.73},
+                },
+            },
+            "push": {
+                "state": "dispatching",
+                "channel": "decision",
+            },
+        }
+        try:
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    trigger.insert().values(
+                        id=event_id,
+                        fired_at=fired_at,
+                        rule_id="migration-existing-dispatch",
+                        payload=original_payload,
+                        alert_sent=False,
+                        dedup_key="migration-existing-dispatch:1",
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "b2c3d4e5f6a7")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                "dispatch_owner_token",
+                "dispatch_generation",
+                "dispatch_lease_expires_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns("trigger_event")
+            }
+            assert {
+                "ck_trigger_event_dispatch_lease_consistent",
+                "ck_trigger_event_dispatch_generation_nonnegative",
+            } <= {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "trigger_event"
+                )
+            }
+            assert (
+                "ix_trigger_event_dispatch_lease_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes("trigger_event")
+                }
+            )
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(trigger).where(
+                        trigger.c.id == event_id
+                    )
+                ).one()
+                assert row.rule_id == "migration-existing-dispatch"
+                assert row.payload == original_payload
+                assert row.dispatch_owner_token is None
+                assert row.dispatch_generation == 0
+                assert row.dispatch_lease_expires_at is None
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="trigger dispatch leases are forward-only",
+        ):
+            command.downgrade(config, "a1b2c3d4e5f6")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_trigger_dispatch_lease_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    event_id = uuid.uuid4()
+    fired_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+    original_payload = {
+        "summary": "Retain this pending outbox row.",
+        "trigger": {
+            "summary": "Nested observation.",
+            "proposal": "Keep the nested structure intact.",
+            "evidence": {
+                "domains": ["activity", "wearable"],
+                "metrics": {"focus_minutes": 42, "recovery": 0.73},
+            },
+        },
+        "push": {
+            "state": "dispatching",
+            "channel": "decision",
+        },
+    }
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "a1b2c3d4e5f6")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    trigger.insert().values(
+                        id=event_id,
+                        fired_at=fired_at,
+                        rule_id="postgres-migration-existing-dispatch",
+                        payload=original_payload,
+                        alert_sent=False,
+                        dedup_key=(
+                            "postgres-migration-existing-dispatch:1"
+                        ),
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "b2c3d4e5f6a7")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                "dispatch_owner_token",
+                "dispatch_generation",
+                "dispatch_lease_expires_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns("trigger_event")
+            }
+            assert {
+                "ck_trigger_event_dispatch_lease_consistent",
+                "ck_trigger_event_dispatch_generation_nonnegative",
+            } <= {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "trigger_event"
+                )
+            }
+            assert (
+                "ix_trigger_event_dispatch_lease_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes("trigger_event")
+                }
+            )
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(trigger).where(
+                        trigger.c.id == event_id
+                    )
+                ).one()
+                assert row.rule_id == (
+                    "postgres-migration-existing-dispatch"
+                )
+                assert row.payload == original_payload
+                assert row.dispatch_owner_token is None
+                assert row.dispatch_generation == 0
+                assert row.dispatch_lease_expires_at is None
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="trigger dispatch leases are forward-only",
+        ):
+            command.downgrade(config, "a1b2c3d4e5f6")
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_policy_constraint_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    legacy = (
+        "ck_decision_domain_policy_"
+        "ck_decision_domain_policy_rev_2495"
+    )
+    canonical = "ck_decision_domain_policy_revision_positive"
+    expected_indexes = {
+        "ix_decision_domain_policy_domain": ("domain",),
+        "ix_decision_domain_policy_owner_principal_id": (
+            "owner_principal_id",
+        ),
+    }
+    expected_unique_constraints = {
+        "uq_decision_domain_policy_owner_domain": (
+            "owner_principal_id",
+            "domain",
+        ),
+    }
+
+    def policy_indexes(inspector):
+        return {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_indexes(
+                "decision_domain_policy"
+            )
+            if not item.get("duplicates_constraint")
+        }
+
+    def policy_unique_constraints(inspector):
+        return {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_unique_constraints(
+                "decision_domain_policy"
+            )
+        }
+
+    policy_id = uuid.uuid4()
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "d4e5f6a7b8c9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            assert policy_indexes(inspector) == expected_indexes
+            assert (
+                policy_unique_constraints(inspector)
+                == expected_unique_constraints
+            )
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=policy_id,
+                        owner_principal_id="migration-owner",
+                        domain="wearable",
+                        enabled=False,
+                        revision=9,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            assert policy_indexes(inspector) == expected_indexes
+            assert (
+                policy_unique_constraints(inspector)
+                == expected_unique_constraints
+            )
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(policy).where(policy.c.id == policy_id)
+                ).one()
+                assert row.enabled is False
+                assert row.revision == 9
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "d4e5f6a7b8c9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 9
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        command.downgrade(config, "d4e5f6a7b8c9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_domain_policy "
+                        f"RENAME CONSTRAINT {legacy} TO {canonical}"
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            assert {
+                item["name"]
+                for item in sa.inspect(scoped_engine).get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 9
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_multi_revision_failure_rolls_back_earlier_downgrade() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_atomic_multi_revision_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+
+        command.upgrade(config, "head")
+        with pytest.raises(
+            RuntimeError,
+            match="decision receipt retention bases are forward-only",
+        ):
+            command.downgrade(config, "b2c3d4e5f6a7")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("storage_object")
+            }
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes("storage_object")
+            }
+            assert "file_cleanup_identity" in columns
+            assert "file_cleanup_completed_at" in columns
+            assert (
+                "ix_storage_object_file_cleanup_completed_at"
+                in indexes
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_offline_trigger_dispatch_lease_sql_executes() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_trigger_lease_offline_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "a1b2c3d4e5f6")
+        rendered = _render_offline_trigger_dispatch_lease_upgrade(
+            schema_url
+        )
+        assert (
+            "ck_trigger_event_dispatch_lease_consistent"
+            in rendered
+        )
+        assert (
+            "ck_trigger_event_dispatch_generation_nonnegative"
+            in rendered
+        )
+        assert (
+            "ix_trigger_event_dispatch_lease_expires_at"
+            in rendered
+        )
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            raw_connection = scoped_engine.raw_connection()
+            try:
+                cursor = raw_connection.cursor()
+                try:
+                    cursor.execute(rendered, prepare=False)
+                finally:
+                    cursor.close()
+                raw_connection.commit()
+            finally:
+                raw_connection.close()
+
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                "dispatch_owner_token",
+                "dispatch_generation",
+                "dispatch_lease_expires_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns("trigger_event")
+            }
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "trigger_event"
+                )
+            } == {
+                "ck_trigger_event_dispatch_lease_consistent",
+                "ck_trigger_event_dispatch_generation_nonnegative",
+            }
+            assert (
+                "ix_trigger_event_dispatch_lease_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes("trigger_event")
+                }
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_wearable_retention_migration_round_trip() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_wearable_retention_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    generic_policy_id = uuid.uuid4()
+    wearable_event_id = uuid.uuid4()
+    observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    original_expiry = observed_at + timedelta(days=3)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "c7d8e9f0a1b2")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=generic_policy_id,
+                        data_class="normalized",
+                        retention_days=14,
+                        enabled=True,
+                    )
+                )
+                connection.execute(
+                    event.insert().values(
+                        id=wearable_event_id,
+                        event_type="wearable.sleep.v1",
+                        schema_version=1,
+                        observed_at=observed_at,
+                        recorded_at=observed_at,
+                        timezone="UTC",
+                        source_provider=(
+                            "healthmes-open-wearables-mirror"
+                        ),
+                        source_device=None,
+                        source_record_id="wearable:postgres:1",
+                        capture_method="import",
+                        sensitivity="wellness",
+                        consent_scope="personal",
+                        retention_policy_id=generic_policy_id,
+                        expires_at=original_expiry,
+                        payload={},
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "d8e9f0a1b2c3")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                wearable_policy = connection.execute(
+                    sa.select(policy).where(
+                        policy.c.data_class == "wearable_normalized"
+                    )
+                ).one()
+                migrated = connection.execute(
+                    sa.select(event).where(
+                        event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert wearable_policy.retention_days == 14
+                assert wearable_policy.enabled is True
+                assert (
+                    migrated.retention_policy_id
+                    == wearable_policy.id
+                )
+                assert migrated.expires_at == original_expiry
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d8e9f0a1b2c3"
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "c7d8e9f0a1b2")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                restored = connection.execute(
+                    sa.select(event).where(
+                        event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert (
+                    restored.retention_policy_id
+                    == generic_policy_id
+                )
+                assert restored.expires_at == original_expiry
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(policy)
+                    .where(
+                        policy.c.data_class
+                        == "wearable_normalized"
+                    )
+                ) == 0
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_calendar_generation_migration_is_lossless() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_calendar_generation_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    mirror_id = uuid.uuid4()
+    start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+    end_at = start_at + timedelta(hours=1)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "a5b6c7d8e9f0")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            legacy_mirror = sa.Table(
+                "calendar_event_mirror",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            legacy_proposal = sa.Table(
+                "calendar_mutation_proposal",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            base_proposal = {
+                "calendar_source": "google",
+                "mirror_event_id": mirror_id,
+                "external_event_id": "legacy-event",
+                "operation": "shorten",
+                "original_start_at": start_at,
+                "original_end_at": end_at,
+                "proposed_start_at": start_at,
+                "proposed_end_at": end_at - timedelta(minutes=15),
+                "expected_etag": '"legacy-etag"',
+                "protected_fingerprint": "legacy-fingerprint",
+                "reply_handle_digest": "legacy-reply",
+                "expires_at": end_at,
+            }
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    legacy_mirror.insert().values(
+                        id=mirror_id,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        summary="Legacy event",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+                connection.execute(
+                    legacy_proposal.insert(),
+                    [
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4(),
+                            "status": "pending",
+                            "dedup_key": "legacy-pending",
+                        },
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4(),
+                            "status": "applying",
+                            "dedup_key": "legacy-applying",
+                        },
+                    ],
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "b6c7d8e9f0a1")
+        scoped_engine = sa.create_engine(schema_url)
+        active_id = uuid.uuid4()
+        raced_id = uuid.uuid4()
+        reconnected_id = uuid.uuid4()
+        try:
+            inspector = sa.inspect(scoped_engine)
+            mirror_columns = {
+                item["name"]: item
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert mirror_columns["connection_generation"]["nullable"] is False
+            assert "ck_calendar_mutation_proposal_active_generation" in checks
+
+            mirror = sa.Table(
+                "calendar_event_mirror",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            proposal = sa.Table(
+                "calendar_mutation_proposal",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                statuses = {
+                    row.dedup_key: row.status
+                    for row in connection.execute(
+                        sa.select(
+                            proposal.c.dedup_key,
+                            proposal.c.status,
+                        )
+                    )
+                }
+                assert statuses == {
+                    "legacy-pending": "conflicted",
+                    "legacy-applying": "unknown",
+                }
+                assert connection.scalar(
+                    sa.select(mirror.c.connection_generation)
+                    .where(mirror.c.id == mirror_id)
+                ) == "__legacy_unbound__"
+                connection.execute(
+                    mirror.insert().values(
+                        id=reconnected_id,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        connection_generation="reconnected-account",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+                connection.execute(
+                    proposal.insert().values(
+                        id=active_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="active-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=end_at,
+                        proposed_start_at=start_at,
+                        proposed_end_at=end_at - timedelta(minutes=15),
+                        expected_etag='"active-etag"',
+                        protected_fingerprint="active-fingerprint",
+                        reply_handle_digest="active-reply",
+                        expires_at=end_at,
+                        status="pending",
+                        dedup_key="active-proposal",
+                    )
+                )
+
+            with pytest.raises(sa.exc.IntegrityError):
+                with scoped_engine.begin() as connection:
+                    connection.execute(
+                        mirror.insert().values(
+                            id=uuid.uuid4(),
+                            external_id="null-generation",
+                            calendar_source="google",
+                            connection_generation=None,
+                            start_at=start_at,
+                            end_at=end_at,
+                            is_agent_created=False,
+                        )
+                    )
+
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    "multiple account generations share one "
+                    "provider event id"
+                ),
+            ):
+                command.downgrade(config, "a5b6c7d8e9f0")
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                assert connection.scalar(
+                    sa.select(proposal.c.status).where(
+                        proposal.c.id == active_id
+                    )
+                ) == "pending"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(mirror)
+                    .where(mirror.c.id == reconnected_id)
+                ) == 1
+                connection.execute(
+                    mirror.delete().where(mirror.c.id == reconnected_id)
+                )
+
+            with pytest.raises(
+                RuntimeError,
+                match="calendar mutation proposals are still active",
+            ):
+                command.downgrade(config, "a5b6c7d8e9f0")
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                connection.execute(
+                    proposal.update()
+                    .where(proposal.c.id == active_id)
+                    .values(status="conflicted")
+                )
+
+            with scoped_engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    proposal.insert().values(
+                        id=raced_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="racing-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=end_at,
+                        proposed_start_at=start_at,
+                        proposed_end_at=end_at - timedelta(minutes=15),
+                        expected_etag='"racing-etag"',
+                        protected_fingerprint="racing-fingerprint",
+                        reply_handle_digest="racing-reply",
+                        expires_at=end_at,
+                        status="pending",
+                        dedup_key="racing-proposal",
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(schema_url),
+                        "a5b6c7d8e9f0",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match="calendar mutation proposals are still active",
+                    ):
+                        downgrade.result(timeout=5)
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                assert connection.scalar(
+                    sa.select(proposal.c.status).where(
+                        proposal.c.id == raced_id
+                    )
+                ) == "pending"
+                connection.execute(
+                    proposal.update()
+                    .where(proposal.c.id == raced_id)
+                    .values(status="conflicted")
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "a5b6c7d8e9f0")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert "account_generation" not in {
+                item["name"]
+                for item in inspector.get_columns(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert "connection_generation" not in {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT COUNT(*) FROM calendar_event_mirror "
+                        "WHERE id = :id"
+                    ),
+                    {"id": mirror_id},
+                ) == 1
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_agent_migration_round_trip() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_alembic_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "e3f4a5b6c7d8")
+        scoped_engine = sa.create_engine(schema_url)
+        legacy_id = uuid.uuid4()
+        try:
+            legacy = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    legacy.insert().values(
+                        id=legacy_id,
+                        kind="insight",
+                        tree={
+                            "id": "legacy",
+                            "type": "llm_step",
+                            "label": "legacy decision",
+                            "children": [],
+                        },
+                        summary="legacy decision",
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "f4a5b6c7d8e9")
+        correlated_id = uuid.uuid4()
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_record"
+                )
+            }
+            indexes = {
+                item["name"]: item
+                for item in inspector.get_indexes("decision_record")
+            }
+            assert {
+                "decision_request_id",
+                "decision_turn_id",
+                "decision_request_fingerprint",
+                "decision_payload",
+                "decision_payload_digest",
+            } <= columns
+            assert (
+                "ck_decision_record_decision_agent_correlation_complete"
+                in checks
+            )
+            assert indexes[
+                "ux_decision_record_decision_request_id"
+            ]["unique"]
+            assert indexes[
+                "ux_decision_record_decision_turn_id"
+            ]["unique"]
+
+            migrated = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                preserved = connection.execute(
+                    sa.select(migrated).where(
+                        migrated.c.id == legacy_id
+                    )
+                ).one()
+                assert preserved.decision_request_id is None
+                assert preserved.decision_payload_digest is None
+                connection.execute(
+                    migrated.insert().values(
+                        id=correlated_id,
+                        kind="insight",
+                        tree={
+                            "id": "new",
+                            "type": "llm_step",
+                            "label": "new decision",
+                            "children": [],
+                        },
+                        summary="new decision",
+                        decision_request_id=uuid.uuid4(),
+                        decision_turn_id=uuid.uuid4(),
+                        decision_request_fingerprint="f" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v1"
+                        },
+                        decision_payload_digest="d" * 64,
+                    )
+                )
+
+            with pytest.raises(sa.exc.IntegrityError):
+                with scoped_engine.begin() as connection:
+                    connection.execute(
+                        migrated.insert().values(
+                            id=uuid.uuid4(),
+                            kind="insight",
+                            tree={
+                                "id": "partial",
+                                "type": "llm_step",
+                                "label": "invalid partial correlation",
+                                "children": [],
+                            },
+                            summary="invalid partial correlation",
+                            decision_request_id=uuid.uuid4(),
+                        )
+                    )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Decision Agent audit and idempotency data",
+        ):
+            command.downgrade(config, "e3f4a5b6c7d8")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            preserved = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(preserved)
+                    .where(preserved.c.id == correlated_id)
+                ) == 1
+                connection.execute(
+                    preserved.delete().where(
+                        preserved.c.id == correlated_id
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        raced_id = uuid.uuid4()
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            migrated = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    migrated.insert().values(
+                        id=raced_id,
+                        kind="insight",
+                        tree={
+                            "id": "raced",
+                            "type": "llm_step",
+                            "label": "concurrent decision",
+                            "children": [],
+                        },
+                        summary="concurrent decision",
+                        decision_request_id=uuid.uuid4(),
+                        decision_turn_id=uuid.uuid4(),
+                        decision_request_fingerprint="a" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v1"
+                        },
+                        decision_payload_digest="b" * 64,
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(schema_url),
+                        "e3f4a5b6c7d8",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match=(
+                            "without losing Decision Agent audit and "
+                            "idempotency data"
+                        ),
+                    ):
+                        downgrade.result(timeout=5)
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(migrated)
+                    .where(migrated.c.id == raced_id)
+                ) == 1
+                connection.execute(
+                    migrated.delete().where(migrated.c.id == raced_id)
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "e3f4a5b6c7d8")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            assert "decision_request_id" not in columns
+            legacy = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(legacy)
+                    .where(legacy.c.id == legacy_id)
+                ) == 1
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_policy_downgrade_is_lossless() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_policy_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "a5b6c7d8e9f0")
+        scoped_engine = sa.create_engine(schema_url)
+        policy_id = uuid.uuid4()
+        try:
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=policy_id,
+                        owner_principal_id="owner",
+                        domain="calendar",
+                        enabled=False,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing disabled Decision Agent domain consent",
+        ):
+            command.downgrade(config, "f4a5b6c7d8e9")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.select(policy.c.enabled).where(
+                        policy.c.id == policy_id
+                    )
+                ) is False
+                connection.execute(
+                    policy.update()
+                    .where(policy.c.id == policy_id)
+                    .values(enabled=True)
+                )
+
+            with scoped_engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    policy.update()
+                    .where(policy.c.id == policy_id)
+                    .values(enabled=False)
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(schema_url),
+                        "f4a5b6c7d8e9",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match=(
+                            "without losing disabled Decision Agent "
+                            "domain consent"
+                        ),
+                    ):
+                        downgrade.result(timeout=5)
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.select(policy.c.enabled).where(
+                        policy.c.id == policy_id
+                    )
+                ) is False
+                connection.execute(
+                    policy.update()
+                    .where(policy.c.id == policy_id)
+                    .values(enabled=True)
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "f4a5b6c7d8e9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            assert (
+                "decision_domain_policy"
+                not in sa.inspect(scoped_engine).get_table_names()
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "a5b6c7d8e9f0")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(policy)
+                ) == 0
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_hardening_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    created_at = datetime(2099, 8, 16, 9, tzinfo=UTC)
+    expired_created_at = datetime(2000, 1, 1, 9, tzinfo=UTC)
+    pending_id = uuid.uuid4()
+    completed_id = uuid.uuid4()
+    expired_id = uuid.uuid4()
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            retention_policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                policy_id = connection.scalar(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                )
+                if policy_id is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4(),
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(retention_policy.c.id == policy_id)
+                        .values(retention_days=1, enabled=True)
+                    )
+                connection.execute(
+                    receipt.insert().values(
+                        id=pending_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="a" * 64,
+                        state="pending",
+                        owner_token=uuid.uuid4(),
+                        lease_expires_at=(
+                            created_at + timedelta(minutes=5)
+                        ),
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=expired_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="c" * 64,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"answer": "expired sensitive answer"},
+                        },
+                        expires_at=datetime(
+                            2099,
+                            1,
+                            1,
+                            tzinfo=UTC,
+                        ),
+                        created_at=expired_created_at,
+                        updated_at=expired_created_at,
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=completed_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="b" * 64,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"status": "completed"},
+                        },
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                "requested_at",
+                "lease_generation",
+                "result_expires_at",
+                "retention_basis_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+            }
+            constraint_names = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            }
+            assert (
+                "ck_decision_request_receipt_"
+                "state_payload_consistent"
+            ) in constraint_names
+            assert (
+                "ck_decision_request_receipt_"
+                "lease_generation_positive"
+            ) in constraint_names
+            assert (
+                "ix_decision_request_receipt_result_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            assert (
+                "ix_decision_request_receipt_retention_basis_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(receipt)
+                    )
+                }
+                assert rows[pending_id].requested_at == created_at
+                assert rows[pending_id].retention_basis_at == created_at
+                assert rows[pending_id].lease_generation == 1
+                assert rows[pending_id].result_expires_at is None
+                assert rows[completed_id].requested_at == created_at
+                assert (
+                    rows[completed_id].retention_basis_at
+                    == created_at
+                )
+                assert rows[completed_id].lease_generation == 1
+                assert (
+                    rows[completed_id].result_expires_at
+                    == created_at + timedelta(days=1)
+                )
+                assert rows[expired_id].state == "tombstone"
+                assert rows[expired_id].result_payload is None
+                assert rows[expired_id].result_expires_at is None
+                assert rows[expired_id].requested_at == expired_created_at
+                assert (
+                    rows[expired_id].retention_basis_at
+                    == expired_created_at
+                )
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_receipt_hardening_repairs_nullable_requested_at() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_nullable_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    receipt_id = uuid.uuid4()
+    created_at = datetime(2099, 8, 17, 9, tzinfo=UTC)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_request_receipt "
+                        "ADD COLUMN requested_at TIMESTAMP WITH TIME ZONE"
+                    )
+                )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="e" * 64,
+                        requested_at=None,
+                        state="pending",
+                        owner_token=uuid.uuid4(),
+                        lease_expires_at=created_at + timedelta(minutes=5),
+                        expires_at=created_at + timedelta(days=30),
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            requested_at_column = next(
+                column
+                for column in sa.inspect(scoped_engine).get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "requested_at"
+            )
+            assert requested_at_column["nullable"] is False
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(receipt.c.id == receipt_id)
+                ).one()
+                assert row.requested_at == created_at
+                assert row.retention_basis_at == created_at
+                assert row.lease_generation == 1
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_receipt_basis_repairs_future_requested_at() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_basis_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    receipt_id = uuid.uuid4()
+    created_at = datetime(2099, 8, 17, 9, tzinfo=UTC)
+    requested_at = created_at + timedelta(days=365)
+    identity_expires_at = created_at + timedelta(days=30)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "b2c3d4e5f6a7")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            metadata = sa.MetaData()
+            receipt = sa.Table(
+                "decision_request_receipt",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            retention_policy = sa.Table(
+                "retention_policy",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                policy_id = connection.scalar(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                )
+                if policy_id is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4(),
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(retention_policy.c.id == policy_id)
+                        .values(retention_days=1, enabled=True)
+                    )
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="a" * 64,
+                        requested_at=requested_at,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"answer": "sensitive answer"},
+                        },
+                        result_expires_at=identity_expires_at,
+                        expires_at=identity_expires_at,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            basis_column = next(
+                column
+                for column in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "retention_basis_at"
+            )
+            assert basis_column["nullable"] is False
+            assert (
+                "ix_decision_request_receipt_retention_basis_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(receipt.c.id == receipt_id)
+                ).one()
+                assert row.requested_at == requested_at
+                assert row.retention_basis_at == created_at
+                assert row.result_expires_at == (
+                    created_at + timedelta(days=1)
+                )
+                assert row.expires_at == identity_expires_at
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_offline_receipt_basis_sql_executes() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_basis_offline_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    receipt_id = uuid.uuid4()
+    created_at = datetime(2099, 8, 17, 9, tzinfo=UTC)
+    requested_at = created_at + timedelta(days=365)
+    identity_expires_at = created_at + timedelta(days=30)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "b2c3d4e5f6a7")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            metadata = sa.MetaData()
+            receipt = sa.Table(
+                "decision_request_receipt",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            retention_policy = sa.Table(
+                "retention_policy",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                policy_id = connection.scalar(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                )
+                if policy_id is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4(),
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(retention_policy.c.id == policy_id)
+                        .values(retention_days=1, enabled=True)
+                    )
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="d" * 64,
+                        requested_at=requested_at,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"answer": "sensitive answer"},
+                        },
+                        result_expires_at=identity_expires_at,
+                        expires_at=identity_expires_at,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        rendered = _render_offline_decision_receipt_basis_upgrade(
+            schema_url
+        )
+        assert "SET retention_basis_at = created_at" in rendered
+        assert (
+            "ix_decision_request_receipt_retention_basis_at"
+            in rendered
+        )
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            raw_connection = scoped_engine.raw_connection()
+            try:
+                cursor = raw_connection.cursor()
+                try:
+                    cursor.execute(rendered, prepare=False)
+                finally:
+                    cursor.close()
+                raw_connection.commit()
+            finally:
+                raw_connection.close()
+
+            inspector = sa.inspect(scoped_engine)
+            basis_column = next(
+                column
+                for column in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "retention_basis_at"
+            )
+            assert basis_column["nullable"] is False
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                (
+                    "ck_decision_request_receipt_"
+                    "lease_generation_positive"
+                ),
+                (
+                    "ck_decision_request_receipt_"
+                    "state_payload_consistent"
+                ),
+            }
+            assert (
+                "ix_decision_request_receipt_retention_basis_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(
+                        receipt.c.id == receipt_id
+                    )
+                ).one()
+                assert row.requested_at == requested_at
+                assert row.retention_basis_at == created_at
+                assert row.result_expires_at == (
+                    created_at + timedelta(days=1)
+                )
+                assert row.expires_at == identity_expires_at
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c3d4e5f6a7b8"
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="decision receipt retention bases are forward-only",
+        ):
+            command.downgrade(config, "b2c3d4e5f6a7")
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_offline_receipt_hardening_sql_executes() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_offline_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        rendered = _render_offline_decision_receipt_hardening_upgrade(
+            schema_url
+        )
+        assert (
+            "DROP CONSTRAINT "
+            "ck_decision_request_receipt_state_payload_consistent"
+            in rendered
+        )
+        assert (
+            "ck_decision_request_receipt_"
+            "ck_decision_request_receipt_state_payload_consistent"
+            not in rendered
+        )
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            raw_connection = scoped_engine.raw_connection()
+            try:
+                cursor = raw_connection.cursor()
+                try:
+                    cursor.execute(rendered, prepare=False)
+                finally:
+                    cursor.close()
+                raw_connection.commit()
+            finally:
+                raw_connection.close()
+
+            inspector = sa.inspect(scoped_engine)
+            requested_at_column = next(
+                column
+                for column in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "requested_at"
+            )
+            assert requested_at_column["nullable"] is False
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                (
+                    "ck_decision_request_receipt_"
+                    "lease_generation_positive"
+                ),
+                (
+                    "ck_decision_request_receipt_"
+                    "state_payload_consistent"
+                ),
+            }
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a1b2c3d4e5f6"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_receipt_downgrade_is_lossless() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "f0a1b2c3d4e5")
+        scoped_engine = sa.create_engine(schema_url)
+        receipt_id = uuid.uuid4()
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="a" * 64,
+                        state="completed",
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"status": "completed"},
+                        },
+                        expires_at=datetime(
+                            2026,
+                            9,
+                            15,
+                            tzinfo=UTC,
+                        ),
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade decision_request_receipt without "
+                "losing durable idempotency results"
+            ),
+        ):
+            command.downgrade(config, "e9f0a1b2c3d4")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f0a1b2c3d4e5"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(receipt)
+                    .where(receipt.c.id == receipt_id)
+                ) == 1
+                connection.execute(
+                    receipt.delete().where(
+                        receipt.c.id == receipt_id
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "e9f0a1b2c3d4")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            assert (
+                "decision_request_receipt"
+                not in sa.inspect(scoped_engine).get_table_names()
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e9f0a1b2c3d4"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()

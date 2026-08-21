@@ -9,12 +9,13 @@ skills/<your-skill-name>/SKILL.md (the directory name must match `name:`),
 then run: uv run python scripts/bootstrap.py
 
 Rules that reviews enforce (docs/EXTENDING.md §1):
-- Call tools by their REGISTERED names: mcp__healthmes__<tool> /
-  mcp__open_wearables__<tool> (double underscores).
-- Never instruct raw REST calls — data access goes through MCP tools only,
-  so every decision stays reconstructable in the decision tree.
-- Always record the decision (mcp__healthmes__record_decision) after a
-  recommendation, and put the returned viewer_url in the message.
+- Call tools by their REGISTERED names: mcp__healthmes__<tool>
+  (double underscores). Direct Open Wearables tools are not exposed to the
+  product decision runtime.
+- Never instruct raw REST calls — decision data access goes through bounded
+  HealthMes MCP tools so source references can be validated.
+- Do not call a generic decision-record writer. HealthMes validates sources and
+  conditionally writes a compact record after the runtime returns.
 - Gate advice on confidence: on "low" or "insufficient_data", say the data
   is too thin — never give categorical advice.
 - Proactive messages follow the notification grammar (PLAN.md §8.5):
@@ -28,10 +29,9 @@ where the agent should apply this skill — and when it should NOT.
 
 # Data to gather
 
-1. `mcp__healthmes__get_daily_readiness_context` with `date=today` — …
-2. `mcp__open_wearables__get_timeseries` with `types=[…]` over the last N
-   days — … (check provider coverage first: not every device has every
-   signal; see docs/EXPERT-ONBOARDING.ko.md §1)
+1. `mcp__healthmes__search_wearable` with a bounded date range and metrics — …
+2. `mcp__healthmes__search_activity` or another domain search only when the
+   question needs it; check coverage before drawing a conclusion.
 
 # Judgment procedure
 
@@ -43,8 +43,11 @@ where the agent should apply this skill — and when it should NOT.
 
 # After deciding
 
-- Call `mcp__healthmes__record_decision` with the tree of inputs → rules →
-  chosen option; include the returned viewer_url as the "왜 이 판단?" link.
-- If the recommendation changes the schedule, use
-  `mcp__healthmes__propose_schedule_blocks` (propose-then-confirm — never
-  write the calendar directly).
+- Return the strict `healthmes.decision-draft.v2` envelope requested by the
+  system instructions.
+- If the result may be retained, select only a `record_summary_code` allowed
+  by the runtime prompt and set `answer` to that code's exact canonical
+  sentence. Set the legacy `record_summary` field to `null`.
+- Do not mutate calendar, settings, tasks, food records, or medical records
+  from the decision-read runtime. A separately confirmed mutation workflow
+  owns those actions.

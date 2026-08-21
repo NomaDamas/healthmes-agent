@@ -1,0 +1,72 @@
+{
+  "access_trace": [],
+  "request": {
+    "budget": {
+      "max_context_bytes": 256000,
+      "max_source_refs": 200,
+      "max_steps": 8,
+      "max_tool_calls": 8
+    },
+    "caller": {
+      "authenticated": true,
+      "channel": "rest",
+      "execution_scope": "local",
+      "principal_id": "owner",
+      "session_id": "legacy-session"
+    },
+    "compatibility_preset": null,
+    "hints": {
+      "end": null,
+      "local_date": null,
+      "lookback_days": null,
+      "related_record_ids": {},
+      "start": null
+    },
+    "question": "Historical retained wellness check.",
+    "request_id": "11111111-1111-4111-8111-111111111111",
+    "requested_at": "2026-08-10T09:30:00Z",
+    "requested_privacy_level": "aggregate",
+    "timezone": "UTC",
+    "turn_id": "22222222-2222-4222-8222-222222222222"
+  },
+  "request_fingerprint": "9c11acc86f72105cf272fcdeb24cdfdb3bf5e60e67150336e72fa507385b3609",
+  "result": {
+    "answer": "Take a short break.",
+    "clarification_question": null,
+    "confidence": null,
+    "decision_record_id": "33333333-3333-4333-8333-333333333333",
+    "follow_up_question": null,
+    "limitations": [],
+    "persistence_status": "persisted",
+    "proposed_action": false,
+    "request_id": "11111111-1111-4111-8111-111111111111",
+    "runtime": {
+      "input_tokens": 10,
+      "model": "legacy-model",
+      "output_tokens": 5,
+      "provider": "legacy-provider",
+      "runtime": "hermes"
+    },
+    "source_refs": [],
+    "status": "completed",
+    "tool_trace": [],
+    "turn_id": "22222222-2222-4222-8222-222222222222",
+    "uncertainty": null
+  },
+  "run": {
+    "finished_at": "2026-08-10T09:30:01Z",
+    "runtime": {
+      "input_tokens": 10,
+      "model": "legacy-model",
+      "output_tokens": 5,
+      "provider": "legacy-provider",
+      "runtime": "hermes"
+    },
+    "started_at": "2026-08-10T09:30:00Z",
+    "steps_used": 1,
+    "system_policy_version": "healthmes-decision-policy.v1"
+  },
+  "schema": "healthmes.decision-private.v1",
+  "source_refs": [],
+  "tool_trace": []
+}

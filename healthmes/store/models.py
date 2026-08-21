@@ -15,10 +15,15 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     ForeignKey,
     Index,
+    String,
+    TypeDecorator,
     UniqueConstraint,
     false,
+    func,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,6 +39,27 @@ from healthmes.store.enums import (
     TaskSource,
 )
 
+LEGACY_CALENDAR_ACCOUNT_GENERATION = "__legacy_unbound__"
+
+
+class _CalendarAccountGeneration(TypeDecorator[str]):
+    """Keep legacy unscoped lookups compatible with non-null identities."""
+
+    impl = String
+    cache_ok = True
+
+    class Comparator(TypeDecorator.Comparator[str]):
+        def is_(self, other):
+            if other is None:
+                return self.expr == LEGACY_CALENDAR_ACCOUNT_GENERATION
+            return super().is_(other)
+
+    comparator_factory = Comparator
+
+    def __init__(self) -> None:
+        super().__init__(length=64)
+
+
 __all__ = [
     "WeeklyGoal",
     "Task",
@@ -44,6 +70,8 @@ __all__ = [
     "AppUsageSample",
     "CognitiveEnergyEstimate",
     "DecisionRecord",
+    "DecisionRequestReceipt",
+    "DecisionDomainPolicy",
     "Insight",
     "MedicalRecord",
     "TriggerEvent",
@@ -115,12 +143,14 @@ class CalendarEventMirror(Base):
     __table_args__ = (
         UniqueConstraint(
             "calendar_source",
+            "connection_generation",
             "external_id",
-            name="uq_calendar_event_mirror_source_external_id",
+            name="uq_calendar_event_mirror_source_generation_external_id",
         ),
         Index(
             "ux_calendar_event_mirror_calendar_identity",
             "calendar_source",
+            "connection_generation",
             "healthmes_kind",
             "healthmes_source",
             "healthmes_source_key",
@@ -132,10 +162,20 @@ class CalendarEventMirror(Base):
             "healthmes_kind",
             "sleep_local_date",
         ),
+        Index(
+            "ix_calendar_event_mirror_source_connection_generation",
+            "calendar_source",
+            "connection_generation",
+        ),
     )
 
     external_id: Mapped[str_255]
     calendar_source: Mapped[CalendarSource]
+    connection_generation: Mapped[str] = mapped_column(
+        _CalendarAccountGeneration(),
+        default=LEGACY_CALENDAR_ACCOUNT_GENERATION,
+        server_default=LEGACY_CALENDAR_ACCOUNT_GENERATION,
+    )
     summary: Mapped[str | None]
     start_at: Mapped[datetime] = mapped_column(index=True)
     end_at: Mapped[datetime]
@@ -191,8 +231,10 @@ class ScheduleProposal(Base):
     decided_at: Mapped[datetime | None] = mapped_column(index=True)
     decision_surface: Mapped[str_32 | None]
     intake_calendar_source: Mapped[CalendarSource | None]
+    intake_account_generation: Mapped[str_64 | None]
     intake_external_id: Mapped[str_255 | None]
     intake_revision: Mapped[str_255 | None]
+    invalidation_reason: Mapped[str_64 | None]
 
 
 class CalendarMutationProposal(Base):
@@ -206,10 +248,24 @@ class CalendarMutationProposal(Base):
             "attempt_id",
             name="uq_calendar_mutation_proposal_attempt_id",
         ),
+        Index(
+            "ix_calendar_mutation_proposal_source_account_generation",
+            "calendar_source",
+            "account_generation",
+        ),
+        CheckConstraint(
+            "status NOT IN ('pending', 'applying') "
+            "OR (account_generation IS NOT NULL "
+            f"AND account_generation <> '{LEGACY_CALENDAR_ACCOUNT_GENERATION}')",
+            name="active_generation",
+        ),
     )
 
     calendar_source: Mapped[CalendarSource] = mapped_column(
         default=CalendarSource.GOOGLE, index=True
+    )
+    account_generation: Mapped[str_64 | None] = mapped_column(
+        server_default=LEGACY_CALENDAR_ACCOUNT_GENERATION,
     )
     mirror_event_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("calendar_event_mirror.id", ondelete="SET NULL"), index=True
@@ -324,6 +380,32 @@ class DecisionRecord(Base):
             "trigger_event_id",
             unique=True,
         ),
+        Index(
+            "ux_decision_record_decision_request_id",
+            "decision_request_id",
+            unique=True,
+        ),
+        Index(
+            "ux_decision_record_decision_turn_id",
+            "decision_turn_id",
+            unique=True,
+        ),
+        CheckConstraint(
+            "("
+            "decision_request_id IS NULL "
+            "AND decision_turn_id IS NULL "
+            "AND decision_request_fingerprint IS NULL "
+            "AND decision_payload IS NULL "
+            "AND decision_payload_digest IS NULL"
+            ") OR ("
+            "decision_request_id IS NOT NULL "
+            "AND decision_turn_id IS NOT NULL "
+            "AND decision_request_fingerprint IS NOT NULL "
+            "AND decision_payload IS NOT NULL "
+            "AND decision_payload_digest IS NOT NULL"
+            ")",
+            name="decision_agent_correlation_complete",
+        ),
     )
 
     kind: Mapped[DecisionKind] = mapped_column(index=True)
@@ -334,6 +416,105 @@ class DecisionRecord(Base):
     trigger_event_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("trigger_event.id", ondelete="SET NULL"),
         default=None,
+    )
+    decision_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        default=None,
+    )
+    decision_turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        default=None,
+    )
+    decision_request_fingerprint: Mapped[str_64 | None] = mapped_column(
+        default=None,
+    )
+    decision_payload: Mapped[JSONDict | None] = mapped_column(default=None)
+    decision_payload_digest: Mapped[str_64 | None] = mapped_column(
+        default=None,
+    )
+    retention_basis_at: Mapped[datetime | None] = mapped_column(index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(index=True)
+
+
+class DecisionRequestReceipt(Base):
+    """Bounded, content-minimized idempotency state for one decision request."""
+
+    __tablename__ = "decision_request_receipt"
+    __table_args__ = (
+        UniqueConstraint(
+            "request_id",
+            name="uq_decision_request_receipt_request_id",
+        ),
+        CheckConstraint(
+            "("
+            "state = 'pending' "
+            "AND owner_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL "
+            "AND result_payload IS NULL "
+            "AND result_expires_at IS NULL"
+            ") OR ("
+            "state = 'completed' "
+            "AND owner_token IS NULL "
+            "AND lease_expires_at IS NULL "
+            "AND result_payload IS NOT NULL "
+            "AND result_expires_at IS NOT NULL"
+            ") OR ("
+            "state = 'tombstone' "
+            "AND owner_token IS NULL "
+            "AND lease_expires_at IS NULL "
+            "AND result_payload IS NULL "
+            "AND result_expires_at IS NULL"
+            ")",
+            name="state_payload_consistent",
+        ),
+        CheckConstraint(
+            "lease_generation >= 1",
+            name="lease_generation_positive",
+        ),
+    )
+
+    request_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    request_fingerprint: Mapped[str_64]
+    requested_at: Mapped[datetime]
+    state: Mapped[str_32] = mapped_column(index=True)
+    owner_token: Mapped[uuid.UUID | None] = mapped_column(index=True)
+    lease_generation: Mapped[int] = mapped_column(
+        default=1,
+        server_default="1",
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    result_payload: Mapped[JSONDict | None]
+    result_expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    retention_basis_at: Mapped[datetime] = mapped_column(
+        index=True,
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+
+
+class DecisionDomainPolicy(Base):
+    """Owner-controlled consent switch for one Decision Agent domain."""
+
+    __tablename__ = "decision_domain_policy"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_principal_id",
+            "domain",
+            name="uq_decision_domain_policy_owner_domain",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="revision_positive",
+        ),
+    )
+
+    owner_principal_id: Mapped[str_255] = mapped_column(index=True)
+    domain: Mapped[str_64] = mapped_column(index=True)
+    enabled: Mapped[bool] = mapped_column(
+        default=True,
+        server_default=true(),
+    )
+    revision: Mapped[int] = mapped_column(
+        default=1,
+        server_default="1",
     )
 
 
@@ -378,12 +559,39 @@ class TriggerEvent(Base):
     """
 
     __tablename__ = "trigger_event"
+    __table_args__ = (
+        CheckConstraint(
+            "("
+            "dispatch_owner_token IS NULL "
+            "AND dispatch_lease_expires_at IS NULL"
+            ") OR ("
+            "dispatch_owner_token IS NOT NULL "
+            "AND dispatch_lease_expires_at IS NOT NULL"
+            ")",
+            name="dispatch_lease_consistent",
+        ),
+        CheckConstraint(
+            "dispatch_generation >= 0",
+            name="dispatch_generation_nonnegative",
+        ),
+    )
 
     fired_at: Mapped[datetime] = mapped_column(index=True)
     rule_id: Mapped[str_64] = mapped_column(index=True)
     payload: Mapped[JSONDict | None]
     alert_sent: Mapped[bool] = mapped_column(default=False)
     dedup_key: Mapped[str_255 | None] = mapped_column(index=True)
+    dispatch_owner_token: Mapped[uuid.UUID | None] = mapped_column(
+        default=None,
+    )
+    dispatch_generation: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+    )
+    dispatch_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        index=True,
+        default=None,
+    )
 
 
 class RawIngestEvent(Base):
@@ -426,7 +634,26 @@ class StorageObject(Base):
     """Index for a large payload stored below ``HEALTHMES_DATA_DIR``."""
 
     __tablename__ = "storage_object"
-    __table_args__ = (UniqueConstraint("relative_path", name="uq_storage_object_relative_path"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "relative_path",
+            name="uq_storage_object_relative_path",
+        ),
+        CheckConstraint(
+            "("
+            "("
+            "file_cleanup_identity IS NULL "
+            "OR CAST(file_cleanup_identity AS TEXT) = 'null'"
+            ") "
+            "AND file_cleanup_completed_at IS NULL"
+            ") OR ("
+            "purged_at IS NOT NULL "
+            "AND file_cleanup_identity IS NOT NULL "
+            "AND CAST(file_cleanup_identity AS TEXT) <> 'null'"
+            ")",
+            name="storage_object_file_cleanup_consistent",
+        ),
+    )
 
     data_class: Mapped[str_64] = mapped_column(index=True)
     relative_path: Mapped[str_255]
@@ -440,6 +667,10 @@ class StorageObject(Base):
     expires_at: Mapped[datetime | None] = mapped_column(index=True)
     safe_to_purge: Mapped[bool] = mapped_column(default=False, index=True)
     purged_at: Mapped[datetime | None] = mapped_column(index=True)
+    file_cleanup_identity: Mapped[JSONDict | None]
+    file_cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        index=True
+    )
 
 
 class WellnessEvent(Base):

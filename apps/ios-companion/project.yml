@@ -15,6 +15,14 @@
 # those files verbatim. Sources/SharedActivity is the iOS-only ActivityKit
 # attributes shared between the app and its widget extension.
 name: HealthMesCompanion
+# These opt-in configurations are an executable entitlement/build contract,
+# not device UI. They keep the normal build fail-closed while giving an
+# approved provisioning profile a distinct Screen Time capability path.
+configs:
+  Debug: debug
+  Release: release
+  ScreenTimeOptInDebug: debug
+  ScreenTimeOptInRelease: release
 options:
   bundleIdPrefix: com.healthmes
   createIntermediateGroups: true
@@ -50,8 +58,22 @@ targets:
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Configurations/HealthMesCompanion.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion
         TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        ScreenTimeOptInDebug:
+          CODE_SIGN_ENTITLEMENTS: >-
+            Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
+        ScreenTimeOptInRelease:
+          CODE_SIGN_ENTITLEMENTS: >-
+            Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
     info:
       path: Support/HealthMesCompanion-Info.plist
       properties:
@@ -73,6 +95,7 @@ targets:
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers:
           - com.healthmes.companion.refresh
+          - com.healthmes.companion.screen-time-refresh
         # Capture shortcuts (photos re-encoded to JPEG, voice memos to m4a;
         # bytes go only to the paired instance's POST /v1/media).
         NSCameraUsageDescription: >-
@@ -92,14 +115,6 @@ targets:
         # viewer URLs must never cross an untrusted network in clear text.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-    entitlements:
-      path: Support/HealthMesCompanion.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.healthmes.companion
-        keychain-access-groups:
-          - $(AppIdentifierPrefix)group.com.healthmes.companion
-
   # ------------------------------------------- iOS home + lock-screen widgets
   # Also hosts the focus-block Live Activity UI (ActivityKit renders live
   # activities from the widget extension).
@@ -249,6 +264,9 @@ targets:
     platform: iOS
     sources:
       - Sources/Shared
+      - Sources/App/ScreenTimeActivityCollector.swift
+      - Sources/App/ScreenTimeActivityLiveFactory.swift
+      - Sources/App/ScreenTimeActivityRuntime.swift
       - path: Tests
         excludes:
           - Fixtures
@@ -257,6 +275,15 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.tests
+      configs:
+        ScreenTimeOptInDebug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
+        ScreenTimeOptInRelease:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
     info:
       path: Support/HealthMesCompanionTests-Info.plist
       properties: {}
@@ -289,6 +316,22 @@ schemes:
       targets:
         - HealthMesCompanionTests
         - HealthMesCompanionUITests
+  HealthMesCompanionScreenTimeOptIn:
+    build:
+      targets:
+        HealthMesCompanion: all
+    run:
+      config: ScreenTimeOptInDebug
+    test:
+      config: ScreenTimeOptInDebug
+      targets:
+        - HealthMesCompanionTests
+    profile:
+      config: ScreenTimeOptInRelease
+    analyze:
+      config: ScreenTimeOptInDebug
+    archive:
+      config: ScreenTimeOptInRelease
   HealthMesWatchApp:
     build:
       targets:

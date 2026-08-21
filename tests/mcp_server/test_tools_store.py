@@ -1,10 +1,11 @@
-"""Tests for the store-backed MCP tools (tasks / schedule / food / decisions).
+"""Tests for the store-backed MCP tools (tasks / schedule / food).
 
 Everything runs against the in-memory sqlite store; DB side effects are
 verified through a direct session from the same factory.
 """
 
 import datetime as dt
+import json
 import uuid
 
 import pytest
@@ -12,10 +13,13 @@ from fastmcp.exceptions import ToolError
 from pydantic import SecretStr
 from sqlalchemy import select
 
-from healthmes.api.auth import viewer_token
-from healthmes.api.briefing import decision_viewer_url
 from healthmes.calendars.adjustments import MAX_EVIDENCE_CLOCK_SKEW
 from healthmes.calendars.base import ExternalEvent
+from healthmes.calendars.state import (
+    FileSyncHealthStore,
+    SyncCoverageKind,
+)
+from healthmes.calendars.visibility import CalendarVisibilityChanged
 from healthmes.config import Settings
 from healthmes.mcp_server import server as server_module
 from healthmes.store import (
@@ -23,6 +27,7 @@ from healthmes.store import (
     CalendarMutationProposal,
     CalendarMutationStatus,
     CalendarSource,
+    DecisionKind,
     DecisionRecord,
     EnergyDemand,
     FoodLog,
@@ -33,21 +38,38 @@ from healthmes.store import (
 )
 from healthmes.trusted_session import issue_trusted_session_proof
 
-TREE = {
-    "type": "rule",
-    "label": "readiness low",
-    "detail": "sleep debt 20, hrv z -1.41",
-    "children": [
-        {"type": "input", "label": "sleep_debt=20"},
-        {
-            "type": "option",
-            "label": "move deep work to tomorrow",
-            "children": [{"type": "action", "label": "propose 09:00-11:00 block"}],
-        },
-    ],
-}
 OWNER_USER_ID = "owner-user"
 OWNER_CHAT_ID = "owner-chat"
+CALENDAR_ACCOUNT_GENERATION = "c" * 32
+
+
+@pytest.fixture
+def connected_google_calendar(mcp_env) -> str:
+    settings = server_module._active_settings()
+    token_path = settings.data_dir / "google" / "calendar_token.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fixture-refresh-token",
+                "client_id": "fixture-client-id",
+                "client_secret": "fixture-client-secret",
+                "_healthmes_account_generation": (
+                    CALENDAR_ACCOUNT_GENERATION
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    FileSyncHealthStore.for_data_dir(settings.data_dir).record_success(
+        CalendarSource.GOOGLE,
+        dt.datetime.now(dt.UTC),
+        event_count=0,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=CALENDAR_ACCOUNT_GENERATION,
+    )
+    return CALENDAR_ACCOUNT_GENERATION
 
 
 def calendar_reply_arguments(
@@ -78,7 +100,6 @@ def calendar_reply_arguments(
 
 def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
     unrelated_secrets = Settings(
-        hermes_webhook_secret=SecretStr("webhook-secret"),
         api_token=SecretStr("api-token"),
         _env_file=None,
     )
@@ -89,7 +110,6 @@ def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
     dedicated_secret = "a" * 64
     configured = Settings(
         calendar_adjustment_secret=SecretStr(dedicated_secret),
-        hermes_webhook_secret=SecretStr("webhook-secret"),
         api_token=SecretStr("api-token"),
         _env_file=None,
     )
@@ -294,6 +314,7 @@ class TestScheduleTools:
                 CalendarEventMirror(
                     external_id=f"evt-{summary}",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=CALENDAR_ACCOUNT_GENERATION,
                     summary=summary,
                     start_at=start,
                     end_at=end,
@@ -301,8 +322,46 @@ class TestScheduleTools:
             )
             session.commit()
 
+    async def test_get_schedule_hides_disconnected_legacy_calendar_rows(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+    ):
+        start = dt.datetime.now(pinned_tz).replace(
+            hour=14, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="disconnected-secret-event",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Former account private event",
+                    start_at=start.astimezone(dt.UTC),
+                    end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+                )
+            )
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "get_schedule",
+            {"range": "7d"},
+        )
+
+        assert result["events"] == []
+        assert result["calendar_limitations"] == [
+            "calendar_not_connected"
+        ]
+        assert "Former account private event" not in str(result)
+
     async def test_propose_blocks_creates_proposals_and_flags_conflicts(
-        self, mcp_client, call_tool, store_factory
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        connected_google_calendar,
     ):
         created = await call_tool(mcp_client, "upsert_task", {"title": "Deep work"})
         task_id = created["task"]["id"]
@@ -340,6 +399,90 @@ class TestScheduleTools:
             rows = list(session.scalars(select(ScheduleProposal)))
             assert len(rows) == 2
             assert all(row.status == ProposalStatus.PROPOSED for row in rows)
+            assert {
+                str(row.decision_record_id) for row in rows
+            } == {result["decision_record_id"]}
+            decision = session.scalars(select(DecisionRecord)).one()
+            assert decision.id == uuid.UUID(result["decision_record_id"])
+            assert decision.kind is DecisionKind.SCHEDULE_CHANGE
+            assert decision.decision_request_id is None
+            assert decision.tree["detail"] == {
+                "proposal_count": 2,
+                "confirmation_required": True,
+            }
+        assert result["decision_url"].endswith(
+            f"/decisions/{result['decision_record_id']}"
+        )
+
+    async def test_propose_timed_intake_uses_only_current_account_generation(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        connected_google_calendar,
+    ):
+        created = await call_tool(
+            mcp_client,
+            "upsert_task",
+            {"title": "Use current intake block"},
+        )
+        task_id = uuid.UUID(created["task"]["id"])
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9,
+            minute=0,
+            second=0,
+            microsecond=0,
+        ) + dt.timedelta(days=1)
+        end = start + dt.timedelta(hours=1)
+        with store_factory() as session:
+            for generation, summary in (
+                ("former-account-generation", "Former private event"),
+                (
+                    connected_google_calendar,
+                    "Current account event",
+                ),
+            ):
+                session.add(
+                    CalendarEventMirror(
+                        external_id="same-provider-event",
+                        calendar_source=CalendarSource.GOOGLE,
+                        connection_generation=generation,
+                        summary=summary,
+                        start_at=start,
+                        end_at=end,
+                        intake_task_id=task_id,
+                    )
+                )
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "task_id": str(task_id),
+                        "start": start.isoformat(),
+                        "end": end.isoformat(),
+                    }
+                ]
+            },
+        )
+
+        [proposal_payload] = result["proposals"]
+        assert proposal_payload["conflicts"] == []
+        assert "Former private event" not in str(result)
+        with store_factory() as session:
+            proposal = session.get(
+                ScheduleProposal,
+                uuid.UUID(proposal_payload["id"]),
+            )
+            assert proposal is not None
+            assert (
+                proposal.intake_account_generation
+                == connected_google_calendar
+            )
+            assert proposal.intake_external_id == "same-provider-event"
 
     async def test_propose_planned_sleep_carries_explicit_calendar_kind(
         self, mcp_client, call_tool, store_factory
@@ -534,7 +677,12 @@ class TestScheduleTools:
             )
 
     async def test_get_schedule_returns_window_events_and_pending_proposals(
-        self, mcp_client, call_tool, store_factory, pinned_tz
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+        connected_google_calendar,
     ):
         # Seed relative to the pinned *local* timezone: the window anchors at
         # local midnight (one "today" across all tools), so 14:00 tomorrow
@@ -569,12 +717,18 @@ class TestScheduleTools:
         assert [event["summary"] for event in result["events"]] == ["Dentist"]
         assert len(result["proposals"]) == 1
         assert result["proposals"][0]["task_title"] == "Deep work"
+        assert result["calendar_limitations"] == []
 
         today_only = await call_tool(mcp_client, "get_schedule", {"range": "today"})
         assert today_only["events"] == []
 
     async def test_get_schedule_projects_adjustment_eligibility_without_provider_ids(
-        self, mcp_client, call_tool, store_factory, pinned_tz
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+        connected_google_calendar,
     ):
         start = dt.datetime.now(pinned_tz).replace(
             hour=14, minute=0, second=0, microsecond=0
@@ -584,6 +738,7 @@ class TestScheduleTools:
                 CalendarEventMirror(
                     external_id="google-secret-event",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=connected_google_calendar,
                     summary="Recovery focus",
                     start_at=start.astimezone(dt.UTC),
                     end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
@@ -610,7 +765,13 @@ class TestScheduleTools:
         }
 
     async def test_evaluate_and_resolve_calendar_adjustment_are_redacted_and_confirmation_gated(
-        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+        connected_google_calendar,
     ):
         day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
         first = dt.datetime.combine(day, dt.time(hour=14), tzinfo=pinned_tz)
@@ -621,6 +782,7 @@ class TestScheduleTools:
                     CalendarEventMirror(
                         external_id=f"google-secret-{index}",
                         calendar_source=CalendarSource.GOOGLE,
+                        connection_generation=connected_google_calendar,
                         summary="Recovery focus",
                         start_at=start.astimezone(dt.UTC),
                         end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
@@ -722,7 +884,12 @@ class TestScheduleTools:
             assert proposal.reply_handle_digest != evaluated["reply_handle"]
             [trigger] = list(session.scalars(select(TriggerEvent)))
             assert trigger.payload["outcome"] == "proposed"
-            tree_text = str(session.get(DecisionRecord, proposal.proposal_decision_record_id).tree)
+            tree_text = str(
+                session.get(
+                    DecisionRecord,
+                    proposal.proposal_decision_record_id,
+                ).tree
+            )
             assert evaluated["reply_handle"] not in tree_text
             assert proposal.reply_handle_digest not in tree_text
             assert "google-secret" not in tree_text
@@ -731,7 +898,10 @@ class TestScheduleTools:
         declined = await call_tool(
             mcp_client,
             "resolve_calendar_adjustment",
-            calendar_reply_arguments(evaluated["reply_handle"], action="그대로"),
+            calendar_reply_arguments(
+                evaluated["reply_handle"],
+                action="그대로",
+            ),
         )
         assert declined["status"] == CalendarMutationStatus.DECLINED.value
         assert declined["receipt"] == {
@@ -742,8 +912,101 @@ class TestScheduleTools:
         }
         assert writer.changes == []
 
+    async def test_calendar_visibility_change_rolls_back_adjustment_side_effects(
+        self,
+        mcp_client,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+        connected_google_calendar,
+    ):
+        day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
+        start = dt.datetime.combine(
+            day,
+            dt.time(hour=14),
+            tzinfo=pinned_tz,
+        )
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="generation-race-target",
+                    calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=connected_google_calendar,
+                    summary="Recovery focus",
+                    start_at=start.astimezone(dt.UTC),
+                    end_at=(start + dt.timedelta(hours=3)).astimezone(
+                        dt.UTC
+                    ),
+                    etag='"etag-v1"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+            )
+            session.commit()
+
+        async def fake_readiness(date: str | None = None) -> dict:
+            return {
+                "status": "ok",
+                "date": date,
+                "sleep_debt": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                },
+                "hrv": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                    "score": 35,
+                },
+                "charge": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                    "value": 35,
+                },
+            }
+
+        def reject_stale_visibility(*_args, **_kwargs) -> None:
+            raise CalendarVisibilityChanged("fixture account switch")
+
+        monkeypatch.setattr(
+            server_module,
+            "get_daily_readiness_context",
+            fake_readiness,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "require_calendar_visibility_current",
+            reject_stale_visibility,
+        )
+
+        with pytest.raises(ToolError, match="calendar visibility changed"):
+            await mcp_client.call_tool(
+                "evaluate_morning_calendar_nudge",
+                {"date": day.isoformat()},
+            )
+
+        with store_factory() as session:
+            assert list(
+                session.scalars(select(CalendarMutationProposal))
+            ) == []
+            assert list(session.scalars(select(TriggerEvent))) == []
+            assert list(session.scalars(select(DecisionRecord))) == []
+
     async def test_evaluate_rejects_same_local_date_future_sleep_score(
-        self, mcp_client, call_tool, mcp_env, store_factory, pinned_tz
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+        connected_google_calendar,
     ):
         now_local = dt.datetime.now(pinned_tz)
         day = (now_local + dt.timedelta(days=1)).date()
@@ -793,6 +1056,7 @@ class TestScheduleTools:
                 CalendarEventMirror(
                     external_id="future-sleep-target",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=connected_google_calendar,
                     summary="Recovery focus",
                     start_at=event_start.astimezone(dt.UTC),
                     end_at=(event_start + dt.timedelta(hours=3)).astimezone(dt.UTC),
@@ -827,7 +1091,13 @@ class TestScheduleTools:
         assert result["reason"] == "future_sleep"
 
     async def test_no_action_returns_authenticated_decision_viewer_without_proposal(
-        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+        connected_google_calendar,
     ):
         day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
         first = dt.datetime.combine(day, dt.time(hour=13), tzinfo=pinned_tz)
@@ -838,6 +1108,7 @@ class TestScheduleTools:
                     CalendarEventMirror(
                         external_id=f"ineligible-secret-{index}",
                         calendar_source=CalendarSource.GOOGLE,
+                        connection_generation=connected_google_calendar,
                         summary="Private busy block",
                         start_at=start.astimezone(dt.UTC),
                         end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
@@ -913,7 +1184,13 @@ class TestScheduleTools:
             )
 
     async def test_resolve_calendar_adjustment_yes_calls_injected_writer_once(
-        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+        connected_google_calendar,
     ):
         day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
         start = dt.datetime.combine(day, dt.time(hour=14), tzinfo=pinned_tz)
@@ -922,6 +1199,7 @@ class TestScheduleTools:
                 CalendarEventMirror(
                     external_id="google-secret-target",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=connected_google_calendar,
                     summary="Recovery focus",
                     start_at=start.astimezone(dt.UTC),
                     end_at=(start + dt.timedelta(hours=3)).astimezone(dt.UTC),
@@ -1018,7 +1296,13 @@ class TestScheduleTools:
         assert len(writer.changes) == 1
 
     async def test_resolve_rejects_forged_or_non_owner_telegram_proof(
-        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+        connected_google_calendar,
     ):
         day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
         start = dt.datetime.combine(day, dt.time(hour=14), tzinfo=pinned_tz)
@@ -1027,6 +1311,7 @@ class TestScheduleTools:
                 CalendarEventMirror(
                     external_id="google-owner-proof-target",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=connected_google_calendar,
                     summary="Recovery focus",
                     start_at=start.astimezone(dt.UTC),
                     end_at=(start + dt.timedelta(hours=3)).astimezone(dt.UTC),
@@ -1112,6 +1397,7 @@ class TestCaptureTools:
             assert row.description == "Bibimbap with extra vegetables"
             assert row.meal_type == "lunch"
             assert row.media_path == "media/2026-07-08/lunch.jpg"
+            assert list(session.scalars(select(DecisionRecord))) == []
 
     async def test_log_food_validation(self, mcp_client):
         with pytest.raises(ToolError, match="description"):
@@ -1119,186 +1405,4 @@ class TestCaptureTools:
         with pytest.raises(ToolError, match="meal_type"):
             await mcp_client.call_tool(
                 "log_food", {"description": "toast", "meal_type": "brunch"}
-            )
-
-    async def test_record_decision_returns_viewer_url(
-        self, mcp_client, call_tool, store_factory
-    ):
-        result = await call_tool(
-            mcp_client,
-            "record_decision",
-            {
-                "kind": "schedule_change",
-                "summary": "Moved deep work to tomorrow morning due to low readiness.",
-                "tree": TREE,
-                "llm_model": "claude-x",
-                "tokens": 1234,
-            },
-        )
-        decision_id = result["decision_id"]
-        assert result["viewer_url"] == f"http://healthmes.test:8100/decisions/{decision_id}"
-        with store_factory() as session:
-            row = session.get(DecisionRecord, uuid.UUID(decision_id))
-            assert row is not None
-            assert row.tree["children"][0]["label"] == "sleep_debt=20"
-            assert row.llm_model == "claude-x"
-
-    async def test_record_decision_viewer_url_embeds_the_derived_token(
-        self, mcp_client, call_tool, tmp_path
-    ):
-        """Token-configured instance: the MCP link must stay byte-identical to
-        the API construction (healthmes.api.auth.viewer_url is the single
-        copy) — derived read-only credential embedded, never the API token."""
-        token = "mcp-viewer-link-test-token"
-        secured = Settings(
-            database_url="sqlite+pysqlite:///:memory:",
-            public_base_url="http://healthmes.test:8100",
-            api_token=SecretStr(token),
-            data_dir=tmp_path / "data-secured",
-            scheduler_enabled=False,
-            _env_file=None,
-        )
-        server_module.set_settings(secured)  # mcp_env teardown resets this
-
-        result = await call_tool(
-            mcp_client,
-            "record_decision",
-            {"kind": "alert", "summary": "tokenized viewer link", "tree": TREE},
-        )
-        decision_id = result["decision_id"]
-        assert result["viewer_url"] == decision_viewer_url(secured, decision_id)
-        assert result["viewer_url"].endswith(f"?token={viewer_token(token)}")
-        assert token not in result["viewer_url"]
-
-    async def test_record_decision_links_to_proposals(self, mcp_client, call_tool):
-        decision = await call_tool(
-            mcp_client,
-            "record_decision",
-            {"kind": "schedule_change", "summary": "plan", "tree": TREE},
-        )
-        created = await call_tool(mcp_client, "upsert_task", {"title": "Deep work"})
-        result = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "task_id": created["task"]["id"],
-                        "start": "2026-07-10T09:00:00Z",
-                        "end": "2026-07-10T10:00:00Z",
-                    }
-                ],
-                "decision_record_id": decision["decision_id"],
-            },
-        )
-        assert result["status"] == "ok"
-
-    async def test_record_alert_decision_binds_exact_trigger_once(
-        self,
-        mcp_client,
-        call_tool,
-        store_factory,
-    ):
-        trigger = TriggerEvent(
-            fired_at=dt.datetime(2026, 7, 9, 14, 0, tzinfo=dt.UTC),
-            rule_id="calendar_task_intake",
-            payload={"summary": "Schedule this task"},
-            alert_sent=True,
-            dedup_key="calendar-task:correlation-test",
-        )
-        with store_factory() as session:
-            session.add(trigger)
-            session.commit()
-            trigger_id = trigger.id
-
-        start = dt.datetime.now(dt.UTC).replace(
-            hour=9, minute=0, second=0, microsecond=0
-        ) + dt.timedelta(days=1)
-        proposed = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "title": "Correlated alert block",
-                        "start": start.isoformat(),
-                        "end": (start + dt.timedelta(hours=1)).isoformat(),
-                    }
-                ]
-            },
-        )
-        proposal_id = proposed["proposals"][0]["id"]
-        result = await call_tool(
-            mcp_client,
-            "record_decision",
-            {
-                "kind": "alert",
-                "summary": "Correlated alert",
-                "tree": TREE,
-                "trigger_event_id": str(trigger_id),
-                "schedule_proposal_ids": [proposal_id],
-            },
-        )
-        assert result["schedule_proposal_ids"] == [proposal_id]
-        with store_factory() as session:
-            row = session.get(DecisionRecord, uuid.UUID(result["decision_id"]))
-            assert row is not None
-            assert row.trigger_event_id == trigger_id
-            proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
-            assert proposal is not None
-            assert proposal.decision_record_id == row.id
-
-        with pytest.raises(ToolError, match="already has a decision"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "Duplicate correlation",
-                    "tree": TREE,
-                    "trigger_event_id": str(trigger_id),
-                },
-            )
-        with pytest.raises(ToolError, match="valid only for kind='alert'"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "insight",
-                    "summary": "Wrong kind",
-                    "tree": TREE,
-                    "trigger_event_id": str(trigger_id),
-                },
-            )
-        with pytest.raises(ToolError, match="not found"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "Missing trigger",
-                    "tree": TREE,
-                    "trigger_event_id": str(uuid.uuid4()),
-                },
-            )
-
-    async def test_record_decision_tree_validation(self, mcp_client):
-        with pytest.raises(ToolError, match="kind"):
-            await mcp_client.call_tool(
-                "record_decision", {"kind": "vibe", "summary": "s", "tree": TREE}
-            )
-        with pytest.raises(ToolError, match="node type"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "s",
-                    "tree": {"type": "wat", "label": "x"},
-                },
-            )
-        with pytest.raises(ToolError, match="label"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "s",
-                    "tree": {"type": "rule", "label": "ok", "children": [{"type": "input"}]},
-                },
             )

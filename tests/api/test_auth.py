@@ -18,8 +18,6 @@ from pydantic import SecretStr
 from healthmes.__main__ import check_bind_safety
 from healthmes.api.auth import viewer_token, viewer_url
 from healthmes.app import create_app
-from healthmes.store import Base
-from healthmes.store.session import get_engine
 
 TOKEN = "test-api-token-123"
 
@@ -32,7 +30,6 @@ def app_client(settings):
         base_url="http://127.0.0.1:8100",
         client=("127.0.0.1", 43123),
     ) as client:
-        Base.metadata.create_all(get_engine())
         yield client
 
 
@@ -163,7 +160,7 @@ class TestViewerLinks:
         )
         # Token configured: the derived read-only credential is embedded —
         # never the API token itself. Every emitter (decision viewer, glance
-        # deep links, weekly report, MCP record_decision) goes through here.
+        # deep links and weekly reports) goes through here.
         secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
         url = viewer_url(secured, "/reports/weekly")
         assert url == (
@@ -248,7 +245,6 @@ class TestNoTokenConfigured:
             base_url="http://127.0.0.1:8100",
             client=("203.0.113.10", 43123),
         ) as client:
-            Base.metadata.create_all(get_engine())
             response = client.get("/v1/tasks")
 
         assert response.status_code == 403

@@ -21,6 +21,20 @@ APP_PASSWORD = "abcd-efgh-ijkl-mnop"
 REFRESH_TOKEN = "fake-refresh-token-value"
 
 
+class FakeGoogleCredentials:
+    def __init__(self, refresh_token: str = REFRESH_TOKEN) -> None:
+        self.refresh_token = refresh_token
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "refresh_token": self.refresh_token,
+                "client_id": "x.apps.googleusercontent.com",
+                "client_secret": "fake-client-secret-value",
+            }
+        )
+
+
 @pytest.fixture
 def connect_env(tmp_path, monkeypatch) -> Path:
     """CLI environment: tmp cwd (no repo .env) + tmp data dir via env vars."""
@@ -146,6 +160,103 @@ class TestConnectICloud:
         assert "empty password" in capsys.readouterr().err
         assert not creds.caldav_credentials_path(connect_env).exists()
 
+    def test_late_validation_cannot_overwrite_disconnect(
+        self,
+        connect_env,
+        capsys,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": APP_PASSWORD)
+
+        def disconnect_during_validation(**_kwargs):
+            assert main(["connect", "disconnect", "icloud"]) == 0
+            return "1 calendar(s): Personal"
+
+        monkeypatch.setattr(
+            "healthmes.calendars.creds.validate_caldav_connection",
+            disconnect_during_validation,
+        )
+
+        assert main(
+            ["connect", "icloud", "--username", "old@icloud.com"]
+        ) == 1
+        captured = capsys.readouterr()
+        assert "stale caldav calendar connection completion" in captured.err
+        assert not creds.caldav_credentials_path(connect_env).exists()
+
+    def test_late_validation_cannot_overwrite_newer_connect(
+        self,
+        connect_env,
+        capsys,
+        monkeypatch,
+    ) -> None:
+        passwords = iter(("old-password", "new-password"))
+        monkeypatch.setattr(
+            "getpass.getpass",
+            lambda prompt="": next(passwords),
+        )
+        validations = 0
+
+        def nested_connect(**_kwargs):
+            nonlocal validations
+            validations += 1
+            if validations == 1:
+                assert main(
+                    [
+                        "connect",
+                        "icloud",
+                        "--username",
+                        "new@icloud.com",
+                    ]
+                ) == 0
+            return "1 calendar(s): Personal"
+
+        monkeypatch.setattr(
+            "healthmes.calendars.creds.validate_caldav_connection",
+            nested_connect,
+        )
+
+        assert main(
+            ["connect", "icloud", "--username", "old@icloud.com"]
+        ) == 1
+        stored = creds.load_caldav_credentials(connect_env)
+        assert stored is not None
+        assert stored.username == "new@icloud.com"
+        assert stored.app_password == "new-password"
+        captured = capsys.readouterr()
+        assert "stale caldav calendar connection completion" in captured.err
+
+    def test_environment_managed_connection_rejects_cli_shadow(
+        self,
+        connect_env,
+        capsys,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "HEALTHMES_CALDAV_USERNAME",
+            "operator@icloud.com",
+        )
+        monkeypatch.setenv(
+            "HEALTHMES_CALDAV_APP_PASSWORD",
+            "operator-password",
+        )
+        monkeypatch.setattr(
+            "getpass.getpass",
+            lambda prompt="": pytest.fail("password prompt must not run"),
+        )
+        monkeypatch.setattr(
+            "healthmes.calendars.creds.validate_caldav_connection",
+            lambda **_kwargs: pytest.fail("validation must not run"),
+        )
+
+        assert main(
+            ["connect", "icloud", "--username", "shadow@icloud.com"]
+        ) == 1
+        captured = capsys.readouterr()
+        assert "managed by HEALTHMES_CALDAV_USERNAME" in captured.err
+        assert "operator-password" not in captured.out + captured.err
+        assert not creds.caldav_credentials_path(connect_env).exists()
+
 
 class TestConnectGoogle:
     def test_missing_client_secret_prints_instructions(self, connect_env, capsys) -> None:
@@ -162,12 +273,19 @@ class TestConnectGoogle:
         client_secret.write_text(json.dumps({"installed": {"client_id": "x"}}), encoding="utf-8")
         calls = {}
 
-        def fake_flow(client_secret_file, token_file, scopes=None, *, port=0):
+        def fake_flow(
+            client_secret_file,
+            token_file,
+            scopes=None,
+            *,
+            port=0,
+            persist=True,
+        ):
             calls["client_secret"] = Path(client_secret_file)
             calls["token_file"] = Path(token_file)
             calls["port"] = port
-            write_google_token(connect_env)
-            return object()
+            calls["persist"] = persist
+            return FakeGoogleCredentials()
 
         monkeypatch.setattr("healthmes.calendars.google.run_installed_app_flow", fake_flow)
         # The identity probe degrades gracefully when the API is unreachable.
@@ -179,6 +297,7 @@ class TestConnectGoogle:
         assert main(["connect", "google"]) == 0
         assert calls["client_secret"] == client_secret
         assert calls["token_file"] == connect_env / "google" / "calendar_token.json"
+        assert calls["persist"] is False
         out = capsys.readouterr().out
         assert "connected" in out
         assert "token saved to" in out
@@ -190,9 +309,16 @@ class TestConnectGoogle:
         client_secret.parent.mkdir(parents=True)
         client_secret.write_text("{}", encoding="utf-8")
 
-        def fake_flow(client_secret_file, token_file, scopes=None, *, port=0):
-            write_google_token(connect_env)
-            return object()
+        def fake_flow(
+            client_secret_file,
+            token_file,
+            scopes=None,
+            *,
+            port=0,
+            persist=True,
+        ):
+            assert persist is False
+            return FakeGoogleCredentials()
 
         class FakeCalendars:
             def get(self, calendarId):  # noqa: N803 - google API parameter name
@@ -225,10 +351,17 @@ class TestConnectGoogle:
         monkeypatch.setenv("HEALTHMES_GOOGLE_CLIENT_SECRET_FILE", str(elsewhere))
         calls = {}
 
-        def fake_flow(client_secret_file, token_file, scopes=None, *, port=0):
+        def fake_flow(
+            client_secret_file,
+            token_file,
+            scopes=None,
+            *,
+            port=0,
+            persist=True,
+        ):
             calls["client_secret"] = Path(client_secret_file)
-            write_google_token(connect_env)
-            return object()
+            assert persist is False
+            return FakeGoogleCredentials()
 
         monkeypatch.setattr("healthmes.calendars.google.run_installed_app_flow", fake_flow)
         monkeypatch.setattr(
@@ -247,6 +380,70 @@ class TestConnectGoogle:
         )
         assert main(["connect", "google"]) == 0
         assert "already connected" in capsys.readouterr().out
+
+    def test_late_oauth_cannot_overwrite_disconnect(
+        self,
+        connect_env,
+        capsys,
+        monkeypatch,
+    ) -> None:
+        client_secret = connect_env / "google" / "client_secret.json"
+        client_secret.parent.mkdir(parents=True)
+        client_secret.write_text("{}", encoding="utf-8")
+
+        def disconnect_during_flow(*_args, **_kwargs):
+            assert main(["connect", "disconnect", "google"]) == 0
+            return FakeGoogleCredentials("stale-refresh-token")
+
+        monkeypatch.setattr(
+            "healthmes.calendars.google.run_installed_app_flow",
+            disconnect_during_flow,
+        )
+
+        assert main(["connect", "google"]) == 1
+        captured = capsys.readouterr()
+        assert "stale google calendar connection completion" in captured.err
+        assert creds.google_connection_state(connect_env) == "not_connected"
+
+    def test_late_oauth_cannot_overwrite_newer_connect(
+        self,
+        connect_env,
+        capsys,
+        monkeypatch,
+    ) -> None:
+        client_secret = connect_env / "google" / "client_secret.json"
+        client_secret.parent.mkdir(parents=True)
+        client_secret.write_text("{}", encoding="utf-8")
+        flows = 0
+
+        def nested_connect(*_args, **_kwargs):
+            nonlocal flows
+            flows += 1
+            if flows == 1:
+                assert main(["connect", "google"]) == 0
+                return FakeGoogleCredentials("stale-refresh-token")
+            return FakeGoogleCredentials("new-refresh-token")
+
+        monkeypatch.setattr(
+            "healthmes.calendars.google.run_installed_app_flow",
+            nested_connect,
+        )
+        monkeypatch.setattr(
+            "healthmes.calendars.google.build_calendar_service",
+            lambda _credentials: (_ for _ in ()).throw(
+                RuntimeError("offline")
+            ),
+        )
+
+        assert main(["connect", "google"]) == 1
+        token = json.loads(
+            (
+                connect_env / "google" / "calendar_token.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert token["refresh_token"] == "new-refresh-token"
+        captured = capsys.readouterr()
+        assert "stale google calendar connection completion" in captured.err
 
 
 class TestDisconnect:
@@ -269,15 +466,16 @@ class TestDisconnect:
         assert "removed" in out
         assert APP_PASSWORD not in out
 
-    def test_disconnect_icloud_warns_when_env_still_configured(
+    def test_disconnect_icloud_rejects_environment_managed_connection(
         self, connect_env, capsys, monkeypatch
     ) -> None:
         monkeypatch.setenv("HEALTHMES_CALDAV_USERNAME", "env@icloud.com")
         monkeypatch.setenv("HEALTHMES_CALDAV_APP_PASSWORD", "env-pw")
-        creds.save_caldav_credentials(
+        path = creds.save_caldav_credentials(
             connect_env, username="me@icloud.com", app_password=APP_PASSWORD, url="https://c.test"
         )
-        assert main(["connect", "disconnect", "icloud"]) == 0
-        out = capsys.readouterr().out
-        assert "HEALTHMES_CALDAV_USERNAME" in out
-        assert "env-pw" not in out
+        assert main(["connect", "disconnect", "icloud"]) == 1
+        captured = capsys.readouterr()
+        assert "managed by HEALTHMES_CALDAV_USERNAME" in captured.err
+        assert "env-pw" not in captured.out + captured.err
+        assert path.exists()

@@ -53,6 +53,7 @@ NOW = datetime(2026, 7, 21, 22, 0, tzinfo=UTC)
 LOCAL_DAY = date(2026, 7, 22)
 SECRET = "test-secret"
 HANDLE = "reply-handle-fixture"
+ACCOUNT_GENERATION = "a" * 32
 
 
 def event(**overrides):
@@ -60,6 +61,7 @@ def event(**overrides):
         "id": uuid.uuid4(),
         "external_id": "evt-fixture",
         "calendar_source": CalendarSource.GOOGLE,
+        "connection_generation": ACCOUNT_GENERATION,
         "summary": "Recovery-safe focus block",
         "start_at": datetime(2026, 7, 22, 5, 0, tzinfo=UTC),
         "end_at": datetime(2026, 7, 22, 6, 0, tzinfo=UTC),
@@ -807,6 +809,7 @@ def test_sqlalchemy_repository_persists_proposal_trigger_and_decisions(session) 
     mirror = CalendarEventMirror(
         external_id="evt-fixture",
         calendar_source=CalendarSource.GOOGLE,
+        connection_generation=ACCOUNT_GENERATION,
         summary="Recovery-safe focus block",
         start_at=datetime(2026, 7, 22, 5, 0, tzinfo=UTC),
         end_at=datetime(2026, 7, 22, 6, 0, tzinfo=UTC),
@@ -870,7 +873,12 @@ def test_provider_deletion_preserves_proposal_and_blocks_later_apply(
     session, fake_backend, make_event
 ) -> None:
     state_store = InMemorySyncStateStore()
-    mirror_service = CalendarMirrorService(session, [fake_backend], state_store)
+    mirror_service = CalendarMirrorService(
+        session,
+        [fake_backend],
+        state_store,
+        account_generation=ACCOUNT_GENERATION,
+    )
     fake_backend.queue_changes(
         [
             make_event(
@@ -910,7 +918,10 @@ def test_provider_deletion_preserves_proposal_and_blocks_later_apply(
     session.expire_all()
 
     retained = session.get(CalendarMutationProposal, result.proposal_id)
-    assert state_store.load(CalendarSource.GOOGLE) == {"sync_token": "tok-2"}
+    assert state_store.load(CalendarSource.GOOGLE) == {
+        "sync_token": "tok-2",
+        "_healthmes_account_generation": ACCOUNT_GENERATION,
+    }
     assert session.get(CalendarEventMirror, mirror.id) is None
     assert retained.mirror_event_id is None
     assert session.get(DecisionRecord, proposal_decision_id) is not None
@@ -1129,6 +1140,7 @@ def persist_mirror(session) -> CalendarEventMirror:
     mirror = CalendarEventMirror(
         external_id="evt-fixture",
         calendar_source=CalendarSource.GOOGLE,
+        connection_generation=ACCOUNT_GENERATION,
         summary="Recovery-safe focus block",
         start_at=datetime(2026, 7, 22, 5, 0, tzinfo=UTC),
         end_at=datetime(2026, 7, 22, 6, 0, tzinfo=UTC),

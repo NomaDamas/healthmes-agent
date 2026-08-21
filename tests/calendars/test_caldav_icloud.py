@@ -25,6 +25,10 @@ from healthmes.calendars.caldav_icloud import (
     ETAG_PROPERTY_TAG,
     CalDavCalendarBackend,
 )
+from healthmes.calendars.state import (
+    SyncCoverageKind,
+    sync_state_coverage,
+)
 
 KST = timezone(timedelta(hours=9))
 
@@ -196,7 +200,13 @@ class TestListChanges:
         events, state = backend.list_changes(None)
 
         assert {event.external_id for event in events} == {"a", "b"}
-        assert state == {"ctag": "ctag-1", "fingerprints": {"a": '"a1"', "b": '"b1"'}}
+        assert state["ctag"] == "ctag-1"
+        assert state["fingerprints"] == {"a": '"a1"', "b": '"b1"'}
+        assert sync_state_coverage(state) == (
+            SyncCoverageKind.FULL_COLLECTION,
+            None,
+            None,
+        )
         agent_event = next(event for event in events if event.external_id == "b")
         assert agent_event.is_agent_created
 
@@ -210,6 +220,24 @@ class TestListChanges:
         assert next_state == state
         assert calendar.events_calls == 1  # no second fetch
         assert all(prop.tag == CTAG_PROPERTY_TAG for prop in calendar.ctag_requests)
+
+    def test_legacy_matching_ctag_without_coverage_forces_full_scan(
+        self,
+        backend,
+        calendar,
+    ) -> None:
+        calendar.put(make_component("a"), etag='"a1"')
+
+        events, state = backend.list_changes(
+            {
+                "ctag": "ctag-1",
+                "fingerprints": {"a": '"a1"'},
+            }
+        )
+
+        assert events == []
+        assert calendar.events_calls == 1
+        assert sync_state_coverage(state)[0] is SyncCoverageKind.FULL_COLLECTION
 
     def test_etag_change_yields_only_changed_event(self, backend, calendar) -> None:
         calendar.put(make_component("a"), etag='"a1"')

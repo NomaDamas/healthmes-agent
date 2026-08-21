@@ -1,0 +1,1915 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import uuid
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from freezegun import freeze_time
+from pydantic import SecretStr
+from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
+
+from healthmes.api.auth import viewer_token
+from healthmes.app import create_app
+from healthmes.decision import (
+    DECISION_PAYLOAD_SCHEMA,
+    ContextAccessLayer,
+    ContextAccessPolicy,
+    ContextCapability,
+    ContextCoverage,
+    ContextFreshness,
+    ContextProviderMetadata,
+    ContextProviderRegistry,
+    ContextQuery,
+    ContextResult,
+    ContextStatus,
+    CoverageStatus,
+    DecisionAgentRun,
+    DecisionBudget,
+    DecisionCaller,
+    DecisionDraft,
+    DecisionEngineBusyError,
+    DecisionEngineClosedError,
+    DecisionFinalizer,
+    DecisionIdempotencyUnavailableError,
+    DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    DomainAccessGrant,
+    ExecutionScope,
+    FreshnessStatus,
+    HealthMesDecisionEngine,
+    HermesHttpResponsesTransport,
+    HermesResponsesDecisionAgent,
+    HermesResponsesTransportError,
+    PersistenceStatus,
+    PrivacyLevel,
+    RuntimeMetadata,
+    RuntimeStepOutput,
+    SourceRef,
+    ToolCallRecord,
+    ToolCallStatus,
+)
+from healthmes.decision.access import _current_source_content_digest
+from healthmes.decision.agent import HealthMesDecisionAgent
+from healthmes.store import (
+    Base,
+    DecisionKind,
+    DecisionRecord,
+    WellnessEvent,
+    create_db_engine,
+    dispose_engine,
+    get_session_factory,
+    init_engine,
+    session_scope,
+)
+from tests.decision.test_e2e import (
+    DAY,
+    NOW,
+)
+
+TOKEN = "wellness-decision-api-token"
+MODEL = "test-model"
+PROVIDER = "test-provider"
+FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
+
+
+def _payload_digest(payload: dict) -> str:
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _bearer(
+    token: str = TOKEN,
+    *,
+    idempotency_key: str | None = None,
+) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Idempotency-Key": idempotency_key or uuid.uuid4().hex,
+    }
+
+
+def _secured_settings(settings, **updates):
+    return settings.model_copy(
+        update={
+            "api_token": SecretStr(TOKEN),
+            "decision_owner_principal_id": "rest-owner",
+            **updates,
+        }
+    )
+
+
+def _trace_with_private_payload() -> ToolCallRecord:
+    query = ContextQuery(
+        provider_id="activity",
+        capability="activity.summary",
+        start=NOW - timedelta(hours=1),
+        end=NOW,
+        timezone="UTC",
+    )
+    return ToolCallRecord(
+        query=query,
+        status=ToolCallStatus.COMPLETED,
+        started_at=NOW,
+        finished_at=NOW,
+        result=ContextResult(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            status=ContextStatus.OK,
+            payload={
+                "private_app_name": "secret-window-title",
+                "active_seconds": 600,
+            },
+        ),
+    )
+
+
+class RecordingDecisionEngine:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        return DecisionResult(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            status=DecisionStatus.COMPLETED,
+            answer="Take a short break.",
+            runtime=RuntimeMetadata(
+                runtime="scripted",
+                model="api-boundary-v1",
+            ),
+            tool_trace=[_trace_with_private_payload()],
+        )
+
+
+class ClosingDecisionEngine:
+    async def ask_wellness(self, _request):
+        raise DecisionEngineClosedError(
+            "HealthMes decision engine is closing"
+        )
+
+
+class BusyDecisionEngine:
+    async def ask_wellness(self, _request):
+        raise DecisionEngineBusyError(
+            "HealthMes decision engine is at capacity"
+        )
+
+
+class UnavailableDecisionService:
+    async def ask_wellness(self, _submission):
+        raise DecisionIdempotencyUnavailableError(
+            "canonical lease disappeared"
+        )
+
+
+class DisconnectAwareDecisionEngine:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def ask_wellness(self, _request):
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+
+    async def ask_wellness_with_control(
+        self,
+        request,
+        execution_control,
+    ):
+        result = await self.ask_wellness(request)
+        if not execution_control.begin_finalization():
+            raise asyncio.CancelledError
+        return result
+
+
+class FailedRuntimeDecisionEngine:
+    def __init__(
+        self,
+        limitation: str,
+        *,
+        status: DecisionStatus = DecisionStatus.FAILED,
+    ) -> None:
+        self.limitation = limitation
+        self.status = status
+
+    async def ask_wellness(self, request):
+        return DecisionResult(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            status=self.status,
+            limitations=[self.limitation],
+            runtime=RuntimeMetadata(
+                runtime="hermes",
+                model=MODEL,
+                provider=PROVIDER,
+            ),
+        )
+
+
+class UnknownPersistenceDecisionEngine:
+    async def ask_wellness(self, request):
+        return DecisionResult(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            status=DecisionStatus.FAILED,
+            limitations=["decision_finalization_outcome_unknown"],
+            persistence_status=PersistenceStatus.UNKNOWN,
+            runtime=RuntimeMetadata(runtime="healthmes-finalizer"),
+        )
+
+
+class StoredRecoveryNutritionProvider:
+    metadata = ContextProviderMetadata(
+        provider_id="nutrition",
+        domain="nutrition",
+        description="Stored nutrition context for GET recovery tests.",
+        capabilities=(
+            ContextCapability(
+                capability="nutrition.summary",
+                description="Read a retained nutrition summary.",
+                granularities=("summary",),
+                query_fields=("start", "end", "timezone"),
+                output_fields=("caffeine_mg",),
+                max_lookback_days=7,
+                sensitivity="nutrition",
+                freshness_expectation="Stored event timestamp.",
+            ),
+        ),
+    )
+
+    async def query(self, _session, _query, *, now):
+        del now
+        raise AssertionError("GET recovery must not rerun providers")
+
+
+def _persist_source_backed_recovery_decision(
+    *,
+    now: datetime,
+    policy_resolver,
+) -> tuple[
+    DecisionRequest,
+    DecisionResult,
+    DecisionFinalizer,
+    ContextProviderRegistry,
+    uuid.UUID,
+]:
+    observed_at = now - timedelta(hours=1)
+    observed_end = now - timedelta(minutes=30)
+    with session_scope() as session:
+        event = WellnessEvent(
+            event_type="nutrition.observation.v1",
+            schema_version=1,
+            observed_at=observed_at,
+            recorded_at=observed_at + timedelta(minutes=1),
+            timezone="UTC",
+            source_provider="healthmes-intake",
+            source_device=None,
+            source_record_id=uuid.uuid4().hex,
+            capture_method="text",
+            quality_flags={},
+            confidence=0.9,
+            coverage=1.0,
+            sensitivity="nutrition",
+            consent_scope="personal",
+            payload={
+                "window": {
+                    "start": observed_at.isoformat(),
+                    "end": observed_end.isoformat(),
+                },
+                "caffeine_mg": 80,
+            },
+            derived_from=None,
+        )
+        session.add(event)
+        session.flush()
+        source_ref = SourceRef(
+            domain="nutrition",
+            resource_type=event.event_type,
+            record_id=str(event.id),
+            source_provider=event.source_provider,
+            observed_start=event.observed_at,
+            observed_end=observed_end,
+            schema_version=event.schema_version,
+            derived_by="nutrition.summary.v1",
+            freshness=FreshnessStatus.CURRENT,
+            coverage=event.coverage,
+            sensitivity=event.sensitivity,
+        )
+        digest = _current_source_content_digest(session, source_ref)
+        assert digest is not None
+        source_ref = source_ref.model_copy(
+            update={"content_digest": digest},
+            deep=True,
+        )
+        event_id = event.id
+
+    request = DecisionRequest(
+        question="Should I pause before having more caffeine?",
+        requested_at=now,
+        timezone="UTC",
+        caller=DecisionCaller(
+            principal_id="rest-owner",
+            authenticated=True,
+            execution_scope=ExecutionScope.LOCAL,
+            channel="rest",
+        ),
+    )
+    query = ContextQuery(
+        provider_id="nutrition",
+        capability="nutrition.summary",
+        start=now - timedelta(hours=2),
+        end=now,
+        timezone="UTC",
+    )
+    result = ContextResult(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        status=ContextStatus.OK,
+        payload={"caffeine_mg": 80},
+        source_refs=(source_ref,),
+        freshness=ContextFreshness(
+            status=FreshnessStatus.CURRENT,
+            as_of=now,
+            age_seconds=0,
+        ),
+        coverage=ContextCoverage(
+            status=CoverageStatus.COMPLETE,
+            ratio=1,
+        ),
+    )
+    run = DecisionAgentRun(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        draft=DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="Delay the next coffee and reassess after a short pause.",
+            record_summary="Take a short restorative break first.",
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=(source_ref.reference_id,),
+            confidence=0.8,
+        ),
+        source_refs=(source_ref,),
+        runtime=RuntimeMetadata(
+            runtime="scripted",
+            model="api-source-recovery-v1",
+        ),
+        steps_used=1,
+        tool_trace=(
+            ToolCallRecord(
+                query=query,
+                status=ToolCallStatus.COMPLETED,
+                started_at=now,
+                finished_at=now,
+                result=result,
+            ),
+        ),
+        system_policy_version="healthmes-decision-policy.api-recovery-test",
+        started_at=now,
+        finished_at=now,
+    )
+    registry = ContextProviderRegistry(
+        (StoredRecoveryNutritionProvider(),)
+    )
+    finalizer = DecisionFinalizer(
+        access_layer=ContextAccessLayer(
+            registry,
+            clock=lambda: now,
+        ),
+        session_factory=get_session_factory(),
+        policy_resolver=policy_resolver,
+        fingerprint_key=FINGERPRINT_KEY,
+        clock=lambda: now,
+    )
+    persisted = finalizer.finalize(request, run)
+    assert persisted.persistence_status is PersistenceStatus.PERSISTED
+    assert persisted.decision_record_id is not None
+    return request, persisted, finalizer, registry, event_id
+
+
+class MissingResponsesTransport:
+    def __init__(self) -> None:
+        self.response_calls = 0
+
+    async def verify_runtime(self, *, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
+
+    async def get_toolsets(self) -> dict[str, Any]:
+        return {
+            "object": "list",
+            "platform": "api_server",
+            "data": [],
+        }
+
+    async def get_models(self) -> dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": MODEL,
+                    "object": "model",
+                    "created": 1,
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": MODEL,
+                    "parent": "healthmes-decision-runtime",
+                }
+            ],
+        }
+
+    async def create_response(
+        self,
+        _payload,
+        *,
+        timeout_seconds: float,
+    ):
+        assert timeout_seconds > 0
+        self.response_calls += 1
+        raise HermesResponsesTransportError(
+            "hermes_responses_endpoint_missing"
+        )
+
+    async def delete_session(self, _session_id: str) -> None:
+        raise AssertionError("no Hermes session was created")
+
+
+class _CancellationSearchService:
+    def __init__(self) -> None:
+        self.aborted = asyncio.Event()
+
+    def begin(self, _request):
+        return SimpleNamespace(session_id="ds_" + "a" * 32)
+
+    def abort(self, _session_id):
+        self.aborted.set()
+        return None
+
+
+class _UnusedFinalizer:
+    async def afinalize(self, request, _run):
+        raise AssertionError(request)
+
+
+class _BlockingHermesStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        await asyncio.Event().wait()
+        yield b""
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class FailingNutritionProvider:
+    metadata = ContextProviderMetadata(
+        provider_id="nutrition",
+        domain="nutrition",
+        description="Provider used to verify real REST failure propagation.",
+        capabilities=(
+            ContextCapability(
+                capability="nutrition.summary",
+                description="Read a nutrition summary.",
+                granularities=("summary",),
+                query_fields=("timezone",),
+                output_fields=("caffeine_mg",),
+                max_lookback_days=7,
+                sensitivity="nutrition",
+                freshness_expectation="Current retained nutrition context.",
+            ),
+        ),
+    )
+
+    async def query(self, _session, _query, *, now):
+        del now
+        raise RuntimeError("private provider failure")
+
+
+class InvalidNutritionProvider(FailingNutritionProvider):
+    async def query(self, _session, _query, *, now):
+        del now
+        raise ValueError("private invalid provider query")
+
+
+class ProviderFailureRuntime:
+    metadata = RuntimeMetadata(
+        runtime="scripted",
+        model="provider-failure-e2e-v1",
+    )
+
+    async def next_step(self, turn):
+        if not turn.history:
+            return RuntimeStepOutput(
+                tool_calls=({"capability": "nutrition.summary"},),
+                metadata=self.metadata,
+            )
+        raise AssertionError(
+            "a failed provider call must terminate before another LLM step"
+        )
+
+
+@pytest.mark.asyncio
+async def test_rest_disconnect_cancels_hermes_responses_stream(
+    settings,
+    tmp_path,
+) -> None:
+    upstream = _BlockingHermesStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/toolsets":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "platform": "api_server",
+                    "data": [],
+                },
+            )
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": MODEL,
+                            "object": "model",
+                            "created": 1,
+                            "owned_by": "hermes",
+                            "permission": [],
+                            "root": MODEL,
+                            "parent": "healthmes-decision-runtime",
+                        }
+                    ],
+                },
+            )
+        assert request.url.path == "/v1/responses"
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-hermes-session-id": "cancelled-rest-session",
+            },
+            stream=upstream,
+        )
+
+    search_service = _CancellationSearchService()
+    agent = HermesResponsesDecisionAgent(
+        transport=HermesHttpResponsesTransport(
+            base_url="http://127.0.0.1:8645",
+            http_transport=httpx.MockTransport(handler),
+        ),
+        search_service=search_service,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        session_ttl_seconds=30,
+        session_purge_interval_seconds=10,
+    )
+    await agent.start()
+    engine = HealthMesDecisionEngine(
+        agent=agent,
+        finalizer=_UnusedFinalizer(),  # type: ignore[arg-type]
+    )
+    configured = _secured_settings(
+        settings,
+        database_url=(
+            f"sqlite+pysqlite:///{tmp_path / 'disconnect.db'}"
+        ),
+    )
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
+    app = create_app(configured)
+    app.state.decision_engine = engine
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:8100",
+        ) as client:
+            caller = asyncio.create_task(
+                client.post(
+                    "/v1/wellness-decisions",
+                    headers=_bearer(),
+                    json={"question": "Should I keep working?"},
+                )
+            )
+            await asyncio.wait_for(upstream.started.wait(), timeout=1)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+        await asyncio.wait_for(upstream.closed.wait(), timeout=1)
+        await asyncio.wait_for(search_service.aborted.wait(), timeout=1)
+    finally:
+        await engine.aclose()
+        dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_actual_asgi_disconnect_cancels_decision_reasoning(
+    settings,
+    tmp_path,
+) -> None:
+    configured = _secured_settings(
+        settings,
+        database_url=(
+            f"sqlite+pysqlite:///{tmp_path / 'asgi-disconnect.db'}"
+        ),
+    )
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
+    app = create_app(configured)
+    engine = DisconnectAwareDecisionEngine()
+    app.state.decision_engine = engine
+    request_body = json.dumps(
+        {"question": "Should I keep working?"}
+    ).encode()
+    receive_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    await receive_queue.put(
+        {
+            "type": "http.request",
+            "body": request_body,
+            "more_body": False,
+        }
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return await receive_queue.get()
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/wellness-decisions",
+        "raw_path": b"/v1/wellness-decisions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"authorization", f"Bearer {TOKEN}".encode()),
+            (b"idempotency-key", b"disconnect-contract-1"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(request_body)).encode()),
+        ],
+        "client": ("127.0.0.1", 43123),
+        "server": ("127.0.0.1", 8100),
+    }
+    try:
+        request_task = asyncio.create_task(
+            app(scope, receive, send)  # type: ignore[arg-type]
+        )
+        started_task = asyncio.create_task(engine.started.wait())
+        done, _pending = await asyncio.wait(
+            (request_task, started_task),
+            timeout=1,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request_task in done:
+            request_task.result()
+        assert started_task in done, {
+            "sent": sent,
+            "request_stack": [
+                f"{frame.f_code.co_filename}:{frame.f_lineno}"
+                for frame in request_task.get_stack()
+            ],
+        }
+
+        await receive_queue.put({"type": "http.disconnect"})
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=1)
+        await asyncio.wait_for(engine.cancelled.wait(), timeout=1)
+        assert sent == []
+    finally:
+        dispose_engine()
+
+
+def test_rest_contract_is_server_owned_and_hides_internal_trace(
+    settings,
+) -> None:
+    secured = _secured_settings(settings)
+    engine = RecordingDecisionEngine()
+    app = create_app(secured)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={
+                "question": " Should I keep working? ",
+                "persistence_requested": True,
+                "hints": {"local_date": DAY.isoformat()},
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "Take a short break."
+    assert "tool_trace" not in body
+    assert "private_app_name" not in response.text
+    assert "secret-window-title" not in response.text
+
+    assert len(engine.requests) == 1
+    request = engine.requests[0]
+    assert request.question == "Should I keep working?"
+    assert request.caller.principal_id == "rest-owner"
+    assert request.caller.authenticated is True
+    assert request.caller.execution_scope is ExecutionScope.LOCAL
+    assert request.caller.channel == "rest"
+    assert request.requested_privacy_level is PrivacyLevel.AGGREGATE
+    assert request.persistence_requested is True
+    assert request.budget == DecisionBudget()
+    assert request.hints.local_date == DAY
+    assert request.hints.related_record_ids == {}
+
+
+def test_rest_requires_durable_idempotency_key(settings) -> None:
+    app = create_app(_secured_settings(settings))
+    app.state.decision_engine = RecordingDecisionEngine()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_rest_idempotency_key_replays_and_rejects_different_input(
+    settings,
+) -> None:
+    app = create_app(_secured_settings(settings))
+    engine = RecordingDecisionEngine()
+
+    with TestClient(app) as client:
+        app.state.decision_engine = engine
+        headers = _bearer(idempotency_key="rest-request-123")
+        first = client.post(
+            "/v1/wellness-decisions",
+            headers=headers,
+            json={"question": "Should I keep working?"},
+        )
+        replay = client.post(
+            "/v1/wellness-decisions",
+            headers=headers,
+            json={"question": "Should I keep working?"},
+        )
+        conflict = client.post(
+            "/v1/wellness-decisions",
+            headers=headers,
+            json={"question": "Should I drink coffee?"},
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(engine.requests) == 1
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == (
+        "decision_idempotency_conflict"
+    )
+
+
+@pytest.mark.parametrize("value", ("true", "yes", "on", 1))
+def test_rest_rejects_non_boolean_persistence_consent(
+    settings,
+    value,
+) -> None:
+    secured = _secured_settings(settings)
+    engine = RecordingDecisionEngine()
+    app = create_app(secured)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={
+                "question": "Track this decision.",
+                "persistence_requested": value,
+            },
+        )
+
+    assert response.status_code == 422
+    assert engine.requests == []
+
+
+def test_hosted_scope_is_server_owned_even_for_loopback_hermes(
+    settings,
+) -> None:
+    hosted = _secured_settings(
+        settings,
+        decision_execution_scope="hosted",
+    )
+    engine = RecordingDecisionEngine()
+    app = create_app(hosted)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 200
+    assert len(engine.requests) == 1
+    assert (
+        engine.requests[0].caller.execution_scope
+        is ExecutionScope.HOSTED
+    )
+
+
+def test_domain_settings_bootstrap_update_and_persist(
+    settings,
+) -> None:
+    configured = _secured_settings(
+        settings,
+        database_url=(
+            f"sqlite+pysqlite:///"
+            f"{settings.data_dir / 'decision-settings.db'}"
+        ),
+    )
+    app = create_app(configured)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        initial = client.get(
+            "/v1/wellness-decisions/settings",
+            headers=_bearer(),
+        )
+        disabled = client.put(
+            "/v1/wellness-decisions/settings/nutrition",
+            headers=_bearer(),
+            json={"enabled": False},
+        )
+        persisted = client.get(
+            "/v1/wellness-decisions/settings",
+            headers=_bearer(),
+        )
+
+    assert initial.status_code == 200
+    assert initial.json() == {
+        "execution_scope": "local",
+        "domains": [
+            {"domain": "activity", "enabled": True},
+            {"domain": "nutrition", "enabled": True},
+            {"domain": "wearable", "enabled": True},
+            {"domain": "calendar", "enabled": True},
+        ],
+    }
+    assert disabled.status_code == 200
+    assert disabled.json() == {
+        "domain": "nutrition",
+        "enabled": False,
+    }
+    assert persisted.json()["domains"][1] == {
+        "domain": "nutrition",
+        "enabled": False,
+    }
+
+    restarted = create_app(configured)
+    with TestClient(
+        restarted,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        after_restart = client.get(
+            "/v1/wellness-decisions/settings",
+            headers=_bearer(),
+        )
+
+    assert after_restart.json()["domains"][1] == {
+        "domain": "nutrition",
+        "enabled": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("caller", {"principal_id": "attacker"}),
+        ("owner_principal_id", "attacker"),
+        ("requested_privacy_level", "scoped_raw"),
+        ("budget", {"max_steps": 32}),
+        ("grants", [{"domain": "medical"}]),
+        ("execution_scope", "hosted"),
+        ("request_id", str(uuid.uuid4())),
+    ],
+)
+def test_callers_cannot_override_identity_privacy_budget_or_domains(
+    settings,
+    field,
+    value,
+) -> None:
+    secured = _secured_settings(settings)
+    engine = RecordingDecisionEngine()
+    app = create_app(secured)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={
+                "question": "Should I keep working?",
+                field: value,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert engine.requests == []
+
+
+def test_decision_post_requires_full_bearer_not_viewer_token(
+    settings,
+) -> None:
+    secured = _secured_settings(settings)
+    app = create_app(secured)
+    payload = {"question": "Should I keep working?"}
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        anonymous = client.post(
+            "/v1/wellness-decisions",
+            json=payload,
+        )
+        wrong = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer("wrong"),
+            json=payload,
+        )
+        viewer = client.post(
+            "/v1/wellness-decisions",
+            params={"token": viewer_token(TOKEN)},
+            json=payload,
+        )
+        authorized = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json=payload,
+        )
+
+    assert anonymous.status_code == 401
+    assert wrong.status_code == 401
+    assert viewer.status_code == 401
+    assert authorized.status_code == 503
+    assert (
+        authorized.json()["error"]["code"]
+        == "decision_runtime_not_configured"
+    )
+
+
+def test_request_contract_errors_are_422_before_runtime_lookup(
+    settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        blank = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "invalid-blank-1"},
+            json={"question": "   "},
+        )
+        overlong_range = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "invalid-range-1"},
+            json={
+                "question": "Summarize this period.",
+                "hints": {
+                    "start": "2026-01-01T00:00:00Z",
+                    "end": "2026-05-01T00:00:00Z",
+                },
+            },
+        )
+
+    assert blank.status_code == 422
+    assert overlong_range.status_code == 422
+    assert blank.json()["error"]["code"] == "validation_error"
+    assert overlong_range.json()["error"]["code"] == "validation_error"
+
+
+@pytest.mark.parametrize(
+    "idempotency_key",
+    (
+        " invalid-surrounding-whitespace ",
+        "invalid\x7fcontrol-character",
+    ),
+)
+def test_invalid_idempotency_key_returns_documented_422(
+    settings,
+    idempotency_key: str,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": idempotency_key},
+            json={"question": "Should I take a break?"},
+        )
+        openapi = client.get("/openapi.json").json()
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == (
+        "invalid_idempotency_key"
+    )
+    documented = openapi["paths"]["/v1/wellness-decisions"][
+        "post"
+    ]["responses"]["422"]
+    assert documented["description"] == (
+        "Invalid request body or Idempotency-Key syntax."
+    )
+
+
+def test_closing_engine_returns_503(settings) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = ClosingDecisionEngine()
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "closing-engine-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "decision_engine_closing"
+
+
+def test_busy_engine_returns_429(settings) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = BusyDecisionEngine()
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "busy-engine-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "decision_engine_busy"
+
+
+def test_unavailable_idempotency_convergence_returns_retryable_503(
+    settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_service = UnavailableDecisionService()
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "unavailable-convergence-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_idempotency_temporarily_unavailable",
+        "message": (
+            "The durable decision result is temporarily unavailable; retry "
+            "the same Idempotency-Key."
+        ),
+        "detail": {"retryable": True},
+    }
+
+
+@pytest.mark.parametrize(
+    "limitation",
+    (
+        "runtime_contract_violation",
+        "runtime_identity_mismatch",
+        "runtime_execution_failed",
+    ),
+)
+def test_runtime_failures_return_503(
+    settings,
+    limitation,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = FailedRuntimeDecisionEngine(
+            limitation
+        )
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": f"runtime-failure-{limitation}"
+            },
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == (
+        "decision_runtime_unavailable"
+    )
+    assert response.json()["error"]["detail"] == {
+        "reason_codes": [limitation],
+    }
+
+
+@pytest.mark.parametrize(
+    "limitation",
+    (
+        "access_policy_resolution_failed",
+        "caller_not_authenticated",
+        "caller_not_policy_owner",
+        "provider_catalog_invalid",
+        "tool_execution_failed",
+        "decision_turn_closed",
+        "unknown_tool",
+        "malformed_tool_arguments",
+        "duplicate_tool_call",
+        "decision_finalization_capacity_exhausted",
+        "decision_record_persistence_failed",
+    ),
+)
+def test_internal_decision_failures_return_503(
+    settings,
+    limitation,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = FailedRuntimeDecisionEngine(
+            limitation
+        )
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": f"internal-failure-{limitation}"
+            },
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_service_unavailable",
+        "message": (
+            "HealthMes could not complete the decision because a required "
+            "internal component was unavailable."
+        ),
+        "detail": {"reason_codes": [limitation]},
+    }
+
+
+def test_finalization_timeout_returns_service_unavailable_503(
+    settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = FailedRuntimeDecisionEngine(
+            "decision_finalization_timeout"
+        )
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "finalization-timeout-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_service_unavailable",
+        "message": (
+            "HealthMes could not complete the decision because a required "
+            "internal component was unavailable."
+        ),
+        "detail": {
+            "reason_codes": ["decision_finalization_timeout"],
+        },
+    }
+
+
+def test_unknown_commit_outcome_returns_202_and_recovery_location(
+    settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = UnknownPersistenceDecisionEngine()
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "unknown-commit-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+        assert response.status_code == 202
+        body = response.json()
+        location = (
+            f"/v1/wellness-decisions/{body['request_id']}"
+        )
+        assert response.headers["Location"] == location
+        assert body["status"] == "failed"
+        assert body["persistence_status"] == "unknown"
+        assert body["decision_record_id"] is None
+        assert body["limitations"] == [
+            "decision_finalization_outcome_unknown"
+        ]
+        pending = client.get(location)
+
+    assert pending.status_code == 404
+    assert pending.json()["error"]["code"] == (
+        "wellness_decision_not_found"
+    )
+
+
+def test_decision_recovery_returns_compact_persisted_result(
+    settings,
+) -> None:
+    settings = settings.model_copy(
+        update={"decision_owner_principal_id": "rest-owner"}
+    )
+    app = create_app(settings)
+    sensitive_answer = "Private recovery marker: take a short break."
+    writer_finalizer = None
+
+    try:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            assert client.get(
+                f"/v1/wellness-decisions/{uuid.uuid4()}"
+            ).status_code == 404
+            with freeze_time("2026-08-16 12:00:00"):
+                current = datetime.now(UTC)
+                decision_request = DecisionRequest(
+                    question="Track this private recovery-marker check-in.",
+                    requested_at=current,
+                    timezone="UTC",
+                    persistence_requested=True,
+                    caller=DecisionCaller(
+                        principal_id="rest-owner",
+                        authenticated=True,
+                        execution_scope=ExecutionScope.LOCAL,
+                        channel="rest",
+                    ),
+                )
+                run = DecisionAgentRun(
+                    request_id=decision_request.request_id,
+                    turn_id=decision_request.turn_id,
+                    draft=DecisionDraft(
+                        status=DecisionStatus.COMPLETED,
+                        answer=sensitive_answer,
+                        record_summary=(
+                            "Take a short restorative break now."
+                        ),
+                        record_summary_code=(
+                            DecisionRecordSummaryCode.TRACK_FOR_REVIEW
+                        ),
+                        persistence_intent=(
+                            DecisionPersistenceIntent.EXPLICIT_TRACKING
+                        ),
+                        confidence=0.75,
+                    ),
+                    runtime=RuntimeMetadata(
+                        runtime="scripted",
+                        model="api-replay-v1",
+                        input_tokens=3,
+                        output_tokens=2,
+                    ),
+                    steps_used=1,
+                    system_policy_version=(
+                        "healthmes-decision-policy.api-replay-test"
+                    ),
+                    started_at=current,
+                    finished_at=current,
+                )
+                policy = ContextAccessPolicy(
+                    owner_principal_id="rest-owner",
+                    grants=(),
+                )
+                writer_finalizer = DecisionFinalizer(
+                    access_layer=ContextAccessLayer(
+                        ContextProviderRegistry(),
+                        clock=lambda: current,
+                    ),
+                    session_factory=get_session_factory(),
+                    policy_resolver=lambda _request: policy,
+                    fingerprint_key=FINGERPRINT_KEY,
+                    clock=lambda: current,
+                )
+                persisted = writer_finalizer.finalize(
+                    decision_request,
+                    run,
+                )
+
+                assert persisted.status is DecisionStatus.COMPLETED
+                assert (
+                    persisted.persistence_status
+                    is PersistenceStatus.PERSISTED
+                )
+                assert persisted.decision_record_id is not None
+                with session_scope() as session:
+                    row = session.scalar(
+                        select(DecisionRecord).where(
+                            DecisionRecord.decision_request_id
+                            == decision_request.request_id
+                        )
+                    )
+                    assert row is not None
+                    assert row.decision_payload is not None
+                    assert (
+                        row.decision_payload["schema"]
+                        == DECISION_PAYLOAD_SCHEMA
+                    )
+                    serialized = json.dumps(
+                        row.decision_payload,
+                        sort_keys=True,
+                    )
+                    assert sensitive_answer not in serialized
+                    assert decision_request.question not in serialized
+                    assert "tool_trace" not in row.decision_payload
+
+                response = client.get(
+                    f"/v1/wellness-decisions/{decision_request.request_id}"
+                )
+    finally:
+        if writer_finalizer is not None:
+            writer_finalizer.close()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "request_id": str(decision_request.request_id),
+        "turn_id": str(decision_request.turn_id),
+        "status": "completed",
+        "answer": "Keep this wellness item tracked for later review.",
+        "proposed_action": False,
+        "source_refs": [],
+        "limitations": ["decision_response_compacted"],
+        "clarification_question": None,
+        "confidence": 0.75,
+        "uncertainty": None,
+        "follow_up_question": None,
+        "persistence_status": "persisted",
+        "decision_record_id": str(persisted.decision_record_id),
+        "runtime": {
+            "runtime": "scripted",
+            "model": "api-replay-v1",
+            "provider": None,
+            "input_tokens": 3,
+            "output_tokens": 2,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_limitation"),
+    (
+        ("delete_source", "source_ref_record_missing"),
+        ("expire_source", "source_ref_expired"),
+        ("revoke_consent", "domain_consent_denied"),
+        ("disable_provider", "provider_disabled"),
+    ),
+)
+def test_get_recovery_revalidates_current_source_access(
+    settings,
+    mutation,
+    expected_limitation,
+) -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    policy_state = {"enabled": True}
+
+    def resolve_policy(_request):
+        return ContextAccessPolicy(
+            owner_principal_id="rest-owner",
+            grants=(
+                DomainAccessGrant(
+                    domain="nutrition",
+                    enabled=policy_state["enabled"],
+                ),
+            ),
+        )
+
+    configured = settings.model_copy(
+        update={"decision_owner_principal_id": "rest-owner"}
+    )
+    app = create_app(configured, decision_clock=lambda: now)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        (
+            request,
+            persisted,
+            finalizer,
+            registry,
+            event_id,
+        ) = _persist_source_backed_recovery_decision(
+            now=now,
+            policy_resolver=resolve_policy,
+        )
+        app.state.decision_recovery_finalizer = finalizer
+
+        try:
+            if mutation in {"delete_source", "expire_source"}:
+                with session_scope() as session:
+                    event = session.get(WellnessEvent, event_id)
+                    assert event is not None
+                    if mutation == "delete_source":
+                        session.delete(event)
+                    else:
+                        event.expires_at = now
+            elif mutation == "revoke_consent":
+                policy_state["enabled"] = False
+            else:
+                registry.set_enabled("nutrition", enabled=False)
+
+            response = client.get(
+                f"/v1/wellness-decisions/{request.request_id}"
+            )
+        finally:
+            finalizer.close()
+            app.state.decision_recovery_finalizer = None
+
+    assert persisted.decision_record_id is not None
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == (
+        "decision_service_unavailable"
+    )
+    reason_codes = response.json()["error"]["detail"]["reason_codes"]
+    assert "decision_source_ref_revalidation_failed" in reason_codes
+    assert expected_limitation in reason_codes
+
+
+def test_decision_recovery_returns_404_for_unknown_request(
+    settings,
+) -> None:
+    request_id = uuid.uuid4()
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        response = client.get(
+            f"/v1/wellness-decisions/{request_id}"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == (
+        "wellness_decision_not_found"
+    )
+
+
+def test_decision_recovery_maps_exact_cutoff_to_unknown_404(
+    settings,
+) -> None:
+    request_id = uuid.uuid4()
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        assert client.get(
+            f"/v1/wellness-decisions/{uuid.uuid4()}"
+        ).status_code == 404
+        with freeze_time("2026-08-16 12:00:00"):
+            with session_scope() as session:
+                session.add(
+                    DecisionRecord(
+                        kind=DecisionKind.INSIGHT,
+                        tree={},
+                        summary="Expired decision fixture",
+                        decision_request_id=request_id,
+                        decision_turn_id=uuid.uuid4(),
+                        decision_request_fingerprint="0" * 64,
+                        decision_payload={"schema": "invalid"},
+                        decision_payload_digest="0" * 64,
+                        retention_basis_at=datetime.now(UTC),
+                        expires_at=datetime.now(UTC),
+                    )
+                )
+
+            expired = client.get(
+                f"/v1/wellness-decisions/{request_id}"
+            )
+            unknown = client.get(
+                f"/v1/wellness-decisions/{uuid.uuid4()}"
+            )
+
+    assert expired.status_code == 404
+    assert expired.json() == unknown.json()
+
+
+def test_decision_recovery_rejects_corrupt_persisted_payload(
+    settings,
+) -> None:
+    request_id = uuid.uuid4()
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        with session_scope() as session:
+            session.add(
+                DecisionRecord(
+                    kind=DecisionKind.INSIGHT,
+                    tree={},
+                    summary="Corrupt decision fixture",
+                    llm_model=None,
+                    tokens=None,
+                    decision_request_id=request_id,
+                    decision_turn_id=uuid.uuid4(),
+                    decision_request_fingerprint="0" * 64,
+                    decision_payload={"schema": "invalid"},
+                    decision_payload_digest="0" * 64,
+                )
+                )
+
+        response = client.get(
+            f"/v1/wellness-decisions/{request_id}"
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_service_unavailable",
+        "message": (
+            "The stored wellness decision could not be revalidated."
+        ),
+        "detail": {
+            "reason_codes": ["decision_record_contract_invalid"],
+        },
+    }
+
+
+def test_decision_recovery_rejects_digest_valid_invalid_timezone(
+    settings,
+) -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+
+    def resolve_policy(_request):
+        return ContextAccessPolicy(
+            owner_principal_id="rest-owner",
+            grants=(DomainAccessGrant(domain="nutrition"),),
+        )
+
+    configured = settings.model_copy(
+        update={"decision_owner_principal_id": "rest-owner"}
+    )
+    app = create_app(configured, decision_clock=lambda: now)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        (
+            request,
+            persisted,
+            finalizer,
+            _registry,
+            _event_id,
+        ) = _persist_source_backed_recovery_decision(
+            now=now,
+            policy_resolver=resolve_policy,
+        )
+        app.state.decision_recovery_finalizer = finalizer
+        try:
+            with session_scope() as session:
+                row = session.get(
+                    DecisionRecord,
+                    persisted.decision_record_id,
+                )
+                assert row is not None
+                assert row.decision_payload is not None
+                payload = json.loads(
+                    json.dumps(row.decision_payload)
+                )
+                payload["request"]["timezone"] = "Mars/Nowhere"
+                row.decision_payload = payload
+                row.decision_payload_digest = _payload_digest(payload)
+
+            response = client.get(
+                f"/v1/wellness-decisions/{request.request_id}"
+            )
+        finally:
+            finalizer.close()
+            app.state.decision_recovery_finalizer = None
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_service_unavailable",
+        "message": (
+            "The stored wellness decision could not be revalidated."
+        ),
+        "detail": {
+            "reason_codes": ["decision_record_contract_invalid"],
+        },
+    }
+
+
+def test_real_provider_failure_reaches_rest_as_503(settings) -> None:
+    database = create_db_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(database)
+    factory = sessionmaker(
+        bind=database,
+        expire_on_commit=False,
+    )
+    registry = ContextProviderRegistry((FailingNutritionProvider(),))
+    access_layer = ContextAccessLayer(registry, clock=lambda: NOW)
+    policy = ContextAccessPolicy(
+        owner_principal_id="rest-owner",
+        grants=(DomainAccessGrant(domain="nutrition"),),
+    )
+    agent = HealthMesDecisionAgent(
+        access_layer=access_layer,
+        runtime=ProviderFailureRuntime(),
+        session_factory=factory,
+        policy_resolver=lambda _request: policy,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+    engine = HealthMesDecisionEngine(
+        agent=agent,
+        finalizer=DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=factory,
+            policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
+            clock=lambda: NOW,
+        ),
+    )
+    app = create_app(_secured_settings(settings))
+    try:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            app.state.decision_engine = engine
+            response = client.post(
+                "/v1/wellness-decisions",
+                headers=_bearer(),
+                json={"question": "How much caffeine did I have?"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["error"] == {
+            "code": "decision_service_unavailable",
+            "message": (
+                "HealthMes could not complete the decision because a required "
+                "internal component was unavailable."
+            ),
+            "detail": {
+                "reason_codes": ["provider_execution_failed"],
+            },
+        }
+        assert "private provider failure" not in response.text
+    finally:
+        engine.close()
+        database.dispose()
+
+
+def test_real_invalid_provider_query_reaches_rest_as_503(settings) -> None:
+    database = create_db_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(database)
+    factory = sessionmaker(
+        bind=database,
+        expire_on_commit=False,
+    )
+    registry = ContextProviderRegistry((InvalidNutritionProvider(),))
+    access_layer = ContextAccessLayer(registry, clock=lambda: NOW)
+    policy = ContextAccessPolicy(
+        owner_principal_id="rest-owner",
+        grants=(DomainAccessGrant(domain="nutrition"),),
+    )
+    agent = HealthMesDecisionAgent(
+        access_layer=access_layer,
+        runtime=ProviderFailureRuntime(),
+        session_factory=factory,
+        policy_resolver=lambda _request: policy,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+    engine = HealthMesDecisionEngine(
+        agent=agent,
+        finalizer=DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=factory,
+            policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
+            clock=lambda: NOW,
+        ),
+    )
+    app = create_app(_secured_settings(settings))
+    try:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            app.state.decision_engine = engine
+            response = client.post(
+                "/v1/wellness-decisions",
+                headers=_bearer(),
+                json={"question": "How much caffeine did I have?"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["error"] == {
+            "code": "decision_service_unavailable",
+            "message": (
+                "HealthMes could not complete the decision because a "
+                "required internal component was unavailable."
+            ),
+            "detail": {
+                "reason_codes": ["invalid_provider_query"],
+            },
+        }
+        assert "private invalid provider query" not in response.text
+    finally:
+        engine.close()
+        database.dispose()
+
+
+@pytest.mark.parametrize(
+    ("status_value", "limitation"),
+    (
+        (
+            DecisionStatus.BLOCKED,
+            "decision_step_budget_exhausted",
+        ),
+        (
+            DecisionStatus.BLOCKED,
+            "decision_tool_call_budget_exhausted",
+        ),
+        (
+            DecisionStatus.BLOCKED,
+            "turn_context_byte_budget_exhausted",
+        ),
+        (
+            DecisionStatus.FAILED,
+            "domain_consent_denied",
+        ),
+        (
+            DecisionStatus.FAILED,
+            "decision_source_ref_revalidation_failed",
+        ),
+    ),
+)
+def test_expected_safe_decision_stops_remain_structured_results(
+    settings,
+    status_value,
+    limitation,
+) -> None:
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = FailedRuntimeDecisionEngine(
+            limitation,
+            status=status_value,
+        )
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": f"safe-stop-{limitation}"
+            },
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == status_value
+    assert response.json()["limitations"] == [limitation]
+
+
+def test_missing_hermes_responses_endpoint_fails_closed(
+    settings,
+) -> None:
+    transport = MissingResponsesTransport()
+    configured = settings.model_copy(
+        update={
+            "decision_hermes_base_url": "http://127.0.0.1:8644",
+            "decision_hermes_model": MODEL,
+            "decision_hermes_provider": PROVIDER,
+        }
+    )
+    app = create_app(
+        configured,
+        decision_transport=transport,
+    )
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "missing-hermes-responses-1"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "decision_runtime_unavailable",
+        "message": (
+            "Hermes does not currently provide the required "
+            "decision runtime."
+        ),
+        "detail": {
+            "reason_codes": [
+                "hermes_responses_endpoint_missing",
+            ]
+        },
+    }
+    assert transport.response_calls == 1

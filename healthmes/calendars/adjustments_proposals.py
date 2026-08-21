@@ -19,6 +19,7 @@ from healthmes.calendars.adjustments_types import (
     START_SAFETY_LEAD,
     AdjustmentError,
     AdjustmentOperation,
+    CalendarAccountGenerationChanged,
     CalendarAdjustmentWriter,
     HandlePair,
     ProposalSnapshot,
@@ -83,8 +84,21 @@ def make_shorten_snapshot(event: Any, *, timezone: tzinfo) -> ProposalSnapshot:
         expected_etag=str(_attr(event, "etag")),
         timezone=timezone,
     )
+    calendar_source = CalendarSource(
+        _source_value(
+            _attr(event, "calendar_source", CalendarSource.GOOGLE)
+        )
+    )
+    account_generation = _attr(
+        event,
+        "connection_generation",
+        _attr(event, "account_generation", None),
+    )
     return ProposalSnapshot(
-        calendar_source=CalendarSource.GOOGLE,
+        calendar_source=calendar_source,
+        account_generation=(
+            str(account_generation) if account_generation is not None else None
+        ),
         mirror_event_id=_attr(event, "id", _attr(event, "external_id")),
         external_event_id=change.external_event_id,
         operation=AdjustmentOperation.SHORTEN,
@@ -146,7 +160,16 @@ def proposal_dedup_key(
     parts = [
         start.astimezone(timezone).date().isoformat(),
         _source_value(_attr(event, "calendar_source", CalendarSource.GOOGLE)),
+        str(
+            _attr(
+                event,
+                "connection_generation",
+                _attr(event, "account_generation", ""),
+            )
+            or ""
+        ),
         str(_attr(event, "id", "")),
+        str(_attr(event, "external_id", "")),
         str(_attr(event, "etag", "")),
         _operation_value(operation),
         start.isoformat(),
@@ -178,7 +201,21 @@ def provider_revision_fingerprint(etag: str | None) -> str | None:
 
 def snapshot_matches(snapshot: ProposalSnapshot, event: Any) -> bool:
     return (
-        coerce_utc(_attr(event, "start_at")) == snapshot.original_start_at
+        _source_value(_attr(event, "calendar_source", ""))
+        == snapshot.calendar_source.value
+        and (
+            _attr(
+                event,
+                "connection_generation",
+                _attr(event, "account_generation", None),
+            )
+            == snapshot.account_generation
+        )
+        and str(_attr(event, "id", "")) == str(snapshot.mirror_event_id)
+        and str(_attr(event, "external_id", ""))
+        == snapshot.external_event_id
+        and coerce_utc(_attr(event, "start_at"))
+        == snapshot.original_start_at
         and coerce_utc(_attr(event, "end_at")) == snapshot.original_end_at
         and _attr(event, "etag", None) == snapshot.expected_etag
         and protected_event_fingerprint(event) == snapshot.protected_fingerprint
@@ -199,6 +236,8 @@ def read_remote_event(
 ) -> ExternalEvent | None:
     try:
         return writer.read_event(external_event_id)
+    except CalendarAccountGenerationChanged:
+        raise
     except Exception:  # noqa: BROAD_EXCEPT_OK — provider SDKs expose no shared read-error base.
         return None
 

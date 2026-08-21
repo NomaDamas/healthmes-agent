@@ -10,6 +10,7 @@ struct HealthMesCompanionApp: App {
         // 1. BGTaskScheduler handlers must be registered before the app
         //    finishes launching.
         BackgroundRefreshManager.shared.register()
+        ScreenTimeActivityRuntime.shared.register()
         // 2. The notification delegate must exist before a notification tap
         //    can deliver its response.
         NotificationManager.shared.configure()
@@ -42,8 +43,12 @@ struct HealthMesCompanionApp: App {
                 // throttles BGAppRefreshTask; Telegram stays the guaranteed
                 // channel).
                 Task { await RefreshCoordinator.shared.sync(isForeground: true) }
+                Task {
+                    await ScreenTimeActivityRuntime.shared.foregroundCatchUp()
+                }
             case .background:
                 BackgroundRefreshManager.shared.schedule()
+                ScreenTimeActivityRuntime.shared.schedule()
             default:
                 break
             }

@@ -7,12 +7,15 @@ mix-up anywhere in the join breaks these numbers.
 """
 
 import datetime as dt
+import json
 import uuid
 
 import pytest
 from fastmcp.exceptions import ToolError
 from sqlalchemy import select
 
+from healthmes.calendars.state import FileSyncHealthStore, SyncCoverageKind
+from healthmes.mcp_server import server as server_module
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
@@ -21,16 +24,46 @@ from healthmes.store import (
 )
 
 DAY = "2026-07-08"  # local (KST) test day = UTC [07-07 15:00, 07-08 15:00)
+CALENDAR_ACCOUNT_GENERATION = "e" * 32
+
+
+def ensure_visible_calendar() -> None:
+    settings = server_module._active_settings()
+    token_path = settings.data_dir / "google" / "calendar_token.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fixture-refresh-token",
+                "client_id": "fixture-client-id",
+                "client_secret": "fixture-client-secret",
+                "_healthmes_account_generation": (
+                    CALENDAR_ACCOUNT_GENERATION
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    FileSyncHealthStore.for_data_dir(settings.data_dir).record_success(
+        CalendarSource.GOOGLE,
+        dt.datetime.now(dt.UTC),
+        event_count=0,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=CALENDAR_ACCOUNT_GENERATION,
+    )
 
 
 def seed_event(
     store_factory, summary: str, start_utc: dt.datetime, end_utc: dt.datetime
 ) -> None:
+    ensure_visible_calendar()
     with store_factory() as session:
         session.add(
             CalendarEventMirror(
                 external_id=uuid.uuid4().hex,
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=CALENDAR_ACCOUNT_GENERATION,
                 summary=summary,
                 start_at=start_utc,
                 end_at=end_utc,
@@ -183,6 +216,132 @@ class TestGetStressTimeline:
     async def test_rejects_malformed_date(self, mcp_client):
         with pytest.raises(ToolError, match="date"):
             await mcp_client.call_tool("get_stress_timeline", {"date": "last tuesday"})
+
+    async def test_disconnected_calendar_context_is_not_exposed(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        store_factory,
+    ):
+        for minute, value in ((0, 60), (15, 65), (30, 70)):
+            mcp_env.add_stress_sample(
+                f"2026-07-08T01:{minute:02d}:00Z",
+                value,
+            )
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="disconnected-stress-secret",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Secret oncology appointment",
+                    start_at=dt.datetime(
+                        2026,
+                        7,
+                        8,
+                        1,
+                        0,
+                        tzinfo=dt.UTC,
+                    ),
+                    end_at=dt.datetime(
+                        2026,
+                        7,
+                        8,
+                        2,
+                        0,
+                        tzinfo=dt.UTC,
+                    ),
+                )
+            )
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "get_stress_timeline",
+            {"date": DAY},
+        )
+
+        assert result["status"] == "ok"
+        assert "Secret oncology appointment" not in str(result)
+        assert result["intervals"][0]["likely_context"] == []
+
+    async def test_arousal_hints_hide_disconnected_calendar_context(
+        self,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+    ):
+        day = dt.date.fromisoformat(DAY)
+        start_utc, end_utc = server_module._local_day_bounds_utc(
+            day,
+            pinned_tz,
+        )
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="disconnected-arousal-secret",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Secret oncology appointment",
+                    start_at=dt.datetime(
+                        2026,
+                        7,
+                        8,
+                        1,
+                        0,
+                        tzinfo=dt.UTC,
+                    ),
+                    end_at=dt.datetime(
+                        2026,
+                        7,
+                        8,
+                        2,
+                        0,
+                        tzinfo=dt.UTC,
+                    ),
+                )
+            )
+            session.commit()
+
+        def capture_context(**kwargs):
+            return {
+                "status": "ok",
+                "context": kwargs["context_for"](
+                    dt.datetime(
+                        2026,
+                        7,
+                        8,
+                        10,
+                        0,
+                        tzinfo=pinned_tz,
+                    ),
+                    dt.datetime(
+                        2026,
+                        7,
+                        8,
+                        11,
+                        0,
+                        tzinfo=pinned_tz,
+                    ),
+                ),
+            }
+
+        monkeypatch.setattr(
+            server_module.arousal,
+            "build_arousal_hints",
+            capture_context,
+        )
+        result = await server_module._arousal_hints_for(
+            server_module.get_ow_client(),
+            await server_module._resolve_user_id(),
+            day,
+            pinned_tz,
+            start_utc,
+            end_utc,
+        )
+
+        assert result == {"status": "ok", "context": []}
+        assert "Secret oncology appointment" not in str(result)
 
 
 class TestCompareImpactNightly:
@@ -392,6 +551,54 @@ class TestCompareImpactNightly:
         assert result["effect"]["n"] == 3
         assert result["effect"]["mean_delta"] == 2.0
 
+    async def test_disconnected_calendar_occurrence_is_not_counted_or_exposed(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+    ):
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="disconnected-impact-secret",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Secret oncology appointment",
+                    start_at=dt.datetime(
+                        2026,
+                        7,
+                        6,
+                        10,
+                        0,
+                        tzinfo=dt.UTC,
+                    ),
+                    end_at=dt.datetime(
+                        2026,
+                        7,
+                        6,
+                        11,
+                        0,
+                        tzinfo=dt.UTC,
+                    ),
+                )
+            )
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "compare_impact",
+            {
+                "factor": "oncology",
+                "metric": "sleep_score",
+                "window": "7d",
+                "end_date": DAY,
+            },
+        )
+
+        assert result["status"] == "insufficient_data"
+        assert result["occurrences"]["matched_by_source"]["calendar"] == 0
+        assert result["occurrences"]["total_matched"] == 0
+        assert "Secret oncology appointment" not in str(result)
+
 
 class TestCompareImpactIntraday:
     async def test_hand_computed_stress_deltas_around_espresso(
@@ -540,4 +747,3 @@ class TestReviewFindingFixes:
         assert result["status"] == "insufficient_data"
         assert result["reason"] == "insufficient_stress_samples"
         assert result["intervals"] == []
-

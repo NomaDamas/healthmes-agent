@@ -57,6 +57,10 @@ from healthmes.api.common import ensure_utc, utc_now
 # on, local-first, derived viewer token on in-page navigation).
 from healthmes.api.decision_html import format_created, shell_context, template_environment
 from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.alert_visibility import (
+    DELIVERED_STATE,
+    alert_delivery_state,
+)
 from healthmes.store import (
     CognitiveEnergyEstimate,
     DecisionKind,
@@ -65,6 +69,9 @@ from healthmes.store import (
     ProposalStatus,
     ScheduleProposal,
     TriggerEvent,
+)
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
 )
 from healthmes.store.session import SessionDep
 
@@ -355,7 +362,7 @@ def _alerts_section(
     for row in rows:
         tally = per_rule[row.rule_id]
         tally[0] += 1
-        if row.alert_sent:
+        if alert_delivery_state(row) == DELIVERED_STATE:
             tally[1] += 1
     by_rule = [
         AlertRuleCountOut(rule_id=rule_id, fired=fired, delivered=delivered)
@@ -365,7 +372,11 @@ def _alerts_section(
     ]
     return AlertDigestOut(
         fired=len(rows),
-        delivered=sum(1 for row in rows if row.alert_sent),
+        delivered=sum(
+            1
+            for row in rows
+            if alert_delivery_state(row) == DELIVERED_STATE
+        ),
         daily_budget=settings.alert_daily_budget,
         weekly_budget=settings.alert_daily_budget * REPORT_DAYS,
         by_rule=by_rule,
@@ -373,7 +384,11 @@ def _alerts_section(
 
 
 def _decisions_section(
-    session: Session, settings: Settings, window_start: datetime, window_end: datetime
+    session: Session,
+    settings: Settings,
+    window_start: datetime,
+    window_end: datetime,
+    now: datetime,
 ) -> WeeklyDecisionsOut:
     """Decision records of the week, newest first, each with its viewer link."""
     rows = [
@@ -383,6 +398,7 @@ def _decisions_section(
             .where(
                 DecisionRecord.created_at >= window_start,
                 DecisionRecord.created_at < window_end,
+                decision_record_is_available_at(now),
             )
             .order_by(DecisionRecord.created_at.desc(), DecisionRecord.id.desc())
         ).all()
@@ -430,7 +446,13 @@ def build_weekly_report(session: Session, settings: Settings, now: datetime) -> 
         insights=_insights_section(session, window_start, window_end),
         schedule=_schedule_section(session, window_start, window_end),
         alerts=_alerts_section(session, settings, window_start, window_end),
-        decisions=_decisions_section(session, settings, window_start, window_end),
+        decisions=_decisions_section(
+            session,
+            settings,
+            window_start,
+            window_end,
+            now,
+        ),
     )
 
 

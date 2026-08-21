@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session
 
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.sleep_event_rendering import observation_fingerprint
-from healthmes.calendars.sleep_observation import SleepObservationNoOp
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    SleepObservationNoOp,
+)
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
 from healthmes.calendars.sleep_proposal_state import (
     capture_provider_state,
@@ -44,6 +47,31 @@ async def prepare_sleep_proposal(
         review_base_url=calendar.review_base_url,
         review_url_builder=calendar.review_url_builder,
     )
+    return prepare_sleep_proposal_from_observation(
+        target_date=target_date,
+        calendar_source=calendar_source,
+        selected=selected,
+        session=session,
+        calendar=calendar,
+        now=now,
+    )
+
+
+def prepare_sleep_proposal_from_observation(
+    *,
+    target_date: dt.date,
+    calendar_source: CalendarSource,
+    selected: ActualSleepObservation | SleepObservationNoOp,
+    session: Session,
+    calendar: ApprovalCalendar,
+    now: dt.datetime | None = None,
+) -> SleepReconciliationProposal:
+    """Create a proposal from a wearable observation already read.
+
+    Separating wearable I/O from calendar I/O lets callers acquire the
+    calendar connection fence only for provider reads and database writes.
+    """
+
     created_at = now or dt.datetime.now(dt.UTC)
     if isinstance(selected, SleepObservationNoOp):
         snapshot: dict[str, Any] = {
@@ -53,6 +81,7 @@ async def prepare_sleep_proposal(
             "local_date": target_date.isoformat(),
             "provider_guard": {
                 "target": redacted_digest(calendar.target),
+                "account_generation": calendar.account_generation,
                 "actual": None,
                 "planned": [],
             },
@@ -66,6 +95,7 @@ async def prepare_sleep_proposal(
             snapshot=snapshot,
             provider_state={
                 "target": calendar.target,
+                "account_generation": calendar.account_generation,
                 "actual": None,
                 "planned": [],
             },
@@ -78,6 +108,7 @@ async def prepare_sleep_proposal(
         calendar_source,
         selected,
         calendar.backend,
+        account_generation=calendar.account_generation,
     )
     provider_state = capture_provider_state(session, calendar, selected)
     snapshot = {**preview, "provider_guard": redacted_provider_guard(provider_state)}
