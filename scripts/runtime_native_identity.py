@@ -161,13 +161,16 @@ def _linux_start_token(pid: int) -> str | None:
     return f"linux:{start_ticks}"
 
 
-def _linux_process_is_zombie(pid: int) -> bool:
+def _linux_process_is_absent_or_zombie(pid: int) -> bool:
     if not sys.platform.startswith("linux"):
         return False
     try:
         payload = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except FileNotFoundError:
-        return False
+        # A process that disappears during a bounded snapshot is absent, not
+        # live. Reporting disappearance here prevents stale `ps` output from
+        # reviving an already-terminated PID.
+        return True
     except OSError as exc:
         raise _IdentityUnavailable(
             "native_identity_linux_proc_unreadable"
@@ -592,7 +595,7 @@ def _bounded_ps_value(
         raise _IdentityUnavailable(
             "native_identity_ps_output_invalid"
         )
-    if _linux_process_is_zombie(pid):
+    if _linux_process_is_absent_or_zombie(pid):
         raise _ProcessAbsent("native_identity_ps_process_absent")
     return output
 
@@ -758,7 +761,7 @@ def _bounded_ps_snapshot(
         raise _IdentityUnavailable(
             "native_identity_ps_probe_arguments_invalid"
         )
-    if _linux_process_is_zombie(pid):
+    if _linux_process_is_absent_or_zombie(pid):
         raise _ProcessAbsent("native_identity_ps_process_absent")
     deadline = time.monotonic() + timeout_seconds
     values: list[str] = []
@@ -776,7 +779,7 @@ def _bounded_ps_snapshot(
                 timeout_seconds=remaining,
             )
         )
-    if _linux_process_is_zombie(pid):
+    if _linux_process_is_absent_or_zombie(pid):
         raise _ProcessAbsent("native_identity_ps_process_absent")
     return (
         values[0],

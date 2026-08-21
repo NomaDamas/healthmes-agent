@@ -608,7 +608,7 @@ def test_native_identity_snapshot_rechecks_linux_zombie_after_collection(
 
     monkeypatch.setattr(
         module,
-        "_linux_process_is_zombie",
+        "_linux_process_is_absent_or_zombie",
         lambda _pid: next(zombie_states),
     )
 
@@ -636,6 +636,29 @@ def test_native_identity_snapshot_rechecks_linux_zombie_after_collection(
         "lstart",
         "command",
     ]
+
+
+def test_native_identity_treats_missing_linux_proc_as_absent(
+    monkeypatch,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "healthmes_test_runtime_native_identity_missing_proc",
+        NATIVE_IDENTITY_HELPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+
+    def missing_proc(_path: Path, *, encoding: str) -> str:
+        assert encoding == "utf-8"
+        raise FileNotFoundError
+
+    monkeypatch.setattr(module.Path, "read_text", missing_proc)
+
+    assert module._linux_process_is_absent_or_zombie(1234)
 
 
 @pytest.mark.skipif(
