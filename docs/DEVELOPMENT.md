@@ -771,13 +771,30 @@ including malformed and unknown names. Never index those entries as
 `raw_payload`; the bounded journal reconciler owns preservation and reporting.
 Usage measurement uses no-follow metadata and counts only regular files, never
 the target bytes of a symlink that escapes the HealthMes data tree. The scan is
-capped at 100,000 entries and two seconds and runs after scheduled/API
-maintenance releases the global write-plane fence. Results are written only
-after a complete scan and root-inode revalidation. A missing/replaced root,
-permission failure or exhausted bound rolls back the measurement and preserves
-the previous `storage_usage_daily` rows for a later retry. When a successful
-scan finds that the last regular file in a class disappeared or became a
-symlink, the current row is explicitly updated to zero.
+capped at 100,000 entries and two seconds for the complete operation, including
+database connection-pool checkout. One clean-session transaction owns
+the global write-plane fence while it reads the storage index, scans the
+filesystem and publishes the daily snapshot; SQLite begins that transaction
+with `BEGIN IMMEDIATE`. This prevents concurrent first measurements from
+racing on the daily unique key and prevents an older scan from overwriting a
+newer storage generation. Results are written only after a complete scan and
+root-inode revalidation. A missing/replaced root, permission failure or
+exhausted bound rolls back the measurement and preserves the previous
+`storage_usage_daily` rows for a later retry. Callers must use a SQLAlchemy
+session with one effective database bind and commit or roll back pending ORM
+changes or an active transaction first. A custom `get_bind()` wrapper or
+mapper route is allowed only when SQLAlchemy's base resolver maps its
+configured default, mapped-class, ORM `Mapper` and query-clause routes for
+`StorageObject` and `StorageUsageDaily` to the same `session.bind`. Caller
+`get_bind()` overrides are never invoked. The measurement itself runs in a
+standard internal Session bound to one deadline-bounded pinned connection, so
+caller routing cannot move the usage transaction, storage index or snapshot
+outside that connection or deadline. SQLite `busy_timeout` and PostgreSQL
+transaction-local
+`lock_timeout`/`statement_timeout` are refreshed from that same remaining
+deadline before blocking database phases. When a successful scan finds that
+the last regular file in a class disappeared or became a symlink, the current
+row is explicitly updated to zero.
 
 `StorageObject` has a database CHECK for the two-phase cleanup state: an active
 row cannot carry cleanup identity/completion metadata, a populated cleanup

@@ -292,12 +292,27 @@ cursor basename은 `.staging/`의 바로 아래 정확한 경로에서만 예약
 객체로 색인하고 사용량에 포함한다.
 
 사용량 측정은 no-follow filesystem scan으로 별도 실행하며 한 번에 최대
-100,000개 항목 또는 2초까지만 허용한다. scheduler와 maintenance API는 global
-write-plane fence를 해제한 뒤 이 측정을 실행하므로 큰 데이터 tree의 용량 계산이
-모든 writer를 오래 막지 않는다. 전체 root scan과 마지막 root inode 재검증까지
-성공한 경우에만 새 측정값을 쓴다. root 부재·교체, 권한 오류, 항목/시간 상한
-초과가 발생하면 transaction을 rollback하여 기존 `storage_usage_daily` 값을
-보존하고 다음 실행에서 다시 시도한다.
+100,000개 항목 또는 DB connection-pool checkout을 포함한 전체 작업이 2초를
+넘지 않도록 허용한다. pending ORM 변경과 활성 transaction이
+없는 clean session 하나가 storage index 조회, filesystem scan, 일일 snapshot
+저장까지 global write-plane fence를 계속 소유한다. SQLite에서는 이 transaction을
+`BEGIN IMMEDIATE`로 시작한다. 따라서 동시 최초 측정의 일일 unique key 충돌과
+오래된 scan이 더 최신 storage generation을 덮는 일을 막는다. 전체 root scan과
+마지막 root inode 재검증까지 성공한 경우에만 새 측정값을 쓴다. root 부재·교체,
+권한 오류, 항목/시간 상한 초과가 발생하면 transaction을 rollback하여 기존
+`storage_usage_daily` 값을 보존하고 다음 실행에서 다시 시도한다. 호출자는 측정
+전에 하나의 유효한 DB bind를 쓰는 SQLAlchemy session을 사용하고 기존 변경을
+commit하거나 rollback해야 한다. custom `get_bind()` wrapper는 기본 route,
+mapped class, ORM `Mapper`, query clause 형태의 `StorageObject`,
+`StorageUsageDaily` 설정을 SQLAlchemy 기본 resolver로 확인했을 때 모두 같은
+`session.bind`로 해석되어야 한다. 호출자가 override한 `get_bind()`는 실행하지
+않는다. 실제 측정도 호출자 routing을 다시 쓰지 않고 deadline 안에 확보한 하나의
+connection에 표준 내부 Session을 직접 bind한다. 따라서 usage transaction,
+storage index, snapshot이 다른 connection이나 deadline 밖으로 빠질 수 없다.
+SQLite
+`busy_timeout`과 PostgreSQL transaction-local `lock_timeout`/`statement_timeout`
+도 DB 대기 단계 직전에 같은 남은 deadline으로 갱신하므로 외부 writer가 기본 DB
+대기시간만큼 측정을 늘릴 수 없다.
 
 성공한 사용량 측정은 오늘 이미 기록된 local 데이터 클래스도 모두 갱신한다.
 마지막 regular file이 삭제되거나 외부 symlink로 바뀌어 현재 측정값이 없어지면

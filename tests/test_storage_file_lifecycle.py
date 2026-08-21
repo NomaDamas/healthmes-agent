@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import sqlite3
 import stat
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,8 +12,9 @@ from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import Engine, select
-from sqlalchemy.exc import IntegrityError
+import sqlalchemy as sa
+from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from healthmes.durable_files import (
@@ -999,6 +1003,7 @@ def test_unlink_quarantine_is_never_indexed_or_measured_as_raw_payload(
 
     with Session(engine) as session:
         storage_service._discover_unindexed(session, settings)
+        session.commit()
         usage = storage_service.measure_usage(session, settings)
         session.flush()
 
@@ -1079,6 +1084,7 @@ def test_durable_unlink_recovery_subtrees_are_not_indexed_or_measured(
 
     with Session(engine) as session:
         storage_service._discover_unindexed(session, settings)
+        session.commit()
         usage = storage_service.measure_usage(session, settings)
         session.flush()
 
@@ -1123,6 +1129,7 @@ def test_control_like_user_payload_names_remain_indexed_and_measured(
 
     with Session(engine) as session:
         storage_service._discover_unindexed(session, settings)
+        session.commit()
         usage = storage_service.measure_usage(session, settings)
         session.flush()
         indexed_paths = set(
@@ -2557,6 +2564,7 @@ def test_cleanup_journal_and_retention_quarantine_are_not_indexed_or_measured(
 
     with Session(engine) as session:
         storage_service._discover_unindexed(session, settings)
+        session.commit()
         usage = storage_service.measure_usage(session, settings)
         session.flush()
 
@@ -2666,6 +2674,7 @@ def test_unknown_cleanup_journal_is_never_indexed_or_retention_deleted(
                 StorageObject.relative_path == relative
             )
         )
+        session.commit()
         usage = storage_service.measure_usage(session, settings)
 
     assert indexed is None
@@ -2700,6 +2709,7 @@ def test_usage_does_not_follow_external_file_symlink(
 
     with Session(engine) as session:
         storage_service._discover_unindexed(session, settings)
+        session.commit()
         usage = storage_service.measure_usage(session, settings)
         indexed = session.scalar(
             select(StorageObject).where(
@@ -2861,6 +2871,736 @@ def test_usage_records_zero_for_classes_seen_only_on_an_earlier_day(
         assert row is not None
         assert row.bytes_used == 0
         assert row.object_count == 0
+
+
+def test_usage_measurement_rejects_an_existing_caller_transaction(
+    engine,
+    settings,
+):
+    settings.data_dir.mkdir(parents=True)
+    with Session(engine) as session:
+        session.scalar(select(func.count()).select_from(StorageObject))
+
+        with pytest.raises(
+            RuntimeError,
+            match="without an active transaction",
+        ):
+            storage_service.measure_usage(session, settings)
+
+        assert session.in_transaction()
+
+
+def test_usage_measurement_rejects_an_existing_connection_transaction(
+    engine,
+    settings,
+):
+    settings.data_dir.mkdir(parents=True)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            with Session(bind=connection) as session:
+                with pytest.raises(
+                    RuntimeError,
+                    match="connection without an active transaction",
+                ):
+                    storage_service.measure_usage(session, settings)
+
+            assert connection.get_transaction() is transaction
+            assert transaction.is_active
+        finally:
+            transaction.rollback()
+
+
+def test_usage_measurement_rejects_mapper_specific_database_bind(
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    primary = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'usage-primary.db'}"
+    )
+    secondary = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'usage-secondary.db'}",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.35,
+    )
+    Base.metadata.create_all(primary)
+    Base.metadata.create_all(secondary)
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.05,
+    )
+
+    try:
+        with secondary.connect():
+            with Session(
+                bind=primary,
+                binds={
+                    StorageObject: secondary,
+                    StorageUsageDaily: secondary,
+                },
+            ) as session:
+                started = time.monotonic()
+                with pytest.raises(
+                    RuntimeError,
+                    match="one database bind",
+                ):
+                    storage_service.measure_usage(session, settings)
+                elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+    finally:
+        secondary.dispose()
+        primary.dispose()
+
+
+def test_usage_measurement_isolates_same_engine_mapper_routing(
+    engine,
+    settings,
+):
+    settings.data_dir.mkdir(parents=True)
+    with Session(
+        bind=engine,
+        binds={
+            StorageObject: engine,
+            StorageUsageDaily: engine,
+        },
+    ) as session:
+        assert storage_service.measure_usage(session, settings) == {}
+        assert not session.in_transaction()
+
+
+def test_usage_measurement_allows_compatible_custom_bind_routing(
+    engine,
+    settings,
+    monkeypatch,
+):
+    measurement_sessions: list[Session] = []
+    real_measure = storage_service._measure_usage_in_transaction
+
+    class CompatibleCustomBindSession(Session):
+        def get_bind(self, *args, **kwargs):
+            return super().get_bind(*args, **kwargs)
+
+    def observe_measurement_session(session, *args, **kwargs):
+        measurement_sessions.append(session)
+        assert type(session) is Session
+        return real_measure(session, *args, **kwargs)
+
+    monkeypatch.setattr(
+        storage_service,
+        "_measure_usage_in_transaction",
+        observe_measurement_session,
+    )
+    settings.data_dir.mkdir(parents=True)
+    with CompatibleCustomBindSession(bind=engine) as session:
+        assert storage_service.measure_usage(session, settings) == {}
+        assert not session.in_transaction()
+        assert measurement_sessions
+        assert all(
+            measurement_session is not session
+            for measurement_session in measurement_sessions
+        )
+
+
+def test_usage_measurement_ignores_divergent_custom_bind_routing(
+    engine,
+    settings,
+    tmp_path,
+):
+    secondary = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'usage-custom-secondary.db'}"
+    )
+    Base.metadata.create_all(secondary)
+    get_bind_calls = 0
+
+    class CustomBindSession(Session):
+        def get_bind(self, *args, **kwargs):
+            nonlocal get_bind_calls
+            get_bind_calls += 1
+            mapper = kwargs.get("mapper")
+            mapped_class = getattr(mapper, "class_", mapper)
+            if mapped_class in {StorageObject, StorageUsageDaily}:
+                return secondary
+            return super().get_bind(*args, **kwargs)
+
+    settings.data_dir.mkdir(parents=True)
+    try:
+        with CustomBindSession(bind=engine) as session:
+            assert storage_service.measure_usage(session, settings) == {}
+            assert not session.in_transaction()
+            assert get_bind_calls == 0
+    finally:
+        secondary.dispose()
+
+
+def test_usage_measurement_never_waits_for_custom_bind_routing(
+    engine,
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    secondary = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'usage-mapper-secondary.db'}",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.35,
+    )
+    Base.metadata.create_all(secondary)
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.05,
+    )
+    get_bind_calls = 0
+
+    class SlowCustomBindSession(Session):
+        def get_bind(self, *args, **kwargs):
+            nonlocal get_bind_calls
+            get_bind_calls += 1
+            time.sleep(0.35)
+            return secondary
+
+    settings.data_dir.mkdir(parents=True)
+    try:
+        with secondary.connect():
+            with SlowCustomBindSession(bind=engine) as session:
+                started = time.monotonic()
+                assert storage_service.measure_usage(session, settings) == {}
+                elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+        assert get_bind_calls == 0
+    finally:
+        secondary.dispose()
+
+
+def test_usage_measurement_bounds_write_plane_wait(
+    engine,
+    settings,
+    monkeypatch,
+):
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    measurement_finished = threading.Event()
+    failures: list[BaseException] = []
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.05,
+    )
+
+    def hold_write_plane() -> None:
+        with Session(engine) as session:
+            storage_service.lock_activity_write_plane(session)
+            lock_acquired.set()
+            assert release_lock.wait(timeout=5)
+            session.rollback()
+
+    def measure() -> None:
+        with Session(engine) as session:
+            try:
+                storage_service.measure_usage(session, settings)
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                measurement_finished.set()
+
+    holder = threading.Thread(
+        target=hold_write_plane,
+        name="usage-lock-holder",
+    )
+    measurement = threading.Thread(
+        target=measure,
+        name="bounded-usage-measurement",
+    )
+    try:
+        holder.start()
+        assert lock_acquired.wait(timeout=5)
+        measurement.start()
+        assert measurement_finished.wait(timeout=1)
+        assert len(failures) == 1
+        assert isinstance(failures[0], TimeoutError)
+        assert "bounded slice" in str(failures[0])
+    finally:
+        release_lock.set()
+        if holder.ident is not None:
+            holder.join(timeout=5)
+        if measurement.ident is not None:
+            measurement.join(timeout=5)
+
+
+def test_usage_measurement_bounds_queue_pool_checkout(
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'usage-pool-timeout.db'}",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=30,
+    )
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.05,
+    )
+
+    try:
+        with engine.connect():
+            with Session(engine) as session:
+                started = time.monotonic()
+                with pytest.raises(TimeoutError, match="bounded slice"):
+                    storage_service.measure_usage(session, settings)
+                elapsed = time.monotonic() - started
+
+        assert 0.02 <= elapsed < 1
+    finally:
+        engine.dispose()
+
+
+def test_usage_measurement_normalizes_queue_pool_timeout(
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'usage-pool-error.db'}",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.02,
+    )
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.5,
+    )
+
+    try:
+        with engine.connect():
+            with Session(engine) as session:
+                started = time.monotonic()
+                with pytest.raises(TimeoutError, match="bounded slice") as caught:
+                    storage_service.measure_usage(session, settings)
+                elapsed = time.monotonic() - started
+
+        assert isinstance(caught.value.__cause__, sa.exc.TimeoutError)
+        assert 0.01 <= elapsed < 0.5
+    finally:
+        engine.dispose()
+
+
+def test_usage_measurement_bounds_external_sqlite_writer_and_restores_timeout(
+    engine,
+    settings,
+    monkeypatch,
+):
+    settings.data_dir.mkdir(parents=True)
+    database_path = engine.url.database
+    assert database_path is not None
+    original_timeout_ms = 17_321
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.15,
+    )
+
+    with engine.connect() as measurement_connection:
+        storage_service.set_sqlite_busy_timeout_ms(
+            measurement_connection,
+            original_timeout_ms,
+        )
+        measurement_connection.rollback()
+        with sqlite3.connect(database_path, timeout=30) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            with Session(bind=measurement_connection) as session:
+                started = time.monotonic()
+                with pytest.raises(TimeoutError, match="bounded slice"):
+                    storage_service.measure_usage(session, settings)
+                elapsed = time.monotonic() - started
+
+            assert 0.08 <= elapsed < 1
+            assert (
+                storage_service.sqlite_busy_timeout_ms(
+                    measurement_connection
+                )
+                == original_timeout_ms
+        )
+
+
+def test_usage_measurement_leaves_caller_connection_transaction_clean(
+    engine,
+    settings,
+):
+    settings.data_dir.mkdir(parents=True)
+
+    with engine.connect() as connection:
+        assert not connection.in_transaction()
+        with Session(bind=connection) as session:
+            assert storage_service.measure_usage(session, settings) == {}
+
+        assert not connection.in_transaction()
+        with connection.begin():
+            assert connection.scalar(sa.text("SELECT 1")) == 1
+        assert not connection.in_transaction()
+
+
+def test_usage_measurement_preserves_a_stricter_sqlite_busy_timeout(
+    engine,
+):
+    original_timeout_ms = 23
+    with engine.connect() as connection:
+        storage_service.set_sqlite_busy_timeout_ms(
+            connection,
+            original_timeout_ms,
+        )
+        with Session(bind=connection) as session:
+            try:
+                storage_service._configure_usage_database_timeout(
+                    session,
+                    deadline=time.monotonic() + 1,
+                )
+                assert (
+                    storage_service.sqlite_busy_timeout_ms(connection)
+                    == original_timeout_ms
+                )
+            finally:
+                session.rollback()
+                storage_service._restore_usage_sqlite_busy_timeout(
+                    session
+                )
+        assert (
+            storage_service.sqlite_busy_timeout_ms(connection)
+            == original_timeout_ms
+        )
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "pgcode"),
+    (
+        ("55P03", None),
+        ("57014", None),
+        (None, "55P03"),
+        (None, "57014"),
+    ),
+)
+def test_usage_measurement_recognizes_postgres_database_timeouts(
+    sqlstate,
+    pgcode,
+):
+    original = RuntimeError("database timeout")
+    original.sqlstate = sqlstate
+    original.pgcode = pgcode
+    error = OperationalError("SELECT storage_object", {}, original)
+
+    assert storage_service._usage_database_timeout_error(error) is True
+
+
+def test_usage_measurement_invalidates_connection_when_timeout_restore_fails(
+    monkeypatch,
+):
+    invalidations: list[BaseException] = []
+
+    class ConnectionStub:
+        def get_transaction(self):
+            return None
+
+        def invalidate(self, cause):
+            invalidations.append(cause)
+
+    connection = ConnectionStub()
+    session = SimpleNamespace(
+        info={
+            storage_service._USAGE_SQLITE_BUSY_TIMEOUT_INFO_KEY: (
+                connection,
+                17_321,
+            )
+        }
+    )
+
+    def fail_restore(_connection, _timeout_ms):
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(
+        storage_service,
+        "set_sqlite_busy_timeout_ms",
+        fail_restore,
+    )
+
+    storage_service._restore_usage_sqlite_busy_timeout(session)
+
+    assert session.info == {}
+    assert len(invalidations) == 1
+    assert str(invalidations[0]) == "restore failed"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_usage_measurement_database_wait_is_bounded(
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(
+        database_url,
+        enforce_runtime_write_fence=False,
+    )
+    schema = f"hm_storage_usage_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    connect_args = {"options": f"-csearch_path={schema}"}
+    engine = create_db_engine(database_url, connect_args=connect_args)
+    blocker_engine = create_db_engine(
+        database_url,
+        connect_args=connect_args,
+        enforce_runtime_write_fence=False,
+    )
+    scoped_settings = settings.model_copy(
+        update={"data_dir": tmp_path / "postgres-usage-data"}
+    )
+    scoped_settings.data_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        storage_service,
+        "_USAGE_SCAN_MAX_SECONDS",
+        0.2,
+    )
+
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+        Base.metadata.create_all(engine)
+
+        with blocker_engine.connect() as blocker:
+            transaction = blocker.begin()
+            blocker.execute(
+                sa.text(
+                    "LOCK TABLE storage_object "
+                    "IN ACCESS EXCLUSIVE MODE"
+                )
+            )
+            try:
+                with Session(engine) as session:
+                    started = time.monotonic()
+                    with pytest.raises(
+                        TimeoutError,
+                        match="bounded slice",
+                    ):
+                        storage_service.measure_usage(
+                            session,
+                            scoped_settings,
+                        )
+                    elapsed = time.monotonic() - started
+                assert 0.1 <= elapsed < 1
+            finally:
+                transaction.rollback()
+    finally:
+        blocker_engine.dispose()
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+def test_concurrent_usage_measurements_publish_one_serialized_snapshot(
+    engine,
+    settings,
+    monkeypatch,
+):
+    payload = b"serialized storage usage"
+    target = settings.data_dir / "media" / "serialized.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    first_scan_entered = threading.Event()
+    release_first_scan = threading.Event()
+    second_lock_attempted = threading.Event()
+    second_finished = threading.Event()
+    failures: list[BaseException] = []
+    results: list[dict[str, dict[str, int]]] = []
+    real_open = storage_service.open_directory_anchored
+    real_lock = storage_service.lock_activity_write_plane
+
+    @contextmanager
+    def paused_open(root):
+        if threading.current_thread().name == "usage-first":
+            first_scan_entered.set()
+            assert release_first_scan.wait(timeout=5)
+        with real_open(root) as opened:
+            yield opened
+
+    def tracked_lock(session, **kwargs):
+        if threading.current_thread().name == "usage-second":
+            second_lock_attempted.set()
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(
+        storage_service,
+        "open_directory_anchored",
+        paused_open,
+    )
+    monkeypatch.setattr(
+        storage_service,
+        "lock_activity_write_plane",
+        tracked_lock,
+    )
+
+    def measure() -> None:
+        with Session(engine) as session:
+            try:
+                results.append(
+                    storage_service.measure_usage(session, settings)
+                )
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                if threading.current_thread().name == "usage-second":
+                    second_finished.set()
+
+    first = threading.Thread(target=measure, name="usage-first")
+    second = threading.Thread(target=measure, name="usage-second")
+    try:
+        first.start()
+        assert first_scan_entered.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_finished.wait(timeout=0.2)
+        release_first_scan.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert failures == []
+        assert results == [
+            {"media": {"bytes": len(payload), "objects": 1}},
+            {"media": {"bytes": len(payload), "objects": 1}},
+        ]
+        with Session(engine) as session:
+            assert (
+                session.scalar(
+                    select(func.count())
+                    .select_from(StorageUsageDaily)
+                    .where(
+                        StorageUsageDaily.measured_on == date.today(),
+                        StorageUsageDaily.provider == "local",
+                        StorageUsageDaily.data_class == "media",
+                    )
+                )
+                == 1
+            )
+    finally:
+        release_first_scan.set()
+        if first.ident is not None:
+            first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+
+def test_usage_measurement_blocks_storage_writer_until_snapshot_commit(
+    engine,
+    settings,
+    monkeypatch,
+):
+    settings.data_dir.mkdir(parents=True)
+    target = settings.data_dir / "media" / "nutrition.jpg"
+    payload = b"nutrition photo"
+    scan_entered = threading.Event()
+    release_scan = threading.Event()
+    writer_attempted = threading.Event()
+    writer_finished = threading.Event()
+    failures: list[BaseException] = []
+    real_open = storage_service.open_directory_anchored
+
+    @contextmanager
+    def paused_open(root):
+        if threading.current_thread().name == "usage-measurement":
+            scan_entered.set()
+            assert release_scan.wait(timeout=5)
+        with real_open(root) as opened:
+            yield opened
+
+    monkeypatch.setattr(
+        storage_service,
+        "open_directory_anchored",
+        paused_open,
+    )
+
+    def measure() -> None:
+        with Session(engine) as session:
+            try:
+                storage_service.measure_usage(session, settings)
+            except BaseException as exc:
+                failures.append(exc)
+
+    def publish() -> None:
+        with Session(engine) as session:
+            try:
+                writer_attempted.set()
+                storage_service.lock_activity_write_plane(session)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+                register_storage_object(
+                    session,
+                    settings,
+                    relative_path="media/nutrition.jpg",
+                    data_class="nutrition_media",
+                    content_type="image/jpeg",
+                    size_bytes=len(payload),
+                    observed_at=datetime(2026, 8, 10, tzinfo=UTC),
+                )
+                session.commit()
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+            finally:
+                writer_finished.set()
+
+    measurement = threading.Thread(
+        target=measure,
+        name="usage-measurement",
+    )
+    writer = threading.Thread(target=publish, name="storage-writer")
+    try:
+        measurement.start()
+        assert scan_entered.wait(timeout=5)
+        writer.start()
+        assert writer_attempted.wait(timeout=5)
+        assert not writer_finished.wait(timeout=0.2)
+        release_scan.set()
+        measurement.join(timeout=10)
+        writer.join(timeout=10)
+
+        assert not measurement.is_alive()
+        assert not writer.is_alive()
+        assert failures == []
+        with Session(engine) as session:
+            usage = storage_service.measure_usage(session, settings)
+        assert usage["nutrition_media"] == {
+            "bytes": len(payload),
+            "objects": 1,
+        }
+        assert "media" not in usage
+    finally:
+        release_scan.set()
+        if measurement.ident is not None:
+            measurement.join(timeout=5)
+        if writer.ident is not None:
+            writer.join(timeout=5)
 
 
 @pytest.mark.skipif(

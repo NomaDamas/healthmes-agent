@@ -1842,6 +1842,44 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     )
 
 
+def test_expired_photo_review_retry_returns_operation_conflict(
+    client,
+    session,
+    fixture_clock,
+):
+    observation_id = _photo_observation(client)
+    review_body = {
+        "operation_id": str(uuid.uuid4()),
+        "status": "confirmed",
+        "source": "desktop-web",
+    }
+    created = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json=review_body,
+    )
+    assert created.status_code == 201
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.review.v1",
+            WellnessEvent.source_record_id == review_body["operation_id"],
+        )
+    )
+    assert event is not None
+    event.expires_at = fixture_clock()
+    session.commit()
+
+    retried = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json=review_body,
+    )
+
+    assert retried.status_code == 409
+    assert retried.json()["error"]["code"] == (
+        "nutrition_review_operation_conflict"
+    )
+    assert "expired nutrition review cannot be retried" in retried.text
+
+
 def test_rejected_photo_observation_cannot_create_interaction(client):
     observation_id = _photo_observation(client)
     rejected = client.post(

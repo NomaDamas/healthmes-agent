@@ -349,14 +349,30 @@ Staging cursor names are reserved only at their exact direct-child path below
 `raw_ingest/` remains a normal indexed and measured object.
 
 Local usage measurement is a separate, no-follow filesystem pass capped at
-100,000 directory entries and two seconds. Scheduled maintenance and
-`POST /v1/storage/maintenance` run that pass only after releasing the global
-write-plane fence, so a large data tree cannot hold every writer behind quota
-accounting. The measurement is published only after the complete data root has
-been scanned and its root inode revalidated. A missing root, permission error,
-replacement root or exhausted bound therefore leaves the previous
-`storage_usage_daily` values unchanged; the API reports the measurement as
-deferred and a later run retries it.
+100,000 directory entries and two seconds for the complete operation, including
+database connection-pool checkout. It requires a clean session and
+owns the shared storage write plane for the complete bounded operation: read
+the indexed storage map, scan the filesystem and publish the daily usage
+snapshot. SQLite starts the owned transaction with `BEGIN IMMEDIATE`. This
+prevents concurrent first measurements from racing on the daily unique key and
+prevents an older scan from overwriting a newer storage generation. A missing
+root, permission error, replacement root or exhausted bound rolls back the
+measurement and leaves the previous `storage_usage_daily` values unchanged;
+the API reports the measurement as deferred and a later run retries it.
+Callers must provide a SQLAlchemy session with one effective database bind and
+commit or roll back pending ORM changes or an active transaction before
+measuring. A custom `get_bind()` wrapper or mapper route is allowed only when
+SQLAlchemy's base resolver maps its configured default, mapped-class, ORM
+`Mapper` and query-clause routes for `StorageObject` and `StorageUsageDaily` to
+the same `session.bind`. Caller `get_bind()` overrides are never invoked. The
+actual measurement also never reuses caller routing: it runs in a standard
+internal Session bound to one deadline-bounded pinned connection, so the usage
+transaction, storage index and usage snapshot cannot escape that connection or
+deadline. SQLite
+`busy_timeout` and PostgreSQL transaction-local `lock_timeout`/
+`statement_timeout` are refreshed from the same remaining deadline before
+blocking database phases, so an external writer cannot extend the bounded scan
+to the normal database wait timeout.
 
 Each usage measurement also writes zero bytes and zero objects to any existing
 current-day local class row that no longer has a regular file. Removing the

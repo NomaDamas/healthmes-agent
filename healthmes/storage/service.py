@@ -20,17 +20,23 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 
 from healthmes import clock
 from healthmes.activity.locking import (
+    _connect_with_bounded_worker,
     activity_write_lock,
     global_write_plane_guard,
     lock_activity_write_plane,
     session_holds_write_plane,
+    set_sqlite_busy_timeout_ms,
+    sqlite_busy_timeout_ms,
 )
 from healthmes.calendar_retention import (
     purge_expired_calendar_mirrors,
@@ -94,6 +100,10 @@ _MAINTENANCE_MAX_HASH_BYTES = 256 * 1024 * 1024
 _MAINTENANCE_MAX_DIRECTORY_ENTRIES = 4096
 _USAGE_SCAN_ENTRY_LIMIT = 100_000
 _USAGE_SCAN_MAX_SECONDS = 2.0
+_USAGE_SQLITE_BUSY_TIMEOUT_INFO_KEY = (
+    "healthmes_storage_usage_sqlite_busy_timeout"
+)
+_USAGE_POSTGRES_TIMEOUT_STATES = frozenset({"55P03", "57014"})
 _DISCOVERY_CURSOR_NAME = ".healthmes-unindexed-discovery-v2.json"
 _DISCOVERY_CURSOR_MAX_BYTES = 128 * 1024
 _DISCOVERY_CLASS_QUANTUM = 32
@@ -407,18 +417,28 @@ def _now() -> datetime:
 
 
 def ensure_default_policies(session: Session) -> list[RetentionPolicy]:
+    policy_query = select(RetentionPolicy).execution_options(
+        populate_existing=True
+    )
     policies = {
         row.data_class: row
-        for row in session.scalars(select(RetentionPolicy))
+        for row in session.scalars(policy_query)
     }
     if DEFAULT_RETENTION.keys() <= policies.keys():
         return sorted(policies.values(), key=lambda row: row.data_class)
 
+    # Bootstrap is the only policy path that may need to write. Keep ordinary
+    # reads lock-free, then re-check under the shared fence before inserting.
     lock_activity_write_plane(session)
     policies = {
         row.data_class: row
-        for row in session.scalars(select(RetentionPolicy))
+        for row in session.scalars(
+            policy_query.execution_options(populate_existing=True)
+        )
     }
+    if DEFAULT_RETENTION.keys() <= policies.keys():
+        return sorted(policies.values(), key=lambda row: row.data_class)
+
     missing = [
         {
             "data_class": data_class,
@@ -446,9 +466,9 @@ def ensure_default_policies(session: Session) -> list[RetentionPolicy]:
     session.flush()
     return list(
         session.scalars(
-            select(RetentionPolicy).order_by(
-                RetentionPolicy.data_class
-            )
+            select(RetentionPolicy)
+            .order_by(RetentionPolicy.data_class)
+            .execution_options(populate_existing=True)
         )
     )
 
@@ -663,6 +683,10 @@ def apply_decision_retention(
 ) -> DecisionRecord:
     """Classify one Decision Agent record under the user-owned policy."""
 
+    # Read the policy only after joining the same write plane used by retention
+    # updates. Otherwise a concurrent policy shrink can leave a newly-created
+    # decision stamped with the previous retention window.
+    lock_activity_write_plane(session)
     policies = {
         policy.data_class: policy
         for policy in ensure_default_policies(session)
@@ -729,8 +753,11 @@ def register_storage_object(
     observed_at: datetime | None = None,
     safe_to_purge: bool = True,
 ) -> StorageObject:
+    lock_activity_write_plane(session)
     existing = session.scalar(
-        select(StorageObject).where(StorageObject.relative_path == relative_path)
+        select(StorageObject)
+        .where(StorageObject.relative_path == relative_path)
+        .execution_options(populate_existing=True)
     )
     if existing is not None:
         if existing.purged_at is not None:
@@ -776,6 +803,7 @@ def classify_storage_object(
     safe_to_purge: bool,
 ) -> StorageObject:
     """Move an indexed object under a purpose-specific retention policy."""
+    lock_activity_write_plane(session)
     policies = {row.data_class: row for row in ensure_default_policies(session)}
     policy = policies[data_class]
     already_classified = obj.data_class == data_class
@@ -1397,6 +1425,12 @@ def _advance_discovery_class(
         except _DiscoveryAncestorMissing as exc:
             if len(stack) > 1:
                 logger.warning("skipping stale discovery directory: %s", exc)
+                # The child may have been renamed within its parent. Some
+                # filesystems do not expose a distinguishable parent
+                # timestamp change for that operation, so generation
+                # comparison alone cannot guarantee that the new name is
+                # revisited.
+                stack[-2].rescan = True
             stack.pop()
             continue
         except _DiscoveryUnsafeAncestor as exc:
@@ -1670,6 +1704,285 @@ def measure_usage(
     session: Session,
     settings: Settings,
 ) -> dict[str, dict[str, int]]:
+    deadline = time.monotonic() + _USAGE_SCAN_MAX_SECONDS
+    try:
+        bind = _require_usage_single_bind(session)
+        if session.new or session.dirty or session.deleted:
+            raise RuntimeError(
+                "storage usage measurement requires a session without "
+                "pending changes"
+            )
+        if session.in_transaction():
+            raise RuntimeError(
+                "storage usage measurement requires a session without an "
+                "active transaction"
+            )
+        if isinstance(bind, Connection) and bind.in_transaction():
+            raise RuntimeError(
+                "storage usage measurement requires a connection without an "
+                "active transaction"
+            )
+        if _usage_bind_holds_write_plane(bind):
+            raise RuntimeError(
+                "storage usage measurement requires the caller to release "
+                "its existing write-plane guard"
+            )
+        with _usage_session_guard(
+            bind=bind,
+            deadline=deadline,
+        ) as measurement_session:
+            try:
+                # One bounded measurement owns the write plane from the
+                # database index read through snapshot publication.
+                _configure_usage_database_timeout(
+                    measurement_session,
+                    deadline=deadline,
+                )
+                lock_activity_write_plane(
+                    measurement_session,
+                    timeout_seconds=_remaining_usage_time(deadline),
+                    cancellation_check=lambda: _check_usage_deadline(
+                        deadline
+                    ),
+                )
+                _configure_usage_database_timeout(
+                    measurement_session,
+                    deadline=deadline,
+                )
+                if (
+                    measurement_session.get_bind().dialect.name
+                    == "sqlite"
+                ):
+                    connection = measurement_session.connection()
+                    driver_connection = (
+                        connection.connection.driver_connection
+                    )
+                    if not driver_connection.in_transaction:
+                        measurement_session.execute(
+                            text("BEGIN IMMEDIATE")
+                        )
+                totals = _measure_usage_in_transaction(
+                    measurement_session,
+                    settings,
+                    deadline=deadline,
+                )
+                _configure_usage_database_timeout(
+                    measurement_session,
+                    deadline=deadline,
+                )
+                measurement_session.commit()
+            except DBAPIError as exc:
+                measurement_session.rollback()
+                if _usage_database_timeout_error(exc):
+                    raise TimeoutError(
+                        "storage usage scan exceeded its bounded slice"
+                    ) from exc
+                raise
+            except BaseException:
+                measurement_session.rollback()
+                raise
+            finally:
+                _restore_usage_sqlite_busy_timeout(
+                    measurement_session
+                )
+    except SQLAlchemyTimeoutError as exc:
+        raise TimeoutError(
+            "storage usage scan exceeded its bounded slice"
+        ) from exc
+    session.expire_all()
+    return totals
+
+
+@contextmanager
+def _usage_session_guard(
+    *,
+    bind: Engine | Connection,
+    deadline: float,
+) -> Iterator[Session]:
+    """Run measurement in one standard Session on one bounded connection."""
+
+    if isinstance(bind, Connection):
+        connection = bind
+        owns_connection = False
+    else:
+        connection = _connect_with_bounded_worker(
+            bind.connect,
+            close_late=lambda candidate: candidate.close(),
+            deadline=deadline,
+            timeout_message="storage usage scan exceeded its bounded slice",
+            worker_name="healthmes-storage-usage-connect",
+            clock=time.monotonic,
+        )
+        owns_connection = True
+    try:
+        with Session(bind=connection) as measurement_session:
+            _assert_usage_routes_use_bind(
+                measurement_session,
+                connection,
+            )
+            yield measurement_session
+    finally:
+        if owns_connection:
+            connection.close()
+
+
+def _require_usage_single_bind(session: Session) -> Engine | Connection:
+    """Resolve one effective bind before a bounded usage transaction starts."""
+
+    bind = session.bind
+    if not isinstance(bind, (Engine, Connection)):
+        raise RuntimeError(
+            "storage usage measurement requires one database bind"
+        )
+    _assert_usage_routes_use_bind(session, bind)
+    return bind
+
+
+def _assert_usage_routes_use_bind(
+    session: Session,
+    expected: Engine | Connection,
+) -> None:
+    storage_object_query = select(StorageObject).where(
+        StorageObject.purged_at.is_(None)
+    )
+    usage_snapshot_query = select(StorageUsageDaily).where(
+        StorageUsageDaily.provider == "local"
+    )
+    # Invoke SQLAlchemy's base resolver directly. Arbitrary caller overrides
+    # must not add unbounded work or route the bounded measurement elsewhere.
+    routes = (
+        Session.get_bind(session),
+        Session.get_bind(session, mapper=StorageObject),
+        Session.get_bind(session, mapper=StorageObject.__mapper__),
+        Session.get_bind(
+            session,
+            mapper=StorageObject.__mapper__,
+            clause=storage_object_query,
+        ),
+        Session.get_bind(session, mapper=StorageUsageDaily),
+        Session.get_bind(session, mapper=StorageUsageDaily.__mapper__),
+        Session.get_bind(
+            session,
+            mapper=StorageUsageDaily.__mapper__,
+            clause=usage_snapshot_query,
+        ),
+    )
+    for route in routes:
+        if route is not expected:
+            raise RuntimeError(
+                "storage usage measurement requires one database bind for "
+                "the usage transaction, storage index and usage snapshot rows"
+            )
+
+
+def _usage_bind_holds_write_plane(bind: Engine | Connection) -> bool:
+    """Check an inherited guard without invoking caller Session routing."""
+
+    with Session(bind=bind) as probe:
+        return session_holds_write_plane(probe)
+
+
+def _configure_usage_database_timeout(
+    session: Session,
+    *,
+    deadline: float,
+) -> None:
+    timeout_seconds = _remaining_usage_time(deadline)
+    timeout_ms = max(1, int(timeout_seconds * 1_000))
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        timeout_value = f"{timeout_ms}ms"
+        session.execute(
+            text("SELECT set_config('lock_timeout', :timeout, true)"),
+            {"timeout": timeout_value},
+        )
+        session.execute(
+            text("SELECT set_config('statement_timeout', :timeout, true)"),
+            {"timeout": timeout_value},
+        )
+        return
+    if dialect != "sqlite":
+        return
+    connection = session.connection()
+    state = session.info.get(_USAGE_SQLITE_BUSY_TIMEOUT_INFO_KEY)
+    if state is None:
+        original_timeout_ms = sqlite_busy_timeout_ms(connection)
+        session.info[_USAGE_SQLITE_BUSY_TIMEOUT_INFO_KEY] = (
+            connection,
+            original_timeout_ms,
+        )
+    else:
+        guarded_connection, original_timeout_ms = state
+        if guarded_connection is not connection:
+            raise RuntimeError(
+                "SQLite storage usage connection changed during measurement"
+            )
+    set_sqlite_busy_timeout_ms(
+        connection,
+        min(original_timeout_ms, timeout_ms),
+    )
+
+
+def _restore_usage_sqlite_busy_timeout(session: Session) -> None:
+    state = session.info.pop(
+        _USAGE_SQLITE_BUSY_TIMEOUT_INFO_KEY,
+        None,
+    )
+    if state is None:
+        return
+    connection, original_timeout_ms = state
+    transaction_before = connection.get_transaction()
+    try:
+        set_sqlite_busy_timeout_ms(connection, original_timeout_ms)
+        if sqlite_busy_timeout_ms(connection) != original_timeout_ms:
+            raise RuntimeError(
+                "SQLite storage usage busy timeout cleanup could not be verified"
+            )
+        transaction_after = connection.get_transaction()
+        if (
+            transaction_before is None
+            and transaction_after is not None
+            and transaction_after.is_active
+        ):
+            transaction_after.rollback()
+    except Exception as exc:
+        try:
+            connection.invalidate(exc)
+        except Exception:
+            pass
+
+
+def _usage_database_timeout_error(exc: DBAPIError) -> bool:
+    original = exc.orig
+    state = getattr(original, "sqlstate", None) or getattr(
+        original,
+        "pgcode",
+        None,
+    )
+    if state in _USAGE_POSTGRES_TIMEOUT_STATES:
+        return True
+    return "database is locked" in str(original).casefold()
+
+
+def _remaining_usage_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(
+            "storage usage scan exceeded its bounded slice"
+        )
+    return remaining
+
+
+def _check_usage_deadline(deadline: float) -> None:
+    _remaining_usage_time(deadline)
+
+
+def _measure_usage_in_transaction(
+    session: Session,
+    settings: Settings,
+    *,
+    deadline: float,
+) -> dict[str, dict[str, int]]:
     if (
         os.name == "nt"
         or not getattr(os, "O_DIRECTORY", 0)
@@ -1755,19 +2068,21 @@ def measure_usage(
             entry_name=entry_name,
         )
 
+    _remaining_usage_time(deadline)
     totals: dict[str, dict[str, int]] = {}
+    _configure_usage_database_timeout(session, deadline=deadline)
     indexed = {
         row.relative_path: row.data_class
         for row in session.scalars(
             select(StorageObject).where(StorageObject.purged_at.is_(None))
         )
     }
+    _remaining_usage_time(deadline)
     physical_files: dict[
         tuple[int, int],
         tuple[tuple[int, int, str], str, int],
     ] = {}
     inspected = 0
-    deadline = time.monotonic() + _USAGE_SCAN_MAX_SECONDS
     try:
         root_frame = open_frame(root_descriptor, relative_parts=())
     except BaseException:
@@ -1887,7 +2202,9 @@ def measure_usage(
         bucket["bytes"] += size_bytes
         bucket["objects"] += 1
 
+    _remaining_usage_time(deadline)
     today = date.today()
+    _configure_usage_database_timeout(session, deadline=deadline)
     existing = {
         row.data_class: row
         for row in session.scalars(
@@ -1897,6 +2214,8 @@ def measure_usage(
             )
         )
     }
+    _remaining_usage_time(deadline)
+    _configure_usage_database_timeout(session, deadline=deadline)
     known_classes = set(
         session.scalars(
             select(StorageUsageDaily.data_class).where(
@@ -1904,16 +2223,21 @@ def measure_usage(
             )
         )
     )
+    _remaining_usage_time(deadline)
     for data_class in existing.keys() | known_classes | totals.keys():
         values = totals.get(data_class, {"bytes": 0, "objects": 0})
         row = existing.get(data_class)
         if row is None:
             row = StorageUsageDaily(
-                measured_on=today, provider="local", data_class=data_class
+                measured_on=today,
+                provider="local",
+                data_class=data_class,
             )
             session.add(row)
         row.bytes_used = values["bytes"]
         row.object_count = values["objects"]
+    _remaining_usage_time(deadline)
+    _configure_usage_database_timeout(session, deadline=deadline)
     session.flush()
     return totals
 

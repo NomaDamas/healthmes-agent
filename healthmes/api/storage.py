@@ -17,7 +17,10 @@ from sqlalchemy.exc import IntegrityError
 
 from healthmes import clock
 from healthmes.activity.contracts import is_reserved_activity_provider
-from healthmes.activity.locking import activity_write_lock
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.api.decision_html import shell_context, template_environment
 from healthmes.api.errors import APIError
 from healthmes.api.local_session import issue_local_session, require_local_session
@@ -175,6 +178,9 @@ def _usage_deferred_reason(exc: OSError | TimeoutError) -> UsageDeferredReason:
 
 def _settings_payload(session: SessionDep, settings: Settings) -> StorageSettingsOut:
     policies = ensure_default_policies(session)
+    # Finish default-policy bootstrap before measure_usage() starts its own
+    # bounded, fenced measurement transaction.
+    session.commit()
     try:
         usage = measure_usage(session, settings)
     except (TimeoutError, PermissionError, OSError) as exc:
@@ -274,7 +280,6 @@ def maintain_storage(
     if not dry_run:
         try:
             measure_usage(session, settings)
-            session.commit()
         except (OSError, TimeoutError) as exc:
             session.rollback()
             usage_errors.append(
@@ -346,6 +351,10 @@ def create_wellness_event(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    # Retention updates and normalized event writes must observe one
+    # serialized policy generation. Acquire the fence before the idempotency
+    # lookup and policy read, not just before the eventual INSERT.
+    lock_activity_write_plane(session)
 
     def validate_existing(event: WellnessEvent) -> WellnessEventOut:
         if (
@@ -374,16 +383,20 @@ def create_wellness_event(
         return WellnessEventOut.model_validate(event)
 
     existing = session.scalar(
-        select(WellnessEvent).where(
+        select(WellnessEvent)
+        .where(
             WellnessEvent.source_provider == body.source_provider,
             WellnessEvent.source_record_id == body.source_record_id,
         )
+        .execution_options(populate_existing=True)
     )
     if existing is not None:
         return validate_existing(existing)
     ensure_default_policies(session)
     policy = session.scalar(
-        select(RetentionPolicy).where(RetentionPolicy.data_class == body.data_class)
+        select(RetentionPolicy)
+        .where(RetentionPolicy.data_class == body.data_class)
+        .execution_options(populate_existing=True)
     )
     if policy is None:
         policy = update_retention_policy(session, body.data_class, "30d")
@@ -392,9 +405,7 @@ def create_wellness_event(
         if policy.retention_days is None
         else body.observed_at + timedelta(days=policy.retention_days)
     )
-    if expires_at is not None and expires_at.astimezone(UTC) <= datetime.now(
-        UTC
-    ):
+    if expires_at is not None and expires_at.astimezone(UTC) <= clock.utc_now():
         raise APIError(
             422,
             "expired_wellness_event",
@@ -428,10 +439,12 @@ def create_wellness_event(
             session.flush()
     except IntegrityError:
         existing = session.scalar(
-            select(WellnessEvent).where(
+            select(WellnessEvent)
+            .where(
                 WellnessEvent.source_provider == body.source_provider,
                 WellnessEvent.source_record_id == body.source_record_id,
             )
+            .execution_options(populate_existing=True)
         )
         if existing is None:
             raise

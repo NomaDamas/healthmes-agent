@@ -39,12 +39,20 @@ from healthmes.decision import (
     ExpiredDecisionSearchSessionError,
     FinishedDecisionSearchSessionError,
     FreshnessStatus,
+    NutritionContextProvider,
     PrivacyLevel,
     ProvenanceSupport,
     SourceRef,
     ToolCallStatus,
     UnknownDecisionSearchSessionError,
 )
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    IntakeIntent,
+    IntakeInteraction,
+    interaction_to_payload,
+)
+from healthmes.storage import ensure_default_policies
 from healthmes.store import Base, WellnessEvent, create_db_engine
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
@@ -395,6 +403,123 @@ async def test_postgres_read_only_control_survives_runtime_fence() -> None:
     finally:
         service.close()
         engine.dispose()
+
+
+@pytest.mark.parametrize("raw_capture_state", ("missing", "expired"))
+async def test_real_nutrition_search_stays_read_only_without_retained_raw_capture(
+    store_factory,
+    raw_capture_state,
+) -> None:
+    observed_at = NOW - timedelta(hours=1)
+    interaction = IntakeInteraction(
+        interaction_id=uuid.uuid4(),
+        operation_fingerprint="a" * 64,
+        intent=IntakeIntent.LOG_CONSUMED,
+        modality=CaptureModality.TEXT,
+        observed_at=observed_at,
+        recorded_at=observed_at + timedelta(minutes=1),
+        timezone="UTC",
+        source="decision-read-only-test",
+        source_text=None,
+        media_path=None,
+        nutrition_observation_id=None,
+        items=(),
+    )
+    interaction_event = WellnessEvent(
+        event_type="nutrition.interaction.v1",
+        schema_version=1,
+        observed_at=observed_at,
+        recorded_at=interaction.recorded_at,
+        timezone="UTC",
+        source_provider="nutrition-interaction",
+        source_device=interaction.source,
+        source_record_id=str(interaction.interaction_id),
+        capture_method="text",
+        quality_flags={},
+        confidence=1,
+        coverage=1,
+        sensitivity="nutrition",
+        consent_scope="personal",
+        expires_at=NOW + timedelta(days=30),
+        payload=interaction_to_payload(interaction),
+        raw_object_id=None,
+        derived_from=None,
+    )
+    with store_factory() as session:
+        ensure_default_policies(session)
+        session.add(interaction_event)
+        if raw_capture_state == "expired":
+            session.add(
+                WellnessEvent(
+                    event_type="nutrition.raw-capture.v1",
+                    schema_version=1,
+                    observed_at=observed_at,
+                    recorded_at=interaction.recorded_at,
+                    timezone="UTC",
+                    source_provider="nutrition-raw-capture",
+                    source_device=interaction.source,
+                    source_record_id=str(interaction.interaction_id),
+                    capture_method="text",
+                    quality_flags={},
+                    confidence=None,
+                    coverage=None,
+                    sensitivity="nutrition",
+                    consent_scope="personal",
+                    expires_at=NOW - timedelta(seconds=1),
+                    payload={
+                        "operation_fingerprint": (
+                            interaction.operation_fingerprint
+                        ),
+                        "source_text": "expired private transcript",
+                        "media_path": None,
+                        "warnings": [],
+                        "item_warnings": [],
+                    },
+                    raw_object_id=None,
+                    derived_from={
+                        "interaction_id": str(
+                            interaction.interaction_id
+                        )
+                    },
+                )
+            )
+        session.commit()
+        interaction_event_id = interaction_event.id
+
+    clock = MutableClock()
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((NutritionContextProvider(),)),
+            clock=clock.now,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(),
+        clock=clock.now,
+        monotonic_clock=clock.tick,
+    )
+    try:
+        handle = service.begin(_request())
+        result = await service.search(
+            handle.session_id,
+            domain="nutrition",
+            capability="nutrition.intake-history",
+            start=NOW - timedelta(days=1),
+            end=NOW,
+            granularity="summary",
+            limit=10,
+        )
+
+        assert result.status in {ContextStatus.OK, ContextStatus.PARTIAL}
+        assert result.payload["count"] == 1
+        assert result.payload["records"][0]["raw_capture_available"] is False
+        assert {ref.record_id for ref in result.source_refs} == {
+            str(interaction_event_id)
+        }
+        assert service.finish(handle.session_id).state is (
+            DecisionSearchSessionState.FINISHED
+        )
+    finally:
+        service.close()
 
 
 async def test_sqlite_query_only_cleanup_failure_discards_pool_connection(

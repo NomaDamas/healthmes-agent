@@ -142,6 +142,30 @@ def _render_offline_decision_policy_downgrade(
     return buffer.getvalue()
 
 
+def _render_offline_decision_policy_constraint_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "d4e5f6a7b8c9:e5f6a7b8c9d0",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_policy_constraint_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "e5f6a7b8c9d0:d4e5f6a7b8c9",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def _render_offline_calendar_generation_downgrade(
     database_url: str,
 ) -> str:
@@ -327,7 +351,75 @@ class TestOfflineRender:
             "file_cleanup_completed_at",
         } <= columns
         assert "storage_object_file_cleanup_consistent" in table_sql
-        assert "d4e5f6a7b8c9" in revisions
+        assert "e5f6a7b8c9d0" in revisions
+
+    def test_decision_policy_constraint_normalization_renders_for_sqlite(
+        self,
+    ) -> None:
+        upgrade = _render_offline_decision_policy_constraint_upgrade(
+            "sqlite:///offline-render.db"
+        )
+        downgrade = _render_offline_decision_policy_constraint_downgrade(
+            "sqlite:///offline-render.db"
+        )
+
+        assert "CREATE TABLE _alembic_tmp_decision_domain_policy" in upgrade
+        assert (
+            "CONSTRAINT ck_decision_domain_policy_revision_positive "
+            "CHECK (revision >= 1)"
+        ) in upgrade
+        assert (
+            "INSERT INTO _alembic_tmp_decision_domain_policy"
+            in upgrade
+        )
+        assert (
+            "CREATE INDEX "
+            "ix_decision_domain_policy_owner_principal_id"
+            in upgrade
+        )
+        assert "CREATE INDEX ix_decision_domain_policy_domain" in upgrade
+
+        assert (
+            "CREATE TABLE _alembic_tmp_decision_domain_policy"
+            in downgrade
+        )
+        assert (
+            "CONSTRAINT ck_decision_domain_policy_"
+            "ck_decision_domain_policy_revision_positive "
+            "CHECK (revision >= 1)"
+        ) in downgrade
+        assert (
+            "INSERT INTO _alembic_tmp_decision_domain_policy"
+            in downgrade
+        )
+
+    def test_decision_policy_constraint_normalization_renders_for_postgres(
+        self,
+    ) -> None:
+        database_url = (
+            "postgresql+psycopg://"
+            "healthmes:healthmes@localhost:5432/healthmes"
+        )
+        upgrade = _render_offline_decision_policy_constraint_upgrade(
+            database_url
+        )
+        downgrade = _render_offline_decision_policy_constraint_downgrade(
+            database_url
+        )
+        legacy = (
+            "ck_decision_domain_policy_"
+            "ck_decision_domain_policy_rev_2495"
+        )
+        canonical = "ck_decision_domain_policy_revision_positive"
+
+        assert (
+            f"RENAME CONSTRAINT {legacy} TO {canonical}"
+            in upgrade
+        )
+        assert (
+            f"RENAME CONSTRAINT {canonical} TO {legacy}"
+            in downgrade
+        )
 
     def test_postgres_receipt_hardening_drops_exact_published_constraint(
         self,
@@ -991,7 +1083,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             engine.dispose()
 
@@ -1061,7 +1153,7 @@ class TestSqliteUpgrade:
             with engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
                 assert (
                     connection.scalar(
                         sa.select(
@@ -1180,7 +1272,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
                 row = connection.execute(
                     sa.select(current_storage_object).where(
                         current_storage_object.c.id == object_id
@@ -1728,7 +1820,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             engine.dispose()
 
@@ -3427,6 +3519,235 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    def test_decision_policy_constraint_normalization_preserves_schema_data(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'decision-policy-constraint.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "d4e5f6a7b8c9")
+        engine = sa.create_engine(database_url)
+        policy_id = uuid.uuid4().hex
+        legacy = (
+            "ck_decision_domain_policy_"
+            "ck_decision_domain_policy_revision_positive"
+        )
+        canonical = "ck_decision_domain_policy_revision_positive"
+        expected_indexes = {
+            "ix_decision_domain_policy_domain": ("domain",),
+            "ix_decision_domain_policy_owner_principal_id": (
+                "owner_principal_id",
+            ),
+        }
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=policy_id,
+                        owner_principal_id="migration-owner",
+                        domain="nutrition",
+                        enabled=False,
+                        revision=7,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(policy).where(policy.c.id == policy_id)
+                ).one()
+                assert row.owner_principal_id == "migration-owner"
+                assert row.domain == "nutrition"
+                assert row.enabled is False
+                assert row.revision == 7
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "d4e5f6a7b8c9")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 7
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d4e5f6a7b8c9"
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            assert {
+                item["name"]
+                for item in sa.inspect(engine).get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 7
+        finally:
+            engine.dispose()
+
+    def test_decision_policy_constraint_normalization_accepts_canonical_db(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'canonical-decision-policy.db'}"
+        )
+        engine = sa.create_engine(database_url)
+        Base.metadata.create_all(engine)
+        config = _config(database_url)
+        command.stamp(config, "d4e5f6a7b8c9")
+        policy_id = uuid.uuid4().hex
+        policy = sa.Table(
+            "decision_domain_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                policy.insert().values(
+                    id=policy_id,
+                    owner_principal_id="canonical-owner",
+                    domain="activity",
+                    enabled=True,
+                    revision=3,
+                )
+            )
+        engine.dispose()
+
+        statements: list[str] = []
+
+        def capture_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            statements.append(statement)
+
+        sa.event.listen(
+            sa.engine.Engine,
+            "before_cursor_execute",
+            capture_statement,
+        )
+        try:
+            command.upgrade(config, "head")
+        finally:
+            sa.event.remove(
+                sa.engine.Engine,
+                "before_cursor_execute",
+                capture_statement,
+            )
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert not any(
+                "_alembic_tmp_decision_domain_policy" in statement
+                for statement in statements
+            )
+            assert {
+                item["name"]
+                for item in sa.inspect(engine).get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {"ck_decision_domain_policy_revision_positive"}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 3
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            engine.dispose()
+
     def test_upgrade_is_idempotent_at_head(self, tmp_path):
         database_url = f"sqlite:///{tmp_path / 'twice.db'}"
         config = _config(database_url)
@@ -4192,7 +4513,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             engine.dispose()
 
@@ -4453,6 +4774,178 @@ def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
         "HEALTHMES_TEST_POSTGRES_URL"
     ),
 )
+def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_policy_constraint_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    legacy = (
+        "ck_decision_domain_policy_"
+        "ck_decision_domain_policy_rev_2495"
+    )
+    canonical = "ck_decision_domain_policy_revision_positive"
+    expected_indexes = {
+        "ix_decision_domain_policy_domain": ("domain",),
+        "ix_decision_domain_policy_owner_principal_id": (
+            "owner_principal_id",
+        ),
+    }
+    policy_id = uuid.uuid4()
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "d4e5f6a7b8c9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=policy_id,
+                        owner_principal_id="migration-owner",
+                        domain="wearable",
+                        enabled=False,
+                        revision=9,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            assert {
+                item["name"]: tuple(item["column_names"])
+                for item in inspector.get_indexes(
+                    "decision_domain_policy"
+                )
+            } == expected_indexes
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(policy).where(policy.c.id == policy_id)
+                ).one()
+                assert row.enabled is False
+                assert row.revision == 9
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e5f6a7b8c9d0"
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "d4e5f6a7b8c9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {legacy}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 9
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        command.downgrade(config, "d4e5f6a7b8c9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_domain_policy "
+                        f"RENAME CONSTRAINT {legacy} TO {canonical}"
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            assert {
+                item["name"]
+                for item in sa.inspect(scoped_engine).get_check_constraints(
+                    "decision_domain_policy"
+                )
+            } == {canonical}
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(policy.c.revision).where(
+                        policy.c.id == policy_id
+                    )
+                ) == 9
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
 def test_postgres_multi_revision_failure_rolls_back_earlier_downgrade() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = sa.create_engine(database_url)
@@ -4494,7 +4987,7 @@ def test_postgres_multi_revision_failure_rolls_back_earlier_downgrade() -> None:
             with scoped_engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             scoped_engine.dispose()
     finally:
@@ -5701,7 +6194,7 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             scoped_engine.dispose()
     finally:
@@ -5795,7 +6288,7 @@ def test_postgres_receipt_hardening_repairs_nullable_requested_at() -> None:
                 assert row.lease_generation == 1
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             scoped_engine.dispose()
     finally:
@@ -5934,7 +6427,7 @@ def test_postgres_receipt_basis_repairs_future_requested_at() -> None:
                 assert row.expires_at == identity_expires_at
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                ) == "e5f6a7b8c9d0"
         finally:
             scoped_engine.dispose()
     finally:

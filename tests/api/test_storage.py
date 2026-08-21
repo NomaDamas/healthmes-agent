@@ -3,13 +3,13 @@ import uuid
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import clock
 from healthmes.activity.contracts import (
@@ -37,6 +37,7 @@ from healthmes.storage import (
 )
 from healthmes.storage import service as storage_service
 from healthmes.store import (
+    Base,
     CalendarEventMirror,
     CalendarSource,
     DecisionKind,
@@ -108,6 +109,72 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
             "hermes_home",
         ],
     }
+
+
+def test_storage_settings_releases_bootstrap_fence_before_usage_scan(
+    tmp_path,
+    settings,
+    monkeypatch,
+) -> None:
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'settings-fence.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    writer_finished = Event()
+    failures: list[BaseException] = []
+
+    def measure_while_writing(_session, _settings):
+        def update_policy() -> None:
+            with factory() as writer:
+                try:
+                    update_retention_policy(
+                        writer,
+                        "activity_raw",
+                        "1d",
+                    )
+                    writer.commit()
+                except BaseException as exc:
+                    writer.rollback()
+                    failures.append(exc)
+                finally:
+                    writer_finished.set()
+
+        worker = Thread(target=update_policy)
+        worker.start()
+        assert writer_finished.wait(timeout=5)
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        return {}
+
+    monkeypatch.setattr(
+        storage_api_mod,
+        "measure_usage",
+        measure_while_writing,
+    )
+    try:
+        with factory() as session:
+            payload = storage_api_mod._settings_payload(
+                session,
+                settings,
+            )
+
+        assert failures == []
+        assert payload.usage == {}
+        with factory() as session:
+            policy = session.scalar(
+                select(RetentionPolicy).where(
+                    RetentionPolicy.data_class == "activity_raw"
+                )
+            )
+            assert policy is not None
+            assert policy.retention_days == 1
+    finally:
+        engine.dispose()
 
 
 def test_storage_settings_reports_prospective_open_wearables_dump_scope(
@@ -681,6 +748,72 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
     assert len(list(session.scalars(select(WellnessEvent)))) == 1
 
 
+def test_wellness_event_waits_for_concurrent_retention_shrink(
+    client: TestClient,
+    session: Session,
+    monkeypatch,
+) -> None:
+    update_retention_policy(session, "normalized", "30d")
+    session.commit()
+    update_retention_policy(session, "normalized", "1d")
+
+    observed_at = clock.utc_now() - timedelta(minutes=1)
+    payload = {
+        "event_type": "subjective_energy",
+        "observed_at": observed_at.isoformat(),
+        "source_provider": "manual",
+        "source_record_id": "retention-race-energy",
+        "data_class": "normalized",
+        "payload": {"score": 4},
+    }
+    test_thread = current_thread()
+    writer_attempted_fence = Event()
+    writer_finished = Event()
+    responses = []
+    failures: list[BaseException] = []
+    real_lock = storage_api_mod.lock_activity_write_plane
+
+    def tracked_lock(writer_session) -> None:
+        if current_thread() is not test_thread:
+            writer_attempted_fence.set()
+        real_lock(writer_session)
+
+    def create_event() -> None:
+        try:
+            responses.append(client.post("/v1/wellness-events", json=payload))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(
+        storage_api_mod,
+        "lock_activity_write_plane",
+        tracked_lock,
+    )
+    worker = Thread(target=create_event)
+    committed = False
+    worker.start()
+    try:
+        assert writer_attempted_fence.wait(timeout=5)
+        assert not writer_finished.wait(timeout=0.2)
+        session.commit()
+        committed = True
+    finally:
+        if not committed:
+            session.rollback()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(responses) == 1
+    assert responses[0].status_code == 201
+    expires_at = datetime.fromisoformat(responses[0].json()["expires_at"])
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    assert expires_at == observed_at + timedelta(days=1)
+
+
 @pytest.mark.parametrize(
     ("event_type", "source_provider"),
     (
@@ -1161,6 +1294,7 @@ def test_cleanup_quarantine_is_not_rediscovered_or_measured(
     assert quarantined_payload.read_bytes() == payload
 
     storage_service._discover_unindexed(session, settings)
+    session.commit()
     usage = storage_service.measure_usage(session, settings)
     session.flush()
 
