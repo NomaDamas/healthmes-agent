@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from healthmes.decision.agent import DecisionAgentRun
 from healthmes.decision.contracts import DecisionRequest, DecisionResult
+from healthmes.decision.execution import DecisionExecutionControl
 from healthmes.decision.finalizer import DecisionFinalizer
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,37 +52,6 @@ class PersistedDecisionFinalizer(Protocol):
         request: DecisionRequest,
         decision_record_id: uuid.UUID,
     ) -> DecisionResult: ...
-
-
-class _RequestPhase:
-    """Coordinate caller cancellation with the finalization commit boundary."""
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._finalization_started = False
-        self._cancellation_requested = False
-
-    def begin_finalization(self) -> bool:
-        """Enter the durable phase unless caller cancellation won the race."""
-
-        with self._lock:
-            if self._cancellation_requested:
-                return False
-            self._finalization_started = True
-            return True
-
-    def cancel_reasoning(
-        self,
-        task: asyncio.Task[DecisionResult],
-    ) -> bool:
-        """Cancel only while the request is still inside model reasoning."""
-
-        with self._lock:
-            if self._finalization_started:
-                return False
-            self._cancellation_requested = True
-            task.cancel()
-            return True
 
 
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
@@ -155,10 +125,10 @@ class HealthMesDecisionEngine:
     async def _run_request(
         self,
         request: DecisionRequest,
-        phase: _RequestPhase,
+        execution_control: DecisionExecutionControl,
     ) -> DecisionResult:
         run = await self._agent.ask(request)
-        if not phase.begin_finalization():
+        if not execution_control.begin_finalization():
             raise asyncio.CancelledError
         async_finalize = getattr(self._finalizer, "afinalize", None)
         if callable(async_finalize):
@@ -203,11 +173,15 @@ class HealthMesDecisionEngine:
         self,
         loop: asyncio.AbstractEventLoop,
         request: DecisionRequest,
-    ) -> tuple[asyncio.Task[DecisionResult], _RequestPhase]:
+        execution_control: DecisionExecutionControl,
+    ) -> asyncio.Task[DecisionResult]:
         if not isinstance(request, DecisionRequest):
             raise TypeError("request must be a DecisionRequest")
+        if not isinstance(execution_control, DecisionExecutionControl):
+            raise TypeError(
+                "execution_control must be a DecisionExecutionControl"
+            )
         task_name = f"healthmes-decision-{request.request_id}"
-        phase = _RequestPhase()
         with self._state_lock:
             if self._closing or self._closed:
                 raise DecisionEngineClosedError(
@@ -227,7 +201,10 @@ class HealthMesDecisionEngine:
                     "HealthMes decision engine is at capacity"
                 )
             self._loop = loop
-            request_coroutine = self._run_request(request, phase)
+            request_coroutine = self._run_request(
+                request,
+                execution_control,
+            )
             try:
                 task = loop.create_task(
                     request_coroutine,
@@ -238,7 +215,7 @@ class HealthMesDecisionEngine:
                 raise
             self._active.add(task)
             task.add_done_callback(self._request_finished)
-            return task, phase
+            return task
 
     def _request_finished(
         self,
@@ -254,14 +231,27 @@ class HealthMesDecisionEngine:
     ) -> DecisionResult:
         """Run one accepted request through reasoning and final persistence."""
 
-        task, phase = self._track_request(
+        return await self.ask_wellness_with_control(
+            request,
+            DecisionExecutionControl(),
+        )
+
+    async def ask_wellness_with_control(
+        self,
+        request: DecisionRequest,
+        execution_control: DecisionExecutionControl,
+    ) -> DecisionResult:
+        """Run one request with service-visible cancellation coordination."""
+
+        task = self._track_request(
             asyncio.get_running_loop(),
             request,
+            execution_control,
         )
         try:
             done, _pending = await asyncio.wait((task,))
         except asyncio.CancelledError:
-            phase.cancel_reasoning(task)
+            execution_control.cancel_reasoning(task)
             raise
         assert task in done
         return task.result()

@@ -18,6 +18,7 @@ from healthmes.decision import (
     DecisionChannelAdapter,
     DecisionChannelRequest,
     DecisionContextHints,
+    DecisionEngineClosedError,
     DecisionIdempotencyConflictError,
     DecisionIdempotencyExpiredError,
     DecisionIngress,
@@ -26,6 +27,7 @@ from healthmes.decision import (
     DecisionServiceRequest,
     DecisionStatus,
     ExecutionScope,
+    HealthMesDecisionEngine,
     HealthMesDecisionService,
     PersistenceStatus,
     PrivacyLevel,
@@ -81,6 +83,68 @@ class RecordingEngine:
         self.requests = []
 
     async def ask_wellness(self, request):
+        self.requests.append(request)
+        return _completed_result(request)
+
+    async def ask_wellness_with_control(
+        self,
+        request,
+        execution_control,
+    ):
+        result = await self.ask_wellness(request)
+        if not execution_control.begin_finalization():
+            raise asyncio.CancelledError
+        return result
+
+
+class BlockingDecisionAgent:
+    def __init__(self) -> None:
+        self.requests = []
+        self.closed = False
+
+    async def ask(self, request):
+        self.requests.append(request)
+        return request
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class CancellableThenCompletingDecisionAgent(BlockingDecisionAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def ask(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled.set()
+        return request
+
+
+class BlockingDecisionFinalizer:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.requests = []
+
+    async def afinalize(self, request, _run):
+        self.requests.append(request)
+        self.started.set()
+        await self.release.wait()
+        return _completed_result(request)
+
+
+class RecordingDecisionFinalizer:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def afinalize(self, request, _run):
         self.requests.append(request)
         return _completed_result(request)
 
@@ -219,6 +283,28 @@ class CompletionBlockingReceiptStore(DecisionReceiptStore):
             self.lease_released.set()
 
 
+class FirstCompletionLeaseLossReceiptStore(DecisionReceiptStore):
+    """Expire the first generation immediately before it can publish."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.losses = 0
+
+    def complete(self, **kwargs):
+        if self.losses == 0:
+            self.losses += 1
+            self.release(
+                request_id=kwargs["request_id"],
+                fingerprint=kwargs["fingerprint"],
+                legacy_fingerprint=kwargs.get("legacy_fingerprint"),
+                owner_token=kwargs["owner_token"],
+                lease_generation=kwargs["lease_generation"],
+                now=kwargs["now"],
+            )
+            raise DecisionReceiptOwnershipError("injected lease loss")
+        return super().complete(**kwargs)
+
+
 class FirstBlockedThenFreshEngine(RecordingEngine):
     def __init__(self) -> None:
         super().__init__()
@@ -232,6 +318,38 @@ class FirstBlockedThenFreshEngine(RecordingEngine):
             await self.release.wait()
             return _completed_result(request, answer="Lost-generation answer.")
         return _completed_result(request, answer="Fresh recovery answer.")
+
+
+class LeaseLossRerunCancellationEngine(RecordingEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_started = asyncio.Event()
+        self.second_cancelled = asyncio.Event()
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 2:
+            self.second_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.second_cancelled.set()
+        return _completed_result(request)
+
+
+class LegacyFinalizingEngine:
+    """Compatibility engine that cannot expose its internal commit boundary."""
+
+    def __init__(self) -> None:
+        self.requests = []
+        self.finalization_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        self.finalization_started.set()
+        await self.release.wait()
+        return _completed_result(request)
 
 
 @pytest.mark.asyncio
@@ -359,6 +477,19 @@ class BlockingRecordingEngine(RecordingEngine):
         self.started.set()
         await self.release.wait()
         return _completed_result(request, answer=self.answer)
+
+
+class ThreadBlockingRecordingEngine(RecordingEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        self.started.set()
+        await asyncio.to_thread(self.release.wait)
+        return _completed_result(request)
 
 
 class AnswerRecordingEngine(RecordingEngine):
@@ -586,7 +717,7 @@ async def test_last_waiter_cancellation_removes_active_entry_and_releases_claim(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_completion_cannot_publish_revoked_generation(
+async def test_cancellation_during_receipt_completion_preserves_generation(
     settings,
     service_session_factory,
 ) -> None:
@@ -624,14 +755,17 @@ async def test_cancelled_completion_cannot_publish_revoked_generation(
     cancelled.cancel()
     with pytest.raises(asyncio.CancelledError):
         await cancelled
-    assert await asyncio.to_thread(lease_released.wait, 1)
+    assert not await asyncio.to_thread(lease_released.wait, 0.05)
 
+    recovered = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.sleep(0)
+    assert not recovered.done()
     release_complete.set()
+    result = await asyncio.wait_for(recovered, timeout=2)
     assert await asyncio.to_thread(complete_finished.wait, 1)
-    assert isinstance(
-        store.completion_error,
-        DecisionReceiptOwnershipError,
-    )
+    assert result.status is DecisionStatus.COMPLETED
+    assert store.completion_error is None
+    assert len(engine.requests) == 1
     with service_session_factory() as session:
         receipt = session.scalar(
             select(DecisionRequestReceipt).where(
@@ -639,13 +773,106 @@ async def test_cancelled_completion_cannot_publish_revoked_generation(
             )
         )
         assert receipt is not None
-        assert receipt.state == "pending"
-        assert receipt.lease_generation == 2
+        assert receipt.state == "completed"
+        assert receipt.lease_generation == 1
 
-    recovered = await service.ask_wellness(submission)
 
-    assert recovered.status is DecisionStatus.COMPLETED
-    assert len(engine.requests) == 2
+@pytest.mark.asyncio
+async def test_last_waiter_cancel_after_engine_finalization_keeps_single_execution(
+    settings,
+    service_session_factory,
+) -> None:
+    agent = BlockingDecisionAgent()
+    finalizer = BlockingDecisionFinalizer()
+    engine = HealthMesDecisionEngine(
+        agent=agent,
+        finalizer=finalizer,
+    )
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    first = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.wait_for(finalizer.started.wait(), timeout=1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    retry = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.sleep(0)
+    assert not retry.done()
+    assert len(agent.requests) == 1
+    assert len(finalizer.requests) == 1
+
+    finalizer.release.set()
+    result = await asyncio.wait_for(retry, timeout=2)
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert len(agent.requests) == 1
+    assert len(finalizer.requests) == 1
+    with service_session_factory() as session:
+        receipt = session.scalar(
+            select(DecisionRequestReceipt).where(
+                DecisionRequestReceipt.request_id == request_id
+            )
+        )
+        assert receipt is not None
+        assert receipt.state == "completed"
+        assert receipt.lease_generation == 1
+    await engine.aclose()
+    assert agent.closed is True
+
+
+@pytest.mark.asyncio
+async def test_last_waiter_cancel_during_reasoning_releases_for_retry(
+    settings,
+    service_session_factory,
+) -> None:
+    agent = CancellableThenCompletingDecisionAgent()
+    finalizer = RecordingDecisionFinalizer()
+    engine = HealthMesDecisionEngine(
+        agent=agent,
+        finalizer=finalizer,
+    )
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    first = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.wait_for(agent.started.wait(), timeout=1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await asyncio.wait_for(agent.cancelled.wait(), timeout=1)
+
+    result = await asyncio.wait_for(
+        service.ask_wellness(submission),
+        timeout=2,
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert len(agent.requests) == 2
+    assert len(finalizer.requests) == 1
     with service_session_factory() as session:
         receipt = session.scalar(
             select(DecisionRequestReceipt).where(
@@ -655,6 +882,194 @@ async def test_cancelled_completion_cannot_publish_revoked_generation(
         assert receipt is not None
         assert receipt.state == "completed"
         assert receipt.lease_generation == 3
+    await engine.aclose()
+    assert agent.closed is True
+
+
+@pytest.mark.asyncio
+async def test_last_waiter_cancel_during_lease_loss_rerun_cancels_new_attempt(
+    settings,
+    service_session_factory,
+) -> None:
+    engine = LeaseLossRerunCancellationEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    service._receipt_store = FirstCompletionLeaseLossReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(minutes=5),
+        retention=timedelta(days=30),
+    )
+    request_id = uuid.uuid4()
+    submission = DecisionServiceRequest(
+        request_id=request_id,
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    caller = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.wait_for(engine.second_started.wait(), timeout=1)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await asyncio.wait_for(engine.second_cancelled.wait(), timeout=1)
+    await service.aclose()
+
+    assert len(engine.requests) == 2
+    assert request_id not in service._active_idempotent_requests
+    assert service._service_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_legacy_engine_call_is_protected_as_one_finalization_boundary(
+    settings,
+    service_session_factory,
+) -> None:
+    engine = LegacyFinalizingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    cancelled = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.wait_for(engine.finalization_started.wait(), timeout=1)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    retry = asyncio.create_task(service.ask_wellness(submission))
+    await asyncio.sleep(0)
+    assert not retry.done()
+    assert len(engine.requests) == 1
+
+    engine.release.set()
+    result = await asyncio.wait_for(retry, timeout=2)
+    await service.aclose()
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert len(engine.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_service_shutdown_drains_retained_receipt_completion(
+    settings,
+    service_session_factory,
+) -> None:
+    complete_entered = threading.Event()
+    release_complete = threading.Event()
+    complete_finished = threading.Event()
+    lease_released = threading.Event()
+    engine = RecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    service._receipt_store = CompletionBlockingReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(minutes=5),
+        retention=timedelta(days=30),
+        complete_entered=complete_entered,
+        release_complete=release_complete,
+        complete_finished=complete_finished,
+        lease_released=lease_released,
+    )
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    caller = asyncio.create_task(service.ask_wellness(submission))
+    assert await asyncio.to_thread(complete_entered.wait, 1)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    service.begin_shutdown()
+    closing = asyncio.create_task(service.aclose())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    with pytest.raises(DecisionEngineClosedError):
+        await service.ask_wellness(
+            submission.model_copy(update={"request_id": uuid.uuid4()})
+        )
+
+    release_complete.set()
+    await asyncio.wait_for(closing, timeout=2)
+
+    assert await asyncio.to_thread(complete_finished.wait, 1)
+    assert service._service_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_active_service_requests_reject_a_different_event_loop(
+    settings,
+    service_session_factory,
+) -> None:
+    engine = ThreadBlockingRecordingEngine()
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=lambda: NOW,
+    )
+    first_submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="first-loop",
+    )
+    second_submission = first_submission.model_copy(
+        update={
+            "request_id": uuid.uuid4(),
+            "source": "second-loop",
+        }
+    )
+    outcome: dict[str, object] = {}
+
+    def run_first_loop() -> None:
+        try:
+            outcome["result"] = asyncio.run(
+                service.ask_wellness(first_submission)
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    owner = threading.Thread(target=run_first_loop)
+    owner.start()
+    try:
+        assert engine.started.wait(timeout=2)
+        with pytest.raises(
+            RuntimeError,
+            match="active HealthMes decision requests belong to another",
+        ):
+            await service.ask_wellness(second_submission)
+    finally:
+        engine.release.set()
+        owner.join(timeout=2)
+
+    assert owner.is_alive() is False
+    assert "error" not in outcome
+    result = outcome["result"]
+    assert isinstance(result, DecisionResult)
+    assert result.status is DecisionStatus.COMPLETED
+    assert len(engine.requests) == 1
+    await service.aclose()
 
 
 @pytest.mark.asyncio

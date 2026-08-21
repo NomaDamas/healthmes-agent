@@ -4795,6 +4795,30 @@ def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
             "owner_principal_id",
         ),
     }
+    expected_unique_constraints = {
+        "uq_decision_domain_policy_owner_domain": (
+            "owner_principal_id",
+            "domain",
+        ),
+    }
+
+    def policy_indexes(inspector):
+        return {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_indexes(
+                "decision_domain_policy"
+            )
+            if not item.get("duplicates_constraint")
+        }
+
+    def policy_unique_constraints(inspector):
+        return {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_unique_constraints(
+                "decision_domain_policy"
+            )
+        }
+
     policy_id = uuid.uuid4()
     try:
         with admin_engine.begin() as connection:
@@ -4812,12 +4836,11 @@ def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
                     "decision_domain_policy"
                 )
             } == {legacy}
-            assert {
-                item["name"]: tuple(item["column_names"])
-                for item in inspector.get_indexes(
-                    "decision_domain_policy"
-                )
-            } == expected_indexes
+            assert policy_indexes(inspector) == expected_indexes
+            assert (
+                policy_unique_constraints(inspector)
+                == expected_unique_constraints
+            )
             policy = sa.Table(
                 "decision_domain_policy",
                 sa.MetaData(),
@@ -4846,12 +4869,11 @@ def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
                     "decision_domain_policy"
                 )
             } == {canonical}
-            assert {
-                item["name"]: tuple(item["column_names"])
-                for item in inspector.get_indexes(
-                    "decision_domain_policy"
-                )
-            } == expected_indexes
+            assert policy_indexes(inspector) == expected_indexes
+            assert (
+                policy_unique_constraints(inspector)
+                == expected_unique_constraints
+            )
             policy = sa.Table(
                 "decision_domain_policy",
                 sa.MetaData(),

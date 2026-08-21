@@ -76,6 +76,16 @@ class RecordingEngine:
         self.requests.append(request)
         return _completed(request)
 
+    async def ask_wellness_with_control(
+        self,
+        request,
+        execution_control,
+    ):
+        result = await self.ask_wellness(request)
+        if not execution_control.begin_finalization():
+            raise asyncio.CancelledError
+        return result
+
 
 class FailedThenCompletedEngine(RecordingEngine):
     async def ask_wellness(self, request):

@@ -63,6 +63,7 @@ from healthmes.decision.engine import (
     DecisionEngineClosedError,
     HealthMesDecisionEngine,
 )
+from healthmes.decision.execution import DecisionExecutionControl
 from healthmes.decision.finalizer import (
     DECISION_PAYLOAD_SCHEMA,
     DECISION_RECORD_SCHEMA,
@@ -214,6 +215,7 @@ __all__ = [
     "DecisionRecordSummaryCode",
     "DecisionEngineBusyError",
     "DecisionEngineClosedError",
+    "DecisionExecutionControl",
     "DecisionFinalizer",
     "DecisionIngress",
     "DecisionRequest",

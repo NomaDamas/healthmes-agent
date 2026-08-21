@@ -391,6 +391,36 @@ async def _close_decision_engine_durably(decision_engine) -> None:
         raise cancelled
 
 
+async def _close_decision_runtime_durably(
+    decision_service,
+    decision_engine,
+) -> None:
+    """Close the engine, then drain service-owned receipt completion."""
+
+    decision_service.begin_shutdown()
+    failures: list[BaseException] = []
+    cancelled: asyncio.CancelledError | None = None
+    for component in (decision_engine, decision_service):
+        if component is None:
+            continue
+        try:
+            await _close_decision_engine_durably(component)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except BaseException as exc:
+            failures.append(exc)
+
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup(
+            "HealthMes decision runtime shutdown failed",
+            failures,
+        )
+    if cancelled is not None:
+        raise cancelled
+
+
 def _initialize_activity_storage(
     session: Session,
     *,
@@ -630,6 +660,17 @@ def create_app(
     # it every /mcp request 500s).
     mcp_app = mcp_server.build_mcp_http_app()
 
+    def build_decision_service(app: FastAPI) -> HealthMesDecisionService:
+        return HealthMesDecisionService(
+            settings=settings,
+            engine_provider=lambda: app.state.decision_engine,
+            session_factory_provider=get_session_factory,
+            recovery_provider=(
+                lambda: app.state.decision_recovery_finalizer
+            ),
+            clock=decision_clock,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.scheduler = None
@@ -714,6 +755,26 @@ def create_app(
                         app.state.decision_recovery_finalizer = None
 
                 cleanup.push_async_callback(close_decision_recovery_finalizer)
+
+            decision_service = app.state.decision_service
+            if decision_service is None:
+                decision_service = build_decision_service(app)
+                app.state.decision_service = decision_service
+
+            decision_engine = None
+
+            async def close_decision_runtime() -> None:
+                try:
+                    await _close_decision_runtime_durably(
+                        decision_service,
+                        decision_engine,
+                    )
+                finally:
+                    app.state.decision_engine = None
+                    app.state.decision_service = None
+
+            cleanup.push_async_callback(close_decision_runtime)
+
             decision_engine = build_configured_decision_engine(
                 settings=settings,
                 session_factory=get_session_factory(),
@@ -723,22 +784,13 @@ def create_app(
                 clock=decision_clock,
             )
             app.state.decision_engine = decision_engine
-            if decision_engine is not None:
-
-                async def close_decision_engine() -> None:
-                    try:
-                        await _close_decision_engine_durably(decision_engine)
-                    finally:
-                        app.state.decision_engine = None
-
-                cleanup.push_async_callback(close_decision_engine)
 
             decision_alert_sender = None
             if decision_engine is not None:
                 decision_alert_sender = DecisionAlertSender(
                     settings,
                     bridge=DecisionServiceThreadBridge(
-                        service=app.state.decision_service,
+                        service=decision_service,
                         loop=asyncio.get_running_loop(),
                         timeout_seconds=(
                             settings.decision_timeout_seconds
@@ -816,13 +868,7 @@ def create_app(
     app.state.decision_clock = decision_clock
     app.state.decision_engine = None
     app.state.decision_recovery_finalizer = None
-    app.state.decision_service = HealthMesDecisionService(
-        settings=settings,
-        engine_provider=lambda: app.state.decision_engine,
-        session_factory_provider=get_session_factory,
-        recovery_provider=lambda: app.state.decision_recovery_finalizer,
-        clock=decision_clock,
-    )
+    app.state.decision_service = build_decision_service(app)
     app.state.scheduler = None
     app.state.decision_receipt_maintenance_task = None
     app.state.staging_reconciliation = None

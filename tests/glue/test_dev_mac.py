@@ -591,6 +591,48 @@ def _run_native_identity_helper(
     )
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(os, "fork"),
+    reason="requires Linux /proc zombie state",
+)
+def test_native_identity_treats_unreaped_linux_zombie_as_absent() -> None:
+    child_pid = os.fork()
+    if child_pid == 0:  # pragma: no cover - child exits immediately.
+        os._exit(0)
+
+    try:
+        stat_path = Path(f"/proc/{child_pid}/stat")
+        for _ in range(100):
+            payload = stat_path.read_text(encoding="utf-8")
+            closing_parenthesis = payload.rfind(")")
+            if payload[closing_parenthesis + 1 :].split()[0] == "Z":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("child did not enter zombie state")
+
+        captured = _run_native_identity_helper(
+            "capture",
+            str(child_pid),
+            check=False,
+        )
+        snapshot = _run_native_identity_helper(
+            "ps-snapshot",
+            "--ps-bin",
+            shutil.which("ps") or "/bin/ps",
+            "--pid",
+            str(child_pid),
+            "--timeout-seconds",
+            "1",
+            check=False,
+        )
+
+        assert captured.returncode == 3
+        assert snapshot.returncode == 3
+    finally:
+        os.waitpid(child_pid, 0)
+
+
 def _passthrough_shutdown_budget_helper(tmp_path: Path) -> Path:
     helper = tmp_path / "passthrough-shutdown-budget.py"
     _write_executable(

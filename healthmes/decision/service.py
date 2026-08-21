@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from threading import Lock
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import (
     AwareDatetime,
@@ -40,6 +40,8 @@ from healthmes.decision.contracts import (
     PersistenceStatus,
     PrivacyLevel,
 )
+from healthmes.decision.engine import DecisionEngineClosedError
+from healthmes.decision.execution import DecisionExecutionControl
 from healthmes.decision.finalizer import (
     decision_request_timezone_from_record,
 )
@@ -68,6 +70,13 @@ _DECISION_SERVICE_FINGERPRINT_CONTEXT = (
     b"healthmes-decision-service-request-fingerprint-v1\x00"
 )
 _MIN_FINGERPRINT_KEY_BYTES = 32
+
+
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
 
 
 class DecisionRuntimeNotConfiguredError(RuntimeError):
@@ -176,6 +185,12 @@ class DecisionEngine(Protocol):
         request: DecisionRequest,
     ) -> DecisionResult: ...
 
+    async def ask_wellness_with_control(
+        self,
+        request: DecisionRequest,
+        execution_control: DecisionExecutionControl,
+    ) -> DecisionResult: ...
+
     async def replay_persisted_decision(
         self,
         request: DecisionRequest,
@@ -206,11 +221,16 @@ class DecisionService(Protocol):
         request_id: uuid.UUID,
     ) -> DecisionResult: ...
 
+    def begin_shutdown(self) -> None: ...
+
+    async def aclose(self) -> None: ...
+
 
 @dataclass(slots=True)
 class _ActiveDecision:
     fingerprint: str
     task: asyncio.Task[_IdempotentExecution]
+    execution_control: DecisionExecutionControl | None = None
     waiters: int = 0
 
 
@@ -278,6 +298,13 @@ class HealthMesDecisionService:
             uuid.UUID,
             _ActiveDecision,
         ] = {}
+        self._service_tasks: set[
+            asyncio.Task[_IdempotentExecution]
+        ] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._closing = False
+        self._closed = False
 
     def build_request(
         self,
@@ -329,6 +356,8 @@ class HealthMesDecisionService:
                 "submission must be a DecisionServiceRequest"
             )
         if submission.request_id is None:
+            with self._idempotency_lock:
+                self._ensure_accepting_locked()
             return await self._execute(submission)
 
         request_id = submission.request_id
@@ -341,6 +370,8 @@ class HealthMesDecisionService:
         )
         loop = asyncio.get_running_loop()
         with self._idempotency_lock:
+            self._ensure_accepting_locked()
+            self._bind_active_loop_locked(loop)
             active = self._active_idempotent_requests.get(request_id)
             if active is not None:
                 _require_matching_idempotency_fingerprint(
@@ -373,6 +404,8 @@ class HealthMesDecisionService:
                         task=task,
                     )
                 )
+                self._loop = loop
+                self._service_tasks.add(task)
                 task.add_done_callback(
                     lambda done: self._finish_idempotent_request(
                         request_id,
@@ -404,12 +437,18 @@ class HealthMesDecisionService:
                         and not task.done()
                     )
                     if cancel_orphaned_task:
-                        self._active_idempotent_requests.pop(
-                            request_id,
-                            None,
-                        )
-            if cancel_orphaned_task:
-                task.cancel()
+                        execution_control = active.execution_control
+                        if execution_control is None:
+                            task.cancel()
+                        else:
+                            cancel_orphaned_task = (
+                                execution_control.cancel_reasoning(task)
+                            )
+                        if cancel_orphaned_task:
+                            self._active_idempotent_requests.pop(
+                                request_id,
+                                None,
+                            )
 
     async def recover_wellness(
         self,
@@ -419,6 +458,8 @@ class HealthMesDecisionService:
 
         if not isinstance(request_id, uuid.UUID):
             raise TypeError("request_id must be a UUID")
+        with self._idempotency_lock:
+            self._ensure_accepting_locked()
         current = _as_utc(self._clock())
         with self._session_factory_provider()() as session:
             identity = session.scalar(
@@ -475,6 +516,8 @@ class HealthMesDecisionService:
     async def _execute(
         self,
         submission: DecisionServiceRequest,
+        *,
+        execution_control: DecisionExecutionControl | None = None,
     ) -> DecisionResult:
         request = self.build_request(submission)
         engine = self._engine_provider()
@@ -482,7 +525,20 @@ class HealthMesDecisionService:
             raise DecisionRuntimeNotConfiguredError(
                 "HealthMes decision runtime is not configured"
             )
-        result = await engine.ask_wellness(request)
+        controlled_ask = getattr(
+            engine,
+            "ask_wellness_with_control",
+            None,
+        )
+        if execution_control is not None and callable(controlled_ask):
+            result = await controlled_ask(request, execution_control)
+        else:
+            if (
+                execution_control is not None
+                and not execution_control.begin_finalization()
+            ):
+                raise asyncio.CancelledError
+            result = await engine.ask_wellness(request)
         if not isinstance(result, DecisionResult):
             raise TypeError("decision engine must return DecisionResult")
         return result
@@ -496,6 +552,8 @@ class HealthMesDecisionService:
     ) -> _IdempotentExecution:
         request_id = submission.request_id
         assert request_id is not None
+        service_task = asyncio.current_task()
+        assert service_task is not None
         owner_token = uuid.uuid4()
         store = self._get_receipt_store()
         requested_at = _as_utc(
@@ -542,8 +600,21 @@ class HealthMesDecisionService:
             frozen_submission = submission.model_copy(
                 update={"requested_at": requested_at}
             )
+            execution_control = DecisionExecutionControl()
             try:
-                result = await self._execute(frozen_submission)
+                if not self._install_execution_control(
+                    request_id=request_id,
+                    fingerprint=fingerprint,
+                    task=service_task,
+                    execution_control=execution_control,
+                ):
+                    raise asyncio.CancelledError
+                result = await self._execute(
+                    frozen_submission,
+                    execution_control=execution_control,
+                )
+                if not execution_control.begin_finalization():
+                    raise asyncio.CancelledError
                 if not _is_terminal_non_retryable(result):
                     await _run_receipt_cleanup(
                         store.release,
@@ -571,6 +642,14 @@ class HealthMesDecisionService:
                         now=self._clock(),
                     )
                 except DecisionReceiptOwnershipError:
+                    execution_control = DecisionExecutionControl()
+                    if not self._install_execution_control(
+                        request_id=request_id,
+                        fingerprint=fingerprint,
+                        task=service_task,
+                        execution_control=execution_control,
+                    ):
+                        raise asyncio.CancelledError
                     canonical = await self._converge_after_lease_loss(
                         store,
                         submission=submission,
@@ -614,6 +693,30 @@ class HealthMesDecisionService:
                     now=self._clock(),
                 )
                 raise
+
+    def _install_execution_control(
+        self,
+        *,
+        request_id: uuid.UUID,
+        fingerprint: str,
+        task: asyncio.Task[_IdempotentExecution],
+        execution_control: DecisionExecutionControl,
+    ) -> bool:
+        """Publish the current lease attempt's cancellation boundary."""
+
+        with self._idempotency_lock:
+            active = self._active_idempotent_requests.get(request_id)
+            if (
+                active is None
+                or active.task is not task
+                or active.fingerprint != fingerprint
+            ):
+                return False
+            active.execution_control = execution_control
+            if active.waiters > 0:
+                return True
+            self._active_idempotent_requests.pop(request_id, None)
+            return False
 
     async def _converge_after_lease_loss(
         self,
@@ -798,6 +901,7 @@ class HealthMesDecisionService:
             execution = task.result()
         except BaseException:
             with self._idempotency_lock:
+                self._service_tasks.discard(task)
                 active = self._active_idempotent_requests.get(
                     request_id
                 )
@@ -809,11 +913,84 @@ class HealthMesDecisionService:
             return
 
         with self._idempotency_lock:
+            self._service_tasks.discard(task)
             active = self._active_idempotent_requests.get(request_id)
             if active is None or active.task is not task:
                 return
             self._active_idempotent_requests.pop(request_id, None)
             del execution, fingerprint
+
+    def _ensure_accepting_locked(self) -> None:
+        if self._closing or self._closed:
+            raise DecisionEngineClosedError(
+                "HealthMes decision service is closing"
+            )
+
+    def _bind_active_loop_locked(
+        self,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Keep concurrently active receipt work on one event loop."""
+
+        completed = {
+            task for task in self._service_tasks if task.done()
+        }
+        self._service_tasks.difference_update(completed)
+        if (
+            self._service_tasks
+            and self._loop is not None
+            and self._loop is not loop
+        ):
+            raise RuntimeError(
+                "active HealthMes decision requests belong to another "
+                "event loop"
+            )
+        self._loop = loop
+
+    def begin_shutdown(self) -> None:
+        """Reject new work before the engine begins its bounded drain."""
+
+        with self._idempotency_lock:
+            self._closing = True
+
+    async def aclose(self) -> None:
+        """Drain service-owned receipt work after engine shutdown."""
+
+        loop = asyncio.get_running_loop()
+        with self._idempotency_lock:
+            shutdown_task = self._shutdown_task
+            if shutdown_task is None:
+                self._bind_active_loop_locked(loop)
+                self._closing = True
+                shutdown_task = loop.create_task(
+                    self._shutdown(),
+                    name="healthmes-decision-service-shutdown",
+                )
+                shutdown_task.add_done_callback(_consume_task_result)
+                self._shutdown_task = shutdown_task
+            elif (
+                not shutdown_task.done()
+                and shutdown_task.get_loop() is not loop
+            ):
+                raise RuntimeError(
+                    "HealthMes decision service shutdown belongs to another "
+                    "event loop"
+                )
+
+        if shutdown_task.done():
+            shutdown_task.result()
+            return
+        await asyncio.shield(shutdown_task)
+
+    async def _shutdown(self) -> None:
+        with self._idempotency_lock:
+            active = tuple(self._service_tasks)
+        try:
+            if active:
+                await asyncio.wait(active)
+        finally:
+            with self._idempotency_lock:
+                self._closed = True
 
 
 class DecisionChannelAdapter:

@@ -143,6 +143,7 @@ def _linux_start_token(pid: int) -> str | None:
     closing_parenthesis = payload.rfind(")")
     fields = payload[closing_parenthesis + 1 :].split()
     try:
+        process_state = fields[0]
         start_ticks = int(fields[19])
     except (IndexError, ValueError) as exc:
         raise _IdentityUnavailable(
@@ -152,7 +153,32 @@ def _linux_start_token(pid: int) -> str | None:
         raise _IdentityUnavailable(
             "native_identity_linux_proc_invalid"
         )
+    # A zombie has no live process to manage. Linux still exposes its PID and
+    # start time until the parent reaps it, so treating the token as live makes
+    # kill -0 based probes spin until their timeout.
+    if process_state == "Z":
+        return None
     return f"linux:{start_ticks}"
+
+
+def _linux_process_is_zombie(pid: int) -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        payload = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_linux_proc_unreadable"
+        ) from exc
+    closing_parenthesis = payload.rfind(")")
+    fields = payload[closing_parenthesis + 1 :].split()
+    if closing_parenthesis < 1 or not fields:
+        raise _IdentityUnavailable(
+            "native_identity_linux_proc_invalid"
+        )
+    return fields[0] == "Z"
 
 
 def _darwin_start_token(pid: int) -> str | None:
@@ -566,6 +592,8 @@ def _bounded_ps_value(
         raise _IdentityUnavailable(
             "native_identity_ps_output_invalid"
         )
+    if _linux_process_is_zombie(pid):
+        raise _ProcessAbsent("native_identity_ps_process_absent")
     return output
 
 

@@ -41,6 +41,7 @@ from healthmes.app import (
     create_app,
 )
 from healthmes.config import Settings
+from healthmes.decision import HealthMesDecisionService
 from healthmes.engine.scheduler import (
     ACTIVITYWATCH_JOB_ID,
     BACKUP_JOB_ID,
@@ -243,6 +244,52 @@ class TestStoreWiring:
         # Shutdown disposes the process-wide engine singleton.
         assert store_session._engine is None
         assert store_session._session_factory is None
+
+    def test_reentering_same_app_builds_fresh_decision_service(
+        self,
+        settings,
+    ) -> None:
+        """Each lifespan owns a service that is not reused after shutdown."""
+
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            first = app.state.decision_service
+            assert isinstance(first, HealthMesDecisionService)
+            first_response = client.post(
+                "/v1/wellness-decisions",
+                headers={"Idempotency-Key": "first-lifespan"},
+                json={"question": "Should I take a break?"},
+            )
+
+        assert app.state.decision_service is None
+
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            second = app.state.decision_service
+            assert isinstance(second, HealthMesDecisionService)
+            assert second is not first
+            second_response = client.post(
+                "/v1/wellness-decisions",
+                headers={"Idempotency-Key": "second-lifespan"},
+                json={"question": "Should I take a break?"},
+            )
+
+        assert app.state.decision_service is None
+        assert first_response.status_code == 503
+        assert second_response.status_code == 503
+        assert first_response.json()["error"]["code"] == (
+            "decision_runtime_not_configured"
+        )
+        assert second_response.json()["error"]["code"] == (
+            "decision_runtime_not_configured"
+        )
 
     def test_file_sqlite_lifespan_holds_runtime_restore_lock(
         self,
@@ -649,6 +696,109 @@ class TestStoreWiring:
         assert observed == ["mcp_enter", "decision", "mcp_exit"]
         assert app.state.decision_engine is None
         assert app.state.scheduler is None
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    async def test_lifespan_drains_service_receipt_work_after_engine(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """DB and MCP outlive receipt completion retained by the service."""
+        import healthmes.app as app_module
+
+        entered = asyncio.Event()
+        hold_lifespan = asyncio.Event()
+        observed: list[str] = []
+
+        class StubMcpApp:
+            @asynccontextmanager
+            async def lifespan(
+                self,
+                _app,
+            ) -> AsyncIterator[None]:
+                observed.append("mcp_enter")
+                try:
+                    yield
+                finally:
+                    assert decision_service.finished.is_set()
+                    assert store_session._engine is not None
+                    observed.append("mcp_exit")
+
+            async def __call__(self, _scope, _receive, _send) -> None:
+                raise AssertionError("MCP request dispatch was not expected")
+
+        class StubDecisionEngine:
+            def __init__(self) -> None:
+                self.closed = asyncio.Event()
+
+            async def aclose(self) -> None:
+                self.closed.set()
+                observed.append("engine")
+
+        class BlockingDecisionService:
+            def __init__(self) -> None:
+                self.closing = False
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.finished = asyncio.Event()
+
+            def begin_shutdown(self) -> None:
+                self.closing = True
+
+            async def aclose(self) -> None:
+                assert self.closing is True
+                assert decision_engine.closed.is_set()
+                assert store_session._engine is not None
+                assert mcp_server._settings_override is settings
+                self.started.set()
+                await self.release.wait()
+                self.finished.set()
+                observed.append("service")
+
+        decision_engine = StubDecisionEngine()
+        decision_service = BlockingDecisionService()
+        monkeypatch.setattr(
+            app_module.mcp_server,
+            "build_mcp_http_app",
+            lambda: StubMcpApp(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            lambda **_kwargs: decision_engine,
+        )
+
+        app = create_app(settings)
+        app.state.decision_service = decision_service
+
+        async def run_lifespan() -> None:
+            async with app.router.lifespan_context(app):
+                entered.set()
+                await hold_lifespan.wait()
+
+        lifespan_task = asyncio.create_task(run_lifespan())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        lifespan_task.cancel()
+        await asyncio.wait_for(decision_service.started.wait(), timeout=1)
+
+        assert lifespan_task.done() is False
+        assert store_session._engine is not None
+        assert mcp_server._settings_override is settings
+        assert observed == ["mcp_enter", "engine"]
+
+        decision_service.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await lifespan_task
+
+        assert observed == [
+            "mcp_enter",
+            "engine",
+            "service",
+            "mcp_exit",
+        ]
+        assert app.state.decision_engine is None
         assert mcp_server._settings_override is None
         assert store_session._engine is None
         assert store_session._session_factory is None
