@@ -355,7 +355,10 @@ def test_postgres_guard_supplied_engine_checkout_cannot_exceed_deadline(
     source = sa.create_engine(
         "postgresql+psycopg://healthmes@example/healthmes"
     )
+    release_connection = threading.Event()
     late_connection_closed = threading.Event()
+    connect_calls = 0
+    clock_reads = 0
 
     class FakeConnection:
         closed = False
@@ -375,12 +378,21 @@ def test_postgres_guard_supplied_engine_checkout_cannot_exceed_deadline(
     late_connection = FakeConnection()
 
     def slow_connect():
-        time.sleep(0.08)
+        nonlocal connect_calls
+        connect_calls += 1
+        assert release_connection.wait(timeout=5)
         return late_connection
 
-    monkeypatch.setattr(source, "connect", slow_connect)
+    def deadline_clock() -> float:
+        nonlocal clock_reads
+        clock_reads += 1
+        if clock_reads >= 3:
+            return 100.02
+        return 100.0
 
-    started = time.monotonic()
+    monkeypatch.setattr(source, "connect", slow_connect)
+    monkeypatch.setattr(locking_module, "steady_time", deadline_clock)
+
     try:
         with pytest.raises(
             TimeoutError,
@@ -393,10 +405,11 @@ def test_postgres_guard_supplied_engine_checkout_cannot_exceed_deadline(
             ):
                 pytest.fail("slow checkout unexpectedly entered the guard")
     finally:
+        release_connection.set()
         source.dispose()
 
-    assert time.monotonic() - started < 0.15
     assert late_connection_closed.wait(timeout=1)
+    assert connect_calls == 1
 
 
 def test_postgres_checkout_timeouts_bound_live_workers() -> None:
