@@ -281,6 +281,11 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
             ).split()
             if str(pid) in absent_pids:
                 return "gone"
+            virtual_pids = os.environ.get(
+                "FAKE_VIRTUAL_PIDS", ""
+            ).split()
+            if str(pid) in virtual_pids:
+                return "live"
             return None
 
         def harness_existence_state(pid: int) -> str:
@@ -578,6 +583,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
             scripts / "runtime_native_identity.py"
         ),
         "FAKE_ABSENT_PIDS": "999998 999999",
+        "FAKE_VIRTUAL_PIDS": "999998 999999",
         "FAKE_SUPERVISOR_STATE": str(supervisor_state),
         "FAKE_STOP_BUDGET": str(
             runtime / "hermes-decision-stop-budget"
@@ -4129,7 +4135,9 @@ def test_generic_start_recovers_live_identity_after_ps_is_unknown(
     runtime = Path(harness["runtime"])
     fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
     real_sleep = shutil.which("sleep")
+    real_ps = shutil.which("ps")
     assert real_sleep is not None
+    assert real_ps is not None
     _install_generic_start_case(
         harness,
         service_name=service_name,
@@ -4171,7 +4179,10 @@ def test_generic_start_recovers_live_identity_after_ps_is_unknown(
         fi
         /bin/kill -0 "$requested_pid" 2>/dev/null || exit 1
         case "$field" in
-        pid= | pgid=) printf '%s\\n' "$requested_pid" ;;
+        pid=) printf '%s\\n' "$requested_pid" ;;
+        pgid=)
+            "$FAKE_GENERIC_REAL_PS" -p "$requested_pid" -o pgid=
+            ;;
         comm=) printf '/bin/bash\\n' ;;
         lstart=) printf 'Mon Aug 17 12:00:00 2026\\n' ;;
         command=)
@@ -4191,6 +4202,7 @@ def test_generic_start_recovers_live_identity_after_ps_is_unknown(
         "HEALTHMES_SLEEP_BIN": real_sleep,
         "FAKE_GENERIC_PS_MODE": mode,
         "FAKE_GENERIC_PS_FAILURE_MARKER": str(failure_marker),
+        "FAKE_GENERIC_REAL_PS": real_ps,
         "FAKE_LOCAL_SCRIPT": str(harness["local_script"]),
     }
     try:
