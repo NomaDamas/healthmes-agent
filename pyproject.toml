@@ -76,7 +76,7 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# vendor/ is read-only upstream reference code with its own lint configs.
+# vendor/ has its own lint configurations and targeted validation commands.
 extend-exclude = ["vendor"]
 
 [tool.ruff.lint]

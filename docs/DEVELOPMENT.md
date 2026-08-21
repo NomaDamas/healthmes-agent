@@ -1,11 +1,11 @@
 # Development Guide
 
-HealthMes Agent glue code lives at the repo root (`healthmes/`, `config/`,
-`scripts/`, `skills/`, `tests/`). `vendor/` contains read-only upstream
-snapshots (`hermes-agent`, `open-wearables`) — **never modify anything under
-`vendor/`**; all integration happens via config rendered outside the vendor
-trees, the root `Makefile`/`scripts/`, and the root `docker-compose.yml`.
-Architecture: `docs/PLAN.md`.
+HealthMes Agent glue code normally lives at the repo root (`healthmes/`,
+`config/`, `scripts/`, `skills/`, `tests/`). `vendor/` contains pinned
+upstream snapshots (`hermes-agent`, `open-wearables`). Prefer public extension
+points and root-level glue, but a minimal vendor source patch is allowed when
+those cannot safely implement the requirement. Normal setup and runtime never
+write vendor source or lockfiles. Architecture: `docs/PLAN.md`.
 
 There are two run paths. **Mac-native is the primary one** (this stack is
 developed and run directly on macOS); docker compose is the alternative for
@@ -19,6 +19,38 @@ a full one-command stack.
   toolchain on demand.
 - Homebrew (mac-native path — installs `postgresql@16` + `redis` on demand)
 - Docker + Docker Compose v2.24+ (only for the compose path)
+
+## Vendor patches
+
+The purpose of the vendor policy is to keep upstream updates manageable, not
+to make necessary work impossible.
+
+1. **Use an extension point first.** Prefer MCP, REST, webhooks,
+   configuration, skills, plugins, and root-level glue. Do not patch a vendor
+   just to place a HealthMes-specific policy or orchestration rule there.
+2. **Patch when required.** If the upstream implementation lacks a required
+   capability or has a defect that cannot be safely handled at the boundary,
+   make the smallest source change in a dedicated task worktree.
+3. **Separate the history.** Put the vendor source change and its
+   upstream-side tests in their own `vendor(ow): ...` or
+   `vendor(hermes): ...` commit. Keep HealthMes glue, root tests, dependency
+   updates, and product documentation in separate commits, even when they are
+   reviewed in the same PR.
+4. **Make it maintainable.** The vendor commit or PR description must explain
+   the missing extension point, why a root-level solution is insufficient, the
+   upstream base revision, the expected upstream outcome, and the tests run.
+   Preserve the upstream license notices and avoid unrelated formatting or
+   upgrades.
+5. **Return reusable work upstream.** Open and link an upstream PR for a
+   generally useful change. An urgent or HealthMes-specific patch may land
+   first, but document why upstream work is pending or not applicable.
+6. **Test both sides of the boundary.** Add the relevant vendor regression
+   test and, when HealthMes depends on the changed behavior, a HealthMes
+   contract or integration test.
+
+`scripts/vendor_sync_check.sh` is a read-only report for reconciling a pinned
+vendor tree with a fresh upstream checkout. It does not treat a documented
+local patch as an error.
 
 ## Mac-native quickstart (primary)
 
@@ -742,7 +774,7 @@ skills/               hermes skills (copied into HERMES_HOME by bootstrap):
                       healthmes-stress, doctor-visit-summary
 tests/                pytest suite (network-free)
 data/                 runtime state (gitignored): pg, redis, sqlite, media, hermes home
-vendor/               read-only upstreams - do not touch
+vendor/               pinned upstream snapshots; patches follow the vendor policy
 ```
 
 ## Conventions
@@ -808,10 +840,9 @@ support `workflow_dispatch`; nothing is ever signed):
 
 ## Vendor upstream sync drill
 
-`vendor/` holds read-only snapshots of the two upstreams; nothing under it
-is ever hand-edited. Upstream sync therefore means **replacing a vendor tree
-wholesale in a dedicated commit** — and before doing that, run the dry-run
-drift report (docs/PLAN.md §10 Phase 3):
+`vendor/` holds pinned upstream snapshots and may contain explicitly reviewed
+local patch commits. Before an upstream update, run the dry-run report to see
+the exact source differences (docs/PLAN.md §10 Phase 3):
 
 ```bash
 # 1. Get a fresh upstream checkout anywhere outside the repo:
@@ -822,16 +853,21 @@ scripts/vendor_sync_check.sh open-wearables /tmp/ow-upstream
 scripts/vendor_sync_check.sh --list          # names under vendor/
 ```
 
-The report classifies every path as **changed** (sync would replace),
+The report classifies every path as **changed** (an update would replace),
 **only in vendor/** (sync would delete) or **only upstream** (sync would
 add), ignoring VCS internals and derived artifacts (`.git`, `__pycache__`,
 `node_modules`, virtualenvs, caches). Exit codes: `0` in sync, `1` drift
 found, `2` usage error — so the drill is scriptable.
 
+Classify each difference before updating: an intentional local patch should
+be reapplied, replaced by the upstream equivalent, or removed with its
+HealthMes caller in the same reviewed change. Do not overwrite it blindly.
+
 When drift touches the coupling surface (docs/PLAN.md §11 — the
 open-wearables REST v1 routes + MCP tool names, and the Hermes
 config/skill/cron/webhook contracts), review the glue that pins it before
-syncing: `healthmes/mcp_server/`, `healthmes/engine/webhook.py`,
+updating: `healthmes/mcp_server/`, `healthmes/engine/webhook.py`,
 `config/hermes-config.yaml.tmpl`, `scripts/bootstrap.py` and their tests.
-After replacing the tree, re-run `uv run pytest -q` and
+After updating the tree, run the affected vendor tests, then re-run
+`uv run pytest -q` and
 `docker compose config -q` (CI runs both on the PR).

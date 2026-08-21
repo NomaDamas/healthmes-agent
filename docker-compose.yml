@@ -8,9 +8,10 @@
 # Service definitions for the vendored upstreams are grounded in
 # vendor/open-wearables/docker-compose.yml and vendor/hermes-agent/docker-compose.yml
 # (images, build contexts, commands, and env names reused verbatim where possible).
-# vendor/ is never modified: open-wearables config lives in ./config/open-wearables.env
-# (compose-injected env vars take precedence over the image's config/.env lookup),
-# and the Hermes home directory is a bind mount at ./data/hermes.
+# Compose never writes vendor source: open-wearables config lives in
+# ./config/open-wearables.env (compose-injected env vars take precedence over
+# the image's config/.env lookup), and the Hermes home directory is a bind
+# mount at ./data/hermes.
 #
 # Quick start:
 #   cp .env.example .env                                  # fill in tokens/keys
@@ -210,7 +211,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./data/hermes:/opt/data
-      # Read-only vendor MCP server for the stdio `mcp_servers` entry rendered
+      # Read-only container mount of the vendor MCP server for the stdio
+      # `mcp_servers` entry rendered
       # from config/hermes-config.yaml.tmpl (uv is on PATH in this image; the
       # venv is redirected to $HERMES_HOME via UV_PROJECT_ENVIRONMENT).
       - ./vendor/open-wearables/mcp:/opt/vendor/open-wearables-mcp:ro

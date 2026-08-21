@@ -3,7 +3,7 @@
 
 ## Context
 
-HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개인 비서**를 목표로 하는 오픈소스 프로젝트다. 현재 레포는 README + 두 개의 vendored 업스트림만 있는 day-zero 스캐폴드이며 글루 코드는 0줄이다.
+HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개인 비서**를 목표로 하는 소스 공개(source-available) 프로젝트다. 현재 레포는 README + 두 개의 vendored 업스트림만 있는 day-zero 스캐폴드이며 글루 코드는 0줄이다.
 
 - `vendor/hermes-agent/` — 성숙한 에이전트 런타임: 스킬 시스템, 메모리, 크론 스케줄러, 멀티채널 게이트웨이(Telegram 내장), MCP 클라이언트 지원
 - `vendor/open-wearables/` — 웨어러블 데이터 플랫폼: 11개 프로바이더(Garmin/Oura/Fitbit/Whoop/Polar/Suunto/Ultrahuman/Strava/Apple/Google/Samsung), 스트레스·수면·HRV 점수, FastAPI+Postgres, **자체 MCP 서버**(`mcp/`)
@@ -12,13 +12,13 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
 
 **사용자 결정사항:** 웨어러블 11개 전부 지원 / Google Calendar + Apple Calendar(iCloud CalDAV) 둘 다 / 의료 라이트 간단 버전 포함 / LLM은 클라우드 API(Claude), 최소 컨텍스트만 전송
 
-## 1. 전체 아키텍처 — 3개 플레인, 벤더 코드 무수정
+## 1. 전체 아키텍처 — 3개 플레인, 벤더 경계와 규율 있는 패치
 
 **원칙 (2026-07-16 개정): `vendor/`는 "기본 무수정 + 필요 시 규율 있는 수정".** 모든 글루는 레포 루트의 `healthmes/` 패키지에 산다. 벤더를 신성불가침으로 두는 게 아니라, 업스트림 업데이트를 계속 받기 위한 **우선순위 규칙**이다:
 
-1. **확장점 먼저** — 플러그인·스킬·MCP·설정·글루로 해결 가능하면 벤더를 건드리지 않는다 (지금까지 전 기능이 이 방식으로 충분했다).
-2. **불가능하면 벤더 수정 허용** — 단 ⑴ `vendor(hermes):`/`vendor(ow):` prefix의 **분리 커밋**으로, ⑵ 커밋 메시지에 왜 확장점으로 안 됐는지 기록, ⑶ 업스트림 pull 시 재적용 가능하도록 최소 diff.
-3. **범용 가치가 있으면 업스트림 PR로 환원** — 우리 포크에만 쌓지 말 것 (오픈소스 선순환, 공모전 §기대효과의 실증이기도 함).
+1. **확장점 먼저** — 플러그인·스킬·MCP·설정·글루로 해결 가능하면 벤더를 건드리지 않는다. HealthMes 고유의 정책·오케스트레이션은 벤더에 넣지 않는다.
+2. **불가능하면 벤더 수정 허용** — `vendor(hermes):`/`vendor(ow):` prefix의 **분리 커밋**으로, 왜 확장점으로 해결할 수 없는지·어느 업스트림 기준점에서 갈라졌는지·무엇을 검증했는지를 남기고, 업스트림 pull 때 재적용 가능한 최소 diff로 유지한다. 해당 벤더의 회귀 테스트와 HealthMes 경계 테스트를 함께 둔다.
+3. **범용 가치가 있으면 업스트림 PR로 환원** — 우리 포크에만 쌓지 말 것 (오픈소스 선순환, 공모전 §기대효과의 실증이기도 함). 긴급하거나 HealthMes 고유인 패치는 먼저 반영할 수 있으나, PR에 업스트림 상태 또는 예외 사유를 기록한다.
 
 ```
 ┌────────────────── 사용자 접점 ──────────────────┐
@@ -60,7 +60,7 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
 
 ### 검증된 갭: 벤더 MCP는 5개 도구뿐
 
-`mcp/app/tools/` = get_users, get_activity_summary, get_sleep_summary, get_workout_events, get_timeseries. **REST에는 있지만 MCP에 없는 것: `/health-scores`(스트레스·body battery·readiness·내부 수면/회복탄력성 점수 전부!), `/summaries/recovery`, `/summaries/body`, `/events/sleep`의 hypnogram, 생리주기, 워크아웃 HR/파워 존.** 심지어 MCP `get_sleep_summary`는 REST가 주는 단계/효율/HRV/호흡/SpO2 필드를 **버리고** date/start/end/duration/source만 남긴다. 즉 벤더 MCP만으로는 에이전트가 스트레스 점수를 못 본다. 벤더 MCP 포크는 금지(업스트림 sync 부담) — HealthMes MCP에 아래 Layer B로 얹는다.
+`mcp/app/tools/` = get_users, get_activity_summary, get_sleep_summary, get_workout_events, get_timeseries. **REST에는 있지만 MCP에 없는 것: `/health-scores`(스트레스·body battery·readiness·내부 수면/회복탄력성 점수 전부!), `/summaries/recovery`, `/summaries/body`, `/events/sleep`의 hypnogram, 생리주기, 워크아웃 HR/파워 존.** 심지어 MCP `get_sleep_summary`는 REST가 주는 단계/효율/HRV/호흡/SpO2 필드를 **버리고** date/start/end/duration/source만 남긴다. 즉 벤더 MCP만으로는 에이전트가 스트레스 점수를 못 본다. 이 갭의 1차 해법은 MCP 포크가 아니라 HealthMes MCP의 아래 Layer B다. Layer B로 안전하게 해결할 수 없는 벤더 결함 또는 범용 기능 갭은 위의 규율 있는 패치 절차로 수정할 수 있다.
 
 ### Decision Agent와 도구 설계 원칙
 
@@ -100,7 +100,7 @@ HealthMes 코드와 계약이 강제한다. 상세 구조는
 [`WELLNESS-DATA-PLATFORM.ko.md`](WELLNESS-DATA-PLATFORM.ko.md)를 따른다.
 
 **오픈 앱 커스터마이징 해자:** HealthMes 엔진뿐 아니라 공식 앱의 기능과 UI 연결
-계약도 오픈소스로 제공한다. iOS·Android·데스크톱·웹 앱은 교체 불가능한 단일
+계약도 소스 공개로 제공한다. iOS·Android·데스크톱·웹 앱은 교체 불가능한 단일
 클라이언트가 아니라 참조 구현이며, 개인과 조직은 화면·알림·승인 workflow·입력
 adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든 커스텀 앱은 같은
 저장소, 권한, provenance, retention, MCP/Skill 계약을 사용해야 하며 안전 경계는
@@ -171,7 +171,7 @@ score = 100
 
 ## 4. 선제적 Alert 루프
 
-**MVP 채널: Telegram 단일.** 폰+워치(Apple Watch/Wear OS 알림 미러링, 음성 빠른답장) 모두 커버, 접근성 좋음, Hermes 게이트웨이가 alert→응답→인터랙티브 세션 수명주기를 공짜로 제공. 벤더 코드 무수정으로 두 메커니즘:
+**MVP 채널: Telegram 단일.** 폰+워치(Apple Watch/Wear OS 알림 미러링, 음성 빠른답장) 모두 커버, 접근성 좋음, Hermes 게이트웨이가 alert→응답→인터랙티브 세션 수명주기를 공짜로 제공. 초기 통합은 벤더 코드 변경 없이 다음 두 메커니즘으로 구현한다:
 
 1. **이벤트 구동 ("에이전트가 먼저 알림"):** `healthmes/engine/triggers.py`(APScheduler 10분 주기)가 결정론적 룰 평가 — 스트레스 스파이크 vs baseline, 낮은 body battery + 무거운 오후 일정, 외부 캘린더 변경이 기존 계획과 충돌, 데드라인 위험. 발화 시 → HMAC 서명 POST → Hermes 웹훅 route(`prompt` 템플릿 + `skills: [healthmes-planner]` + `deliver: telegram`) → 에이전트가 양쪽 MCP로 근거 조회 → `record_decision` 호출 → Telegram push → 사용자 응답 시 일반 게이트웨이 세션으로 Q&A. 중복 방지: `trigger_event.dedup_key`.
 2. **시간 구동 브리핑:** Hermes cron(`cron/jobs.py::create_job`, `scripts/bootstrap.py`가 등록) — 아침 플랜(07:00, "오늘 일정을 에너지 예보 기반으로 배치 제안"), 저녁 리뷰(21:30), 주간 계획(일요일). `script:` 컨텍스트 주입으로 상태 스냅샷 JSON을 프롬프트에 선주입해 도구 왕복 절약.
@@ -317,7 +317,7 @@ worktree 격리의 상세 계약은
 Phase 0–3 완료 이후의 확장 단계. issue #7(컴패니언 앱 글랜스 표면)이 Phase 5–7의
 사전 실기기 작업 범위를 정의했고(feat/phase5-7-glance-vault에서 서버/앱 플럼빙 구현),
 issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)이 Phase 5를 실앱
-수준으로 확장했다(feat/native-apps-desktop). **원칙 유지: vendor 무수정, 로컬 first,
+수준으로 확장했다(feat/native-apps-desktop). **원칙 유지: 확장점 우선, 필요 시 규율 있는 vendor 패치, 로컬 first,
 알림 문법(§8.5)이 디자인 시스템, 워치 알림 UX 최종 설계는 헬스케어 도메인 전문가 몫.**
 
 **Phase 4 — 실사용 안정화 (전부 남음 — 실기기·실크리덴셜 필요)**
