@@ -617,11 +617,11 @@ resolve_native_identity_python() {
     if [ -n "$NATIVE_IDENTITY_PYTHON_BIN" ]; then
         [ -x "$NATIVE_IDENTITY_PYTHON_BIN" ] || return 1
         printf '%s\n' "$NATIVE_IDENTITY_PYTHON_BIN"
-        return
+        return 0
     fi
     if [ -x "$RUNTIME_PYTHON_BIN" ]; then
         printf '%s\n' "$RUNTIME_PYTHON_BIN"
-        return
+        return 0
     fi
     command -v python3 2>/dev/null || return 1
 }

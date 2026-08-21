@@ -5,6 +5,7 @@ the read-only vendor tree are pinned here as text/syntax assertions.
 """
 
 import hashlib
+import importlib.util
 import os
 import plistlib
 import re
@@ -589,6 +590,52 @@ def _run_native_identity_helper(
         capture_output=True,
         text=True,
     )
+
+
+def test_native_identity_snapshot_rechecks_linux_zombie_after_collection(
+    monkeypatch,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "healthmes_test_runtime_native_identity",
+        NATIVE_IDENTITY_HELPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    zombie_states = iter((False, True))
+    collected_fields: list[str] = []
+
+    monkeypatch.setattr(
+        module,
+        "_linux_process_is_zombie",
+        lambda _pid: next(zombie_states),
+    )
+
+    def collect_field(**arguments) -> str:
+        field = arguments["field"]
+        collected_fields.append(field)
+        return field
+
+    monkeypatch.setattr(module, "_bounded_ps_value", collect_field)
+
+    with pytest.raises(
+        module._ProcessAbsent,
+        match="native_identity_ps_process_absent",
+    ):
+        module._bounded_ps_snapshot(
+            ps_bin="/unused/ps",
+            pid=os.getpid(),
+            timeout_seconds=1,
+        )
+
+    assert collected_fields == [
+        "pid",
+        "pgid",
+        "comm",
+        "lstart",
+        "command",
+    ]
 
 
 @pytest.mark.skipif(

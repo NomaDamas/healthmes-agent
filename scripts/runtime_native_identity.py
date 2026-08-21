@@ -758,6 +758,8 @@ def _bounded_ps_snapshot(
         raise _IdentityUnavailable(
             "native_identity_ps_probe_arguments_invalid"
         )
+    if _linux_process_is_zombie(pid):
+        raise _ProcessAbsent("native_identity_ps_process_absent")
     deadline = time.monotonic() + timeout_seconds
     values: list[str] = []
     for field in ("pid", "pgid", "comm", "lstart", "command"):
@@ -774,6 +776,8 @@ def _bounded_ps_snapshot(
                 timeout_seconds=remaining,
             )
         )
+    if _linux_process_is_zombie(pid):
+        raise _ProcessAbsent("native_identity_ps_process_absent")
     return (
         values[0],
         values[1],

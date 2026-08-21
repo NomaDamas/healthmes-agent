@@ -1510,23 +1510,34 @@ def test_staging_hash_stops_at_deadline_without_publishing(
         )
         session.commit()
 
+    now = [0.0]
+    monkeypatch.setattr(
+        staging_service.time,
+        "monotonic",
+        lambda: now[0],
+    )
     real_read = staging_service.os.read
     payload_reads = 0
 
-    def slow_read(descriptor, size):
+    def deadline_advancing_read(descriptor, size):
         nonlocal payload_reads
+        chunk = real_read(descriptor, size)
         if size == 1024 * 1024:
             payload_reads += 1
-            time.sleep(0.03)
-        return real_read(descriptor, size)
+            now[0] = 2.0
+        return chunk
 
-    monkeypatch.setattr(staging_service.os, "read", slow_read)
+    monkeypatch.setattr(
+        staging_service.os,
+        "read",
+        deadline_advancing_read,
+    )
 
     report = reconcile_staging_files(
         engine,
         settings,
         max_entries=1,
-        max_seconds=0.02,
+        max_seconds=1,
     )
 
     assert report.restored == 0
