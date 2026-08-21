@@ -21,17 +21,40 @@ These rules apply to the entire repository.
 - If another task changes the same file, stop and resolve ownership before
   continuing. Never overwrite or revert the other task's changes.
 
-## Hermes Boundary
+## Vendor Boundary
 
-- `vendor/hermes-agent/` is read-only from HealthMes tasks.
-- Hermes development must happen in its own repository, branch, and worktree.
-- HealthMes may depend only on documented Hermes contracts such as MCP,
-  webhook, configuration, skill, and delivery interfaces.
-- A required Hermes change must be proposed as a separate Hermes commit or PR.
-  Do not patch the vendored tree as part of a HealthMes branch.
+`vendor/hermes-agent/` and `vendor/open-wearables/` are pinned upstream
+snapshots, not immutable code. Prefer documented extension points first:
+MCP, REST, webhooks, configuration, skills, plugins, and HealthMes glue.
 
-## Scope Of This Branch
+- A vendor source change is allowed when an extension point cannot implement
+  the required behavior safely or completely.
+- The task must explicitly own the affected `vendor/<name>/` path and use its
+  own branch and worktree. Do not edit a vendor path owned by another task.
+- Keep each vendor change in a separate, minimal commit named
+  `vendor(hermes): ...` or `vendor(ow): ...`. That commit may include only
+  the vendor patch and its upstream-side regression tests; keep HealthMes
+  glue, integration tests, dependency changes, and product documentation in
+  separate commits.
+- The vendor commit or its PR description must state: the missing extension
+  point, why a root-level implementation is insufficient, the upstream base
+  revision, how the patch can be reapplied during an upstream sync, and the
+  tests run.
+- Add the relevant vendor regression test and any HealthMes contract or
+  integration test affected by the patch. Preserve upstream copyright and
+  license notices; do not mix formatting sweeps or unrelated upgrades into a
+  vendor patch.
+- Send generally useful fixes upstream and link the upstream PR. A
+  HealthMes-specific or urgent patch may land first, but the PR must explain
+  why an upstream PR is not appropriate or is still pending.
 
-- Storage architecture and product documentation may change.
-- Application, migration, runtime, and vendored code must not change unless a
-  later implementation task explicitly owns those files in a new worktree.
+The development scripts must never mutate vendor source or lockfiles as a
+side effect. That runtime safety rule does not prohibit an explicitly owned,
+reviewed vendor patch.
+
+## Task Scope
+
+- Every task must state the files and boundaries it owns before editing.
+- Application, migration, runtime, documentation, and vendor changes are
+  allowed only when they are explicitly in scope for that task and follow the
+  worktree and vendor rules above.

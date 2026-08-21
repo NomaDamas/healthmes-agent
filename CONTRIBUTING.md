@@ -11,9 +11,11 @@ Two kinds of contributions are expected here, and both are first-class:
 
 ## Ground rules
 
-1. **`vendor/` is read-only.** Both upstreams are vendored verbatim for
-   upstream sync; all glue lives at the repo root (`healthmes/`, `skills/`,
-   `config/`, `scripts/`, `apps/`).
+1. **Use vendor extension points first.** Both upstreams are pinned under
+   `vendor/`; put normal HealthMes glue at the repo root (`healthmes/`,
+   `skills/`, `config/`, `scripts/`, `apps/`). A minimal vendor patch is
+   allowed when those extension points cannot implement the requirement; see
+   “Vendor patches” below.
 2. **Python via uv only** (`uv sync`, `uv run …`), Python 3.12, deps managed
    exclusively in `pyproject.toml` + `uv.lock`.
 3. **Code, comments, and docstrings in English.** Discussion and
@@ -37,6 +39,30 @@ uv run ruff check .   # lint (CI-enforced)
 Every metric/rule needs a hand-computed test vector under `tests/` — that
 vector is the contract your change keeps forever. See existing patterns in
 `tests/mcp_server/` (httpx MockTransport + sqlite fixtures).
+
+## Vendor patches
+
+Do not treat `vendor/` as untouchable. Treat it as a pinned upstream snapshot
+that must remain easy to update.
+
+- First check whether MCP, REST, webhooks, configuration, skills, plugins, or
+  root-level glue can implement the feature.
+- When a source patch is necessary, make it in a dedicated worktree and put it
+  in a separate minimal commit: `vendor(ow): ...` or `vendor(hermes): ...`.
+  Do not mix that commit with HealthMes glue, root tests, dependency upgrades,
+  or formatting changes.
+- State why the extension point is insufficient, the upstream revision, the
+  expected upstream outcome, and the vendor plus HealthMes tests run in the
+  commit body or PR description.
+- Add an upstream-side regression test. Add a HealthMes contract or
+  integration test when the patch changes a boundary HealthMes uses.
+- Propose broadly useful changes upstream and link the upstream PR. For an
+  urgent or HealthMes-specific patch, record why an upstream PR is pending or
+  not applicable.
+
+The local dev scripts deliberately do not write vendor source or lockfiles.
+That protects normal setup and runtime, but does not forbid an explicit,
+reviewed patch.
 
 ## PR flow
 

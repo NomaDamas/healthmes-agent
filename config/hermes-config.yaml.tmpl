@@ -87,7 +87,7 @@ mcp_servers:
   # Layer A — vendored open-wearables MCP server, registered as-is over stdio
   # (docs/PLAN.md §1.5). `start` is the [project.scripts] entry of
   # vendor/open-wearables/mcp/pyproject.toml. The uv venv/cache are always
-  # redirected outside the read-only vendor tree; the directory defaults below
+  # redirected outside the vendor source tree; the directory defaults below
   # are the docker-compose mount points — a mac-native bootstrap MUST pass
   # absolute repo-local paths (e.g. <repo>/vendor/open-wearables/mcp and
   # <repo>/data/ow-mcp-venv) since relative paths would resolve into vendor/.

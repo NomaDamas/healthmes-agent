@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# vendor_sync_check.sh — read-only vendor drift report (upstream sync dry run).
+# vendor_sync_check.sh — read-only vendor/upstream drift report.
 #
-# docs/PLAN.md §10 Phase 3 / §11: vendor/ holds read-only upstream snapshots;
-# before replacing one wholesale, run this drill against a fresh upstream
-# checkout to see exactly what a sync would change. The script NEVER writes —
-# it only diffs and prints a report.
+# docs/PLAN.md §1: vendor/ holds pinned upstream snapshots that can have
+# explicitly reviewed local patches. Before an upstream update, run this drill
+# against a fresh checkout to see exactly what would change. The script NEVER
+# writes — it only diffs and prints a report.
 #
 # Usage:
 #   scripts/vendor_sync_check.sh <vendor-name> <upstream-checkout-path>
@@ -139,7 +139,7 @@ echo
 echo "Next steps (see docs/DEVELOPMENT.md, 'Vendor upstream sync drill'):"
 echo "  1. Review the changed list against the coupling surface (docs/PLAN.md §11):"
 echo "     open-wearables REST v1 + MCP tool names; hermes config/skill/cron/webhook contracts."
-echo "  2. To sync: replace vendor/$VENDOR_NAME wholesale in a dedicated commit"
-echo "     (never hand-edit files under vendor/)."
-echo "  3. Re-run the offline suite + compose validation: uv run pytest -q && docker compose config -q"
+echo "  2. Classify intentional local patches, then update vendor/$VENDOR_NAME in a"
+echo "     dedicated vendor(...) commit; preserve, replace, or remove each patch deliberately."
+echo "  3. Run affected vendor tests, then: uv run pytest -q && docker compose config -q"
 exit 1

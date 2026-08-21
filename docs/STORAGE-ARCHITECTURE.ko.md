@@ -587,9 +587,14 @@ Hermes 작업
 
 1. 작업마다 새 branch와 새 worktree를 만든다.
 2. 한 branch를 두 worktree 또는 두 agent가 동시에 사용하지 않는다.
-3. `vendor/hermes-agent/`는 HealthMes branch에서 수정하지 않는다.
-4. Hermes 변경은 Hermes 저장소의 독립 commit/PR로 만든다.
-5. 통합은 검토된 commit의 merge 또는 cherry-pick으로만 한다.
+3. `vendor/hermes-agent/`와 `vendor/open-wearables/`는 확장점으로 먼저
+   해결한다. 확장점으로 안전하고 완전하게 해결할 수 없는 경우에는 해당
+   vendor 경계를 명시적으로 소유한 별도 worktree에서 최소 패치를 허용한다.
+4. vendor 패치와 해당 upstream 회귀 테스트는
+   `vendor(hermes):` 또는 `vendor(ow):` 독립 commit으로 만든다. 범용
+   변경은 upstream 저장소의 PR도 함께 제안한다.
+5. HealthMes glue와 통합은 검토된 commit의 merge 또는 cherry-pick으로만
+   한다.
 6. 다른 worktree의 dirty 파일을 덮어쓰거나 reset하지 않는다.
 7. 같은 파일을 다른 agent가 수정 중이면 즉시 멈추고 소유권을 조정한다.
 

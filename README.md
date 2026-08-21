@@ -1,6 +1,7 @@
 # HealthMes
 
-HealthMes is **open, local-first infrastructure for wellness agents**.
+HealthMes is **source-available, local-first infrastructure for wellness
+agents**.
 It turns wearable, activity, nutrition, calendar, environment and subjective
 signals into permission-aware context that an agent can use to make
 explainable, reversible decisions.
@@ -54,10 +55,14 @@ HealthMes deliberately delegates commodity infrastructure:
 - native apps and chat surfaces consume stable HealthMes contracts rather
   than becoming the source of wellness policy.
 
-Both vendored trees are read-only from HealthMes work. Integration uses only
-documented REST, MCP, webhook, configuration, skill and delivery contracts.
-See [`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
-and [`docs/PLAN.md`](docs/PLAN.md).
+Both vendored trees are pinned upstream snapshots. HealthMes uses documented
+REST, MCP, webhook, configuration, skill and delivery contracts first. If
+those extension points cannot safely provide a required capability, a scoped,
+separately reviewed vendor patch is allowed. The policy preserves upstream
+syncability; it is not a blanket ban. See
+[`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md),
+[`docs/PLAN.md`](docs/PLAN.md), and
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#vendor-patches).
 
 ## Why this can compound
 
@@ -439,8 +444,8 @@ export HEALTHMES_BACKUP_PROVIDER=remote_vault    # weekly job replicates too
   bar + widgets + screensaver), `windows-companion/` (tray + screensaver,
   .NET 8)
 - `config/`, `scripts/`, `alembic/`, `tests/`, `docs/`
-- `vendor/hermes-agent/`, `vendor/open-wearables/` — read-only upstreams,
-  never modified
+- `vendor/hermes-agent/`, `vendor/open-wearables/` — pinned upstream
+  snapshots; extension points first, disciplined patches when necessary
 
 Developer guide (run paths, credentials, tests, CI, vendor sync):
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
@@ -470,6 +475,9 @@ in `LICENSE`.
 
 Commercial use requires a separate paid commercial license from the project
 owner. See `LICENSE` for details.
+
+This is a custom source-available, non-commercial license; it is not AGPL/GPL
+and should not be described as an OSI-approved open-source license.
 
 This repository includes code derived from Hermes Agent by Nous Research and
 open-wearables by Momentum, both released under the MIT License, and vendors

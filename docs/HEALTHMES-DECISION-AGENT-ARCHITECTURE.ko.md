@@ -293,9 +293,10 @@ HealthMes가 소유해야 하는 기능:
 - DecisionRecord와 outcome 연결
 
 MVP에서는 `HermesRuntimeAdapter`가 Hermes의 기존 loop를 사용한다. 새 LLM runtime을
-처음부터 만들지 않는다. Hermes에 필수 generic hook이 없다면 HealthMes vendored
-tree를 직접 수정하지 않고 별도 Hermes 저장소와 PR에서 다음과 같은 범용 확장만
-제안한다.
+처음부터 만들지 않는다. Hermes에 필수 generic hook이 없다면 먼저 공개 계약과
+adapter로 해결 가능한지 확인한다. 안전하고 완전한 해법이 없다면 HealthMes의
+vendor 정책에 따라 최소 `vendor(hermes):` 패치와 회귀 테스트를 별도 커밋으로
+만들고, 범용 확장은 업스트림 Hermes PR로도 제안한다.
 
 - 필수 system policy 주입 hook
 - turn 완료 후 finalizer callback

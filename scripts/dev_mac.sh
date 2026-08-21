@@ -25,8 +25,9 @@
 #   ow-beat          celery beat scheduler of the open-wearables backend
 #                    (requires redis from services-start)
 #
-# Vendor grounding (vendor/ is read-only — the venv of the vendored backend is
-# redirected outside the vendor tree via UV_PROJECT_ENVIRONMENT):
+# Vendor grounding (runtime tooling never writes vendor source — the venv of
+# the vendored backend is redirected outside the vendor tree via
+# UV_PROJECT_ENVIRONMENT):
 #   - boot commands: vendor/open-wearables/backend/README.md +
 #     scripts/start/app.sh / worker.sh
 #   - env names (DB_HOST, REDIS_HOST, ...): vendor backend app/config.py;
@@ -59,7 +60,7 @@ PG_SUPERUSER="${PG_SUPERUSER:-$USER}"
 OW_BACKEND_DIR="$REPO_ROOT/vendor/open-wearables/backend"
 OW_ENV_FILE="$REPO_ROOT/config/open-wearables.env"
 OW_ENV_EXAMPLE="$REPO_ROOT/config/open-wearables.env.example"
-# Keep the vendored backend's venv OUT of the read-only vendor tree.
+# Keep the vendored backend's venv outside its source tree.
 OW_VENV_DIR="$DATA_DIR/ow-backend-venv"
 
 info() { printf '\033[1;34m[dev_mac]\033[0m %s\n' "$*"; }
@@ -233,7 +234,7 @@ load_ow_env() {
     . "$file"
     set +a
     export UV_PROJECT_ENVIRONMENT="$OW_VENV_DIR"
-    # Never let uv rewrite the vendored uv.lock (vendor/ is read-only):
+    # Never let uv rewrite the vendored uv.lock during setup or runtime:
     # UV_FROZEN=1 makes both our `uv sync` and the bare `uv run` inside the
     # vendor scripts/start/*.sh behave like --frozen — symmetric with the
     # hermes config template and the ow-mcp compose service, which pass
