@@ -1,5 +1,15 @@
 # HealthMes
 
+## Index
+
+- [🧭 Platform Boundary](#platform-boundary)
+- [📈 Why This Can Compound](#why-this-can-compound)
+- [✨ What Works Today](#what-works-today)
+- [🚀 Quickstart](#quickstart)
+- [🧩 Repository Layout](#repository-layout)
+- [📚 References](#references)
+- [⚖️ License](#license)
+
 HealthMes is **open, local-first infrastructure for wellness agents**.
 It turns wearable, activity, nutrition, calendar, environment and subjective
 signals into permission-aware context that an agent can use to make
@@ -11,7 +21,8 @@ schedule or recovery interventions, and records what happened afterward.
 The infrastructure is the product boundary; the assistant, native apps and
 chat channels are reference experiences on top.
 
-## Platform boundary
+<a id="platform-boundary"></a>
+## 🧭 Platform Boundary
 
 ```text
 CLI / Discord / Telegram / native apps / custom clients
@@ -59,7 +70,8 @@ documented REST, MCP, webhook, configuration, skill and delivery contracts.
 See [`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
 and [`docs/PLAN.md`](docs/PLAN.md).
 
-## Why this can compound
+<a id="why-this-can-compound"></a>
+## 📈 Why This Can Compound
 
 Wearable connectors, MCP, chat, automatic scheduling and native widgets are
 useful but are not a durable moat by themselves. The potential moat is the
@@ -79,7 +91,8 @@ and measured outcomes. See
 [`docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md)
 and [`docs/COMPETITIVE-LANDSCAPE.ko.md`](docs/COMPETITIVE-LANDSCAPE.ko.md).
 
-## What works today
+<a id="what-works-today"></a>
+## ✨ What Works Today
 
 **Data & domain (Phase 0–1)**
 - Dedicated `healthmes` database (Postgres or zero-setup sqlite) with its own
@@ -259,13 +272,14 @@ read-only bounded preparation proposal),
 decision), `healthmes-stress` (source-aware stress/recovery evidence →
 keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
 
-## Quickstart (macOS)
+<a id="quickstart"></a>
+## 🚀 Quickstart (macOS)
 
 The shortest path needs Git, [Homebrew](https://brew.sh/) and
 [uv](https://docs.astral.sh/uv/). It does not need Docker, PostgreSQL, Redis
 or an `.env` file.
 
-### 1. Run the HealthMes core locally
+### 1. 💻 Run the HealthMes Core Locally
 
 From a fresh terminal:
 
@@ -323,7 +337,7 @@ The zero-config run proves the local HealthMes infrastructure. Live wearable
 data, the Hermes agent and external channels require their respective
 credentials and the following steps.
 
-### 2. Configure and chat from the terminal
+### 2. 💬 Configure and Chat from the Terminal
 
 Set one supported model/provider credential in `.env`, then render the
 HealthMes MCP servers, skills and briefing jobs into a Hermes home:
@@ -342,7 +356,7 @@ The terminal agent uses the same HealthMes tools and skills as messaging
 channels. This is the shortest path to validate the agent before creating a
 bot.
 
-### 3. Connect Discord or Telegram through Hermes
+### 3. 📡 Connect Discord or Telegram Through Hermes
 
 From `vendor/hermes-agent/`, run the interactive Hermes gateway setup against
 the same home, choose Discord or Telegram, then start the gateway:
@@ -376,7 +390,7 @@ make mac-test
 make mac-services-stop
 ```
 
-### Docker alternative
+### 🐳 Docker Alternative
 
 ```bash
 install -m 600 .env.example .env
@@ -390,7 +404,7 @@ container clocks are UTC. The compose path also **requires**
 `HEALTHMES_API_TOKEN` (the container binds 0.0.0.0 and publishes the port;
 the service refuses to start unauthenticated on a non-loopback bind).
 
-### CLI chat & choosing your LLM
+### 🤖 CLI Chat and Choosing Your LLM
 
 The same agent is available from the terminal (no Telegram needed) via the
 vendor CLI, against the same skills and MCP tools — see the CLI section of
@@ -399,7 +413,7 @@ model: any of the ~29 vendor provider plugins (OpenAI, Gemini, OpenRouter,
 Ollama, Bedrock, …) can be selected with `HERMES_MODEL`/`HERMES_PROVIDER` in
 `.env` — all HealthMes glue is provider-agnostic.
 
-### Extending with domain knowledge
+### 🧠 Extending with Domain Knowledge
 
 Healthcare experts can add judgment procedures as **skills** (one markdown
 file, no code), new metrics as **Layer B MCP tools**, and correlation
@@ -411,7 +425,7 @@ catalog, skill authoring, real-device QA protocol), and
 [`CONTRIBUTING.md`](CONTRIBUTING.md). Proposals go through the
 `Metric proposal` / `Skill proposal` issue forms.
 
-### Backups
+### 🔐 Backups
 
 ```bash
 export HEALTHMES_BACKUP_PASSPHRASE='...'   # or set it in .env
@@ -429,7 +443,8 @@ uv run healthmes backup create --provider remote # create + replicate
 export HEALTHMES_BACKUP_PROVIDER=remote_vault    # weekly job replicates too
 ```
 
-## Repository layout
+<a id="repository-layout"></a>
+## 🧩 Repository Layout
 
 - `healthmes/` — the glue service: `store/`, `engine/`, `calendars/`,
   `mcp_server/`, `api/`, `backup/`
@@ -452,7 +467,8 @@ agent architecture, and the current runtime-independent compatibility contract:
 [`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md),
 [`docs/contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](docs/contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md).
 
-## References
+<a id="references"></a>
+## 📚 References
 
 This project is based on and references:
 
@@ -463,13 +479,19 @@ The open-wearables code is kept in a separate folder so wearable data
 integration work can be developed without mixing it into the Hermes runtime
 base.
 
-## License
+<a id="license"></a>
+## ⚖️ License
 
-HealthMes Agent is available for non-commercial use under the project license
-in `LICENSE`.
+HealthMes Agent is dual-licensed:
 
-Commercial use requires a separate paid commercial license from the project
-owner. See `LICENSE` for details.
+- **AGPL-3.0:** the default license in [`LICENSE`](LICENSE). It permits
+  personal and commercial use, modification, and distribution under AGPL-3.0
+  terms. If a modified version is offered for remote network use, the
+  corresponding source must be offered to those users.
+- **Commercial license:** a separately negotiated option for organizations
+  that need permission beyond AGPL-3.0, such as proprietary product or service
+  use without AGPL-3.0 source-availability conditions. See
+  [`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md).
 
 This repository includes code derived from Hermes Agent by Nous Research and
 open-wearables by Momentum, both released under the MIT License, and vendors
