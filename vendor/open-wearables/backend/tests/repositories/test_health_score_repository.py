@@ -16,10 +16,10 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import HealthScore
+from app.models import DataSource, HealthScore
 from app.repositories.health_score_repository import HealthScoreRepository
 from app.schemas.enums import HealthScoreCategory, ProviderName
-from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
+from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, ScoreComponent
 from tests.factories import DataSourceFactory, HealthScoreFactory, UserFactory
 
 
@@ -230,3 +230,100 @@ class TestHealthScoreRepositoryBulkCreate:
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 1
         assert results[0].value == Decimal("80.00")
+
+
+class TestHealthScoreRepositoryWhoopDayStrain:
+    @staticmethod
+    def _score(
+        data_source: DataSource,
+        *,
+        value: str,
+        cycle_updated_at: str,
+        cycle_id: str = "cycle-1",
+    ) -> HealthScoreCreate:
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=data_source.user_id,
+            data_source_id=data_source.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.DAY_STRAIN,
+            value=Decimal(value),
+            recorded_at=datetime(2026, 8, 13, 1, 30, tzinfo=timezone.utc),
+            components={
+                "cycle_id": ScoreComponent(qualifier=cycle_id),
+                "cycle_updated_at": ScoreComponent(qualifier=cycle_updated_at),
+            },
+        )
+
+    def test_newer_revision_updates_same_cycle_and_older_revision_is_ignored(
+        self, db: Session, repo: HealthScoreRepository
+    ) -> None:
+        data_source = DataSourceFactory()
+        original = self._score(
+            data_source,
+            value="10.5",
+            cycle_updated_at="2026-08-13T06:20:00+00:00",
+        )
+        repo.upsert_whoop_day_strain(db, [original])
+        db.commit()
+
+        newer = self._score(
+            data_source,
+            value="14.2",
+            cycle_updated_at="2026-08-13T08:20:00+00:00",
+        )
+        repo.upsert_whoop_day_strain(db, [newer])
+        db.commit()
+
+        row = (
+            db.query(HealthScore)
+            .filter(
+                HealthScore.user_id == data_source.user_id,
+                HealthScore.category == HealthScoreCategory.DAY_STRAIN,
+            )
+            .one()
+        )
+        assert row.value == Decimal("14.2")
+        assert row.components["cycle_updated_at"]["qualifier"] == "2026-08-13T08:20:00+00:00"
+
+        older = self._score(
+            data_source,
+            value="11.1",
+            cycle_updated_at="2026-08-13T07:20:00+00:00",
+        )
+        repo.upsert_whoop_day_strain(db, [older])
+        db.commit()
+
+        db.refresh(row)
+        assert row.value == Decimal("14.2")
+        assert row.components["cycle_updated_at"]["qualifier"] == "2026-08-13T08:20:00+00:00"
+
+    def test_different_cycle_does_not_replace_existing_row(self, db: Session, repo: HealthScoreRepository) -> None:
+        data_source = DataSourceFactory()
+        original = self._score(
+            data_source,
+            value="10.5",
+            cycle_updated_at="2026-08-13T06:20:00+00:00",
+        )
+        repo.upsert_whoop_day_strain(db, [original])
+        db.commit()
+
+        different_cycle = self._score(
+            data_source,
+            value="14.2",
+            cycle_updated_at="2026-08-13T08:20:00+00:00",
+            cycle_id="cycle-2",
+        )
+        repo.upsert_whoop_day_strain(db, [different_cycle])
+        db.commit()
+
+        row = (
+            db.query(HealthScore)
+            .filter(
+                HealthScore.user_id == data_source.user_id,
+                HealthScore.category == HealthScoreCategory.DAY_STRAIN,
+            )
+            .one()
+        )
+        assert row.value == Decimal("10.5")
+        assert row.components["cycle_id"]["qualifier"] == "cycle-1"
