@@ -48,5 +48,6 @@ HEALTH_SCORES: frozenset[HealthScoreCategory] = frozenset(
         HealthScoreCategory.SLEEP,
         HealthScoreCategory.RECOVERY,
         HealthScoreCategory.STRAIN,
+        HealthScoreCategory.DAY_STRAIN,
     }
 )
