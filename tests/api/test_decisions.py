@@ -53,6 +53,38 @@ def test_get_decision_json(client, session):
     assert body["tokens"] == 321
 
 
+def test_decision_evidence_refs_stay_off_public_json_and_html(client, session):
+    record = _seed_decision(session)
+    record.evidence_refs = {
+        "source_refs": [
+            {
+                "domain": "wearable",
+                "record_id": "private-whoop-source-row",
+                "source_provider": "open-wearables",
+                "upstream_provider": "whoop",
+                "resource_type": "health_score",
+                "observed_at": "2026-07-08T07:00:00+09:00",
+                "schema_version": 1,
+                "derived_by": "open-wearables.daily-readiness.v1",
+            }
+        ],
+        "cycle_ids": {
+            "recovery": "private-whoop-cycle",
+            "day_strain": "private-whoop-cycle",
+        },
+    }
+    session.commit()
+
+    json_response = client.get(f"/v1/decisions/{record.id}")
+    list_response = client.get("/v1/decisions")
+    html_response = client.get(f"/decisions/{record.id}")
+
+    for response in (json_response, list_response, html_response):
+        assert "evidence_refs" not in response.text
+        assert "private-whoop-source-row" not in response.text
+        assert "private-whoop-cycle" not in response.text
+
+
 def test_get_decision_json_404_envelope(client):
     response = client.get("/v1/decisions/00000000-0000-0000-0000-000000000000")
 

@@ -640,6 +640,37 @@ class TestDecisionRecord:
         assert record.llm_model == "claude-fable-5"
         assert record.tokens == 1234
 
+    def test_roundtrip_with_private_evidence_refs(self, session):
+        evidence_refs = {
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "whoop-recovery-row",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "whoop",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-07-08T07:00:00+09:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                }
+            ],
+            "cycle_ids": {
+                "recovery": "cycle-2026-07-08",
+                "day_strain": "cycle-2026-07-08",
+            },
+        }
+        record = _roundtrip(
+            session,
+            DecisionRecord(
+                kind=DecisionKind.INSIGHT,
+                tree={"id": "root", "type": "input", "label": "whoop", "children": []},
+                summary="WHOOP package",
+                evidence_refs=evidence_refs,
+            ),
+        )
+
+        assert record.evidence_refs == evidence_refs
+
     def test_alert_decision_roundtrips_trigger_correlation(self, session):
         trigger = TriggerEvent(
             fired_at=T0,

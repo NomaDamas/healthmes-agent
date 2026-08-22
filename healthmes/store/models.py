@@ -331,6 +331,7 @@ class DecisionRecord(Base):
     summary: Mapped[str]
     llm_model: Mapped[str_64 | None]
     tokens: Mapped[int | None]
+    evidence_refs: Mapped[JSONDict | None]
     trigger_event_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("trigger_event.id", ondelete="SET NULL"),
         default=None,
