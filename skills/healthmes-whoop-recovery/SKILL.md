@@ -74,6 +74,19 @@ response. Use a valid `input -> rule -> option -> action` tree. Persist only:
 - chosen level or `insufficient_data`, considered walk choices, and package;
 - optional signal *types* (sleep / nighttime HRV direction), never their values.
 
+Pass the context tool's provenance unchanged to `record_decision`:
+
+```python
+evidence_refs = {
+    "source_refs": context["source_refs"],
+    "cycle_ids": context["cycle_ids"],
+}
+```
+
+This private provenance is stored separately from the tree: never copy source
+row IDs, cycle IDs, timestamps, or raw scores into the tree, summary, or user
+response.
+
 Never put raw scores, timestamps, identifiers, symptom text, or the tool's
 viewer URL inside the record. Include the returned `viewer_url` only in the
 requesting user's response as the “왜 이 판단?” link; never log or publish it.
@@ -87,7 +100,9 @@ allowed choice, for example “20분으로 할게”:
 2. Call `mcp__healthmes__record_decision` again with a separate immutable
    `kind: "insight"` record. Its tree should state that the user selected the
    offered walking option and name that option, without health values.
-3. Confirm the choice and include the new viewer link only to that user.
+3. Pass the same `evidence_refs` object from the immediately preceding
+   recovery package; never rebuild or expose it.
+4. Confirm the choice and include the new viewer link only to that user.
 
 If the user says “20분 했어”, acknowledge it warmly but do **not** create a
 completion record, mark the walk as completed, or imply that completion was

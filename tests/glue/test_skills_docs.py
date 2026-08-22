@@ -88,3 +88,6 @@ def test_whoop_recovery_skill_keeps_its_data_and_recording_boundaries() -> None:
     assert "do **not** create a\ncompletion record" in text
     assert "v0 leaves completion unrecorded" in text
     assert "Never put raw scores, timestamps" in text
+    assert '"source_refs": context["source_refs"]' in text
+    assert '"cycle_ids": context["cycle_ids"]' in text
+    assert "same `evidence_refs` object from the immediately preceding" in text

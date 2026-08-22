@@ -223,6 +223,20 @@ MAX_MEDICAL_LIST_LIMIT = 500
 DECISION_TREE_NODE_TYPES = frozenset({"input", "rule", "llm_step", "option", "action"})
 MAX_TREE_DEPTH = 12
 MAX_TREE_NODES = 500
+WHOOP_EVIDENCE_REF_KEYS = frozenset(
+    {
+        "domain",
+        "record_id",
+        "source_provider",
+        "upstream_provider",
+        "resource_type",
+        "observed_at",
+        "schema_version",
+        "derived_by",
+    }
+)
+WHOOP_EVIDENCE_REF_RESOURCE_TYPE = "health_score"
+WHOOP_EVIDENCE_REF_DERIVED_BY = "open-wearables.daily-readiness.v1"
 SCHEDULE_PROPOSAL_TTL = dt.timedelta(hours=24)
 
 _RANGE_PATTERN = re.compile(r"^(\d{1,3})d$")
@@ -693,8 +707,8 @@ _summary_daily_values = interpret.summary_daily_values
 
 async def _fetch_health_scores(
     user_id: str,
-    start: dt.date,
-    end_exclusive: dt.date,
+    start: dt.date | dt.datetime,
+    end_exclusive: dt.date | dt.datetime,
     *,
     category: str | None = None,
     provider: str | None = None,
@@ -707,8 +721,8 @@ async def _fetch_health_scores(
 
 async def _fetch_health_scores_tracked(
     user_id: str,
-    start: dt.date,
-    end_exclusive: dt.date,
+    start: dt.date | dt.datetime,
+    end_exclusive: dt.date | dt.datetime,
     *,
     category: str | None = None,
     provider: str | None = None,
@@ -732,11 +746,11 @@ def _whoop_label(category: str, value: float) -> str | None:
         if 67 <= value <= 100:
             return "green"
     if category == "day_strain":
-        if 0 <= value <= 9:
+        if 0 <= value < 10:
             return "light"
-        if 10 <= value <= 13:
+        if 10 <= value < 14:
             return "moderate"
-        if 14 <= value <= 17:
+        if 14 <= value < 18:
             return "high"
         if 18 <= value <= 21:
             return "all_out"
@@ -751,6 +765,19 @@ def _whoop_cycle_updated_at(row: dict[str, Any]) -> dt.datetime | None:
     if not isinstance(source, dict):
         return None
     return _parse_recorded_at(source.get("qualifier"))
+
+
+def _whoop_cycle_id(row: Mapping[str, Any]) -> str | None:
+    components = row.get("components")
+    if not isinstance(components, Mapping):
+        return None
+    source = components.get("cycle_id")
+    if not isinstance(source, Mapping):
+        return None
+    qualifier = source.get("qualifier")
+    if not isinstance(qualifier, str) or not qualifier.strip():
+        return None
+    return qualifier
 
 
 def _whoop_primary_signal(
@@ -782,7 +809,7 @@ def _whoop_primary_signal(
     if not matching:
         return {**result, "status": interpret.STATUS_INSUFFICIENT, "reason": f"no_whoop_{name}"}
 
-    parsed: list[tuple[dt.datetime, dt.datetime, dict[str, Any]]] = []
+    recorded: list[tuple[dt.datetime, dict[str, Any]]] = []
     for row in matching:
         recorded_at = _parse_recorded_at(row.get("recorded_at"))
         if recorded_at is None:
@@ -791,6 +818,16 @@ def _whoop_primary_signal(
                 "status": interpret.STATUS_INSUFFICIENT,
                 "reason": "unparseable_recorded_at",
             }
+        recorded.append((recorded_at, row))
+
+    current_day = [
+        (recorded_at, row)
+        for recorded_at, row in recorded
+        if recorded_at.astimezone(tz).date() == as_of
+    ]
+    candidates = current_day or recorded
+    parsed: list[tuple[dt.datetime, dt.datetime, dict[str, Any]]] = []
+    for recorded_at, row in candidates:
         updated_at = recorded_at
         if category == "day_strain":
             updated_at = _whoop_cycle_updated_at(row)
@@ -823,6 +860,7 @@ def _whoop_primary_signal(
         "updated_at": updated_at.isoformat(),
         "freshness": "current_day" if observed_on == as_of else "stale",
         "stale_days": stale_days,
+        "_source_row": row,
     }
     if value is None or not math.isfinite(value):
         return {**base, "status": interpret.STATUS_INSUFFICIENT, "reason": "unparseable_raw_value"}
@@ -1114,8 +1152,8 @@ async def get_whoop_recovery_context(date: str | None = None) -> dict[str, Any]:
     tz = _local_timezone()
     as_of = _parse_date_local(date, "date", tz)
     user_id = await _resolve_user_id()
-    fetch_start = as_of - dt.timedelta(days=2)
-    fetch_end = as_of + dt.timedelta(days=1)
+    fetch_start, _ = _local_day_bounds_utc(as_of - dt.timedelta(days=2), tz)
+    _, fetch_end = _local_day_bounds_utc(as_of, tz)
     (recovery_rows, recovery_truncated), (strain_rows, strain_truncated) = await asyncio.gather(
         _fetch_health_scores_tracked(
             user_id, fetch_start, fetch_end, category="recovery", provider="whoop"
@@ -1138,9 +1176,62 @@ async def get_whoop_recovery_context(date: str | None = None) -> dict[str, Any]:
         tz=tz,
         truncated=strain_truncated,
     )
+    recovery_source_row = recovery.pop("_source_row", None)
+    strain_source_row = strain.pop("_source_row", None)
+    source_refs_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in (recovery_source_row, strain_source_row):
+        if not isinstance(row, Mapping):
+            continue
+        observed_at = row.get("recorded_at")
+        if not isinstance(observed_at, str):
+            continue
+        source_ref = _open_wearables_source_ref(
+            row,
+            resource_type="health_score",
+            observed_at=observed_at,
+        )
+        source_refs_by_key[
+            (
+                str(source_ref["resource_type"]),
+                str(source_ref["record_id"]),
+            )
+        ] = source_ref
+    cycle_ids = {
+        "recovery": (
+            _whoop_cycle_id(recovery_source_row)
+            if isinstance(recovery_source_row, Mapping)
+            else None
+        ),
+        "day_strain": (
+            _whoop_cycle_id(strain_source_row)
+            if isinstance(strain_source_row, Mapping)
+            else None
+        ),
+    }
+    primary_signals_ok = (
+        recovery["status"] == interpret.STATUS_OK
+        and strain["status"] == interpret.STATUS_OK
+    )
+    if not primary_signals_ok:
+        cycle_linkage = {
+            "status": "not_evaluated",
+            "reason": "primary_signal_unavailable",
+        }
+    elif not all(isinstance(value, str) and value for value in cycle_ids.values()):
+        cycle_linkage = {
+            "status": interpret.STATUS_INSUFFICIENT,
+            "reason": "cycle_id_missing",
+        }
+    elif cycle_ids["recovery"] != cycle_ids["day_strain"]:
+        cycle_linkage = {
+            "status": interpret.STATUS_INSUFFICIENT,
+            "reason": "cycle_id_mismatch",
+        }
+    else:
+        cycle_linkage = {"status": interpret.STATUS_OK, "reason": None}
     status = (
         interpret.STATUS_OK
-        if recovery["status"] == interpret.STATUS_OK and strain["status"] == interpret.STATUS_OK
+        if primary_signals_ok and cycle_linkage["status"] == interpret.STATUS_OK
         else interpret.STATUS_INSUFFICIENT
     )
     return {
@@ -1150,6 +1241,12 @@ async def get_whoop_recovery_context(date: str | None = None) -> dict[str, Any]:
         "confidence": "high" if status == interpret.STATUS_OK else "low",
         "recovery": recovery,
         "strain": strain,
+        "cycle_ids": cycle_ids,
+        "cycle_linkage": cycle_linkage,
+        "source_refs": [
+            source_refs_by_key[key]
+            for key in sorted(source_refs_by_key)
+        ],
     }
 
 
@@ -4496,6 +4593,76 @@ def _validate_tree(node: Any, depth: int = 0, count: int = 0) -> int:
     return count
 
 
+def _validate_whoop_evidence_refs(
+    value: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate the private WHOOP provenance shape before it reaches the store."""
+    if value is None:
+        return None
+    if set(value) != {"source_refs", "cycle_ids"}:
+        raise ToolError("evidence_refs must contain only source_refs and cycle_ids")
+    source_refs = value.get("source_refs")
+    cycle_ids = value.get("cycle_ids")
+    if not isinstance(source_refs, list):
+        raise ToolError("evidence_refs.source_refs must be a list")
+    if not isinstance(cycle_ids, dict) or set(cycle_ids) != {"recovery", "day_strain"}:
+        raise ToolError("evidence_refs.cycle_ids must contain recovery and day_strain")
+    for cycle_name, cycle_id in cycle_ids.items():
+        if cycle_id is not None and (
+            not isinstance(cycle_id, str) or not cycle_id.strip()
+        ):
+            raise ToolError(f"evidence_refs.cycle_ids.{cycle_name} must be a string or null")
+    if len(source_refs) > 2:
+        raise ToolError("evidence_refs may contain at most the two WHOOP primary source refs")
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, source_ref in enumerate(source_refs):
+        if not isinstance(source_ref, dict):
+            raise ToolError(f"evidence_refs[{index}] must be an object")
+        if set(source_ref) != WHOOP_EVIDENCE_REF_KEYS:
+            raise ToolError(
+                f"evidence_refs[{index}] must contain only the WHOOP source-ref fields"
+            )
+        if source_ref.get("domain") != "wearable":
+            raise ToolError(f"evidence_refs[{index}].domain must be 'wearable'")
+        if source_ref.get("source_provider") != "open-wearables":
+            raise ToolError(
+                f"evidence_refs[{index}].source_provider must be 'open-wearables'"
+            )
+        if source_ref.get("upstream_provider") != "whoop":
+            raise ToolError(f"evidence_refs[{index}].upstream_provider must be 'whoop'")
+        if source_ref.get("resource_type") != WHOOP_EVIDENCE_REF_RESOURCE_TYPE:
+            raise ToolError(
+                f"evidence_refs[{index}].resource_type must be 'health_score'"
+            )
+        if source_ref.get("schema_version") != 1:
+            raise ToolError(f"evidence_refs[{index}].schema_version must be 1")
+        if source_ref.get("derived_by") != WHOOP_EVIDENCE_REF_DERIVED_BY:
+            raise ToolError(f"evidence_refs[{index}].derived_by is not supported")
+        record_id = source_ref.get("record_id")
+        observed_at = source_ref.get("observed_at")
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ToolError(f"evidence_refs[{index}].record_id must be a non-empty string")
+        if not isinstance(observed_at, str):
+            raise ToolError(f"evidence_refs[{index}].observed_at must be an ISO-8601 datetime")
+        try:
+            parsed_observed_at = dt.datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ToolError(
+                f"evidence_refs[{index}].observed_at must be an ISO-8601 datetime"
+            ) from exc
+        if parsed_observed_at.tzinfo is None:
+            raise ToolError(
+                f"evidence_refs[{index}].observed_at must include a UTC offset"
+            )
+        key = (str(source_ref["resource_type"]), record_id)
+        if key in seen:
+            raise ToolError("evidence_refs must not contain duplicate source refs")
+        seen.add(key)
+        normalized.append(dict(source_ref))
+    return {"source_refs": normalized, "cycle_ids": dict(cycle_ids)}
+
+
 def _claim_schedule_proposals(
     session: Session,
     proposals: list[tuple[str, uuid.UUID]],
@@ -4537,6 +4704,7 @@ def record_decision(
     tokens: int | None = None,
     trigger_event_id: str | None = None,
     schedule_proposal_ids: list[str] | None = None,
+    evidence_refs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist an explainable decision record and get its viewer link.
 
@@ -4548,8 +4716,11 @@ def record_decision(
     trigger_event_id unchanged so native clients can resolve the exact
     decision and proposal. When proposals were created before this call, pass
     their returned ids as schedule_proposal_ids; they are linked to this
-    decision atomically. Returns the decision viewer URL to attach to any alert
-    or message about this decision.
+    decision atomically. WHOOP recovery packages may pass the context tool's
+    source_refs and cycle_ids together as evidence_refs; they are private
+    store-only provenance and never appear in the decision tree, viewer, or
+    public JSON. Returns the decision viewer URL to attach to any alert or
+    message about this decision.
     """
     if kind not in {k.value for k in DecisionKind}:
         raise ToolError(
@@ -4571,6 +4742,7 @@ def record_decision(
     ]
     if len(set(proposal_uuids)) != len(proposal_uuids):
         raise ToolError("schedule_proposal_ids must not contain duplicates")
+    private_evidence_refs = _validate_whoop_evidence_refs(evidence_refs)
     with _store_session() as session:
         if trigger_uuid is not None:
             if session.get(TriggerEvent, trigger_uuid) is None:
@@ -4590,6 +4762,7 @@ def record_decision(
             summary=summary,
             llm_model=llm_model,
             tokens=tokens,
+            evidence_refs=private_evidence_refs,
             trigger_event_id=trigger_uuid,
         )
         session.add(row)

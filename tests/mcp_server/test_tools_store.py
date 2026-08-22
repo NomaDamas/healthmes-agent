@@ -1143,6 +1143,88 @@ class TestCaptureTools:
             assert row.tree["children"][0]["label"] == "sleep_debt=20"
             assert row.llm_model == "claude-x"
 
+    async def test_record_decision_stores_whoop_evidence_refs_privately(
+        self, mcp_client, call_tool, store_factory
+    ):
+        evidence_refs = {
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "whoop-recovery-row",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "whoop",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-07-08T07:00:00+09:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                },
+                {
+                    "domain": "wearable",
+                    "record_id": "whoop-day-strain-row",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "whoop",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-07-08T07:00:00+09:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                },
+            ],
+            "cycle_ids": {
+                "recovery": "cycle-2026-07-08",
+                "day_strain": "cycle-2026-07-08",
+            },
+        }
+        result = await call_tool(
+            mcp_client,
+            "record_decision",
+            {
+                "kind": "insight",
+                "summary": "WHOOP recovery package",
+                "tree": TREE,
+                "evidence_refs": evidence_refs,
+            },
+        )
+
+        assert "evidence_refs" not in result
+        with store_factory() as session:
+            row = session.get(DecisionRecord, uuid.UUID(result["decision_id"]))
+            assert row is not None
+            assert row.evidence_refs == evidence_refs
+
+    async def test_record_decision_rejects_unbounded_whoop_evidence_refs(
+        self, mcp_client, call_tool
+    ):
+        invalid_evidence_refs = {
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "whoop-recovery-row",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "whoop",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-07-08T07:00:00+09:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                    "raw_value": 50,
+                }
+            ],
+            "cycle_ids": {
+                "recovery": "cycle-2026-07-08",
+                "day_strain": "cycle-2026-07-08",
+            },
+        }
+
+        with pytest.raises(ToolError, match="only the WHOOP source-ref fields"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "insight",
+                    "summary": "unsafe provenance",
+                    "tree": TREE,
+                    "evidence_refs": invalid_evidence_refs,
+                },
+            )
+
     async def test_record_decision_viewer_url_embeds_the_derived_token(
         self, mcp_client, call_tool, tmp_path
     ):

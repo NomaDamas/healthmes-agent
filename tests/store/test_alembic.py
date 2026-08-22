@@ -191,6 +191,10 @@ class TestSqliteUpgrade:
             inspector = sa.inspect(engine)
             assert EXPECTED_TABLES <= set(inspector.get_table_names())
             assert "alembic_version" in inspector.get_table_names()
+            assert "evidence_refs" in {
+                column["name"]
+                for column in inspector.get_columns("decision_record")
+            }
 
             # The migrated schema (not create_all) accepts real ORM writes.
             factory = sessionmaker(bind=engine)
@@ -210,6 +214,7 @@ class TestSqliteUpgrade:
                 record = session.scalars(sa.select(DecisionRecord)).one()
                 assert record.kind is DecisionKind.INSIGHT
                 assert record.tree == {"id": "root", "children": []}
+                assert record.evidence_refs is None
         finally:
             engine.dispose()
 
@@ -310,8 +315,9 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        # e3 -> d2 removes only snapshot fields, so cross-generation rows are
-        # still lossless at this boundary.
+        # f4 -> e3 removes private evidence refs before e3 -> d2 removes only
+        # snapshot fields, so cross-generation rows are still lossless at this
+        # boundary.
         command.downgrade(config, "d2e3f4a5b6c7")
 
         engine = sa.create_engine(database_url)
@@ -361,7 +367,7 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "e3f4a5b6c7d8")
 
         engine = sa.create_engine(database_url)
         metadata = sa.MetaData()
@@ -653,7 +659,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e3f4a5b6c7d8"
+                ) == "f4a5b6c7d8e"
         finally:
             engine.dispose()
 

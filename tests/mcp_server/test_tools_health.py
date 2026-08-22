@@ -135,10 +135,13 @@ class TestWhoopRecoveryContext:
             ("recovery", 100, "green"),
             ("day_strain", 0, "light"),
             ("day_strain", 9, "light"),
+            ("day_strain", 9.5, "light"),
             ("day_strain", 10, "moderate"),
             ("day_strain", 13, "moderate"),
+            ("day_strain", 13.5, "moderate"),
             ("day_strain", 14, "high"),
             ("day_strain", 17, "high"),
+            ("day_strain", 17.5, "high"),
             ("day_strain", 18, "all_out"),
             ("day_strain", 21, "all_out"),
             ("recovery", -1, None),
@@ -153,13 +156,22 @@ class TestWhoopRecoveryContext:
     async def test_uses_cycle_day_strain_and_returns_official_labels(
         self, mcp_client, mcp_env, call_tool
     ):
-        mcp_env.add_score("recovery", "whoop", "2026-07-08T07:00:00+09:00", 50)
+        mcp_env.add_score(
+            "recovery",
+            "whoop",
+            "2026-07-08T07:00:00+09:00",
+            50,
+            components={"cycle_id": {"qualifier": "cycle-2026-07-08"}},
+        )
         mcp_env.add_score(
             "day_strain",
             "whoop",
             "2026-07-08T17:00:00+09:00",
             14,
-            components={"cycle_updated_at": {"qualifier": "2026-07-09T01:00:00+00:00"}},
+            components={
+                "cycle_id": {"qualifier": "cycle-2026-07-08"},
+                "cycle_updated_at": {"qualifier": "2026-07-09T01:00:00+00:00"},
+            },
         )
         mcp_env.add_score("strain", "whoop", "2026-07-08T09:00:00+09:00", 5)
 
@@ -175,9 +187,156 @@ class TestWhoopRecoveryContext:
         assert result["strain"]["raw_value"] == 14.0
         assert result["strain"]["observed_on"] == AS_OF
         assert result["strain"]["updated_at"] == "2026-07-09T01:00:00+00:00"
+        assert result["cycle_ids"] == {
+            "recovery": "cycle-2026-07-08",
+            "day_strain": "cycle-2026-07-08",
+        }
+        assert result["cycle_linkage"] == {"status": "ok", "reason": None}
+        assert {
+            source_ref["record_id"]
+            for source_ref in result["source_refs"]
+        } == {
+            mcp_env.health_scores[0]["id"],
+            mcp_env.health_scores[1]["id"],
+        }
+        assert {
+            source_ref["resource_type"]
+            for source_ref in result["source_refs"]
+        } == {"health_score"}
+        assert all(
+            source_ref["derived_by"] == "open-wearables.daily-readiness.v1"
+            for source_ref in result["source_refs"]
+        )
         assert all(
             request.url.params.get("category") != "strain" for request in mcp_env.requests[-2:]
         )
+
+    async def test_prefers_today_cycle_over_yesterdays_later_revision(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        mcp_env.add_score(
+            "recovery",
+            "whoop",
+            "2026-07-08T07:00:00+09:00",
+            50,
+            components={"cycle_id": {"qualifier": "cycle-today"}},
+        )
+        mcp_env.add_score(
+            "day_strain",
+            "whoop",
+            "2026-07-07T07:00:00+09:00",
+            17.5,
+            components={
+                "cycle_id": {"qualifier": "cycle-yesterday"},
+                "cycle_updated_at": {"qualifier": "2026-07-09T01:00:00+00:00"},
+            },
+        )
+        mcp_env.add_score(
+            "day_strain",
+            "whoop",
+            "2026-07-08T07:00:00+09:00",
+            10.5,
+            components={
+                "cycle_id": {"qualifier": "cycle-today"},
+                "cycle_updated_at": {"qualifier": "2026-07-08T01:00:00+00:00"},
+            },
+        )
+
+        result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
+
+        assert result["status"] == "ok"
+        assert result["strain"]["observed_on"] == AS_OF
+        assert result["strain"]["raw_value"] == 10.5
+        assert result["strain"]["label"] == "moderate"
+        assert result["cycle_ids"]["day_strain"] == "cycle-today"
+
+    async def test_queries_the_entire_local_day_with_utc_bounds(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        server_module.set_timezone(dt.timezone(dt.timedelta(hours=-8)))
+        mcp_env.add_score(
+            "recovery",
+            "whoop",
+            "2026-07-09T07:30:00Z",
+            50,
+            components={"cycle_id": {"qualifier": "cycle-local-evening"}},
+        )
+        mcp_env.add_score(
+            "day_strain",
+            "whoop",
+            "2026-07-09T07:30:00Z",
+            10.5,
+            components={
+                "cycle_id": {"qualifier": "cycle-local-evening"},
+                "cycle_updated_at": {"qualifier": "2026-07-09T07:35:00Z"},
+            },
+        )
+
+        result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
+
+        assert result["status"] == "ok"
+        requests = [
+            request
+            for request in mcp_env.requests
+            if request.url.params.get("category") in {"recovery", "day_strain"}
+        ]
+        assert {request.url.params["start_date"] for request in requests} == {
+            "2026-07-06T08:00:00+00:00"
+        }
+        assert {request.url.params["end_date"] for request in requests} == {
+            "2026-07-09T08:00:00+00:00"
+        }
+
+    @pytest.mark.parametrize(
+        ("recovery_cycle_id", "strain_cycle_id", "reason"),
+        [
+            ("cycle-a", "cycle-b", "cycle_id_mismatch"),
+            (None, "cycle-a", "cycle_id_missing"),
+        ],
+    )
+    async def test_fails_closed_when_primary_rows_do_not_share_a_cycle(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        recovery_cycle_id,
+        strain_cycle_id,
+        reason,
+    ):
+        recovery_components = (
+            {"cycle_id": {"qualifier": recovery_cycle_id}}
+            if recovery_cycle_id is not None
+            else {}
+        )
+        strain_components = {
+            "cycle_updated_at": {"qualifier": "2026-07-08T01:00:00+00:00"},
+        }
+        if strain_cycle_id is not None:
+            strain_components["cycle_id"] = {"qualifier": strain_cycle_id}
+        mcp_env.add_score(
+            "recovery",
+            "whoop",
+            "2026-07-08T07:00:00+09:00",
+            50,
+            components=recovery_components,
+        )
+        mcp_env.add_score(
+            "day_strain",
+            "whoop",
+            "2026-07-08T07:00:00+09:00",
+            10.5,
+            components=strain_components,
+        )
+
+        result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
+
+        assert result["status"] == "insufficient_data"
+        assert result["recovery"]["status"] == "ok"
+        assert result["strain"]["status"] == "ok"
+        assert result["cycle_linkage"] == {
+            "status": "insufficient_data",
+            "reason": reason,
+        }
 
     async def test_fails_closed_for_stale_or_missing_day_strain(
         self, mcp_client, mcp_env, call_tool
