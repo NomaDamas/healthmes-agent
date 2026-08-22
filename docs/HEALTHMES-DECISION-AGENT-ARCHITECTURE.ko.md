@@ -106,6 +106,39 @@ source_refs 정합성
 결정론적 계층이 있다는 것이 질문 종류를 고정한다는 뜻은 아니다. LLM은 자유롭게
 도구를 고르고, 코드는 선택된 도구가 실제 데이터 규칙을 지키도록 한다.
 
+### 단일 LLM의 충분조건과 한계
+
+MVP에는 하나의 부모 Hermes LLM이면 충분하다. 한 turn 안에서 질문을 해석하고,
+Skill을 읽고, 여러 domain search를 순차 호출하고, 결과를 본 뒤 추가 조회하고,
+최종 cross-domain 답변을 만들 수 있기 때문이다.
+
+그러나 “한 LLM이면 엄밀한 조회도 보장된다”는 결론은 틀리다.
+
+```text
+LLM
+  -> 무엇을 조회할지 계획
+
+HealthMes MCP + Access Layer + Provider
+  -> 정확히 어떤 행과 기간을 조회할지 실행
+  -> retention, timezone, dedup, freshness와 단위를 적용
+
+DecisionFinalizer
+  -> 실제 반환된 source_refs만 사용했는지 재검증
+```
+
+| 품질 축 | 성격 | 보장 방법 |
+|---|---|---|
+| Retrieval-plan completeness | 확률적 | 질문 평가셋, tool-call telemetry, 반복 조회 prompt |
+| Query execution integrity | 결정론적 | typed query, Provider, retention/timezone 경계 |
+| Provenance integrity | 결정론적 | canonical trace, `source_refs`, finalizer 재검증 |
+| 최종 설명 품질 | 확률적 | LLM 평가와 도메인 Skill 검토 |
+
+따라서 단일 LLM은 **오케스트레이터로 충분**하지만 DB query engine이나 정책
+검증기를 대체하지 않는다. 임의 질문에서 관련 domain을 빠뜨리는 비율이 실제
+평가에서 문제로 확인되면 #193의 bounded retrieval subagent를 추가한다. 그
+경우에도 Provider 내부가 아니라 부모 판단 계층이 읽기 전용 worker를 생성하고,
+최종 판단과 저장은 계속 부모 하나가 소유해야 한다.
+
 ## 4. Tool과 Skill
 
 Decision runtime tool allowlist:
@@ -406,7 +439,45 @@ HealthMes /health + /mcp ready
 Hermes가 HealthMes MCP를 필요로 하면서 HealthMes startup이 Hermes를 기다리는
 순환 의존을 제거한다.
 
-## 10. 확장 원칙
+## 10. 최신 main의 WHOOP 기능 통합 원칙
+
+2026-08-22 기준 최신 `main`은 WHOOP Cycle `day_strain`, 전용 recovery context,
+WHOOP Skill과 별도 decision provenance 저장을 추가했다. 이 변경은 현재 #138
+제품 코드에 아직 병합되지 않았다.
+
+기능 자체는 유지해야 하지만 기존 형태를 그대로 병합하면 #138의 단일 runtime
+불변조건을 깨뜨린다.
+
+```text
+그대로 병합하면
+WHOOP Skill -> 전용 context -> Skill이 직접 저장
+
+#138에 맞게 적응하면
+WHOOP Skill
+  -> search_wearable
+  -> wearable.whoop-recovery-package
+  -> WearableContextProvider
+  -> Recovery + day_strain + Cycle linkage + source_refs
+  -> DecisionFinalizer
+```
+
+통합 시 다음을 지킨다.
+
+- Open Wearables의 WHOOP ingest와 정규화 계산은 유지한다.
+- `day_strain`을 wearable health-score allowlist와 typed contract에 추가한다.
+- 동일 Cycle인지 확인하는 fail-closed 계산을 Provider capability로 옮긴다.
+- WHOOP 전용 MCP decision tool은 추가하지 않는다.
+- Skill은 LLM이 읽는 절차 문서로만 남기고 직접 persistence를 지시하지 않는다.
+- 별도 provenance 컬럼을 중복 추가하지 않고 기존 private
+  `decision_payload.source_refs`와 source attestation을 확장한다.
+- 자유 형식 판단을 저장하는 writer는 `DecisionFinalizer` 하나로 유지한다.
+
+이 통합 전까지 #138의 알려진 기능 공백은 WHOOP의 정확한 Recovery + 현재
+day-strain package다. 이는 일반 wearable search나 단일 LLM loop가 없어서가
+아니라, 최신 `main`의 새 domain 계산을 아직 Provider capability로 옮기지 않았기
+때문이다.
+
+## 11. 확장 원칙
 
 새 wellness domain을 추가할 때 순서는 다음과 같다.
 

@@ -4,7 +4,12 @@
 >
 > **대상:** PR #138 `feat: add HealthMes Decision Agent and unified wellness inputs`
 >
-> **코드 기준점:** `1acd2221` 이후 제품 코드 변경 없이 리뷰 문서만 추가·최신화한 상태
+> **제품 코드 기준점:** `1acd2221`
+>
+> **이번 갱신 이전 리뷰 문서 기준점:** `c8640707`
+>
+> **최신 main 비교 기준:** `103b7269`이며 아직 PR #138에 병합하지 않았다.
+> 2026-08-22 현재 GitHub 상태는 `CONFLICTING / DIRTY`다.
 >
 > **목적:** Sake와 후속 리뷰어가 PR의 대목표, 실제 실행 경로, 저장 경계,
 > 핵심 불변조건과 검증 지점을 빠르게 확인하도록 한다.
@@ -42,7 +47,61 @@ HealthMes 코드는 조회 허용 범위, 보존기간, 시간대, 정확한 계
 저장을 소유한다. Hermes는 이 판단을 실행하는 교체 가능한 runtime이며
 `vendor/hermes-agent/`는 수정하지 않았다.
 
-## 1. 사용자 요구와 구현 결과
+중요한 경계가 하나 있다. **한 부모 LLM은 MVP의 조회 계획과 종합에는 충분하지만,
+엄밀한 데이터 조회를 혼자 보장하지는 않는다.** 정확한 행, 기간, 중복 제거,
+freshness, retention과 `source_refs`는 HealthMes의 결정론적 조회 코드가
+보장한다.
+
+## 1. 아키텍처가 어떻게 바뀌었나
+
+### #138 이전
+
+```text
+경로 A
+사용자 -> Hermes + Skill -> 여러 MCP/전용 도구 -> Skill이 판단 저장 요청
+
+경로 B
+호출자 -> 고정 question_kind -> 고정 domain resolver -> context만 반환
+```
+
+이 구조에서는 질문 해석, 자료 선택, 최종 저장의 주인이 분산됐다. Skill별 전용
+도구와 direct Open Wearables 접근을 계속 추가하면 같은 wellness 질문이 서로 다른
+검증·저장 규칙을 타게 된다.
+
+### #138 이후
+
+```text
+사용자/채널
+    |
+    v
+HealthMesDecisionService
+    |
+    v
+Hermes의 단일 LLM/tool loop
+    |
+    v
+HealthMes MCP의 4개 domain search + 2개 Skill catalog 도구
+    |
+    v
+Context Access Layer -> 결정론적 Domain Provider
+    |
+    v
+ContextResult + source_refs
+    |
+    v
+LLM 종합 -> DecisionFinalizer 검증 -> 필요한 경우만 compact 저장
+```
+
+| 경계 | 이전 | #138 |
+|---|---|---|
+| 자유 형식 판단 입구 | Hermes 경로와 HealthMes resolver가 분리 | `HealthMesDecisionService` 하나 |
+| 자료 선택 | Skill별 절차 또는 고정 `question_kind` | 하나의 LLM이 질문별로 자율 선택 |
+| 실제 조회 | 혼합 MCP와 전용 도구 | HealthMes MCP의 typed domain search |
+| Open Wearables | Hermes에 직접 노출 가능 | Wearable Provider 뒤 bounded reader |
+| 판단 저장 | Skill이 범용 writer 호출을 기억해야 함 | `DecisionFinalizer`만 조건부 저장 |
+| 출처 검증 | 도구별로 상이 | canonical trace와 `source_refs` 공통 검증 |
+
+## 2. 사용자 요구와 구현 결과
 
 | 요구 | PR #138 구현 |
 |---|---|
@@ -57,7 +116,7 @@ HealthMes 코드는 조회 허용 범위, 보존기간, 시간대, 정확한 계
 | iPhone Screen Time 수준 activity | eligible build용 aggregate collector/sync/outbox와 activity 저장 연결 |
 | UI와 Hermes vendor 격리 | UI 미구현, `vendor/hermes-agent/` 변경 없음 |
 
-## 2. 실제 조회 책임
+## 3. 실제 조회 책임
 
 ```text
 LLM
@@ -116,7 +175,34 @@ LLM
 - 각 domain별 별도 최종 판단 agent
 - `question_kind -> 고정 domain 목록`을 주 경로로 사용
 
-## 3. Skill과 데이터 도구
+### 단일 LLM이 충분한 범위
+
+| 항목 | 한 부모 LLM | HealthMes 코드 |
+|---|---|---|
+| 질문 의도와 필요한 domain 추정 | 담당 | 고정 표로 대신하지 않음 |
+| 여러 도구를 어떤 순서로 호출할지 | 담당 | 허용 도구와 호출 예산만 제한 |
+| 정확한 DB/API 행 선택 | 직접 담당하지 않음 | Provider가 결정론적으로 담당 |
+| retention·timezone·중복·단위 | 신뢰하지 않음 | Access Layer와 Provider가 담당 |
+| 사용 출처의 진위 | 최종 ref를 선언 | canonical trace와 finalizer가 검증 |
+| 여러 영역의 의미와 최종 설명 | 담당 | strict 결과 계약을 검증 |
+
+따라서 엄밀성은 다음 합성 결과다.
+
+```text
+LLM의 조회 계획
+  + 결정론적 domain query
+  + access/retention/freshness 검사
+  + source_refs 재검증
+  = 검증 가능한 wellness 판단
+```
+
+현재 남은 품질 위험은 **retrieval-plan completeness**다. 즉 임의의 자연어 질문에서
+LLM이 관련 domain을 모두 떠올리는지는 확률적이며, 평가 fixture와 tool-call
+telemetry로 측정해야 한다. 반면 선택된 도구가 정확한 범위와 출처를 반환했는지는
+코드가 검증한다. 측정 결과 실제 누락이 확인되기 전에는 subagent를 필수 구조로
+추가하지 않는다.
+
+## 4. Skill과 데이터 도구
 
 Decision profile에 보이는 도구는 정확히 여섯 개다.
 
@@ -148,7 +234,7 @@ LLM은 질문에 전문 절차가 필요하면 Skill 목록에서 관련 Skill�
 간단한 질문은 Skill을 읽지 않고 바로 검색할 수 있다. Skill을 읽었다는 이유만으로
 모든 관련 domain을 조회하지도 않는다.
 
-## 4. 여러 입력을 조회할 때
+## 5. 여러 입력을 조회할 때
 
 Hermes `/v1/responses` 호출은 한 번이지만 그 내부 transcript에는 여러
 `function_call -> function_call_output` 쌍이 들어갈 수 있다.
@@ -170,7 +256,7 @@ final message: healthmes.decision-draft.v2
 session은 canonical trace와 policy 일관성을 위해 호출을 직렬화한다. 향후 병렬
 retrieval subagent는 #193에서 별도로 검토한다.
 
-## 5. 저장 경계
+## 6. 저장 경계
 
 ```text
 HealthMes Personal Data Node
@@ -198,7 +284,7 @@ HealthMes Personal Data Node
 상세 질문에서는 bounded Open Wearables reader를 호출한 뒤 필요한 결과와
 provenance만 HealthMes 계약으로 반환한다.
 
-## 6. iPhone Screen Time과 입력 설정
+## 7. iPhone Screen Time과 입력 설정
 
 iPhone Screen Time은 별도 wellness domain이 아니라 Activity domain의 collector다.
 
@@ -226,7 +312,112 @@ PUT  /v1/inputs/{source_id}/settings
 
 데스크톱과 모바일의 오래된 설정 덮어쓰기는 ETag/`If-Match` CAS로 방지한다.
 
-## 7. Sake 권장 리뷰 순서
+## 8. 최신 main 충돌과 통합 방안
+
+### 현재 확인된 충돌
+
+공통 조상 `d89b314a` 기준으로 #138과 최신 `main`이 함께 수정한 파일은 11개다.
+Git merge가 직접 표시한 텍스트 충돌은 다음 6개다.
+
+```text
+README.md
+healthmes/mcp_server/server.py
+tests/glue/test_bootstrap.py
+tests/glue/test_skills_docs.py
+tests/mcp_server/test_tools_store.py
+tests/store/test_alembic.py
+```
+
+자동 병합되더라도 의미 검토가 필요한 공통 수정 파일은 다음 5개다.
+
+```text
+healthmes/store/models.py
+skills/healthmes-sleep/SKILL.md
+tests/api/test_decisions.py
+tests/mcp_server/test_server_app.py
+tests/store/test_models.py
+```
+
+`main`이 추가한 중요한 제품 변경은 다음과 같다.
+
+- Open Wearables의 WHOOP Cycle `day_strain` 수집·정규화
+- WHOOP recovery와 같은 Cycle의 day strain을 결합하는 전용 context
+- `healthmes-whoop-recovery` Skill
+- 범용 decision writer에 별도 `evidence_refs` 저장
+- Alembic revision `f4a5b6c7d8e`
+- 이중 라이선스와 README 변경
+
+### 가장 큰 의미적 충돌
+
+```text
+최신 main
+WHOOP Skill
+  -> WHOOP 전용 context 도구
+  -> Skill이 범용 decision writer 직접 호출
+
+#138
+HealthMesDecisionService
+  -> Hermes 단일 LLM loop
+  -> search_wearable
+  -> 공통 source_refs 검증
+  -> DecisionFinalizer만 저장
+```
+
+두 방식을 그대로 남기면 같은 질문에 대해 조회 도구와 저장 주체가 둘이 된다.
+이는 #138이 제거한 이중 reasoning/persistence 경로를 되살린다.
+
+또한 현재 #138 코드 자체에는 다음 두 WHOOP 공백이 있다.
+
+- bounded wearable health-score category에 `day_strain`이 없다.
+- `wearable.recovery`는 HRV, charge와 어제 load를 반환하지만 같은 WHOOP Cycle의
+  Recovery + 현재 day strain package를 정확히 반환하지 않는다.
+
+이는 #138의 단일-runtime 설계가 잘못됐다는 뜻이 아니라, #138이 갈라진 뒤
+`main`에 추가된 WHOOP 기능을 아직 공통 Provider 계약으로 옮기지 않았다는 뜻이다.
+
+### 병합 시 해결 원칙
+
+```text
+healthmes-whoop-recovery Skill
+  -> LLM이 Skill catalog에서 읽음
+  -> search_wearable(
+       capability="wearable.whoop-recovery-package"
+     )
+  -> WearableContextProvider
+  -> Recovery + day_strain + Cycle linkage + source_refs
+  -> LLM DecisionDraft
+  -> #138 DecisionFinalizer
+```
+
+1. Open Wearables의 WHOOP 수집, 정규화, freshness, Cycle matching과 fail-closed
+   계산은 유지한다.
+2. #138 wearable allowlist와 typed contract에 `day_strain`을 추가한다.
+3. WHOOP 전용 계산은 `WearableContextProvider`의 capability로 옮긴다.
+4. 일곱 번째 제품 decision tool을 추가하지 않고 기존 `search_wearable`을
+   사용한다.
+5. WHOOP Skill은 조회 절차를 설명하되 판단을 직접 저장하지 않는다.
+6. provenance는 #138의 private `decision_payload.source_refs`와 source
+   attestation에 통합한다. 별도 `evidence_refs` 저장 경로를 중복 추가하지 않는다.
+7. `e3f4a5b6c7d8`에서 갈라진 Alembic 계보는 후속 adapted revision 또는 merge
+   revision으로 단일 head를 만든다.
+8. 라이선스와 README 변경은 보존하되 #138의 단일 ingress 설명과 충돌하지 않게
+   합친다.
+
+### #138의 현재 문제를 정확히 요약하면
+
+| 문제 | 성격 | 해결 |
+|---|---|---|
+| 최신 `main`과 Git 충돌 | 통합 미완료 | 위 6개 텍스트 충돌을 의도 기반으로 해결 |
+| WHOOP day strain 미지원 | 기능 격차 | 공통 wearable capability로 흡수 |
+| main의 Skill 직접 저장 | 아키텍처 회귀 위험 | `DecisionFinalizer` 단일 writer 유지 |
+| 별도 `evidence_refs` 컬럼 | provenance 중복 위험 | 기존 private payload/attestation으로 통합 |
+| LLM이 관련 domain을 빠뜨릴 가능성 | 모델 품질 위험 | eval·telemetry 추가, 필요 시 #193 |
+
+이 문서 변경에서는 `main`을 실제로 병합하거나 제품 코드를 수정하지 않는다.
+따라서 문서 반영 후에도 PR #138의 GitHub merge 상태는 충돌 해결 커밋이 들어가기
+전까지 `CONFLICTING`이다.
+
+## 9. Sake 권장 리뷰 순서
 
 1. **단일 제품 진입점**
    - `healthmes/api/wellness_decisions.py`
@@ -265,7 +456,7 @@ PUT  /v1/inputs/{source_id}/settings
    - `tests/api/test_wellness_decisions.py`
    - `tests/glue/test_single_wellness_runtime_repository.py`
 
-## 8. 리뷰 핵심 불변조건
+## 10. 리뷰 핵심 불변조건
 
 - 외부 자유 형식 reasoning ingress는 하나여야 한다.
 - Hermes가 LLM/tool loop를 실행하지만 HealthMes가 제품 정책과 데이터를 소유해야
@@ -280,7 +471,7 @@ PUT  /v1/inputs/{source_id}/settings
 - 단순 조회는 DecisionRecord를 만들지 않아야 한다.
 - UI와 `vendor/hermes-agent/`는 이 PR에서 변경하면 안 된다.
 
-## 9. 검증 결과
+## 11. 검증 결과
 
 - macOS lifecycle: `166 passed, 1 skipped`
 - 격리 Linux/procps-ng: targeted `2 passed`, full lifecycle `167 passed`
@@ -292,8 +483,10 @@ PUT  /v1/inputs/{source_id}/settings
 - Compose, Ruff, `bash -n`, `git diff --check`, Alembic render: 통과
 - 전체 기능 diff 독립 GPT-5.6 Sol xhigh 리뷰:
   `High 0 / Medium 0 / Low 0 / PASS`
+- 이번 아키텍처·main 충돌 문서 갱신:
+  canonical docs/glue targeted `23 passed`, `git diff --check` 통과
 
-## 10. 후속 작업
+## 12. 후속 작업
 
 - 검색 전용 bounded subagent: #193
 - GPS/location input: #158

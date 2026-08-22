@@ -47,6 +47,38 @@ REST / Future Channel Wrapper / Proactive / Scheduled
 `/v1/responses`는 HealthMes가 내부에서 호출하는 runtime 계약이며, 앱이나
 사용자가 선택할 수 있는 두 번째 제품 경로가 아니다.
 
+### #138 이전과 이후
+
+```text
+#138 이전
+
+Hermes + Skill ----------------> 혼합 MCP/전용 도구 ----> Skill 직접 저장
+호출자 + 고정 question_kind ---> 고정 resolver ----------> context만 반환
+
+#138 이후
+
+모든 자유 형식 요청
+       |
+       v
+HealthMesDecisionService
+       |
+       v
+Hermes 단일 LLM/tool loop
+       |
+       v
+HealthMes MCP domain search
+       |
+       v
+결정론적 Provider + source_refs
+       |
+       v
+DecisionFinalizer 단일 저장 경계
+```
+
+변경의 핵심은 Hermes를 없애는 것이 아니다. Hermes는 유일한 LLM loop로 유지하되,
+제품 ingress, 데이터 조회 계약, provenance와 persistence의 소유권을 HealthMes로
+모은 것이다.
+
 두 개의 LLM loop를 합치는 방식은 다음과 같다.
 
 - **HealthMes**가 제품 ingress, 데이터, 도구 계약, 저장·보존, 결과 검증을
@@ -539,6 +571,40 @@ Open Wearables의 상세 DB는 별도 물리 저장소로 유지한다. 그러�
 고정 `question_kind` resolver는 기존 호출자 호환용 preset일 뿐 공식 자연어
 reasoning 경로가 아니다.
 
+### 최신 main의 WHOOP 변경을 반영하는 방법
+
+2026-08-22의 최신 `main`(`103b7269`)에는 WHOOP Cycle `day_strain` 수집과 전용
+recovery package가 추가됐다. 현재 #138 제품 기준점 `1acd2221`에는 이 변경이
+아직 들어오지 않았으며 PR은 Git 충돌 상태다.
+
+`main`의 계산을 버리면 안 되지만 전용 decision tool과 Skill 직접 저장 경로를
+그대로 유지해서도 안 된다. 목표 통합은 다음과 같다.
+
+```text
+Open Wearables
+  -> WHOOP Recovery + Cycle day_strain 정규화
+  -> bounded wearable reader
+  -> WearableContextProvider
+  -> wearable.whoop-recovery-package
+  -> search_wearable
+  -> Hermes LLM 종합
+  -> DecisionFinalizer
+```
+
+따라서 통합 작업은 다음 원칙을 따른다.
+
+1. WHOOP raw parsing, 공식 label, freshness, Cycle matching과 fail-closed 계산을
+   보존한다.
+2. `day_strain`을 #138의 wearable category allowlist에 추가한다.
+3. 전용 WHOOP context 도구 대신 기존 `search_wearable` capability로 노출한다.
+4. WHOOP Skill은 LLM 지침으로만 사용하고 persistence를 직접 실행하지 않는다.
+5. 출처는 별도 중복 컬럼보다 기존 private `decision_payload.source_refs`와
+   attestation에 통합한다.
+6. 두 Alembic 계보는 adapted follow-up 또는 merge revision으로 합친다.
+
+이 문서 변경은 통합 설계를 명시한 것이며 실제 `main` merge나 제품 코드 적응을
+완료했다고 주장하지 않는다.
+
 ### 실행 전·후 검증
 
 1. 렌더된 Hermes decision config는 제품 MCP로 `healthmes` 하나만 가진다.
@@ -576,6 +642,33 @@ row/byte/call budget
 고성능 LLM을 사용해도 삭제된 행, stale device revision, timezone cutoff, 중복
 합산과 DB transaction을 확실하게 지키지는 못한다. 따라서 LLM에 DB나 자유 SQL을
 직접 주지 않는다.
+
+### 한 부모 LLM으로 충분한가
+
+MVP의 **질문 해석과 자료 선택**에는 충분하다. 하나의 Hermes turn이 Skill과 여러
+`search_*` 도구를 반복 호출하고 최종 답변을 합성할 수 있다.
+
+MVP의 **엄밀한 데이터 조회 전체**를 LLM 하나에 맡기는 것은 충분하지 않다.
+
+```text
+LLM이 보장하는 대상
+  필요한 domain/capability를 추론하고 결과를 종합
+
+코드가 보장하는 대상
+  정확한 행, 기간, timezone, retention, dedup, freshness, coverage,
+  source_refs와 저장 원자성
+```
+
+두 문제를 구분해야 한다.
+
+| 문제 | 의미 | 현재 대응 |
+|---|---|---|
+| 조회 계획 누락 | LLM이 관련 domain을 떠올리지 못함 | 평가셋·telemetry로 측정, 필요 시 #193 |
+| 조회 실행 오류 | 잘못된 기간·행·중복·출처 사용 | typed Provider와 finalizer가 차단 |
+
+검색 subagent는 첫 번째 문제를 개선할 수 있지만 두 번째 문제의 대체물이 아니다.
+현재는 단일 부모 LLM을 기준선으로 유지하고 실제 누락률이 확인될 때만 bounded
+read-only retrieval worker를 추가한다.
 
 ## 5. 중앙 Personal Data Node와 저장 경계
 
@@ -779,6 +872,15 @@ PR #138 구현 기준:
 - 단순 조회는 미저장, 행동·위험·명시 추적만 compact 저장한다.
 - iPhone Screen Time lifecycle/outbox code와 입력 설정 CAS가 검증된다.
 - UI와 `vendor/hermes-agent/`는 수정하지 않는다.
+
+2026-08-22 통합 상태:
+
+- #138 제품 기준점은 `1acd2221`, 이번 갱신 이전 문서 기준점은
+  `c8640707`이다.
+- 최신 `main`은 `103b7269`이며 아직 병합되지 않았다.
+- Git이 직접 표시하는 텍스트 충돌은 6개 파일이다.
+- WHOOP `day_strain`과 recovery package는 위 Provider 적응을 마친 뒤 완료로
+  판정해야 한다.
 
 비범위:
 
