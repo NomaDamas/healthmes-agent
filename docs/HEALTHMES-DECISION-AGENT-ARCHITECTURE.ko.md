@@ -7,6 +7,9 @@
 > 제품 전체 경계와 저장 구조는
 > [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 > 를 먼저 읽는다.
+>
+> PR #138의 구현 범위, 코드 검토 순서와 검증 증거는
+> [`PR-138-REVIEW-GUIDE.ko.md`](PR-138-REVIEW-GUIDE.ko.md)를 따른다.
 
 ## TLDR
 
@@ -122,6 +125,85 @@ Skill catalog는 도메인 전문가가 작성한 읽기 전용 지침을 제공
 VLM 사진 분석, 식사 확정, 설정 변경과 캘린더 mutation은 이 read-only decision
 profile에 넣지 않는다. 이들은 각 bounded intake/command workflow가 소유하고,
 필요한 판단만 같은 Decision Service에 요청한다.
+
+### Skill을 읽은 뒤 데이터가 조회되는 순서
+
+Skill과 데이터 검색은 같은 `healthmes` MCP 서버를 사용하지만 역할이 다르다.
+
+| 종류 | 예시 | 반환하는 것 |
+|---|---|---|
+| Skill catalog tool | `list_wellness_skills`, `read_wellness_skill` | 검토된 판단 절차와 도구 사용 지침 |
+| Domain search tool | `search_activity`, `search_nutrition`, `search_calendar`, `search_wearable` | 실제 저장 데이터에서 계산된 context와 `source_refs` |
+
+LLM은 사용자 질문을 읽고 Skill이 필요하면 catalog에서 관련 Skill을 골라 읽는다.
+Skill 문서는 예를 들어 "후보 카페인, 오늘의 확정 섭취량, 현재 시각과 수면을
+확인하라"고 안내할 수 있다. Skill 자체가 다음 MCP 도구를 실행하지는 않는다.
+**Skill 내용을 읽은 같은 LLM이** 필요한 `search_*` 도구를 다시 선택한다.
+
+```text
+사용자 질문
+  -> LLM이 관련 Skill 필요 여부 판단
+  -> 필요하면 list/read_wellness_skill
+  -> LLM이 Skill 지침과 질문을 함께 해석
+  -> search_nutrition 또는 다른 search_* 호출
+  -> 결과의 freshness/coverage/limitations 확인
+  -> 필요하면 다른 domain을 추가 조회
+  -> 최종 DecisionDraft
+```
+
+간단한 조회는 Skill을 읽지 않고 바로 domain search를 호출할 수 있다. 반대로 Skill을
+읽었다고 해서 Skill에 적힌 모든 domain을 기계적으로 조회해서도 안 된다. 실제
+질문에 필요한 최소 자료를 LLM이 선택한다.
+
+### 여러 domain을 조회하는 방식
+
+여러 입력이 필요하면 LLM은 한 Hermes `/v1/responses` 요청 안에서 하나 이상의
+MCP `function_call`을 만든다. 각 호출 결과는 `function_call_output`으로 다시
+LLM에게 들어가고, LLM은 결과를 본 뒤 추가 호출 여부를 판단한다.
+
+```text
+LLM
+  -> function_call: search_nutrition
+  <- function_call_output: 오늘 카페인 ledger
+  -> function_call: search_wearable
+  <- function_call_output: 수면/readiness
+  -> function_call: search_activity
+  <- function_call_output: 연속 작업과 휴식
+  -> final assistant output: healthmes.decision-draft.v2
+```
+
+따라서 `search_*` 호출들은 **중간 출력**이고 최종 assistant 출력은 하나의 strict
+`DecisionDraft`다. 구현은 여러 call/output pair를 검증하지만 현재
+`DecisionContextSearchSessionService`는 한 요청의 canonical trace와 policy
+일관성을 위해 검색 작업을 직렬화한다. 여러 도구를 호출할 수 있다는 말이 곧
+동시 병렬 조회를 의미하지는 않는다.
+
+### Domain Provider와 서브에이전트 경계
+
+Domain Provider는 AI가 아니라 정해진 입력 계약을 실행하는 조회·계산 adapter다.
+
+```text
+LLM이 capability 선택
+  -> HealthMes MCP search tool
+  -> DecisionContextSearchSessionService
+  -> Context Access Layer
+  -> Provider Registry가 capability owner 결정
+  -> Activity/Nutrition/Calendar/Wearable Provider.query()
+  -> HealthMes DB, mirror 또는 bounded Open Wearables reader
+  -> ContextResult + source_refs
+```
+
+Provider Registry의 매핑은 결정론적이다. 예를 들어
+`nutrition.caffeine-ledger`는 `NutritionContextProvider`가 처리한다. Provider는
+질문의 의미를 해석하거나 최종 행동을 추천하지 않고, 내부에서 서브에이전트를
+spawn하지도 않는다.
+
+현재 MVP에는 검색 서브에이전트가 없다. 하나의 부모 Hermes LLM이 모든 검색 도구를
+직접 선택한다. 향후 복잡한 장기·다중 domain 검색을 병렬 위임하는 기능은
+[#193](https://github.com/NomaDamas/healthmes-agent/issues/193)에서 추적한다.
+그 기능도 Provider 안에서 agent를 만들지 않고, 부모 판단 계층이 제한된 읽기 전용
+retrieval worker를 선택적으로 생성하는 구조여야 한다. 최종 판단, source 검증과
+저장은 계속 부모 HealthMes Decision Agent만 소유한다.
 
 ## 5. Source Refs와 Canonical Trace
 
@@ -340,3 +422,7 @@ Hermes가 HealthMes MCP를 필요로 하면서 HealthMes startup이 Hermes를 �
 새 domain마다 별도 agent, 별도 제품 MCP나 별도 질문 taxonomy를 만들지 않는다.
 필요한 데이터 특성만 논리적으로 분리하고 같은 Decision Service와 source 계약에
 연결한다.
+
+검색 복잡도가 실제 병목으로 확인되면 #193의 bounded retrieval subagent를 검토한다.
+도입 조건은 단일 ingress, 부모 단일 최종 판단, 기존 Context Access Layer와
+Provider 계약, canonical trace와 `source_refs` 검증을 모두 유지하는 것이다.

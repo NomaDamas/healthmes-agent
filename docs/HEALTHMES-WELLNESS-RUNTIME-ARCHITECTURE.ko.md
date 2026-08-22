@@ -7,6 +7,9 @@
 >
 > **범위:** 자유 형식 wellness 판단, HealthMes MCP, 도메인 저장 경계,
 > 조건부 판단 기록, iPhone Screen Time 수집 lifecycle과 입력 설정 계약.
+>
+> **리뷰 가이드:** PR #138의 구현 요약과 코드 검토 순서는
+> [`PR-138-REVIEW-GUIDE.ko.md`](PR-138-REVIEW-GUIDE.ko.md)를 따른다.
 
 ## TLDR
 
@@ -782,6 +785,7 @@ PR #138 구현 기준:
 - Apple entitlement 승인과 실제 iPhone dogfood
 - hosted multi-user identity와 휴대폰 단독 hosted node
 - 실시간 multi-master device sync
+- bounded retrieval subagent와 병렬 검색(#193)
 - 가격·과금 정책
 - 완전한 Personal Data Node disaster recovery
 - 디바이스 UI
