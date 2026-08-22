@@ -94,12 +94,8 @@ GENERATED_SECRET_KEY = "HEALTHMES_HERMES_WEBHOOK_SECRET"
 GENERATED_ADJUSTMENT_SECRET_KEY = "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
 
 # Non-generatable credentials we can only warn about.
-WARN_IF_MISSING = (
-    "TELEGRAM_BOT_TOKEN",
-    "OPEN_WEARABLES_API_KEY",
-    "HEALTHMES_TELEGRAM_OWNER_USER_ID",
-    "HEALTHMES_TELEGRAM_OWNER_CHAT_ID",
-)
+WARN_IF_MISSING = ("OPEN_WEARABLES_API_KEY",)
+DELIVERY_PLATFORMS = frozenset({"telegram", "discord"})
 
 # Briefing state-snapshot script (docs/PLAN.md section 4 `script:` context
 # injection). The vendor scheduler resolves relative script paths under
@@ -125,12 +121,17 @@ HEALTHMES_MANAGED_CRON_FIELDS = (
 # Every variable the template references. Optional ones render as "" so the
 # template's `| default(..., true)` fallbacks kick in under StrictUndefined.
 TEMPLATE_KEYS = (
+    "delivery_platform",
     "telegram_bot_token",
     "telegram_home_chat_id",
     "telegram_home_chat_name",
     "telegram_allowed_user_ids",
     "telegram_owner_user_id",
     "telegram_owner_chat_id",
+    "discord_bot_token",
+    "discord_home_channel_id",
+    "discord_home_channel_name",
+    "discord_allowed_user_ids",
     "hermes_webhook_port",
     "hermes_webhook_secret",
     "healthmes_alert_prompt",
@@ -211,6 +212,11 @@ BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
         "script": SNAPSHOT_SCRIPT_NAME,
     },
 )
+
+
+def briefing_jobs(delivery_platform: str) -> tuple[dict[str, Any], ...]:
+    """Return HealthMes cron declarations for the selected delivery surface."""
+    return tuple({**job, "deliver": delivery_platform} for job in BRIEFING_JOBS)
 
 LEGACY_HEALTHMES_MORNING_CRON_FINGERPRINTS: tuple[dict[str, Any], ...] = (
     {
@@ -368,17 +374,40 @@ def build_context(
 ) -> dict[str, Any]:
     """Template context: every TEMPLATE_KEYS entry is present (maybe '')."""
     defaults = mode_defaults(mode, repo_root, env)
+    delivery_platform = (
+        env.get("HEALTHMES_DELIVERY_PLATFORM", "telegram").strip().lower()
+        or "telegram"
+    )
+    if delivery_platform not in DELIVERY_PLATFORMS:
+        choices = ", ".join(sorted(DELIVERY_PLATFORMS))
+        raise ValueError(
+            f"HEALTHMES_DELIVERY_PLATFORM must be one of: {choices}"
+        )
     owner_user_id = env.get("HEALTHMES_TELEGRAM_OWNER_USER_ID", "").strip()
     owner_chat_id = env.get("HEALTHMES_TELEGRAM_OWNER_CHAT_ID", "").strip()
     if "*" in {owner_user_id, owner_chat_id}:
         raise ValueError("Telegram owner user/chat ids must be explicit; '*' is forbidden")
+    discord_allowed_user_ids = [
+        value.strip()
+        for value in env.get("DISCORD_ALLOWED_USERS", "").split(",")
+        if value.strip()
+    ]
+    if "*" in discord_allowed_user_ids:
+        raise ValueError("Discord allowed user ids must be explicit; '*' is forbidden")
     context: dict[str, Any] = {
+        "delivery_platform": delivery_platform,
         "telegram_bot_token": env.get("TELEGRAM_BOT_TOKEN", "").strip(),
         "telegram_home_chat_id": env.get("TELEGRAM_HOME_CHAT_ID", "").strip(),
         "telegram_home_chat_name": env.get("TELEGRAM_HOME_CHAT_NAME", "").strip(),
         "telegram_allowed_user_ids": [owner_user_id] if owner_user_id else [],
         "telegram_owner_user_id": owner_user_id,
         "telegram_owner_chat_id": owner_chat_id,
+        "discord_bot_token": env.get("DISCORD_BOT_TOKEN", "").strip(),
+        "discord_home_channel_id": env.get("DISCORD_HOME_CHANNEL", "").strip(),
+        "discord_home_channel_name": env.get(
+            "DISCORD_HOME_CHANNEL_NAME", ""
+        ).strip(),
+        "discord_allowed_user_ids": discord_allowed_user_ids,
         "hermes_webhook_port": env.get("HERMES_WEBHOOK_PORT", "").strip(),
         "hermes_webhook_secret": webhook_secret,
         "healthmes_alert_prompt": env.get("HEALTHMES_ALERT_PROMPT", "").strip(),
@@ -928,12 +957,16 @@ def _apply_fallback_cron_updates(
     return updated
 
 
-def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
-    """Create BRIEFING_JOBS and reconcile the HealthMes-owned morning job.
+def register_cron_jobs(
+    hermes_home: Path,
+    plan: Plan,
+    jobs: tuple[dict[str, Any], ...] = BRIEFING_JOBS,
+) -> str:
+    """Create briefing jobs and reconcile HealthMes-owned jobs.
 
-    The morning job is updated only when a HealthMes ownership marker or a
-    legacy HealthMes-specific fingerprint is present. Runtime state and job
-    identity remain untouched; only the managed declaration fields drift.
+    A job is updated only when a HealthMes ownership marker or the legacy
+    morning-specific fingerprint is present. Runtime state and job identity
+    remain untouched; only the managed declaration fields drift.
     """
     jobs_file = hermes_home / "cron" / "jobs.json"
     existing_jobs = _load_jobs_envelope(jobs_file)
@@ -943,7 +976,7 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
 
     missing: list[dict[str, Any]] = []
     drifted: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
-    for desired in BRIEFING_JOBS:
+    for desired in jobs:
         matches = jobs_by_name.get(desired["name"], [])
         if not matches:
             missing.append(desired)
@@ -955,9 +988,6 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
             )
             continue
         existing = matches[0]
-        if desired["name"] != HEALTHMES_MORNING_CRON_NAME:
-            plan.act(f"keep cron job '{desired['name']}' (already registered)")
-            continue
         job_id = str(existing.get("id") or "").strip()
         id_matches = [
             job
@@ -1123,6 +1153,10 @@ def run(args: argparse.Namespace) -> int:
     env_file = Path(args.env_file).expanduser()
     hermes_home = resolve_hermes_home(args, REPO_ROOT)
     env = resolve_env(env_file)
+    delivery_platform = (
+        env.get("HEALTHMES_DELIVERY_PLATFORM", "telegram").strip().lower()
+        or "telegram"
+    )
 
     for key in WARN_IF_MISSING:
         if not env.get(key, "").strip():
@@ -1130,17 +1164,41 @@ def run(args: argparse.Namespace) -> int:
                 f"{key} is not set (in {env_file} or the environment); the "
                 f"rendered config will contain an empty value"
             )
-    if not env.get("TELEGRAM_HOME_CHAT_ID", "").strip():
+    if delivery_platform == "telegram":
+        selected_requirements = (
+            "TELEGRAM_BOT_TOKEN",
+            "HEALTHMES_TELEGRAM_OWNER_USER_ID",
+            "HEALTHMES_TELEGRAM_OWNER_CHAT_ID",
+        )
+    elif delivery_platform == "discord":
+        selected_requirements = ("DISCORD_BOT_TOKEN", "DISCORD_ALLOWED_USERS")
+    else:
+        choices = ", ".join(sorted(DELIVERY_PLATFORMS))
+        raise ValueError(
+            f"HEALTHMES_DELIVERY_PLATFORM must be one of: {choices}"
+        )
+    for key in selected_requirements:
+        if not env.get(key, "").strip():
+            plan.warn(
+                f"{key} is not set (in {env_file} or the environment); "
+                f"{delivery_platform} chat will not be ready"
+            )
+
+    home_target_key = (
+        "TELEGRAM_HOME_CHAT_ID"
+        if delivery_platform == "telegram"
+        else "DISCORD_HOME_CHANNEL"
+    )
+    if not env.get(home_target_key, "").strip():
         # Without it the rendered config has neither telegram.home_channel nor
-        # the alert route's deliver_extra.chat_id, so `deliver: telegram`
+        # the alert route's deliver_extra.chat_id, so the selected delivery
         # (cron briefings + webhook alerts) fails at send time with "No
         # chat_id or home channel" (vendor gateway/platforms/webhook.py)
         # until a home channel exists.
         plan.warn(
-            "TELEGRAM_HOME_CHAT_ID is not set: cron briefings and webhook "
-            "alerts have no Telegram delivery target and will fail at send "
-            "time until you set it (re-run bootstrap) or send /sethome to "
-            "the bot in your Telegram chat"
+            f"{home_target_key} is not set: cron briefings and webhook alerts "
+            f"have no {delivery_platform} delivery target and will fail at "
+            "send time until you set it and re-run bootstrap"
         )
 
     webhook_secret = ensure_webhook_secret(env_file, env, plan)
@@ -1159,7 +1217,11 @@ def run(args: argparse.Namespace) -> int:
     if args.skip_cron:
         plan.act("skip cron registration (--skip-cron)")
     else:
-        method = register_cron_jobs(hermes_home, plan)
+        method = register_cron_jobs(
+            hermes_home,
+            plan,
+            briefing_jobs(context["delivery_platform"]),
+        )
         plan.act(f"cron registration method: {method}")
 
     plan.report()

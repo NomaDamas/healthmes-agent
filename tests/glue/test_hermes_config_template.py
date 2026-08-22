@@ -23,12 +23,17 @@ TEMPLATE_PATH = (
 )
 
 FULL_CONTEXT = {
+    "delivery_platform": "telegram",
     "telegram_bot_token": "123456:test-token",
     "telegram_home_chat_id": "987654321",
     "telegram_home_chat_name": "Me",
     "telegram_allowed_user_ids": ["987654321"],
     "telegram_owner_user_id": "987654321",
     "telegram_owner_chat_id": "987654321",
+    "discord_bot_token": "",
+    "discord_home_channel_id": "",
+    "discord_home_channel_name": "",
+    "discord_allowed_user_ids": [],
     "hermes_webhook_port": 8644,
     "hermes_webhook_secret": "hmac-secret",
     "healthmes_alert_prompt": "Alert {rule_id}: {summary}",
@@ -46,6 +51,7 @@ FULL_CONTEXT = {
 }
 
 MINIMAL_CONTEXT = {
+    "delivery_platform": "telegram",
     "telegram_bot_token": "123456:test-token",
     "hermes_webhook_secret": "hmac-secret",
     "ow_api_key": "ow-key",
@@ -85,6 +91,33 @@ def test_home_channel_only_rendered_when_chat_id_set() -> None:
 
     minimal = render(dict(MINIMAL_CONTEXT))
     assert "home_channel" not in minimal["platforms"]["telegram"]
+
+
+def test_discord_platform_and_delivery_are_selected_together() -> None:
+    cfg = render(
+        dict(
+            FULL_CONTEXT,
+            delivery_platform="discord",
+            discord_bot_token="discord-test-token",
+            discord_home_channel_id="112233445566",
+            discord_home_channel_name="Dogfood",
+            discord_allowed_user_ids=["998877665544"],
+        )
+    )
+
+    assert cfg["platforms"]["telegram"]["enabled"] is False
+    discord = cfg["platforms"]["discord"]
+    assert discord["enabled"] is True
+    assert discord["token"] == "discord-test-token"
+    assert discord["extra"]["allow_from"] == ["998877665544"]
+    assert discord["home_channel"] == {
+        "platform": "discord",
+        "chat_id": "112233445566",
+        "name": "Dogfood",
+    }
+    route = cfg["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"]
+    assert route["deliver"] == "discord"
+    assert route["deliver_extra"] == {"chat_id": "112233445566"}
 
 
 def test_webhook_route_matches_adapter_contract(config: dict) -> None:
