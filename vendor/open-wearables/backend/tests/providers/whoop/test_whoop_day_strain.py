@@ -45,6 +45,21 @@ class TestWhoopDayStrain:
         assert score.components["cycle_id"].qualifier == "93845"
         assert score.components["cycle_updated_at"].qualifier == "2026-08-13T06:20:00+00:00"
 
+    def test_keeps_recovery_cycle_identity(self, data_247: Whoop247Data) -> None:
+        user_id = uuid4()
+        normalized = {
+            "timestamp": datetime(2026, 8, 13, 6, 20, tzinfo=timezone.utc),
+            "cycle_id": 93845,
+            "recovery_score": 72,
+            "resting_heart_rate": 55,
+        }
+
+        score = data_247._normalize_recovery_health_score(normalized, user_id)
+
+        assert score is not None
+        assert score.components is not None
+        assert score.components["cycle_id"].qualifier == "93845"
+
     def test_rejects_unscored_or_unparseable_cycles(self, data_247: Whoop247Data, scored_cycle: dict) -> None:
         user_id = uuid4()
         scored_cycle["score_state"] = "PENDING_SCORE"
@@ -68,8 +83,8 @@ class TestWhoopDayStrain:
             )
 
         assert count == 1
-        health_score_service.bulk_create.assert_called_once()
-        persisted = health_score_service.bulk_create.call_args.args[1][0]
+        health_score_service.upsert_whoop_day_strain.assert_called_once()
+        persisted = health_score_service.upsert_whoop_day_strain.call_args.args[1][0]
         assert persisted.category == HealthScoreCategory.DAY_STRAIN
         assert persisted.recorded_at == datetime(2026, 8, 13, 1, 30, tzinfo=timezone.utc)
         assert persisted.components is not None

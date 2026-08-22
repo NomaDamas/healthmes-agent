@@ -750,6 +750,9 @@ class Whoop247Data(Base247DataTemplate):
             for k in ("resting_heart_rate", "hrv_rmssd_milli", "spo2_percentage", "skin_temp_celsius")
             if normalized.get(k) is not None
         }
+        cycle_id = normalized.get("cycle_id")
+        if cycle_id is not None:
+            components["cycle_id"] = ScoreComponent(qualifier=str(cycle_id))
         return HealthScoreCreate(
             id=uuid4(),
             user_id=user_id,
@@ -956,6 +959,7 @@ class Whoop247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
     ) -> list[dict[str, Any]]:
+        """Fetch cumulative WHOOP Cycle scores from the v2 cycle endpoint."""
         all_cycle_data: list[dict[str, Any]] = []
         next_token = None
         start_iso = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -985,6 +989,7 @@ class Whoop247Data(Base247DataTemplate):
         raw_cycle: dict[str, Any],
         user_id: UUID,
     ) -> HealthScoreCreate | None:
+        """Normalize one scored WHOOP Cycle cumulative strain value."""
         if raw_cycle.get("score_state") != "SCORED":
             return None
 
@@ -1022,6 +1027,7 @@ class Whoop247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
     ) -> int:
+        """Persist scored WHOOP Cycle strain, refreshing newer revisions."""
         health_scores = [
             score
             for raw_cycle in self.get_cycle_data(db, user_id, start_time, end_time)
@@ -1029,7 +1035,7 @@ class Whoop247Data(Base247DataTemplate):
         ]
         if not health_scores:
             return 0
-        health_score_service.bulk_create(db, health_scores)
+        health_score_service.upsert_whoop_day_strain(db, health_scores)
         db.commit()
         return len(health_scores)
 
