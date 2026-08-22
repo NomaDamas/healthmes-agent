@@ -31,6 +31,10 @@ class HealthScoreService(
         self.crud.bulk_create(db_session, scores)
 
     @handle_exceptions
+    def upsert_whoop_day_strain(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> None:
+        self.crud.upsert_whoop_day_strain(db_session, scores)
+
+    @handle_exceptions
     def get_latest_by_category(
         self,
         db_session: DbSession,
