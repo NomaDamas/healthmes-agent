@@ -22,6 +22,9 @@ from healthmes.decision import (
     ContextCapability,
     ContextCoverage,
     ContextFreshness,
+    ContextParameterFormat,
+    ContextParameterSpec,
+    ContextParameterType,
     ContextProviderMetadata,
     ContextProviderRegistry,
     ContextResult,
@@ -29,6 +32,7 @@ from healthmes.decision import (
     CoverageStatus,
     DecisionBudget,
     DecisionCaller,
+    DecisionContextHints,
     DecisionContextSearchSessionService,
     DecisionRequest,
     DecisionSearchBudgetError,
@@ -148,6 +152,63 @@ class SearchProvider:
         )
 
 
+class WhoopSearchProvider(SearchProvider):
+    metadata = ContextProviderMetadata(
+        provider_id="wearable",
+        domain="wearable",
+        description="Deterministic WHOOP package provider for alias tests.",
+        capabilities=(
+            ContextCapability(
+                capability="wearable.whoop-recovery-package",
+                description="Return one exact retained WHOOP package.",
+                granularities=("day",),
+                query_fields=("timezone", "fields"),
+                output_fields=("status",),
+                parameters=("date", "package_record_id"),
+                parameter_specs=(
+                    ContextParameterSpec(
+                        name="date",
+                        value_type=ContextParameterType.STRING,
+                        required=True,
+                        min_length=10,
+                        max_length=10,
+                        format=ContextParameterFormat.DATE,
+                    ),
+                    ContextParameterSpec(
+                        name="package_record_id",
+                        value_type=ContextParameterType.STRING,
+                        min_length=36,
+                        max_length=36,
+                        format=ContextParameterFormat.UUID,
+                        accepts_related_record_ref=True,
+                    ),
+                ),
+                max_lookback_days=1,
+                sensitivity="wearable",
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation="Selected retained package.",
+            ),
+        ),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.payload_factory = lambda _query: {"status": "ok"}
+
+
+class BlockingWhoopSearchProvider(WhoopSearchProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def query(self, session, query, *, now):
+        del session, now
+        self.queries.append(query)
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("expired WHOOP provider call resumed")
+
+
 class CommitAttemptProvider(SearchProvider):
     async def query(self, session, query, *, now):
         self.queries.append(query)
@@ -241,9 +302,11 @@ def _request(
     *,
     budget: DecisionBudget | None = None,
     privacy: PrivacyLevel = PrivacyLevel.AGGREGATE,
+    question: str = "Search the relevant retained health context.",
+    related_record_ids: dict[str, str] | None = None,
 ) -> DecisionRequest:
     return DecisionRequest(
-        question="Search the relevant retained health context.",
+        question=question,
         requested_at=NOW,
         timezone="UTC",
         caller=DecisionCaller(
@@ -253,11 +316,15 @@ def _request(
         ),
         requested_privacy_level=privacy,
         budget=budget or DecisionBudget(),
+        hints=DecisionContextHints(
+            related_record_ids=related_record_ids or {}
+        ),
     )
 
 
 def _policy(
     *,
+    domain: str = "nutrition",
     enabled: bool = True,
     privacy: PrivacyLevel = PrivacyLevel.AGGREGATE,
     max_rows: int = 250,
@@ -266,7 +333,7 @@ def _policy(
         owner_principal_id="owner",
         grants=(
             DomainAccessGrant(
-                domain="nutrition",
+                domain=domain,
                 enabled=enabled,
                 max_privacy_level=privacy,
                 execution_scopes=(ExecutionScope.LOCAL,),
@@ -900,6 +967,239 @@ async def test_snapshot_preserves_server_canonical_query_and_effective_query(
     assert trace[0].effective_query is not None
     assert trace[0].effective_query.limit == 2
     assert trace[0].effective_query.parameters == {}
+
+
+async def test_whoop_related_record_alias_is_restored_only_for_provider(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = WhoopSearchProvider()
+    package_record_id = uuid.uuid4()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy(domain="wearable")],
+        clock,
+    )
+    request = _request(
+        question=f"Reuse package {package_record_id}.",
+        related_record_ids={
+            "whoop_recovery_package": str(package_record_id)
+        },
+    )
+
+    handle = service.begin(request)
+
+    assert str(package_record_id) not in handle.model_dump_json()
+    assert str(package_record_id) not in handle.runtime_question
+    assert len(handle.related_records) == 1
+    related = handle.related_records[0]
+    assert related.reference in handle.runtime_question
+    assert related.domain == "wearable"
+    assert related.hint_keys == ("whoop_recovery_package",)
+
+    await service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.whoop-recovery-package",
+        granularity="day",
+        parameters={
+            "date": "2026-08-16",
+            "package_record_id": related.reference,
+        },
+    )
+
+    assert provider.queries[0].parameters == {
+        "date": "2026-08-16",
+        "package_record_id": str(package_record_id),
+    }
+    trace = service.inspect(handle.session_id).tool_trace
+    assert len(trace) == 1
+    assert trace[0].query.parameters == {
+        "date": "2026-08-16",
+        "package_record_id": related.reference,
+    }
+    assert trace[0].effective_query is not None
+    assert trace[0].effective_query.query_id == trace[0].query.query_id
+    assert trace[0].effective_query.parameters == {
+        "date": "2026-08-16",
+        "package_record_id": str(package_record_id),
+    }
+
+
+@pytest.mark.parametrize(
+    "related_record_ids",
+    (
+        {"wearable_capture": "00000000-0000-4000-8000-000000000001"},
+        {"whoop_recovery_package": "00000000-0000-4000-8000-000000000001"},
+    ),
+)
+async def test_whoop_package_rejects_wrong_or_unknown_alias(
+    store_factory,
+    related_record_ids,
+) -> None:
+    clock = MutableClock()
+    provider = WhoopSearchProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy(domain="wearable")],
+        clock,
+    )
+    handle = service.begin(
+        _request(related_record_ids=related_record_ids)
+    )
+    alias = (
+        handle.related_records[0].reference
+        if related_record_ids.get("wearable_capture")
+        else "rr_0000000000000000"
+    )
+
+    with pytest.raises(DecisionSearchQueryError):
+        await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.whoop-recovery-package",
+            granularity="day",
+            parameters={
+                "date": "2026-08-16",
+                "package_record_id": alias,
+            },
+        )
+
+    assert provider.queries == []
+    assert service.inspect(handle.session_id).tool_trace == ()
+
+
+async def test_whoop_selected_uuid_remains_compatible_for_trusted_callers(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = WhoopSearchProvider()
+    package_record_id = uuid.uuid4()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy(domain="wearable")],
+        clock,
+    )
+    handle = service.begin(
+        _request(
+            related_record_ids={
+                "whoop_recovery_package": str(package_record_id)
+            }
+        )
+    )
+
+    await service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.whoop-recovery-package",
+        granularity="day",
+        parameters={
+            "date": "2026-08-16",
+            "package_record_id": str(package_record_id),
+        },
+    )
+
+    trace = service.inspect(handle.session_id).tool_trace[0]
+    assert trace.query.parameters["package_record_id"] == str(
+        package_record_id
+    )
+    assert trace.effective_query is not None
+    assert trace.effective_query.parameters == trace.query.parameters
+
+
+async def test_whoop_alias_policy_denial_preserves_requested_and_effective_query(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = WhoopSearchProvider()
+    package_record_id = uuid.uuid4()
+    policies = [_policy(domain="wearable")]
+    service = _service(
+        store_factory,
+        provider,
+        policies,
+        clock,
+    )
+    handle = service.begin(
+        _request(
+            related_record_ids={
+                "whoop_recovery_package": str(package_record_id)
+            }
+        )
+    )
+    alias = handle.related_records[0].reference
+    policies[0] = _policy(domain="wearable", enabled=False)
+
+    result = await service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.whoop-recovery-package",
+        granularity="day",
+        parameters={
+            "date": "2026-08-16",
+            "package_record_id": alias,
+        },
+    )
+
+    assert result.status is ContextStatus.DENIED
+    assert provider.queries == []
+    trace = service.inspect(handle.session_id).tool_trace[0]
+    assert trace.status is ToolCallStatus.DENIED
+    assert trace.query.parameters["package_record_id"] == alias
+    assert trace.effective_query is not None
+    assert trace.effective_query.query_id == trace.query.query_id
+    assert trace.effective_query.parameters["package_record_id"] == str(
+        package_record_id
+    )
+
+
+async def test_whoop_alias_expiry_preserves_requested_and_effective_query(
+    store_factory,
+) -> None:
+    provider = BlockingWhoopSearchProvider()
+    package_record_id = uuid.uuid4()
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: datetime.now(UTC),
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        ttl_seconds=0.02,
+    )
+    handle = service.begin(
+        _request(
+            related_record_ids={
+                "whoop_recovery_package": str(package_record_id)
+            }
+        )
+    )
+    alias = handle.related_records[0].reference
+
+    with pytest.raises(ExpiredDecisionSearchSessionError):
+        await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.whoop-recovery-package",
+            granularity="day",
+            parameters={
+                "date": "2026-08-16",
+                "package_record_id": alias,
+            },
+        )
+
+    trace = service.inspect(handle.session_id).tool_trace[0]
+    assert trace.status is ToolCallStatus.FAILED
+    assert trace.error_code == "decision_search_session_expired"
+    assert trace.query.parameters["package_record_id"] == alias
+    assert trace.effective_query is not None
+    assert trace.effective_query.query_id == trace.query.query_id
+    assert trace.effective_query.parameters["package_record_id"] == str(
+        package_record_id
+    )
 
 
 async def test_source_ref_budget_is_shared_and_snapshot_order_is_stable(

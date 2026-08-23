@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from healthmes import clock
+from healthmes.source_providers import canonical_source_provider
 from healthmes.timezones import parse_timezone
 
 RESERVED_ACTIVITY_PROVIDER_NAMES = frozenset(
@@ -60,7 +61,7 @@ def _utc(value: datetime) -> datetime:
 
 
 def is_reserved_activity_provider(value: str) -> bool:
-    normalized = value.casefold()
+    normalized = value.strip().lower()
     return (
         normalized in RESERVED_ACTIVITY_PROVIDER_NAMES
         or normalized.startswith("healthmes-activity-")
@@ -405,12 +406,13 @@ class ActivityBatchIn(BaseModel):
     def validate_batch_timezone(cls, value: str) -> str:
         return validate_timezone(value)
 
-    @field_validator("source_provider")
+    @field_validator("source_provider", mode="before")
     @classmethod
-    def protect_internal_provider_namespace(cls, value: str) -> str:
-        if value.casefold().startswith("healthmes-activity-"):
+    def normalize_and_protect_provider_namespace(cls, value: str) -> str:
+        canonical = canonical_source_provider(value)
+        if canonical.startswith("healthmes-activity-"):
             raise ValueError("healthmes-activity-* providers are reserved for the engine")
-        return value
+        return canonical
 
     @field_validator("collected_at", mode="after")
     @classmethod

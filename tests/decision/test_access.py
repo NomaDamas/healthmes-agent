@@ -4,7 +4,8 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from copy import deepcopy
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -75,6 +76,17 @@ from healthmes.store import (
     create_db_engine,
 )
 from healthmes.store.enums import CalendarSource
+from healthmes.wearables.provenance import (
+    OPEN_WEARABLES_QUERY_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    persist_open_wearables_query_snapshot,
+)
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_ALGORITHM,
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+    calculate_whoop_recovery_package,
+)
 
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 DAY_START = datetime(2026, 8, 10, tzinfo=UTC)
@@ -415,6 +427,136 @@ def _source_ref(
     )
 
 
+def _whoop_private_provenance() -> list[dict[str, Any]]:
+    return [
+        {
+            "source_provider": "open-wearables",
+            "upstream_provider": "whoop",
+            "record_id": "recovery-row-1",
+            "resource_type": "health_score",
+            "metric": "recovery",
+            "metric_definition": "whoop.recovery-score.0-to-100.v1",
+            "observed_at": "2026-08-10T08:00:00+00:00",
+            "revision_at": "2026-08-10T08:00:00+00:00",
+            "cycle_id": "cycle-1",
+            "raw_value": 70,
+            "schema_version": 1,
+            "derived_by": WHOOP_RECOVERY_ALGORITHM,
+        },
+        {
+            "source_provider": "open-wearables",
+            "upstream_provider": "whoop",
+            "record_id": "day-strain-row-1",
+            "resource_type": "health_score",
+            "metric": "day_strain",
+            "metric_definition": (
+                "whoop.cycle-cumulative-day-strain.0-to-21.v1"
+            ),
+            "observed_at": "2026-08-10T09:00:00+00:00",
+            "revision_at": "2026-08-10T10:00:00+00:00",
+            "cycle_id": "cycle-1",
+            "raw_value": 12,
+            "schema_version": 1,
+            "derived_by": WHOOP_RECOVERY_ALGORITHM,
+        },
+    ]
+
+
+def _whoop_public_result() -> dict[str, Any]:
+    rows: dict[str, list[dict[str, Any]]] = {
+        "recovery": [],
+        "day_strain": [],
+    }
+    for item in _whoop_private_provenance():
+        components = {"cycle_id": {"qualifier": item["cycle_id"]}}
+        if item["metric"] == "day_strain":
+            components["cycle_updated_at"] = {
+                "qualifier": item["revision_at"]
+            }
+        rows[item["metric"]].append(
+            {
+                "id": item["record_id"],
+                "provider": "whoop",
+                "category": item["metric"],
+                "recorded_at": item["observed_at"],
+                "value": item["raw_value"],
+                "components": components,
+            }
+        )
+    return calculate_whoop_recovery_package(
+        rows["recovery"],
+        rows["day_strain"],
+        as_of=date(2026, 8, 10),
+        timezone="UTC",
+    ).public
+
+
+def _persist_whoop_package(session):
+    return persist_open_wearables_query_snapshot(
+        session,
+        capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+        start=DAY_START,
+        end=DAY_END,
+        timezone="UTC",
+        parameters={"as_of": "2026-08-10"},
+        result=_whoop_public_result(),
+        private_provenance=_whoop_private_provenance(),
+        collected_at=NOW,
+        now=NOW,
+    )
+
+
+def _whoop_source_ref(event: WellnessEvent) -> SourceRef:
+    window = event.payload["window"]
+    return SourceRef(
+        domain="wearable",
+        resource_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
+        record_id=str(event.id),
+        source_provider=OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+        observed_start=datetime.fromisoformat(
+            window["start"]
+        ),
+        observed_end=datetime.fromisoformat(
+            window["end"]
+        ),
+        collected_at=NOW,
+        schema_version=2,
+        derived_by=WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+        freshness=FreshnessStatus.CURRENT,
+        coverage=event.coverage,
+        sensitivity="wearable",
+    )
+
+
+async def _query_whoop_ref(
+    session,
+    source_ref: SourceRef,
+) -> ContextResult:
+    provider = StaticProvider(
+        provider_id="wearable",
+        domain="wearable",
+        result_factory=lambda query, now: _result(
+            query,
+            now=now,
+            payload={"value": 1},
+            source_refs=[source_ref],
+        ),
+    )
+    _, turn = _turn(
+        provider,
+        policy=_policy(domain="wearable"),
+    )
+    return await turn.query(
+        session,
+        _query(
+            provider_id="wearable",
+            domain="wearable",
+            start=DAY_START,
+            end=NOW,
+        ),
+    )
+
+
 def _turn(
     provider: StaticProvider,
     *,
@@ -428,6 +570,100 @@ def _turn(
         current_request,
         policy=policy or _policy(domain=provider.metadata.domain),
     )
+
+
+async def test_whoop_source_ref_requires_canonical_snapshot_v2(
+    session,
+):
+    snapshot = _persist_whoop_package(session)
+    event = session.get(WellnessEvent, snapshot.event_id)
+    assert event is not None
+
+    result = await _query_whoop_ref(
+        session,
+        _whoop_source_ref(event),
+    )
+
+    assert result.status is ContextStatus.OK
+    assert result.limitations == []
+    assert [ref.record_id for ref in result.source_refs] == [
+        str(event.id)
+    ]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("public_result", "downgrade", "source_ref"),
+)
+async def test_whoop_source_ref_rejects_tampered_or_downgraded_snapshot(
+    session,
+    tamper,
+):
+    snapshot = _persist_whoop_package(session)
+    event = session.get(WellnessEvent, snapshot.event_id)
+    assert event is not None
+    source_ref = _whoop_source_ref(event)
+    if tamper == "public_result":
+        payload = deepcopy(event.payload)
+        payload["public_result"]["level"] = "priority"
+        event.payload = payload
+    else:
+        if tamper == "downgrade":
+            event.schema_version = 1
+            source_ref = source_ref.model_copy(
+                update={"schema_version": 1}
+            )
+        else:
+            source_ref = source_ref.model_copy(
+                update={"derived_by": "wearable.invalid.v1"}
+            )
+    session.flush()
+
+    result = await _query_whoop_ref(session, source_ref)
+
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == ["source_ref_identity_mismatch"]
+
+
+async def test_whoop_source_ref_refreshes_stale_identity_map(
+    tmp_path,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path}/whoop-access.db"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    try:
+        with factory() as setup:
+            snapshot = _persist_whoop_package(setup)
+            setup.commit()
+            event_id = snapshot.event_id
+
+        with factory() as primary:
+            cached = primary.get(WellnessEvent, event_id)
+            assert cached is not None
+            source_ref = _whoop_source_ref(cached)
+            assert cached.payload["public_result"]["level"] == "basic"
+
+            with factory() as external:
+                persisted = external.get(WellnessEvent, event_id)
+                assert persisted is not None
+                payload = deepcopy(persisted.payload)
+                payload["public_result"]["level"] = "priority"
+                persisted.payload = payload
+                external.commit()
+
+            result = await _query_whoop_ref(primary, source_ref)
+
+            assert result.status is ContextStatus.DENIED
+            assert result.limitations == [
+                "source_ref_identity_mismatch"
+            ]
+            assert (
+                cached.payload["public_result"]["level"] == "priority"
+            )
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize(

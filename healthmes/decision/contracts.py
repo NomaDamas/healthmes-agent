@@ -18,6 +18,7 @@ from pydantic import (
     Field,
     JsonValue,
     StrictBool,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -30,6 +31,8 @@ MAX_RECORD_SUMMARY_LENGTH = 160
 MAX_LIMITATIONS = 100
 MAX_SOURCE_REFS = 500
 MAX_TOOL_TRACE = 64
+MAX_DECISION_ACTIONS = 5
+MAX_RELATED_RECORD_IDS = 32
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SOURCE_REF_ID = re.compile(r"^sr_[0-9a-f]{32}$")
@@ -272,6 +275,95 @@ class DecisionPersistenceIntent(StrEnum):
     EXPLICIT_TRACKING = "explicit_tracking"
 
 
+class DecisionActionKind(StrEnum):
+    """Privacy-safe action categories supported by compact persistence."""
+
+    WALK = "walk"
+    DRINK_WATER = "drink_water"
+    SLEEP_PREPARATION = "sleep_preparation"
+
+
+class DecisionActionState(StrEnum):
+    """Lifecycle detail retained without implying action completion."""
+
+    RECOMMENDED = "recommended"
+    OFFERED = "offered"
+    SELECTED = "selected"
+
+
+class DecisionAction(BaseModel):
+    """Bounded action metadata without free text or health measurements."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: DecisionActionKind
+    state: DecisionActionState
+    duration_minutes: StrictInt | None = None
+    advance_minutes: StrictInt | None = None
+
+    @model_validator(mode="after")
+    def validate_action(self) -> DecisionAction:
+        if self.kind is DecisionActionKind.WALK:
+            if self.duration_minutes not in {10, 20, 30}:
+                raise ValueError(
+                    "walk actions require duration_minutes of 10, 20, or 30"
+                )
+            if self.advance_minutes is not None:
+                raise ValueError(
+                    "walk actions cannot include advance_minutes"
+                )
+            return self
+        if self.kind is DecisionActionKind.DRINK_WATER:
+            if self.state is not DecisionActionState.RECOMMENDED:
+                raise ValueError(
+                    "drink_water actions must be recommended"
+                )
+            if (
+                self.duration_minutes is not None
+                or self.advance_minutes is not None
+            ):
+                raise ValueError(
+                    "drink_water actions cannot include minute values"
+                )
+            return self
+        if self.state is not DecisionActionState.RECOMMENDED:
+            raise ValueError(
+                "sleep_preparation actions must be recommended"
+            )
+        if self.advance_minutes != 30:
+            raise ValueError(
+                "sleep_preparation actions require advance_minutes=30"
+            )
+        if self.duration_minutes is not None:
+            raise ValueError(
+                "sleep_preparation actions cannot include duration_minutes"
+            )
+        return self
+
+
+def validate_decision_actions(
+    actions: list[DecisionAction],
+) -> list[DecisionAction]:
+    identities = [
+        (action.kind, action.duration_minutes, action.advance_minutes)
+        for action in actions
+    ]
+    if len(identities) != len(set(identities)):
+        raise ValueError(
+            "actions must not repeat the same bounded action option"
+        )
+    selected = [
+        action
+        for action in actions
+        if action.state is DecisionActionState.SELECTED
+    ]
+    if len(selected) > 1:
+        raise ValueError("actions may contain at most one selected option")
+    if selected and selected[0].kind is not DecisionActionKind.WALK:
+        raise ValueError("only a walk option may be selected")
+    return actions
+
+
 class DecisionRecordSummaryCode(StrEnum):
     """Allowlisted conclusion categories safe for compact persistence."""
 
@@ -351,6 +443,25 @@ def decision_record_summary_code_is_allowed(
     )
 
 
+def _validated_related_record_ids(
+    value: dict[str, str],
+) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, record_id in value.items():
+        clean_key = _identifier(
+            key,
+            label="related record key",
+            max_length=64,
+        )
+        clean_id = _bounded_text(
+            record_id,
+            label="related record id",
+            max_length=255,
+        )
+        normalized[clean_key] = clean_id
+    return normalized
+
+
 class CompatibilityPreset(StrEnum):
     """Legacy resolver presets; never required by the decision core."""
 
@@ -405,7 +516,7 @@ class DecisionContextHints(BaseModel):
     lookback_days: int | None = Field(default=None, ge=1, le=90)
     related_record_ids: dict[str, str] = Field(
         default_factory=dict,
-        max_length=32,
+        max_length=MAX_RELATED_RECORD_IDS,
     )
 
     @field_validator("start", "end", mode="after")
@@ -419,20 +530,7 @@ class DecisionContextHints(BaseModel):
         cls,
         value: dict[str, str],
     ) -> dict[str, str]:
-        normalized: dict[str, str] = {}
-        for key, record_id in value.items():
-            clean_key = _identifier(
-                key,
-                label="related record key",
-                max_length=64,
-            )
-            clean_id = _bounded_text(
-                record_id,
-                label="related record id",
-                max_length=255,
-            )
-            normalized[clean_key] = clean_id
-        return normalized
+        return _validated_related_record_ids(value)
 
     @model_validator(mode="after")
     def validate_range(self) -> DecisionContextHints:
@@ -1087,6 +1185,10 @@ class DecisionDraft(BaseModel):
     )
     record_summary_code: DecisionRecordSummaryCode | None = None
     proposed_action: bool = False
+    actions: list[DecisionAction] = Field(
+        default_factory=list,
+        max_length=MAX_DECISION_ACTIONS,
+    )
     persistence_intent: DecisionPersistenceIntent = (
         DecisionPersistenceIntent.NONE
     )
@@ -1170,6 +1272,14 @@ class DecisionDraft(BaseModel):
             max_item_length=255,
         )
 
+    @field_validator("actions")
+    @classmethod
+    def validate_actions(
+        cls,
+        value: list[DecisionAction],
+    ) -> list[DecisionAction]:
+        return validate_decision_actions(value)
+
     @model_validator(mode="after")
     def validate_draft(self) -> DecisionDraft:
         if self.status is DecisionStatus.COMPLETED and self.answer is None:
@@ -1220,6 +1330,10 @@ class DecisionDraft(BaseModel):
             raise ValueError(
                 "proposed actions require action or risk persistence"
             )
+        if self.actions and not self.proposed_action:
+            raise ValueError(
+                "action metadata requires proposed_action=true"
+            )
         if (
             self.persistence_intent
             in {
@@ -1269,9 +1383,17 @@ class DecisionResult(BaseModel):
     status: DecisionStatus
     answer: str | None = Field(default=None, max_length=MAX_ANSWER_LENGTH)
     proposed_action: bool = False
+    actions: list[DecisionAction] = Field(
+        default_factory=list,
+        max_length=MAX_DECISION_ACTIONS,
+    )
     source_refs: list[SourceRef] = Field(
         default_factory=list,
         max_length=MAX_SOURCE_REFS,
+    )
+    related_record_ids: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=MAX_RELATED_RECORD_IDS,
     )
     limitations: list[str] = Field(
         default_factory=list,
@@ -1330,11 +1452,37 @@ class DecisionResult(BaseModel):
             max_item_length=255,
         )
 
+    @field_validator("actions")
+    @classmethod
+    def validate_actions(
+        cls,
+        value: list[DecisionAction],
+    ) -> list[DecisionAction]:
+        return validate_decision_actions(value)
+
+    @field_validator("related_record_ids")
+    @classmethod
+    def validate_related_record_ids(
+        cls,
+        value: dict[str, str],
+    ) -> dict[str, str]:
+        return _validated_related_record_ids(value)
+
     @model_validator(mode="after")
     def validate_final_result(self) -> DecisionResult:
         reference_ids = [item.reference_id for item in self.source_refs]
         if len(reference_ids) != len(set(reference_ids)):
             raise ValueError("source_refs must contain unique references")
+        source_record_ids = {
+            item.record_id for item in self.source_refs
+        }
+        if any(
+            record_id not in source_record_ids
+            for record_id in self.related_record_ids.values()
+        ):
+            raise ValueError(
+                "related_record_ids must refer to returned source_refs"
+            )
         if self.status is DecisionStatus.COMPLETED and self.answer is None:
             raise ValueError("completed decisions require an answer")
         if self.status is DecisionStatus.NEEDS_CLARIFICATION:
@@ -1369,4 +1517,8 @@ class DecisionResult(BaseModel):
                 raise ValueError(
                     "proposed actions are completed only after persistence"
                 )
+        elif self.actions:
+            raise ValueError(
+                "action metadata requires proposed_action=true"
+            )
         return self

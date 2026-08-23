@@ -36,6 +36,7 @@ from healthmes.decision import (
     CoverageStatus,
     DecisionAgentRun,
     DecisionCaller,
+    DecisionContextHints,
     DecisionDraft,
     DecisionFinalizer,
     DecisionIngress,
@@ -56,10 +57,16 @@ from healthmes.decision import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    WearableContextProvider,
     decision_record_summary,
     decision_result_from_record,
 )
 from healthmes.decision.access import _current_source_content_digest
+from healthmes.decision.contracts import (
+    DecisionAction,
+    DecisionActionKind,
+    DecisionActionState,
+)
 from healthmes.storage import (
     apply_decision_retention,
     update_retention_policy,
@@ -73,6 +80,16 @@ from healthmes.store import (
     TriggerEvent,
     WellnessEvent,
     create_db_engine,
+)
+from healthmes.wearables.provenance import (
+    OPEN_WEARABLES_QUERY_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    persist_open_wearables_query_snapshot,
+)
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+    calculate_whoop_recovery_package,
 )
 
 NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
@@ -243,6 +260,155 @@ def _source_ref(event: WellnessEvent) -> SourceRef:
     )
 
 
+def _whoop_snapshot(
+    session: Session,
+    *,
+    recovery_value: float = 70,
+    day_strain_value: float = 12,
+    suffix: str = "current",
+):
+    local_day = NOW.date()
+    start = datetime.combine(local_day, datetime.min.time(), tzinfo=UTC)
+    end = start + timedelta(days=1)
+    calculation = calculate_whoop_recovery_package(
+        (
+            {
+                "id": f"recovery-{suffix}",
+                "provider": "whoop",
+                "category": "recovery",
+                "recorded_at": (
+                    start + timedelta(hours=4)
+                ).isoformat(),
+                "value": recovery_value,
+                "components": {
+                    "cycle_id": {"qualifier": f"cycle-{suffix}"}
+                },
+            },
+        ),
+        (
+            {
+                "id": f"strain-{suffix}",
+                "provider": "whoop",
+                "category": "day_strain",
+                "recorded_at": (
+                    start + timedelta(hours=5)
+                ).isoformat(),
+                "value": day_strain_value,
+                "components": {
+                    "cycle_id": {"qualifier": f"cycle-{suffix}"},
+                    "cycle_updated_at": {
+                        "qualifier": (
+                            start + timedelta(hours=5, minutes=30)
+                        ).isoformat()
+                    },
+                },
+            },
+        ),
+        as_of=local_day,
+        timezone="UTC",
+    )
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters={"as_of": local_day.isoformat()},
+        result=calculation.public,
+        private_provenance=calculation.provenance,
+        collected_at=NOW,
+        now=NOW,
+    )
+    event = session.get(WellnessEvent, snapshot.event_id)
+    assert event is not None
+    ref = SourceRef(
+        domain="wearable",
+        resource_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
+        record_id=str(snapshot.event_id),
+        source_provider=OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+        observed_start=start,
+        observed_end=end,
+        collected_at=snapshot.collected_at,
+        schema_version=2,
+        derived_by=WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+        freshness=FreshnessStatus.CURRENT,
+        coverage=snapshot.coverage,
+        sensitivity="wearable",
+    )
+    content_digest = _current_source_content_digest(session, ref)
+    assert content_digest is not None
+    ref = ref.model_copy(
+        update={"content_digest": content_digest},
+        deep=True,
+    )
+    session.commit()
+    actions = [
+        DecisionAction.model_validate(action)
+        for action in calculation.public["actions"]
+    ]
+    return snapshot, event, ref, calculation.public, actions
+
+
+def _whoop_query(
+    *,
+    package_record_id: str | None = None,
+) -> ContextQuery:
+    parameters = {"date": NOW.date().isoformat()}
+    if package_record_id is not None:
+        parameters["package_record_id"] = package_record_id
+    return ContextQuery(
+        provider_id="wearable",
+        capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+        timezone="UTC",
+        granularity="day",
+        parameters=parameters,
+    )
+
+
+def _whoop_request(
+    *,
+    package_record_id: str | None = None,
+) -> DecisionRequest:
+    request = _request(question="How should I recover today?")
+    if package_record_id is None:
+        return request
+    return request.model_copy(
+        update={
+            "hints": DecisionContextHints(
+                related_record_ids={
+                    "whoop_recovery_package": package_record_id
+                }
+            )
+        },
+        deep=True,
+    )
+
+
+def _whoop_finalizer(factory) -> DecisionFinalizer:
+    return _finalizer(
+        factory,
+        policy=_policy(domain="wearable"),
+        registry=ContextProviderRegistry((WearableContextProvider(),)),
+    )
+
+
+def _selected_walk(
+    actions: list[DecisionAction],
+    duration_minutes: int,
+) -> list[DecisionAction]:
+    return [
+        (
+            action.model_copy(
+                update={"state": DecisionActionState.SELECTED}
+            )
+            if action.kind is DecisionActionKind.WALK
+            and action.duration_minutes == duration_minutes
+            else action
+        )
+        for action in actions
+    ]
+
+
 def _query() -> ContextQuery:
     return ContextQuery(
         provider_id="nutrition",
@@ -271,6 +437,7 @@ def _run(
     result_limitations: list[str] | None = None,
     draft_limitations: list[str] | None = None,
     persistence_intent: DecisionPersistenceIntent | None = None,
+    actions: list[DecisionAction] | None = None,
 ) -> DecisionAgentRun:
     query = query or _query()
     result = ContextResult(
@@ -321,6 +488,7 @@ def _run(
                 "answer": answer
                 or "Take a short break before choosing more caffeine.",
                 "proposed_action": proposed_action,
+                "actions": actions or [],
                 "persistence_intent": selected_intent,
                 "confidence": 0.8,
                 "uncertainty": "Only the retained context was considered.",
@@ -499,6 +667,577 @@ def test_source_backed_action_is_atomically_persisted(persistence):
         assert str(ref.record_id) not in visible
         assert "query_id" not in visible
         assert "tool_trace" not in visible
+
+
+def test_action_metadata_roundtrips_through_v7_persistence_and_replay(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    actions = [
+        DecisionAction(
+            kind=DecisionActionKind.DRINK_WATER,
+            state=DecisionActionState.RECOMMENDED,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.SLEEP_PREPARATION,
+            state=DecisionActionState.RECOMMENDED,
+            advance_minutes=30,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.OFFERED,
+            duration_minutes=10,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.SELECTED,
+            duration_minutes=20,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.OFFERED,
+            duration_minutes=30,
+        ),
+    ]
+    finalizer = _finalizer(factory)
+
+    first = finalizer.finalize(
+        request,
+        _run(request, [ref], actions=actions),
+    )
+
+    assert first.actions == actions
+    assert first.decision_record_id is not None
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        assert row.decision_payload["schema"] == (
+            "healthmes.decision-private.v7"
+        )
+        assert row.decision_payload["outcome"]["actions"] == [
+            action.model_dump(mode="json")
+            for action in actions
+        ]
+        stored_actions = row.decision_payload["outcome"]["actions"]
+        serialized_actions = json.dumps(stored_actions, sort_keys=True)
+        assert all("completed" not in action for action in stored_actions)
+        assert "cycle_id" not in serialized_actions
+        assert "source_id" not in serialized_actions
+        assert "health_value" not in serialized_actions
+
+    replay = finalizer.revalidate_persisted(
+        request.model_copy(update={"turn_id": uuid.uuid4()}),
+        first.decision_record_id,
+    )
+
+    assert replay.actions == actions
+    assert replay.tool_trace == []
+
+
+def test_whoop_package_actions_persist_with_one_canonical_source_ref(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        _snapshot, _event_row, ref, public, actions = _whoop_snapshot(
+            session
+        )
+    request = _whoop_request()
+    finalizer = _whoop_finalizer(factory)
+
+    result = finalizer.finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=_whoop_query(),
+            payload=public,
+            actions=actions,
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.source_refs == [ref]
+    assert result.actions == actions
+    assert result.decision_record_id is not None
+    with factory() as session:
+        row = session.get(DecisionRecord, result.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        assert row.decision_payload["source_refs"] == [
+            ref.model_dump(mode="json")
+        ]
+        assert row.decision_payload["outcome"]["actions"] == [
+            action.model_dump(mode="json") for action in actions
+        ]
+
+
+def test_whoop_package_action_not_returned_by_provider_is_rejected(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        _snapshot, _event_row, ref, public, actions = _whoop_snapshot(
+            session
+        )
+    request = _whoop_request()
+
+    result = _whoop_finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=_whoop_query(),
+            payload=public,
+            actions=actions[:-1],
+        ),
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == [
+        "decision_whoop_recovery_action_mismatch"
+    ]
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "multiple", "noncanonical"),
+)
+def test_whoop_package_requires_exactly_one_canonical_source_ref(
+    persistence,
+    mutation: str,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        _snapshot, _event_row, ref, public, actions = _whoop_snapshot(
+            session,
+            suffix="first",
+        )
+        _other_snapshot, _other_event, other_ref, _other_public, _ = (
+            _whoop_snapshot(
+                session,
+                recovery_value=45,
+                day_strain_value=16,
+                suffix="second",
+            )
+        )
+        unrelated_ref = _source_ref(_event(session))
+    if mutation == "missing":
+        trace_refs: list[SourceRef] = []
+    elif mutation == "multiple":
+        trace_refs = [ref, other_ref]
+    else:
+        trace_refs = [
+            ref.model_copy(
+                update={"derived_by": "wearable.readiness.mirror.v1"}
+            )
+        ]
+    request = _whoop_request()
+    if mutation == "missing":
+        base_run = _run(
+            request,
+            [unrelated_ref],
+            actions=actions,
+        )
+        whoop_query = _whoop_query()
+        missing_result = ContextResult(
+            query_id=whoop_query.query_id,
+            provider_id=whoop_query.provider_id,
+            capability=whoop_query.capability,
+            status=ContextStatus.OK,
+            payload=public,
+            source_refs=[],
+            freshness=ContextFreshness(
+                status=FreshnessStatus.CURRENT,
+                as_of=NOW,
+                age_seconds=0,
+            ),
+            coverage=ContextCoverage(
+                status=CoverageStatus.COMPLETE,
+                ratio=1,
+            ),
+        )
+        run = base_run.model_copy(
+            update={
+                "tool_trace": (
+                    ToolCallRecord(
+                        query=whoop_query,
+                        status=ToolCallStatus.COMPLETED,
+                        started_at=NOW,
+                        finished_at=NOW,
+                        result=missing_result,
+                    ),
+                    *base_run.tool_trace,
+                )
+            },
+            deep=True,
+        )
+    else:
+        run = _run(
+            request,
+            trace_refs,
+            used_ids=[item.reference_id for item in trace_refs],
+            query=_whoop_query(),
+            payload=public,
+            actions=actions,
+        )
+
+    result = _whoop_finalizer(factory).finalize(
+        request,
+        run,
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == [
+        "decision_whoop_recovery_package_invalid"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("related_package_id", "expected_code"),
+    (
+        (
+            None,
+            "decision_whoop_recovery_followup_binding_missing",
+        ),
+        (
+            str(uuid.UUID(int=1)),
+            "decision_whoop_recovery_followup_binding_mismatch",
+        ),
+    ),
+)
+def test_whoop_selected_walk_requires_exact_prior_package_binding(
+    persistence,
+    related_package_id: str | None,
+    expected_code: str,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        snapshot, _event_row, ref, public, actions = _whoop_snapshot(
+            session
+        )
+    request = _whoop_request(
+        package_record_id=related_package_id
+    )
+
+    result = _whoop_finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=_whoop_query(
+                package_record_id=str(snapshot.event_id)
+            ),
+            payload=public,
+            actions=_selected_walk(actions, 20),
+        ),
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == [expected_code]
+
+
+def test_whoop_selected_walk_can_bind_to_exact_older_package(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        first, _first_event, first_ref, first_public, first_actions = (
+            _whoop_snapshot(
+                session,
+                recovery_value=70,
+                day_strain_value=12,
+                suffix="first",
+            )
+        )
+        latest, _latest_event, _latest_ref, _latest_public, _latest_actions = (
+            _whoop_snapshot(
+                session,
+                recovery_value=45,
+                day_strain_value=16,
+                suffix="latest",
+            )
+        )
+    assert latest.event_id != first.event_id
+    request = _whoop_request(
+        package_record_id=str(first.event_id)
+    )
+
+    result = _whoop_finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [first_ref],
+            query=_whoop_query(
+                package_record_id=str(first.event_id)
+            ),
+            payload=first_public,
+            actions=_selected_walk(first_actions, 20),
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.source_refs == [first_ref]
+    assert [
+        action.duration_minutes
+        for action in result.actions
+        if action.state is DecisionActionState.SELECTED
+    ] == [20]
+
+
+@pytest.mark.parametrize(
+    ("effective_package_record_id", "expected_code"),
+    (
+        (
+            None,
+            "decision_whoop_recovery_followup_binding_missing",
+        ),
+        (
+            str(uuid.UUID(int=1)),
+            "decision_whoop_recovery_followup_binding_mismatch",
+        ),
+    ),
+)
+def test_whoop_selected_walk_requires_exact_effective_query_selector(
+    persistence,
+    effective_package_record_id: str | None,
+    expected_code: str,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        snapshot, _event_row, ref, public, actions = _whoop_snapshot(
+            session
+        )
+    package_record_id = str(snapshot.event_id)
+    request = _whoop_request(package_record_id=package_record_id)
+    requested_query = _whoop_query(package_record_id=package_record_id)
+    effective_query = requested_query.model_copy(
+        update={
+            "parameters": {
+                "date": NOW.date().isoformat(),
+                **(
+                    {
+                        "package_record_id": (
+                            effective_package_record_id
+                        )
+                    }
+                    if effective_package_record_id is not None
+                    else {}
+                ),
+            }
+        },
+        deep=True,
+    )
+
+    result = _whoop_finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=requested_query,
+            effective_query=effective_query,
+            payload=public,
+            actions=_selected_walk(actions, 20),
+        ),
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == [expected_code]
+
+
+@pytest.mark.parametrize("mutation", ("tamper", "delete"))
+def test_whoop_persisted_replay_rejects_changed_package_snapshot(
+    persistence,
+    mutation: str,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        snapshot, _event_row, ref, public, actions = _whoop_snapshot(
+            session
+        )
+    request = _whoop_request()
+    finalizer = _whoop_finalizer(factory)
+    first = finalizer.finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=_whoop_query(),
+            payload=public,
+            actions=actions,
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+        ),
+    )
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        event = session.get(WellnessEvent, snapshot.event_id)
+        assert event is not None
+        if mutation == "delete":
+            session.delete(event)
+        else:
+            payload = copy.deepcopy(event.payload)
+            payload["public_result"]["actions"] = payload[
+                "public_result"
+            ]["actions"][:-1]
+            event.payload = payload
+        session.commit()
+
+    replay = finalizer.revalidate_persisted(
+        request.model_copy(update={"turn_id": uuid.uuid4()}),
+        first.decision_record_id,
+    )
+
+    assert replay.status is DecisionStatus.FAILED
+    assert replay.persistence_status is PersistenceStatus.FAILED
+    assert "decision_source_ref_revalidation_failed" in replay.limitations
+    assert any(
+        code
+        in {
+            "source_ref_record_missing",
+            "source_ref_identity_mismatch",
+        }
+        for code in replay.limitations
+    )
+
+
+def test_whoop_context_without_action_is_allowed(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    with factory() as session:
+        _snapshot, _event_row, ref, public, _actions = _whoop_snapshot(
+            session
+        )
+    request = _whoop_request()
+
+    result = _whoop_finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=_whoop_query(),
+            payload=public,
+            proposed_action=False,
+            actions=[],
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert result.source_refs == [ref]
+    assert result.actions == []
+
+
+def test_legacy_v6_replay_defaults_action_metadata_to_empty(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    actions = [
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.SELECTED,
+            duration_minutes=20,
+        )
+    ]
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(
+        request,
+        _run(request, [ref], actions=actions),
+    )
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        payload = copy.deepcopy(row.decision_payload)
+        payload["schema"] = "healthmes.decision-private.v6"
+        payload["outcome"].pop("actions")
+        row.decision_payload = payload
+        row.decision_payload_digest = _payload_digest(payload)
+        session.commit()
+
+    replay = finalizer.revalidate_persisted(
+        request.model_copy(update={"turn_id": uuid.uuid4()}),
+        first.decision_record_id,
+    )
+
+    assert replay.status is DecisionStatus.COMPLETED
+    assert replay.proposed_action is True
+    assert replay.actions == []
+    assert replay.decision_record_id == first.decision_record_id
+
+
+def test_legacy_v5_replay_defaults_action_metadata_to_empty(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    actions = [
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.SELECTED,
+            duration_minutes=20,
+        )
+    ]
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(
+        request,
+        _run(request, [ref], actions=actions),
+    )
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        payload = copy.deepcopy(row.decision_payload)
+        payload["schema"] = "healthmes.decision-private.v5"
+        payload["outcome"].pop("actions")
+        payload["outcome"]["record_summary"] = (
+            finalizer_module._stored_outcome_summary(
+                DecisionPersistenceIntent.ACTION
+            )
+        )
+        payload["outcome"].pop("summary_code")
+        row.summary = payload["outcome"]["record_summary"]
+        row.decision_payload = payload
+        row.decision_payload_digest = _payload_digest(payload)
+        session.commit()
+
+    replay = finalizer.revalidate_persisted(
+        request.model_copy(update={"turn_id": uuid.uuid4()}),
+        first.decision_record_id,
+    )
+
+    assert replay.status is DecisionStatus.COMPLETED
+    assert replay.proposed_action is True
+    assert replay.actions == []
+    assert replay.decision_record_id == first.decision_record_id
 
 
 def test_persisted_pointer_replay_revalidates_current_source_state(
@@ -1478,7 +2217,7 @@ def test_public_record_redacts_internal_source_reference_ids(
         assert request.question not in json.dumps(row.decision_payload)
 
 
-def test_persisted_decision_canonicalizes_sensitive_answer_without_storage(
+def test_persisted_decision_preserves_live_answer_without_storage(
     persistence,
 ):
     _engine, factory = persistence
@@ -1516,8 +2255,8 @@ def test_persisted_decision_canonicalizes_sensitive_answer_without_storage(
 
     assert result.status is DecisionStatus.COMPLETED
     assert result.persistence_status is PersistenceStatus.PERSISTED
-    assert result.answer == "Pause and reassess before continuing."
-    assert sensitive_marker not in result.answer
+    assert result.answer == answer
+    assert sensitive_marker in result.answer
     with factory() as session:
         row = session.scalars(sa.select(DecisionRecord)).one()
         assert row.decision_payload is not None
@@ -1542,7 +2281,8 @@ def test_persisted_decision_canonicalizes_sensitive_answer_without_storage(
         assert outcome["limitation_codes"] == ["context_stale"]
 
         recovered = decision_result_from_record(row)
-        assert recovered.answer == result.answer
+        assert recovered.answer == "Pause and reassess before continuing."
+        assert recovered.answer != result.answer
         assert "decision_response_compacted" in recovered.limitations
 
 
@@ -2909,6 +3649,7 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
                 for entry in run.access_trace
             ],
         }
+        legacy_payload["result"].pop("actions", None)
         row.decision_request_fingerprint = (
             finalizer_module._legacy_decision_request_fingerprint(
                 request
@@ -3004,6 +3745,7 @@ def test_retry_reads_and_revalidates_legacy_v2_v3_v4_payloads(
                     deep=True,
                 ).model_dump(mode="json", round_trip=True),
             }
+            legacy_payload["result"].pop("actions", None)
         elif legacy_schema.endswith(".v3"):
             legacy_payload = {
                 **common,

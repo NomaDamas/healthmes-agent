@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -29,10 +30,12 @@ from healthmes.decision import (
     ContextStatus,
     DecisionBudget,
     DecisionCaller,
+    DecisionContextHints,
     DecisionPersistenceIntent,
     DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionSearchBudgetUsage,
+    DecisionSearchRelatedRecord,
     DecisionStatus,
     ExecutionScope,
     HermesDecisionProfileAssertion,
@@ -458,9 +461,104 @@ def _activity_trace(
     return trace, search_result, source_ref
 
 
+def _whoop_alias_trace(
+    *,
+    alias: str,
+    package_record_id: uuid.UUID,
+) -> tuple[
+    ToolCallRecord,
+    ContextSearchResult,
+    SourceRef,
+]:
+    source_ref = SourceRef(
+        domain="wearable",
+        resource_type="open-wearables-query-snapshot",
+        record_id=str(package_record_id),
+        source_provider="healthmes-open-wearables",
+        observed_start=NOW - timedelta(hours=1),
+        observed_end=NOW,
+        collected_at=NOW,
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.whoop-recovery-package",
+        timezone="UTC",
+        granularity="day",
+        parameters={
+            "date": "2026-08-16",
+            "package_record_id": alias,
+        },
+    )
+    effective_query = query.model_copy(
+        update={
+            "parameters": {
+                "date": "2026-08-16",
+                "package_record_id": str(package_record_id),
+            }
+        },
+        deep=True,
+    )
+    context = ContextResult(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        status=ContextStatus.OK,
+        payload={
+            "status": "ok",
+            "date": "2026-08-16",
+            "level": "basic",
+        },
+        source_refs=[source_ref],
+    )
+    audit = AccessAuditEntry(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        outcome=AccessOutcome.ALLOWED,
+        occurred_at=NOW,
+        requested_privacy_level=PrivacyLevel.AGGREGATE,
+        effective_privacy_level=PrivacyLevel.AGGREGATE,
+        requested_limit=query.limit,
+        effective_limit=query.limit,
+        source_ref_ids=(source_ref.reference_id,),
+        payload_bytes=64,
+    )
+    search_result = ContextSearchResult(
+        **context.model_dump(mode="python", round_trip=True),
+        access_audit=ContextSearchAccessAudit(
+            **audit.model_dump(mode="python", round_trip=True),
+            budget=DecisionSearchBudgetUsage(
+                tool_calls_used=1,
+                tool_calls_limit=4,
+                context_bytes_used=64,
+                context_bytes_limit=64_000,
+                source_refs_used=1,
+                source_refs_limit=20,
+            ),
+        ),
+    )
+    trace = ToolCallRecord(
+        query=query,
+        effective_query=effective_query,
+        status=ToolCallStatus.COMPLETED,
+        started_at=NOW,
+        finished_at=NOW,
+        result=context,
+    )
+    return trace, search_result, source_ref
+
+
 class _SearchService:
-    def __init__(self, snapshot: SimpleNamespace) -> None:
+    def __init__(
+        self,
+        snapshot: SimpleNamespace,
+        *,
+        handle: SimpleNamespace | None = None,
+    ) -> None:
         self.snapshot = snapshot
+        self.handle = handle or SimpleNamespace(
+            session_id=snapshot.session_id
+        )
         self.begun = 0
         self.finished = 0
         self.aborted = 0
@@ -468,7 +566,7 @@ class _SearchService:
 
     def begin(self, _request: DecisionRequest) -> SimpleNamespace:
         self.begun += 1
-        return SimpleNamespace(session_id=self.snapshot.session_id)
+        return self.handle
 
     def finish(self, session_id: str) -> SimpleNamespace:
         assert session_id == self.snapshot.session_id
@@ -652,13 +750,165 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
     assert "pause_and_reassess" in payload["instructions"]
     assert "take_restorative_break" in payload["instructions"]
     assert "track_for_review" in payload["instructions"]
-    assert "answer MUST exactly equal" in payload["instructions"]
+    assert "answer is the detailed user-facing response" in (
+        payload["instructions"]
+    )
+    assert "duration_minutes exactly 10, 20, or 30" in payload["instructions"]
+    assert "it never means the action was completed" in payload["instructions"]
+    assert "source IDs, cycle IDs" in payload["instructions"]
     assert transport.deleted_sessions == [
         HERMES_SESSION_ID,
         HERMES_SESSION_ID,
     ]
     assert search.finished == 1
     assert search.aborted == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_exposes_only_related_record_alias_to_hermes() -> None:
+    package_record_id = uuid.uuid4()
+    alias = "rr_0123456789abcdef"
+    trace, search_result, source_ref = _whoop_alias_trace(
+        alias=alias,
+        package_record_id=package_record_id,
+    )
+    output_prefix = [
+        {
+            "type": "function_call",
+            "name": "mcp__healthmes__search_wearable",
+            "arguments": json.dumps(
+                {
+                    "decision_session_id": DECISION_SESSION_ID,
+                    "capability": trace.query.capability,
+                    "granularity": trace.query.granularity,
+                    "date": "2026-08-16",
+                    "package_record_id": alias,
+                }
+            ),
+            "call_id": "call-whoop-related-record",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-whoop-related-record",
+            "output": json.dumps(
+                {
+                    "structuredContent": search_result.model_dump(
+                        mode="json",
+                        round_trip=True,
+                    )
+                }
+            ),
+        },
+    ]
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "The exact prior WHOOP package was reused.",
+                "used_source_ref_ids": [source_ref.reference_id],
+            },
+            output_prefix=output_prefix,
+        )
+    )
+    snapshot = SimpleNamespace(
+        session_id=DECISION_SESSION_ID,
+        source_refs=(source_ref,),
+        access_trace=(search_result.access_audit,),
+        tool_trace=(trace,),
+    )
+    handle = SimpleNamespace(
+        session_id=DECISION_SESSION_ID,
+        runtime_question=f"Reuse package {alias}.",
+        has_related_records=True,
+        related_records=(
+            DecisionSearchRelatedRecord(
+                reference=alias,
+                domain="wearable",
+                hint_keys=("whoop_recovery_package",),
+            ),
+        ),
+    )
+    search = _SearchService(snapshot, handle=handle)
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+    request = _request().model_copy(
+        update={
+            "question": f"Reuse package {package_record_id}.",
+            "hints": DecisionContextHints(
+                related_record_ids={
+                    "whoop_recovery_package": str(package_record_id)
+                }
+            ),
+        }
+    )
+
+    run = await agent.ask(request)
+
+    assert run.draft.status is DecisionStatus.COMPLETED
+    serialized = transport.response_calls[0]["input"][0]["content"]
+    assert str(package_record_id) not in serialized
+    request_payload = json.loads(serialized)
+    assert request_payload["question"] == f"Reuse package {alias}."
+    assert request_payload["hints"] == {
+        "local_date": None,
+        "start": None,
+        "end": None,
+        "lookback_days": None,
+        "has_related_records": True,
+        "related_records": [
+            {
+                "reference": alias,
+                "domain": "wearable",
+                "hint_keys": ["whoop_recovery_package"],
+            }
+        ],
+    }
+    assert run.tool_trace[0].query.parameters["package_record_id"] == alias
+    assert run.tool_trace[0].effective_query is not None
+    assert (
+        run.tool_trace[0]
+        .effective_query.parameters["package_record_id"]
+        == str(package_record_id)
+    )
+
+
+def test_transcript_must_use_model_visible_related_record_alias() -> None:
+    package_record_id = uuid.uuid4()
+    alias = "rr_0123456789abcdef"
+    trace, _search_result, _source_ref = _whoop_alias_trace(
+        alias=alias,
+        package_record_id=package_record_id,
+    )
+    direct_uuid_call = responses_module.HermesFunctionCallItem(
+        type="function_call",
+        name="mcp__healthmes__search_wearable",
+        arguments=json.dumps(
+            {
+                "decision_session_id": DECISION_SESSION_ID,
+                "capability": trace.query.capability,
+                "granularity": trace.query.granularity,
+                "date": "2026-08-16",
+                "package_record_id": str(package_record_id),
+            }
+        ),
+        call_id="call-direct-uuid",
+    )
+
+    with pytest.raises(
+        HermesResponsesContractError,
+        match="hermes_tool_arguments_trace_mismatch",
+    ):
+        responses_module._validate_tool_arguments_against_query(
+            direct_uuid_call,
+            trace.query,
+            decision_session_id=DECISION_SESSION_ID,
+        )
 
 
 @pytest.mark.asyncio
@@ -1125,7 +1375,53 @@ def test_final_envelope_uses_typed_persistence_intent_contract(
     )
 
 
-def test_final_envelope_rejects_answer_that_conflicts_with_summary_code():
+def test_final_envelope_accepts_only_bounded_action_metadata():
+    envelope = {
+        "schema": HERMES_DECISION_DRAFT_SCHEMA,
+        "decision": {
+            "status": "completed",
+            "answer": decision_record_summary(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            "record_summary_code": "take_restorative_break",
+            "proposed_action": True,
+            "actions": [
+                {
+                    "kind": "drink_water",
+                    "state": "recommended",
+                },
+                {
+                    "kind": "sleep_preparation",
+                    "state": "recommended",
+                    "advance_minutes": 30,
+                },
+                {
+                    "kind": "walk",
+                    "state": "selected",
+                    "duration_minutes": 20,
+                },
+            ],
+            "persistence_intent": "action",
+            "used_source_ref_ids": ["sr_" + "0" * 32],
+        },
+    }
+
+    parsed = _parse_final_draft(json.dumps(envelope))
+
+    assert [action.kind.value for action in parsed.decision.actions] == [
+        "drink_water",
+        "sleep_preparation",
+        "walk",
+    ]
+    envelope["decision"]["actions"][2]["completed"] = True
+    with pytest.raises(
+        HermesResponsesContractError,
+        match="hermes_final_json_invalid",
+    ):
+        _parse_final_draft(json.dumps(envelope))
+
+
+def test_final_envelope_accepts_detailed_answer_with_summary_code():
     response = _final_response(
         {
             "status": "completed",
@@ -1139,11 +1435,13 @@ def test_final_envelope_rejects_answer_that_conflicts_with_summary_code():
     )
     raw_text = response["output"][-1]["content"][0]["text"]
 
-    with pytest.raises(
-        HermesResponsesContractError,
-        match="hermes_final_json_invalid",
-    ):
-        _parse_final_draft(raw_text)
+    parsed = _parse_final_draft(raw_text)
+
+    assert parsed.decision.answer == "You may drink this coffee now."
+    assert (
+        parsed.decision.record_summary_code
+        is DecisionRecordSummaryCode.REDUCE_OR_AVOID
+    )
 
 
 @pytest.mark.parametrize("intent", (None, 1, True, "save"))

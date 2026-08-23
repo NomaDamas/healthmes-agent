@@ -44,6 +44,7 @@ from healthmes.durable_files import (
     verify_regular_file,
     write_all,
 )
+from healthmes.source_providers import canonical_source_provider
 from healthmes.store import RawIngestEvent
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ def store_raw(
     date-partitioned, content-hash suffixed so identical re-posts never
     collide with different payloads) before this returns.
     """
+    source = canonical_source_provider(source)
     received = _utcnow()
     digest = hashlib.sha256(body).hexdigest()
     rel_dir = (

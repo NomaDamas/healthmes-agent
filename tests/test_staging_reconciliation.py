@@ -141,6 +141,81 @@ def test_reconciler_restores_missing_raw_destination_from_db_index(
         assert session.scalar(select(WellnessEvent)) is not None
 
 
+def test_raw_index_canonicalizes_provider_before_idempotency_lookup(
+    engine,
+    settings,
+):
+    payload = b"canonical raw payload"
+    raw = RawIngestEvent(
+        received_at=datetime(2026, 8, 18, 4, 15, tzinfo=UTC),
+        source="  Sleep-Diary  ",
+        content_type="application/octet-stream",
+        path="raw_ingest/2026/08/18/canonical-provider.bin",
+        size_bytes=len(payload),
+        sha256=_sha(payload),
+        parse_status="stored_unparsed",
+        forward_status="not_applicable",
+        forward_detail=None,
+        records_forwarded=0,
+    )
+    with Session(engine) as session:
+        session.add(raw)
+
+        first = index_raw_ingest(session, settings, raw)
+        raw.source = " SLEEP-DIARY "
+        retry = index_raw_ingest(session, settings, raw)
+        session.commit()
+
+        events = list(session.scalars(select(WellnessEvent)))
+        assert raw.source == "sleep-diary"
+        assert retry.id == first.id
+        assert len(events) == 1
+        assert events[0].source_provider == "sleep-diary"
+
+
+@pytest.mark.parametrize(
+    "source_provider",
+    (
+        "   ",
+        "-sleep-diary",
+        "\tsleep-diary\t",
+        "ÄPFEL",
+        "CAFÉ",
+        "Σ",
+        "straße",
+        "K",
+        "sleep\x00diary",
+        "a" * 65,
+    ),
+)
+def test_raw_index_rejects_invalid_provider_without_storage_side_effects(
+    engine,
+    settings,
+    source_provider,
+):
+    raw = RawIngestEvent(
+        received_at=datetime(2026, 8, 18, 4, 15, tzinfo=UTC),
+        source=source_provider,
+        content_type="application/octet-stream",
+        path="raw_ingest/2026/08/18/blank-provider.bin",
+        size_bytes=1,
+        sha256=_sha(b"x"),
+        parse_status="stored_unparsed",
+        forward_status="not_applicable",
+        forward_detail=None,
+        records_forwarded=0,
+    )
+    with Session(engine) as session:
+        with pytest.raises(
+            ValueError,
+            match="source_provider must be an ASCII identifier",
+        ):
+            index_raw_ingest(session, settings, raw)
+
+        assert list(session.scalars(select(StorageObject))) == []
+        assert list(session.scalars(select(WellnessEvent))) == []
+
+
 def test_reconciler_preserves_unindexed_staging_file(
     engine,
     settings,

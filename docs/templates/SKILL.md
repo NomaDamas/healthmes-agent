@@ -46,8 +46,11 @@ where the agent should apply this skill — and when it should NOT.
 - Return the strict `healthmes.decision-draft.v2` envelope requested by the
   system instructions.
 - If the result may be retained, select only a `record_summary_code` allowed
-  by the runtime prompt and set `answer` to that code's exact canonical
-  sentence. Set the legacy `record_summary` field to `null`.
+  by the runtime prompt. Keep `answer` as the concise detailed response for
+  the current turn and keep its conclusion consistent with the selected
+  code. HealthMes stores the code rather than the free-form answer and uses
+  the canonical compact sentence on replay. Set the legacy `record_summary`
+  field to `null`.
 - Do not mutate calendar, settings, tasks, food records, or medical records
   from the decision-read runtime. A separately confirmed mutation workflow
   owns those actions.

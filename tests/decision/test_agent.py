@@ -746,6 +746,161 @@ async def test_related_record_is_exposed_only_as_turn_scoped_alias(
     }
 
 
+async def test_whoop_package_hint_binds_to_wearable_package_parameter(
+    session_factory,
+):
+    package_event_id = uuid.uuid4()
+    unrelated_wearable_event_id = uuid.uuid4()
+
+    class WhoopPackageProvider:
+        def __init__(self) -> None:
+            self.calls = []
+            self.metadata = ContextProviderMetadata(
+                provider_id="wearable",
+                domain="wearable",
+                description="Selected WHOOP package.",
+                capabilities=(
+                    ContextCapability(
+                        capability="wearable.whoop-recovery-package",
+                        description="Selected retained WHOOP package.",
+                        granularities=("day",),
+                        query_fields=("timezone",),
+                        output_fields=("status",),
+                        parameters=("date", "package_record_id"),
+                        parameter_specs=(
+                            ContextParameterSpec(
+                                name="date",
+                                value_type=ContextParameterType.STRING,
+                                required=True,
+                                min_length=10,
+                                max_length=10,
+                                format=ContextParameterFormat.DATE,
+                            ),
+                            ContextParameterSpec(
+                                name="package_record_id",
+                                value_type=ContextParameterType.STRING,
+                                min_length=36,
+                                max_length=36,
+                                format=ContextParameterFormat.UUID,
+                                accepts_related_record_ref=True,
+                            ),
+                        ),
+                        max_lookback_days=1,
+                        sensitivity="wearable",
+                        provenance=ProvenanceSupport.STABLE,
+                        freshness_expectation="Selected retained package.",
+                    ),
+                ),
+            )
+
+        async def query(self, session, query, *, now):
+            del session
+            self.calls.append(query)
+            return ContextResult(
+                query_id=query.query_id,
+                provider_id=query.provider_id,
+                capability=query.capability,
+                status=ContextStatus.OK,
+                payload={"status": "ok"},
+                freshness=ContextFreshness(
+                    status=FreshnessStatus.CURRENT,
+                    as_of=now,
+                ),
+                coverage=ContextCoverage(
+                    status=CoverageStatus.COMPLETE,
+                    ratio=1,
+                ),
+            )
+
+    class WhoopFollowUpRuntime:
+        metadata = RuntimeMetadata(runtime="scripted")
+
+        def __init__(self) -> None:
+            self.reference: str | None = None
+
+        async def next_step(self, turn):
+            if not turn.history:
+                related = turn.request.hints.related_records
+                assert len(related) == 2
+                assert {item.domain for item in related} == {"wearable"}
+                serialized = turn.model_dump_json()
+                assert str(package_event_id) not in serialized
+                assert str(unrelated_wearable_event_id) not in serialized
+                match = re.search(
+                    r"Use the same package (rr_[0-9a-f]{16}) again\.",
+                    turn.request.question,
+                )
+                assert match is not None
+                self.reference = match.group(1)
+                tool = turn.tools[0]
+                parameter = next(
+                    item
+                    for item in tool.parameter_specs
+                    if item.name == "package_record_id"
+                )
+                assert (
+                    parameter.format
+                    is ContextParameterFormat.RELATED_RECORD_REF
+                )
+                assert parameter.allowed_values == (self.reference,)
+                return RuntimeStepOutput(
+                    tool_calls=(
+                        {
+                            "capability": tool.capability,
+                            "granularity": "day",
+                            "parameters": {
+                                "date": "2026-08-11",
+                                "package_record_id": self.reference,
+                            },
+                        },
+                    ),
+                    metadata=self.metadata,
+                )
+            return RuntimeStepOutput(
+                draft=DecisionDraft(
+                    status=DecisionStatus.COMPLETED,
+                    answer="The exact prior package was reused.",
+                ),
+                metadata=self.metadata,
+            )
+
+    provider = WhoopPackageProvider()
+    runtime = WhoopFollowUpRuntime()
+    request = _request(
+        question=f"Use the same package {package_event_id} again."
+    ).model_copy(
+        update={
+            "hints": DecisionContextHints(
+                related_record_ids={
+                    "whoop_recovery_package": str(package_event_id),
+                    "wearable_capture": str(
+                        unrelated_wearable_event_id
+                    ),
+                }
+            )
+        }
+    )
+
+    result = await _agent(
+        session_factory,
+        providers=(provider,),
+        runtime=runtime,
+        policy=_policy("wearable"),
+    ).ask(request)
+
+    assert result.draft.status is DecisionStatus.COMPLETED
+    assert runtime.reference is not None
+    assert runtime.reference.startswith("rr_")
+    assert provider.calls[0].parameters == {
+        "date": "2026-08-11",
+        "package_record_id": str(package_event_id),
+    }
+    assert result.tool_trace[0].query.parameters == {
+        "date": "2026-08-11",
+        "package_record_id": str(package_event_id),
+    }
+
+
 async def test_unbound_related_record_ids_are_redacted_from_question(
     session_factory,
 ):

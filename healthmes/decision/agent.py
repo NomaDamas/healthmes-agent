@@ -112,11 +112,11 @@ persistence. For this one model iteration you must:
     - risk: pause_and_reassess, delay_and_reassess, reduce_or_avoid,
       seek_professional_support
     - explicit_tracking: track_for_review
-    For a persisted decision, `answer` must exactly equal the canonical
-    sentence supplied by the runtime for the selected code. HealthMes uses
-    that structured code as the single conclusion for both the live response
-    and later recovery. Never put sensitive facts into a compact record.
-    `record_summary` is a legacy transient hint and should be omitted.
+    For a persisted decision, keep `answer` as the detailed user-facing live
+    response and keep it semantically consistent with the selected code.
+    HealthMes stores only that structured code and renders its canonical
+    sentence during later recovery. Never put sensitive facts into a compact
+    record. `record_summary` is a legacy transient hint and should be omitted.
 12. Keep the final answer concise. Return structured data matching the
     supplied runtime contract. HealthMes validates source references and
     conditionally persists a compact record after this loop.
@@ -149,6 +149,9 @@ _ACTIVE_CONSENT_FAILURES = frozenset(
         "execution_scope_denied",
     }
 )
+_RELATED_RECORD_DOMAIN_ALIASES = {
+    "whoop_recovery_package": "wearable",
+}
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 AccessPolicyResolver = Callable[[DecisionRequest], ContextAccessPolicy]
@@ -671,6 +674,7 @@ class _RelatedRecordBinding:
     domain: str
     identity: str
     record_ids: tuple[str, ...]
+    hint_keys: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1803,13 +1807,18 @@ def _related_record_bindings(
     for key, record_id in sorted(
         request.hints.related_record_ids.items()
     ):
-        matching_domains = tuple(
-            domain
-            for domain in sorted(allowed_domains)
-            if (
-                key == domain
-                or key.startswith(f"{domain}_")
-                or key.endswith(f"_{domain}")
+        aliased_domain = _RELATED_RECORD_DOMAIN_ALIASES.get(key)
+        matching_domains = (
+            (aliased_domain,)
+            if aliased_domain in allowed_domains
+            else tuple(
+                domain
+                for domain in sorted(allowed_domains)
+                if (
+                    key == domain
+                    or key.startswith(f"{domain}_")
+                    or key.endswith(f"_{domain}")
+                )
             )
         )
         if len(matching_domains) != 1:
@@ -1819,10 +1828,12 @@ def _related_record_bindings(
             identity,
             {
                 "domains": set(),
+                "hint_keys": set(),
                 "record_ids": [],
             },
         )
         candidate["domains"].add(matching_domains[0])
+        candidate["hint_keys"].add(key)
         variants = [record_id]
         if parsed is not None:
             variants.extend(
@@ -1854,6 +1865,7 @@ def _related_record_bindings(
                 domain=next(iter(domains)),
                 identity=identity,
                 record_ids=tuple(candidate["record_ids"]),
+                hint_keys=tuple(sorted(candidate["hint_keys"])),
             )
         )
     return tuple(bindings)
@@ -2037,16 +2049,20 @@ def _runtime_parameter_specs(
     domain: str,
     related_records: tuple[_RelatedRecordBinding, ...],
 ) -> tuple[ContextParameterSpec, ...] | None:
-    references = tuple(
-        item.reference
-        for item in related_records
-        if item.domain == domain
-    )
     runtime_specs: list[ContextParameterSpec] = []
     for spec in specs:
         if not spec.accepts_related_record_ref:
             runtime_specs.append(spec.model_copy(deep=True))
             continue
+        references = tuple(
+            item.reference
+            for item in related_records
+            if item.domain == domain
+            and (
+                spec.name != "package_record_id"
+                or "whoop_recovery_package" in item.hint_keys
+            )
+        )
         if spec.required and not references:
             return None
         runtime_specs.append(

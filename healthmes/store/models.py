@@ -27,6 +27,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from healthmes.source_providers import (
+    RAW_INGEST_SOURCE_CHECK_EXPRESSION,
+    SOURCE_PROVIDER_CHECK_EXPRESSION,
+)
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
 from healthmes.store.enums import (
     CalendarMutationOperation,
@@ -607,6 +611,12 @@ class RawIngestEvent(Base):
     """
 
     __tablename__ = "raw_ingest_event"
+    __table_args__ = (
+        CheckConstraint(
+            RAW_INGEST_SOURCE_CHECK_EXPRESSION,
+            name="source_canonical",
+        ),
+    )
 
     received_at: Mapped[datetime] = mapped_column(index=True)
     source: Mapped[str_64] = mapped_column(index=True)
@@ -683,6 +693,10 @@ class WellnessEvent(Base):
             "source_provider",
             "source_record_id",
             name="uq_wellness_event_source_record",
+        ),
+        CheckConstraint(
+            SOURCE_PROVIDER_CHECK_EXPRESSION,
+            name="source_provider_canonical",
         ),
         Index(
             "ux_wellness_event_event_type_raw_object_id",

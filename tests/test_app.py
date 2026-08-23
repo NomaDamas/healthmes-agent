@@ -74,6 +74,7 @@ _MCP_INITIALIZE = {
 }
 _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_EXPECTED_ALEMBIC_HEAD = "b7c8d9e0f1a2"
 
 
 def _migration_config(database_url: str) -> Config:
@@ -150,7 +151,9 @@ class TestStoreWiring:
                 sa.column("id"),
             )
             with engine.connect() as connection:
-                assert connection.scalar(sa.select(version_table.c.version_num)) == "e5f6a7b8c9d0"
+                assert connection.scalar(
+                    sa.select(version_table.c.version_num)
+                ) == _EXPECTED_ALEMBIC_HEAD
                 connection.execute(sa.select(storage_object.c.id).limit(1))
 
     def test_direct_app_factory_rejects_existing_non_head_database(
@@ -173,7 +176,8 @@ class TestStoreWiring:
         with pytest.raises(
             DatabaseSchemaError,
             match=(
-                r"current: c3d4e5f6a7b8; expected: e5f6a7b8c9d0.*"
+                rf"current: c3d4e5f6a7b8; expected: "
+                rf"{_EXPECTED_ALEMBIC_HEAD}.*"
                 r"uv run alembic upgrade head"
             ),
         ):
@@ -210,7 +214,7 @@ class TestStoreWiring:
         assert cli_module.main([]) == 1
         error = capsys.readouterr().err
         assert "current: c3d4e5f6a7b8" in error
-        assert "expected: e5f6a7b8c9d0" in error
+        assert f"expected: {_EXPECTED_ALEMBIC_HEAD}" in error
         assert "uv run alembic upgrade head" in error
 
     def test_lifespan_binds_engine_to_app_settings_and_serves_rest(self, settings) -> None:

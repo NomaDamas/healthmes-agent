@@ -24,6 +24,7 @@ from pydantic import (
 )
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from healthmes.activity.privacy import collection_gate
 from healthmes.activity.repository import (
@@ -101,6 +102,11 @@ from healthmes.wearables.provenance import (
     OPEN_WEARABLES_QUERY_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    wearable_query_snapshot_from_event,
+)
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_RECOVERY_SNAPSHOT_DERIVER,
 )
 
 _PRIVACY_RANK = {
@@ -401,6 +407,41 @@ def _wellness_event_snapshot(
         derived_from=(
             dict(row["derived_from"])
             if row["derived_from"] is not None
+            else None
+        ),
+    )
+
+
+def _wellness_event_orm_snapshot(
+    event: WellnessEvent,
+) -> _WellnessEventSnapshot:
+    return _WellnessEventSnapshot(
+        id=event.id,
+        event_type=event.event_type,
+        schema_version=event.schema_version,
+        observed_at=event.observed_at,
+        recorded_at=event.recorded_at,
+        timezone=event.timezone,
+        source_provider=event.source_provider,
+        source_device=event.source_device,
+        source_record_id=event.source_record_id,
+        capture_method=event.capture_method,
+        quality_flags=(
+            dict(event.quality_flags)
+            if event.quality_flags is not None
+            else None
+        ),
+        confidence=event.confidence,
+        coverage=event.coverage,
+        sensitivity=event.sensitivity,
+        consent_scope=event.consent_scope,
+        retention_policy_id=event.retention_policy_id,
+        expires_at=event.expires_at,
+        payload=dict(event.payload or {}),
+        raw_object_id=event.raw_object_id,
+        derived_from=(
+            dict(event.derived_from)
+            if event.derived_from is not None
             else None
         ),
     )
@@ -1890,7 +1931,10 @@ class ContextAccessTurn:
                 now=now,
                 reason_codes=("query_granularity_unsupported",),
             )
-        if not set(query.fields).issubset(capability.output_fields):
+        if (
+            query.fields
+            and "fields" not in capability.query_fields
+        ) or not set(query.fields).issubset(capability.output_fields):
             return self._deny(
                 query,
                 now=now,
@@ -2803,6 +2847,16 @@ def _validate_source_ref(
         else None
     )
     if event is not None:
+        event, whoop_limitations = (
+            _validate_whoop_query_snapshot_source(
+                session,
+                source_ref,
+                event,
+                now=now,
+            )
+        )
+        if event is None:
+            return None, whoop_limitations
         wearable_limitations = _validate_wearable_observation_source(
             session,
             source_ref,
@@ -3361,6 +3415,58 @@ def _source_refs_depend_on_calendar(
     return False
 
 
+def _validate_whoop_query_snapshot_source(
+    session: Session,
+    source_ref: SourceRef,
+    event: _WellnessEventSnapshot,
+    *,
+    now: datetime,
+) -> tuple[_WellnessEventSnapshot | None, tuple[str, ...]]:
+    query = event.payload.get("query")
+    capability = (
+        query.get("capability")
+        if isinstance(query, Mapping)
+        else None
+    )
+    is_whoop_candidate = (
+        event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE
+        and (
+            event.schema_version == 2
+            or source_ref.derived_by == WHOOP_RECOVERY_SNAPSHOT_DERIVER
+            or (
+                isinstance(capability, str)
+                and capability.strip().casefold()
+                == WHOOP_RECOVERY_PACKAGE_CAPABILITY
+            )
+        )
+    )
+    if not is_whoop_candidate:
+        return event, ()
+    try:
+        current = session.get(
+            WellnessEvent,
+            event.id,
+            populate_existing=True,
+        )
+    except ObjectDeletedError:
+        return None, ("source_ref_record_missing",)
+    if current is None:
+        return None, ("source_ref_record_missing",)
+    snapshot = wearable_query_snapshot_from_event(
+        session,
+        current,
+        now=now,
+    )
+    if (
+        snapshot is None
+        or snapshot.event_id != current.id
+        or snapshot.capability != WHOOP_RECOVERY_PACKAGE_CAPABILITY
+        or snapshot.schema_version != 2
+    ):
+        return None, ("source_ref_identity_mismatch",)
+    return _wellness_event_orm_snapshot(current), ()
+
+
 def _source_ref_record_uuid(
     source_ref: SourceRef,
 ) -> uuid.UUID | None:
@@ -3408,6 +3514,16 @@ def _validate_wellness_event_ref(
         )
         or event.coverage != source_ref.coverage
         or event.sensitivity != source_ref.sensitivity
+        or (
+            event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE
+            and event.schema_version == 2
+            and (
+                event.payload.get("query", {}).get("capability")
+                != WHOOP_RECOVERY_PACKAGE_CAPABILITY
+                or source_ref.derived_by
+                != WHOOP_RECOVERY_SNAPSHOT_DERIVER
+            )
+        )
     ):
         return None, ("source_ref_identity_mismatch",)
     if event.consent_scope not in grant.consent_scopes:
@@ -3692,7 +3808,11 @@ def _open_wearables_query_effective_window(
     payload_window = event.payload.get("window")
     if not isinstance(payload_window, Mapping):
         return None
-    result = event.payload.get("result")
+    result = (
+        event.payload.get("public_result")
+        if event.schema_version == 2
+        else event.payload.get("result")
+    )
     retention_window = (
         result.get("retention_window")
         if isinstance(result, Mapping)

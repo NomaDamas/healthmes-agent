@@ -210,9 +210,57 @@ def test_raw_ingest_stores_anything(client, session, settings):
     assert _stored_file(settings, event).read_text() == "오늘 새벽 3시에 깼다"
 
 
+def test_raw_ingest_canonicalizes_before_provider_length_check(
+    client,
+    session,
+) -> None:
+    provider = "A" * 64
+
+    response = client.post(
+        "/v1/ingest/raw",
+        params={"source": f" {provider} "},
+        content=b"x",
+    )
+
+    assert response.status_code == 202
+    assert session.scalars(select(RawIngestEvent)).one().source == (
+        provider.lower()
+    )
+
+
 def test_raw_ingest_validates_source_slug(client):
     response = client.post("/v1/ingest/raw?source=../evil", content=b"x")
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "   ",
+        "-sleep-diary",
+        "\tsleep-diary\t",
+        "ÄPFEL",
+        "sleep\x00diary",
+        "a" * 65,
+    ),
+)
+def test_raw_ingest_rejects_invalid_provider_before_writing(
+    client,
+    session,
+    settings,
+    source,
+) -> None:
+    response = client.post(
+        "/v1/ingest/raw",
+        params={"source": source},
+        content=b"x",
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_source_provider"
+    assert list(session.scalars(select(RawIngestEvent))) == []
+    raw_root = settings.data_dir / "raw_ingest"
+    assert not raw_root.exists() or not any(raw_root.rglob("*"))
 
 
 def test_raw_ingest_partial_staging_write_failure_removes_bytes_and_indexes(

@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from healthmes.activity.locking import global_write_plane_guard
+from healthmes.api.errors import APIError
 from healthmes.durable_files import (
     DurableFileIdentity,
     durable_unlink,
@@ -35,6 +36,7 @@ from healthmes.ingest import (
     store_raw,
     transform_hae,
 )
+from healthmes.source_providers import canonical_source_provider
 from healthmes.storage import index_raw_ingest
 from healthmes.store import RawIngestEvent, StorageObject, WellnessEvent
 from healthmes.store.session import SessionDep
@@ -332,6 +334,7 @@ def _persist_raw_ingest(
     body: bytes,
 ) -> _RawIngestPersistence:
     """Persist raw bytes and references without using the async event loop."""
+    source = canonical_source_provider(source)
     with global_write_plane_guard(bind) as guard_connection:
         writer_bind = guard_connection if guard_connection is not None else bind
         publication = store_raw(
@@ -630,13 +633,21 @@ async def ingest_raw(
     session: SessionDep,
     source: str = Query(
         default="unknown",
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-z0-9][a-z0-9._-]*$",
-        description="Slug naming the sender (e.g. 'garmin-csv', 'sleep-diary').",
+        description=(
+            "Portable provider ID naming the sender "
+            "(e.g. 'garmin-csv', 'sleep-diary')."
+        ),
     ),
 ) -> IngestAck:
     """Store any payload verbatim — no parsing, no forwarding, never rejected."""
+    try:
+        source = canonical_source_provider(source)
+    except ValueError as exc:
+        raise APIError(
+            422,
+            "invalid_source_provider",
+            str(exc),
+        ) from exc
     settings = request.app.state.settings
     body = await _read_capped_body(request)
     persisted = await anyio.to_thread.run_sync(

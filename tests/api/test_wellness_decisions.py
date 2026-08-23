@@ -160,6 +160,39 @@ class RecordingDecisionEngine:
         )
 
 
+class RelatedWhoopDecisionEngine:
+    def __init__(self, package_record_id: str) -> None:
+        self.package_record_id = package_record_id
+        self.requests = []
+
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        source_ref = SourceRef(
+            domain="wearable",
+            resource_type="open-wearables.query-snapshot.v1",
+            record_id=self.package_record_id,
+            source_provider="healthmes-open-wearables-mirror",
+            observed_start=NOW - timedelta(hours=1),
+            observed_end=NOW,
+            schema_version=2,
+            derived_by="healthmes.whoop-recovery-package.snapshot.v2",
+            freshness=FreshnessStatus.CURRENT,
+            coverage=1,
+            sensitivity="wearable",
+        )
+        return DecisionResult(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            status=DecisionStatus.COMPLETED,
+            answer="Use this retained WHOOP recovery recommendation.",
+            source_refs=[source_ref],
+            related_record_ids={
+                "whoop_recovery_package": self.package_record_id
+            },
+            runtime=RuntimeMetadata(runtime="scripted"),
+        )
+
+
 class ClosingDecisionEngine:
     async def ask_wellness(self, _request):
         raise DecisionEngineClosedError(
@@ -725,6 +758,7 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
     secured = _secured_settings(settings)
     engine = RecordingDecisionEngine()
     app = create_app(secured)
+    whoop_package_id = str(uuid.uuid4())
 
     with TestClient(
         app,
@@ -738,7 +772,12 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
             json={
                 "question": " Should I keep working? ",
                 "persistence_requested": True,
-                "hints": {"local_date": DAY.isoformat()},
+                "hints": {
+                    "local_date": DAY.isoformat(),
+                    "related_record_ids": {
+                        "whoop_recovery_package": whoop_package_id,
+                    },
+                },
             },
         )
 
@@ -760,7 +799,65 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
     assert request.persistence_requested is True
     assert request.budget == DecisionBudget()
     assert request.hints.local_date == DAY
-    assert request.hints.related_record_ids == {}
+    assert request.hints.related_record_ids == {
+        "whoop_recovery_package": whoop_package_id,
+    }
+
+
+def test_rest_returns_related_whoop_package_for_follow_up(settings) -> None:
+    app = create_app(_secured_settings(settings))
+    package_record_id = str(uuid.uuid4())
+    engine = RelatedWhoopDecisionEngine(package_record_id)
+
+    with TestClient(app) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={"question": "How should I recover today?"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["related_record_ids"] == {
+        "whoop_recovery_package": package_record_id
+    }
+    assert [item["record_id"] for item in body["source_refs"]] == [
+        package_record_id
+    ]
+    assert len(engine.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "related_record_ids",
+    (
+        {"WHOOP recovery package": str(uuid.uuid4())},
+        {"whoop_recovery_package": " "},
+    ),
+)
+def test_rest_rejects_invalid_related_record_binding(
+    settings,
+    related_record_ids,
+) -> None:
+    app = create_app(_secured_settings(settings))
+    engine = RecordingDecisionEngine()
+
+    with TestClient(app) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={
+                "question": "Use the same WHOOP recovery package.",
+                "hints": {
+                    "related_record_ids": related_record_ids,
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert engine.requests == []
 
 
 def test_rest_requires_durable_idempotency_key(settings) -> None:
@@ -1429,7 +1526,9 @@ def test_decision_recovery_returns_compact_persisted_result(
         "status": "completed",
         "answer": "Keep this wellness item tracked for later review.",
         "proposed_action": False,
+        "actions": [],
         "source_refs": [],
+        "related_record_ids": {},
         "limitations": ["decision_response_compacted"],
         "clarification_question": None,
         "confidence": 0.75,

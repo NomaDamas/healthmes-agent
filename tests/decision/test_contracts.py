@@ -31,8 +31,14 @@ from healthmes.decision import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    decision_record_summary,
     decision_request_from_activity_context,
     source_ref_id,
+)
+from healthmes.decision.contracts import (
+    DecisionAction,
+    DecisionActionKind,
+    DecisionActionState,
 )
 
 T0 = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
@@ -510,6 +516,179 @@ def test_action_draft_requires_valid_source_reference():
             status=DecisionStatus.COMPLETED,
             answer="Take a break.",
             used_source_ref_ids=["activity:event-1"],
+        )
+
+
+def test_action_metadata_preserves_whoop_recovery_recommendations():
+    reference_id = _source_ref().reference_id
+    actions = [
+        DecisionAction(
+            kind=DecisionActionKind.DRINK_WATER,
+            state=DecisionActionState.RECOMMENDED,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.SLEEP_PREPARATION,
+            state=DecisionActionState.RECOMMENDED,
+            advance_minutes=30,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.OFFERED,
+            duration_minutes=10,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.SELECTED,
+            duration_minutes=20,
+        ),
+        DecisionAction(
+            kind=DecisionActionKind.WALK,
+            state=DecisionActionState.OFFERED,
+            duration_minutes=30,
+        ),
+    ]
+
+    draft = DecisionDraft(
+        status=DecisionStatus.COMPLETED,
+        answer=decision_record_summary(
+            DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+        ),
+        record_summary_code=(
+            DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+        ),
+        proposed_action=True,
+        actions=actions,
+        persistence_intent=DecisionPersistenceIntent.ACTION,
+        used_source_ref_ids=[reference_id],
+    )
+    result = DecisionResult(
+        request_id=uuid.uuid4(),
+        turn_id=uuid.uuid4(),
+        status=DecisionStatus.COMPLETED,
+        answer=draft.answer,
+        proposed_action=True,
+        actions=actions,
+        source_refs=[_source_ref()],
+        persistence_status=PersistenceStatus.PERSISTED,
+        decision_record_id=uuid.uuid4(),
+        runtime=RuntimeMetadata(runtime="test-runtime"),
+    )
+
+    assert draft.actions == actions
+    assert result.actions == actions
+    assert all(
+        "completed" not in action.model_dump()
+        for action in result.actions
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        {
+            "kind": "walk",
+            "state": "selected",
+            "duration_minutes": 15,
+        },
+        {
+            "kind": "drink_water",
+            "state": "selected",
+        },
+        {
+            "kind": "sleep_preparation",
+            "state": "recommended",
+            "advance_minutes": 20,
+        },
+        {
+            "kind": "walk",
+            "state": "recommended",
+            "duration_minutes": "10",
+        },
+        {
+            "kind": "walk",
+            "state": "recommended",
+            "duration_minutes": 10,
+            "completed": True,
+        },
+        {
+            "kind": "walk",
+            "state": "recommended",
+            "duration_minutes": 10,
+            "source_id": "cycle-private",
+        },
+        {
+            "kind": "walk",
+            "state": "recommended",
+            "duration_minutes": 10,
+            "label": "Private free-form action",
+        },
+    ),
+)
+def test_action_metadata_rejects_unbounded_or_sensitive_fields(action):
+    with pytest.raises(ValidationError):
+        DecisionAction.model_validate(action)
+
+
+def test_action_metadata_enforces_proposed_action_consistency():
+    reference_id = _source_ref().reference_id
+    selected_walk = DecisionAction(
+        kind=DecisionActionKind.WALK,
+        state=DecisionActionState.SELECTED,
+        duration_minutes=20,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="requires proposed_action=true",
+    ):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="No action.",
+            actions=[selected_walk],
+        )
+    with pytest.raises(
+        ValidationError,
+        match="must not repeat",
+    ):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer=decision_record_summary(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            proposed_action=True,
+            actions=[
+                selected_walk,
+                selected_walk.model_copy(
+                    update={"state": DecisionActionState.OFFERED}
+                ),
+            ],
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=[reference_id],
+        )
+    with pytest.raises(
+        ValidationError,
+        match="at most one selected",
+    ):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer=decision_record_summary(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            record_summary_code=(
+                DecisionRecordSummaryCode.TAKE_RESTORATIVE_BREAK
+            ),
+            proposed_action=True,
+            actions=[
+                selected_walk,
+                selected_walk.model_copy(
+                    update={"duration_minutes": 30}
+                ),
+            ],
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=[reference_id],
         )
 
 

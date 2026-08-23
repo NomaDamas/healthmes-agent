@@ -14,6 +14,11 @@ from typing import Any
 
 from healthmes.mcp_server.ow_client import OWClient
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_UPSTREAM_PROVIDER,
+    calculate_whoop_recovery_package,
+)
 
 WEARABLE_DETAIL_CAPABILITIES = frozenset(
     {
@@ -21,11 +26,13 @@ WEARABLE_DETAIL_CAPABILITIES = frozenset(
         "wearable.summaries",
         "wearable.workouts",
         "wearable.timeseries",
+        WHOOP_RECOVERY_PACKAGE_CAPABILITY,
     }
 )
 WEARABLE_HEALTH_SCORE_CATEGORIES = (
     "activity",
     "body_battery",
+    "day_strain",
     "readiness",
     "recovery",
     "resilience",
@@ -88,6 +95,7 @@ _CAPABILITY_PARAMETERS = {
     "wearable.summaries": frozenset({"summary_kind"}),
     "wearable.workouts": frozenset(),
     "wearable.timeseries": frozenset({"resolution", "series_type"}),
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY: frozenset(),
 }
 _PRIVATE_KEYS = frozenset(
     {
@@ -157,6 +165,7 @@ class WearableSearchRequest:
     timezone: str
     parameters: Mapping[str, Any]
     retained_after: datetime | None = None
+    as_of: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +184,8 @@ class WearableSearchFetch:
     summary_window_partial: bool = False
     conflicting_duplicate_rows: bool = False
     stream_attribution_unavailable: bool = False
+    package: dict[str, Any] | None = None
+    private_provenance: tuple[dict[str, Any], ...] = ()
 
     @property
     def limitations(self) -> tuple[str, ...]:
@@ -468,6 +479,10 @@ def validate_wearable_search_request(
             not in WEARABLE_SUMMARY_KINDS
         ):
             raise ValueError("wearable summary kind is not allowlisted")
+    elif request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+        _whoop_as_of(request.as_of)
+    elif request.as_of is not None:
+        raise ValueError("as_of is only supported by the WHOOP package")
     if request.capability != "wearable.timeseries":
         if end - start > timedelta(days=30):
             raise ValueError("wearable detail window exceeds 30 days")
@@ -504,6 +519,9 @@ class BoundedOpenWearablesSearch:
             user_id = await user_id
         if not isinstance(user_id, str) or not user_id:
             raise LookupError("open-wearables user is unavailable")
+
+        if request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+            return await self._whoop_recovery_package(user_id, request)
 
         summary_window_partial = False
         if request.capability == "wearable.health-scores":
@@ -605,6 +623,92 @@ class BoundedOpenWearablesSearch:
                 stream_attribution_unavailable
             ),
         )
+
+    async def _whoop_recovery_package(
+        self,
+        user_id: str,
+        request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        as_of = _whoop_as_of(request.as_of)
+        timezone = parse_timezone(request.timezone)
+        fetch_start = datetime.combine(
+            as_of - timedelta(days=2),
+            time.min,
+            tzinfo=timezone,
+        ).astimezone(UTC)
+        fetch_end = datetime.combine(
+            as_of + timedelta(days=1),
+            time.min,
+            tzinfo=timezone,
+        ).astimezone(UTC)
+
+        recovery_rows, recovery_truncated, recovery_discarded = (
+            await self._whoop_health_scores(
+                user_id,
+                start=fetch_start,
+                end=fetch_end,
+                category="recovery",
+            )
+        )
+        day_strain_rows, day_strain_truncated, day_strain_discarded = (
+            await self._whoop_health_scores(
+                user_id,
+                start=fetch_start,
+                end=fetch_end,
+                category="day_strain",
+            )
+        )
+        calculation = calculate_whoop_recovery_package(
+            recovery_rows,
+            day_strain_rows,
+            as_of=as_of,
+            timezone=timezone,
+            recovery_truncated=recovery_truncated,
+            day_strain_truncated=day_strain_truncated,
+            retained_after=request.retained_after,
+        )
+        if _contains_private_value(
+            calculation.public,
+            user_id,
+        ) or _contains_private_value(calculation.provenance, user_id):
+            raise ValueError(
+                "open-wearables package exposed the private user identifier"
+            )
+        return WearableSearchFetch(
+            records=(),
+            package=calculation.public,
+            private_provenance=calculation.provenance,
+            upstream_truncated=(
+                recovery_truncated or day_strain_truncated
+            ),
+            discarded_rows=(
+                recovery_discarded + day_strain_discarded
+            ),
+            conflicting_duplicate_rows=(
+                calculation.conflicting_duplicate_rows
+            ),
+        )
+
+    async def _whoop_health_scores(
+        self,
+        user_id: str,
+        *,
+        start: datetime,
+        end: datetime,
+        category: str,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        async def fetch(limit: int, offset: int) -> Mapping[str, Any]:
+            return await self._client.get_health_scores(
+                user_id,
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                category=category,
+                provider=WHOOP_UPSTREAM_PROVIDER,
+                limit=limit,
+                offset=offset,
+            )
+
+        return await _collect_offset_pages(fetch)
 
     async def _health_scores(
         self,
@@ -931,6 +1035,12 @@ def _day(value: Any) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _whoop_as_of(value: Any) -> date:
+    if type(value) is not date:
+        raise ValueError("WHOOP package as_of must be an exact local date")
+    return value
 
 
 def _provider_family(value: Any) -> str | None:

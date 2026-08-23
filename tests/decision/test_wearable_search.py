@@ -58,10 +58,17 @@ from healthmes.wearables.search import (
     WearableSearchFetch,
     WearableSearchRequest,
 )
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    calculate_whoop_recovery_package,
+)
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
 DETAIL_START = datetime(2026, 8, 16, 8, tzinfo=UTC)
 DETAIL_END = DETAIL_START + timedelta(hours=1)
+WHOOP_DAY = date(2026, 8, 10)
+WHOOP_START = datetime(2026, 8, 10, tzinfo=UTC)
+WHOOP_END = datetime(2026, 8, 11, tzinfo=UTC)
 DETAIL_DATE_CASES = (
     (
         "wearable.health-scores",
@@ -199,6 +206,83 @@ def _detail_timeseries_fetch() -> WearableSearchFetch:
     )
 
 
+def _whoop_calculation(
+    *,
+    recovery_value: float,
+    day_strain_value: float,
+    suffix: str,
+    day_strain_updated_at: str = "2026-08-10T10:00:00+00:00",
+):
+    return calculate_whoop_recovery_package(
+        (
+            {
+                "id": f"recovery-{suffix}",
+                "provider": "whoop",
+                "category": "recovery",
+                "recorded_at": "2026-08-10T08:00:00+00:00",
+                "value": recovery_value,
+                "components": {
+                    "cycle_id": {"qualifier": f"cycle-{suffix}"}
+                },
+            },
+        ),
+        (
+            {
+                "id": f"strain-{suffix}",
+                "provider": "whoop",
+                "category": "day_strain",
+                "recorded_at": "2026-08-10T09:00:00+00:00",
+                "value": day_strain_value,
+                "components": {
+                    "cycle_id": {"qualifier": f"cycle-{suffix}"},
+                    "cycle_updated_at": {
+                        "qualifier": day_strain_updated_at
+                    },
+                },
+            },
+        ),
+        as_of=WHOOP_DAY,
+        timezone="UTC",
+    )
+
+
+def _persist_whoop_snapshot(
+    session: Session,
+    *,
+    recovery_value: float,
+    day_strain_value: float,
+    suffix: str,
+):
+    calculation = _whoop_calculation(
+        recovery_value=recovery_value,
+        day_strain_value=day_strain_value,
+        suffix=suffix,
+    )
+    result = dict(calculation.public)
+    result["retention_window"] = (
+        domain_providers._wearable_retention_window(
+            start=WHOOP_START,
+            end=WHOOP_END,
+            effective_now=NOW,
+            retention_policy=(
+                open_wearables_retention_policy_binding(session)
+            ),
+        )
+    )
+    return persist_open_wearables_query_snapshot(
+        session,
+        capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+        start=WHOOP_START,
+        end=WHOOP_END,
+        timezone="UTC",
+        parameters={"as_of": WHOOP_DAY.isoformat()},
+        result=result,
+        private_provenance=calculation.provenance,
+        collected_at=NOW,
+        now=NOW,
+    )
+
+
 def _request() -> DecisionRequest:
     return DecisionRequest(
         question="Use the wearable context needed for this decision.",
@@ -222,6 +306,326 @@ def _turn(provider: WearableContextProvider):
             owner_principal_id="owner",
             grants=(DomainAccessGrant(domain="wearable"),),
         ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("day", "timezone", "expected_start", "expected_end"),
+    (
+        (
+            date(2026, 8, 10),
+            "UTC-07:00",
+            datetime(2026, 8, 10, 7, tzinfo=UTC),
+            datetime(2026, 8, 11, 7, tzinfo=UTC),
+        ),
+        (
+            date(2025, 3, 9),
+            "America/New_York",
+            datetime(2025, 3, 9, 5, tzinfo=UTC),
+            datetime(2025, 3, 10, 4, tzinfo=UTC),
+        ),
+        (
+            date(2025, 11, 2),
+            "America/New_York",
+            datetime(2025, 11, 2, 4, tzinfo=UTC),
+            datetime(2025, 11, 3, 5, tzinfo=UTC),
+        ),
+    ),
+)
+def test_whoop_detail_bounds_cover_complete_requested_local_day(
+    day: date,
+    timezone: str,
+    expected_start: datetime,
+    expected_end: datetime,
+) -> None:
+    query = ContextQuery(
+        provider_id="wearable",
+        capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+        timezone=timezone,
+        granularity="day",
+        parameters={"date": day.isoformat()},
+    )
+
+    start, end = WearableContextProvider._detail_bounds(
+        query,
+        now=expected_start + timedelta(hours=2),
+    )
+
+    assert start == expected_start
+    assert end == expected_end
+
+
+def test_generic_detail_bounds_keep_current_time_cap() -> None:
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.health-scores",
+        timezone="UTC",
+        granularity="record",
+        parameters={
+            "date": NOW.date().isoformat(),
+            "category": "stress",
+        },
+    )
+
+    start, end = WearableContextProvider._detail_bounds(query, now=NOW)
+
+    assert start == datetime(2026, 8, 16, tzinfo=UTC)
+    assert end == NOW + timedelta(seconds=1)
+
+
+async def test_whoop_related_record_reuses_exact_retained_snapshot(
+    session: Session,
+) -> None:
+    first = _persist_whoop_snapshot(
+        session,
+        recovery_value=70,
+        day_strain_value=12,
+        suffix="first",
+    )
+    latest = _persist_whoop_snapshot(
+        session,
+        recovery_value=45,
+        day_strain_value=16,
+        suffix="latest",
+    )
+    assert latest.event_id != first.event_id
+    calls = 0
+
+    async def forbidden_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("an exact related snapshot must not fetch upstream")
+
+    result = await _turn(
+        WearableContextProvider(search_reader=forbidden_reader)
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            timezone="UTC",
+            granularity="day",
+            parameters={
+                "date": WHOOP_DAY.isoformat(),
+                "package_record_id": str(first.event_id),
+            },
+        ),
+    )
+
+    assert result.status is ContextStatus.OK
+    assert result.payload["recovery"]["label"] == "green"
+    assert result.payload["day_strain"]["label"] == "moderate"
+    assert result.payload == {
+        key: value
+        for key, value in first.result.items()
+        if key != "retention_window"
+    }
+    assert "provenance_mode" not in result.payload
+    assert [ref.record_id for ref in result.source_refs] == [
+        str(first.event_id)
+    ]
+    assert str(latest.event_id) not in {
+        ref.record_id for ref in result.source_refs
+    }
+    assert calls == 0
+
+
+async def test_whoop_related_record_scope_mismatch_does_not_use_latest(
+    session: Session,
+) -> None:
+    first = _persist_whoop_snapshot(
+        session,
+        recovery_value=70,
+        day_strain_value=12,
+        suffix="first",
+    )
+    _persist_whoop_snapshot(
+        session,
+        recovery_value=45,
+        day_strain_value=16,
+        suffix="latest",
+    )
+    calls = 0
+
+    async def forbidden_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("a mismatched related snapshot must not fetch")
+
+    result = await _turn(
+        WearableContextProvider(search_reader=forbidden_reader)
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            timezone="UTC",
+            granularity="day",
+            parameters={
+                "date": (WHOOP_DAY - timedelta(days=1)).isoformat(),
+                "package_record_id": str(first.event_id),
+            },
+        ),
+    )
+
+    assert result.status is ContextStatus.UNAVAILABLE
+    assert result.source_refs == []
+    assert result.limitations == [
+        "wearable_related_snapshot_unavailable"
+    ]
+    assert calls == 0
+
+
+async def test_whoop_runtime_limitations_stay_outside_canonical_package(
+    session: Session,
+) -> None:
+    calculation = _whoop_calculation(
+        recovery_value=70,
+        day_strain_value=12,
+        suffix="runtime-envelope",
+    )
+
+    async def limited_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(),
+            package=dict(calculation.public),
+            private_provenance=calculation.provenance,
+            upstream_truncated=True,
+            discarded_rows=1,
+        )
+
+    result = await _turn(
+        WearableContextProvider(search_reader=limited_reader)
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            timezone="UTC",
+            granularity="day",
+            parameters={"date": WHOOP_DAY.isoformat()},
+        ),
+    )
+
+    assert result.payload == calculation.public
+    assert result.payload["limitations"] == []
+    assert set(result.limitations) >= {
+        "wearable_rows_discarded",
+        "wearable_upstream_page_limit_reached",
+    }
+    assert len(result.source_refs) == 1
+
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    stored_package = dict(event.payload["public_result"])
+    retention_window = stored_package.pop("retention_window")
+    assert isinstance(retention_window, dict)
+    assert retention_window
+    assert stored_package == calculation.public
+    assert stored_package["limitations"] == []
+
+
+async def test_whoop_package_rejects_field_projection_before_fetch(
+    session: Session,
+) -> None:
+    calls = 0
+
+    async def forbidden_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("WHOOP projection must fail before fetch")
+
+    provider = WearableContextProvider(search_reader=forbidden_reader)
+    result = await _turn(provider).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            timezone="UTC",
+            granularity="day",
+            fields=["status"],
+            parameters={"date": WHOOP_DAY.isoformat()},
+        ),
+    )
+
+    assert result.status is ContextStatus.DENIED
+    assert result.payload == {}
+    assert result.source_refs == []
+    assert result.limitations == ["query_fields_unsupported"]
+    assert calls == 0
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported context output fields",
+    ):
+        await provider.query(
+            session,
+            ContextQuery(
+                provider_id="wearable",
+                capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                timezone="UTC",
+                granularity="day",
+                fields=["status"],
+                parameters={"date": WHOOP_DAY.isoformat()},
+            ),
+            now=NOW,
+        )
+    assert calls == 0
+
+
+async def test_whoop_provider_persists_revision_before_observation(
+    session: Session,
+) -> None:
+    calculation = _whoop_calculation(
+        recovery_value=70,
+        day_strain_value=12,
+        suffix="revision-before-observation",
+        day_strain_updated_at="2026-08-10T08:59:59+00:00",
+    )
+
+    async def reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(),
+            package=dict(calculation.public),
+            private_provenance=calculation.provenance,
+        )
+
+    result = await _turn(
+        WearableContextProvider(search_reader=reader)
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            timezone="UTC",
+            granularity="day",
+            parameters={"date": WHOOP_DAY.isoformat()},
+        ),
+    )
+
+    assert result.payload == calculation.public
+    assert "wearable_snapshot_persistence_failed" not in result.limitations
+    assert len(result.source_refs) == 1
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.payload["private_provenance"][1]["revision_at"] == (
+        "2026-08-10T08:59:59+00:00"
     )
 
 

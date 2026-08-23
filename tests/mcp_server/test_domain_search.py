@@ -73,6 +73,7 @@ SEARCH_CAPABILITIES = {
         "wearable.sleep",
         "wearable.recovery",
         "wearable.stress",
+        "wearable.whoop-recovery-package",
         "wearable.metric-detail",
     },
 }
@@ -400,6 +401,17 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
     nutrition = tools["search_nutrition"].inputSchema["properties"]
     assert _schema_value(nutrition["text_query"])["maxLength"] == 500
     wearable = tools["search_wearable"].inputSchema["properties"]
+    wearable_fields = set(_schema_value(wearable["fields"])["items"]["enum"])
+    assert "limitations" in wearable_fields
+    assert "provenance_mode" not in wearable_fields
+    package_record_id = _schema_value(wearable["package_record_id"])
+    assert package_record_id["minLength"] == 19
+    assert package_record_id["maxLength"] == 36
+    assert package_record_id["pattern"] == (
+        r"^(?:rr_[0-9a-f]{16}|"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+        r"[89ab][0-9a-f]{3}-[0-9a-f]{12})$"
+    )
     assert set(_schema_value(wearable["kind"])["enum"]) == {
         "load",
         "recovery",
@@ -421,6 +433,7 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         "recovery",
         "resilience",
         "sleep",
+        "day_strain",
         "strain",
         "stress",
     }

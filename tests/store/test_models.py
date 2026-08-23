@@ -32,6 +32,7 @@ from healthmes.store import (
     TaskSource,
     TriggerEvent,
     WeeklyGoal,
+    WellnessEvent,
 )
 
 MONDAY = date(2026, 7, 6)
@@ -717,6 +718,47 @@ class TestAppUsageSample:
         session.commit()
 
         assert len(session.scalars(select(AppUsageSample)).all()) == 2
+
+
+class TestWellnessEvent:
+    @pytest.mark.parametrize(
+        "source_provider",
+        (
+            "Manual",
+            " manual ",
+            "   ",
+            "-manual",
+            ".manual",
+            "_manual",
+            "\tmanual\t",
+            "ÄPFEL",
+            "CAFÉ",
+            "Σ",
+            "straße",
+            "K",
+            "manual\x00a",
+            "a" * 65,
+        ),
+    )
+    def test_source_provider_must_be_canonical(
+        self,
+        session,
+        source_provider,
+    ):
+        session.add(
+            WellnessEvent(
+                event_type="subjective_energy",
+                observed_at=T0,
+                recorded_at=T0,
+                source_provider=source_provider,
+                source_record_id="noncanonical-provider",
+                payload={"score": 4},
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
 
 
 class TestCognitiveEnergyEstimate:

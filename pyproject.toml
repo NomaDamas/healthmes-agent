@@ -72,6 +72,7 @@ packages = ["healthmes"]
 "skills/healthmes-nutrition-decision" = "healthmes/_wellness_skills/healthmes-nutrition-decision"
 "skills/healthmes-sleep" = "healthmes/_wellness_skills/healthmes-sleep"
 "skills/healthmes-stress" = "healthmes/_wellness_skills/healthmes-stress"
+"skills/healthmes-whoop-recovery" = "healthmes/_wellness_skills/healthmes-whoop-recovery"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

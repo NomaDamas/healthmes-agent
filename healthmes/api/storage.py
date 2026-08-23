@@ -33,6 +33,7 @@ from healthmes.backup.snapshot import (
     resolve_data_locations,
 )
 from healthmes.config import Settings
+from healthmes.source_providers import canonical_source_provider
 from healthmes.storage import (
     RETENTION_PRESETS,
     ensure_default_policies,
@@ -142,7 +143,9 @@ class WellnessEventCreate(BaseModel):
     observed_at: AwareDatetime
     recorded_at: AwareDatetime | None = None
     timezone: str | None = None
-    source_provider: str = Field(min_length=1, max_length=64)
+    # Canonicalization removes caller-only ASCII padding before enforcing the
+    # portable 64-character provider identity.
+    source_provider: str
     source_device: str | None = None
     source_record_id: str = Field(min_length=1, max_length=255)
     capture_method: str = "import"
@@ -311,12 +314,21 @@ def create_wellness_event(
     body: WellnessEventCreate, session: SessionDep
 ) -> WellnessEventOut:
     event_type = body.event_type.casefold()
-    source_provider = body.source_provider.casefold()
+    try:
+        source_provider = canonical_source_provider(
+            body.source_provider
+        )
+    except ValueError as exc:
+        raise APIError(
+            422,
+            "invalid_source_provider",
+            str(exc),
+        ) from exc
     if (
         event_type.startswith("nutrition.")
         or event_type.startswith("activity.")
         or source_provider.startswith("nutrition-")
-        or is_reserved_activity_provider(body.source_provider)
+        or is_reserved_activity_provider(source_provider)
         or source_provider
         in {
             "sake-vlm",
@@ -344,9 +356,11 @@ def create_wellness_event(
             "invalid_observed_at",
             "observed_at cannot be more than 5 minutes in the future",
         )
+    canonical_input = body.model_dump(mode="json")
+    canonical_input["source_provider"] = source_provider
     fingerprint = sha256(
         json.dumps(
-            body.model_dump(mode="json"),
+            canonical_input,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -385,7 +399,7 @@ def create_wellness_event(
     existing = session.scalar(
         select(WellnessEvent)
         .where(
-            WellnessEvent.source_provider == body.source_provider,
+            WellnessEvent.source_provider == source_provider,
             WellnessEvent.source_record_id == body.source_record_id,
         )
         .execution_options(populate_existing=True)
@@ -416,7 +430,7 @@ def create_wellness_event(
         observed_at=body.observed_at,
         recorded_at=body.recorded_at or body.observed_at,
         timezone=body.timezone,
-        source_provider=body.source_provider,
+        source_provider=source_provider,
         source_device=body.source_device,
         source_record_id=body.source_record_id,
         capture_method=body.capture_method,
@@ -441,7 +455,7 @@ def create_wellness_event(
         existing = session.scalar(
             select(WellnessEvent)
             .where(
-                WellnessEvent.source_provider == body.source_provider,
+                WellnessEvent.source_provider == source_provider,
                 WellnessEvent.source_record_id == body.source_record_id,
             )
             .execution_options(populate_existing=True)

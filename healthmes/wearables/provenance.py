@@ -29,6 +29,15 @@ from healthmes.storage.service import (
 from healthmes.store import RetentionPolicy, WellnessEvent
 from healthmes.store.session import session_scope
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_ALGORITHM,
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_RESOURCE_TYPE,
+    WHOOP_SOURCE_PROVIDER,
+    WHOOP_UPSTREAM_PROVIDER,
+    calculate_whoop_recovery_package,
+    whoop_label,
+)
 
 OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE = "wearable.open-wearables-snapshot.v1"
 OPEN_WEARABLES_OBSERVATION_EVENT_TYPE = (
@@ -41,12 +50,19 @@ OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS = "wearable_normalized"
 _SNAPSHOT_SCHEMA = "healthmes.open-wearables-snapshot.v1"
 _OBSERVATION_SCHEMA = "healthmes.open-wearables-observation.v1"
 _QUERY_SCHEMA = "healthmes.open-wearables-query.v1"
+_WHOOP_PACKAGE_QUERY_SCHEMA = "healthmes.open-wearables-query.v2"
+_WHOOP_PACKAGE_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-query-identity.v3"
+)
 _RETENTION_BINDING_SCHEMA = "healthmes.retention-policy-binding.v1"
 _MAX_CONTEXT_BYTES = 1_000_000
 _MAX_PAYLOAD_BYTES = 2_000_000
 _MAX_QUERY_RESULT_BYTES = 220_000
 _MAX_QUERY_ROWS = 250
 _MAX_RETAINED_QUERY_CANDIDATES = 32
+_MAX_WHOOP_PRIVATE_PROVENANCE_BYTES = 32_000
+_MAX_WHOOP_PRIVATE_PROVENANCE_ROWS = 2
+_MAX_WHOOP_PROVENANCE_TEXT = 2_048
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 20_000
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
@@ -86,6 +102,68 @@ _PRIVATE_IDENTITY_KEYS = frozenset(
         "userid",
     }
 )
+_WHOOP_PRIVATE_RESULT_KEYS = frozenset(
+    {
+        "cycleid",
+        "cycleids",
+        "derivedby",
+        "evidenceids",
+        "metric",
+        "metricdefinition",
+        "observedat",
+        "provider",
+        "rawvalue",
+        "rawscore",
+        "recordedat",
+        "recordid",
+        "resourcetype",
+        "revisionat",
+        "sourceprovider",
+        "sourcerefs",
+        "updatedat",
+        "upstreamprovider",
+    }
+)
+_WHOOP_PRIVATE_PROVENANCE_KEYS = frozenset(
+    {
+        "source_provider",
+        "upstream_provider",
+        "record_id",
+        "resource_type",
+        "metric",
+        "metric_definition",
+        "observed_at",
+        "revision_at",
+        "cycle_id",
+        "raw_value",
+        "schema_version",
+        "derived_by",
+    }
+)
+_WHOOP_METRICS = frozenset({"recovery", "day_strain"})
+_WHOOP_METRIC_ORDER = {"recovery": 0, "day_strain": 1}
+_WHOOP_METRIC_DEFINITIONS = {
+    "recovery": "whoop.recovery-score.0-to-100.v1",
+    "day_strain": "whoop.cycle-cumulative-day-strain.0-to-21.v1",
+}
+_WHOOP_UNREPRESENTABLE_FAILURE_METRICS = {
+    "source_record_id_missing": _WHOOP_METRICS,
+    "unparseable_raw_value": _WHOOP_METRICS,
+    "unparseable_recorded_at": _WHOOP_METRICS,
+    "unparseable_cycle_updated_at": frozenset({"day_strain"}),
+    "ambiguous_latest_row": _WHOOP_METRICS,
+}
+_WHOOP_BASE_FAILURE_REASONS = frozenset(
+    {
+        "unparseable_recorded_at",
+        "unparseable_cycle_updated_at",
+        "ambiguous_latest_row",
+    }
+)
+_WHOOP_LABEL_PROBES = {
+    "recovery": (0.0, 34.0, 67.0),
+    "day_strain": (0.0, 10.0, 14.0, 18.0),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +202,8 @@ class WearableQuerySnapshot:
     collected_at: datetime
     retention_basis_at: datetime
     coverage: float | None
+    schema_version: int = 1
+    private_provenance_digest: str | None = None
 
 
 def _aware_utc(value: datetime, *, field: str) -> datetime:
@@ -180,6 +260,36 @@ def _reject_private_identity_keys(value: Any, *, path: str = "$") -> None:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         for index, item in enumerate(value):
             _reject_private_identity_keys(item, path=f"{path}[{index}]")
+
+
+def _reject_whoop_private_result_keys(
+    value: Any,
+    *,
+    path: str = "$",
+) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isalnum()
+            )
+            if normalized in _WHOOP_PRIVATE_RESULT_KEYS:
+                raise ValueError(
+                    "public wearable package contains private provenance "
+                    f"at {path}"
+                )
+            _reject_whoop_private_result_keys(
+                item,
+                path=f"{path}.{key}",
+            )
+        return
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        for index, item in enumerate(value):
+            _reject_whoop_private_result_keys(
+                item,
+                path=f"{path}[{index}]",
+            )
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -314,6 +424,40 @@ def _retention_policy_binding(
         **state,
         "revision": f"sha256:{revision}",
     }
+
+
+def _normalize_retention_policy_binding_value(
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "data_class",
+        "enabled",
+        "retention_days",
+        "revision",
+    }:
+        raise ValueError("wearable retention policy binding is invalid")
+    enabled = value.get("enabled")
+    retention_days = value.get("retention_days")
+    if (
+        value.get("data_class")
+        != OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS
+        or type(enabled) is not bool
+        or (
+            retention_days is not None
+            and (
+                type(retention_days) is not int
+                or retention_days <= 0
+            )
+        )
+    ):
+        raise ValueError("wearable retention policy binding is invalid")
+    expected = _retention_policy_binding(
+        enabled=enabled,
+        retention_days=retention_days,
+    )
+    if dict(value) != expected:
+        raise ValueError("wearable retention policy binding is invalid")
+    return expected
 
 
 def open_wearables_retention_policy_binding(
@@ -859,7 +1003,11 @@ def open_wearables_query_digest(
     return query_digest
 
 
-def _normalize_query_result(result: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_query_result(
+    result: Mapping[str, Any],
+    *,
+    capability: str,
+) -> dict[str, Any]:
     normalized = _normalize_json(
         dict(result),
         max_bytes=_MAX_QUERY_RESULT_BYTES,
@@ -867,6 +1015,9 @@ def _normalize_query_result(result: Mapping[str, Any]) -> dict[str, Any]:
     assert isinstance(normalized, dict)
     _reject_secret_keys(normalized)
     _reject_private_identity_keys(normalized)
+    if capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+        _reject_whoop_private_result_keys(normalized)
+        return normalized
     records = normalized.get("records")
     if (
         not isinstance(records, list)
@@ -874,6 +1025,423 @@ def _normalize_query_result(result: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("wearable query result records are invalid")
     return normalized
+
+
+def _whoop_provenance_text(
+    value: Any,
+    *,
+    field: str,
+) -> str:
+    if type(value) is not str:
+        raise ValueError(f"WHOOP private provenance {field} is invalid")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized.encode("utf-8")) > _MAX_WHOOP_PROVENANCE_TEXT
+    ):
+        raise ValueError(f"WHOOP private provenance {field} is invalid")
+    return normalized
+
+
+def _whoop_provenance_timestamp(
+    value: Any,
+    *,
+    field: str,
+) -> datetime:
+    text = _whoop_provenance_text(value, field=field)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"WHOOP private provenance {field} is invalid"
+        ) from None
+    return _aware_utc(parsed, field=f"private_provenance.{field}")
+
+
+def _normalize_whoop_private_provenance(
+    private_provenance: Sequence[Mapping[str, Any]] | None,
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    as_of: date,
+    collected_at: datetime,
+) -> list[dict[str, Any]]:
+    if private_provenance is None:
+        rows: list[Any] = []
+    elif isinstance(private_provenance, Sequence) and not isinstance(
+        private_provenance,
+        str | bytes,
+    ):
+        rows = list(private_provenance)
+    else:
+        raise TypeError("private_provenance must be a sequence")
+    if len(rows) > _MAX_WHOOP_PRIVATE_PROVENANCE_ROWS:
+        raise ValueError("WHOOP private provenance exceeds row limit")
+    _reject_secret_keys(rows)
+
+    observed_start = _aware_utc(start, field="start")
+    observed_end = _aware_utc(end, field="end")
+    expected_start, expected_end = _local_day_bounds(as_of, timezone)
+    if (
+        observed_start != expected_start
+        or observed_end != expected_end
+    ):
+        raise ValueError("WHOOP package query must cover one full local day")
+    provenance_start, _ = _local_day_bounds(
+        as_of - timedelta(days=2),
+        timezone,
+    )
+    collected = _aware_utc(collected_at, field="collected_at")
+    normalized_rows: list[dict[str, Any]] = []
+    seen_metrics: set[str] = set()
+    seen_records: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("WHOOP private provenance row is invalid")
+        if set(row) != _WHOOP_PRIVATE_PROVENANCE_KEYS:
+            raise ValueError(
+                "WHOOP private provenance row has an invalid shape"
+            )
+        source_provider = _whoop_provenance_text(
+            row["source_provider"],
+            field="source_provider",
+        )
+        upstream_provider = _whoop_provenance_text(
+            row["upstream_provider"],
+            field="upstream_provider",
+        )
+        record_id = _whoop_provenance_text(
+            row["record_id"],
+            field="record_id",
+        )
+        resource_type = _whoop_provenance_text(
+            row["resource_type"],
+            field="resource_type",
+        )
+        metric = _whoop_provenance_text(
+            row["metric"],
+            field="metric",
+        )
+        metric_definition = _whoop_provenance_text(
+            row["metric_definition"],
+            field="metric_definition",
+        )
+        derived_by = _whoop_provenance_text(
+            row["derived_by"],
+            field="derived_by",
+        )
+        if (
+            source_provider != WHOOP_SOURCE_PROVIDER
+            or upstream_provider != WHOOP_UPSTREAM_PROVIDER
+            or resource_type != WHOOP_RESOURCE_TYPE
+            or metric not in _WHOOP_METRICS
+            or metric_definition != _WHOOP_METRIC_DEFINITIONS.get(metric)
+            or derived_by != WHOOP_RECOVERY_ALGORITHM
+            or type(row["schema_version"]) is not int
+            or row["schema_version"] != 1
+        ):
+            raise ValueError(
+                "WHOOP private provenance semantic metadata is invalid"
+            )
+        if metric in seen_metrics:
+            raise ValueError(
+                "WHOOP private provenance contains duplicate metrics"
+            )
+        record_identity = (resource_type, record_id)
+        if record_identity in seen_records:
+            raise ValueError(
+                "WHOOP private provenance contains duplicate records"
+            )
+
+        observed_at = _whoop_provenance_timestamp(
+            row["observed_at"],
+            field="observed_at",
+        )
+        revision_at = _whoop_provenance_timestamp(
+            row["revision_at"],
+            field="revision_at",
+        )
+        if (
+            observed_at < provenance_start
+            or observed_at >= observed_end
+            or observed_at > collected + _MAX_CLOCK_SKEW
+            or revision_at > collected + _MAX_CLOCK_SKEW
+        ):
+            raise ValueError(
+                "WHOOP private provenance timestamps are invalid"
+            )
+
+        raw_value = row["raw_value"]
+        if (
+            type(raw_value) not in {int, float}
+            or not math.isfinite(float(raw_value))
+        ):
+            raise ValueError(
+                "WHOOP private provenance raw_value is invalid"
+            )
+        cycle_value = row["cycle_id"]
+        cycle_id = (
+            None
+            if cycle_value is None
+            else _whoop_provenance_text(
+                cycle_value,
+                field="cycle_id",
+            )
+        )
+        normalized_rows.append(
+            {
+                "source_provider": source_provider,
+                "upstream_provider": upstream_provider,
+                "record_id": record_id,
+                "resource_type": resource_type,
+                "metric": metric,
+                "metric_definition": metric_definition,
+                "observed_at": observed_at.isoformat(),
+                "revision_at": revision_at.isoformat(),
+                "cycle_id": cycle_id,
+                "raw_value": float(raw_value),
+                "schema_version": 1,
+                "derived_by": derived_by,
+            }
+        )
+        seen_metrics.add(metric)
+        seen_records.add(record_identity)
+
+    normalized_rows.sort(
+        key=lambda row: _WHOOP_METRIC_ORDER[str(row["metric"])]
+    )
+    if (
+        len(_canonical_json(normalized_rows))
+        > _MAX_WHOOP_PRIVATE_PROVENANCE_BYTES
+    ):
+        raise ValueError("WHOOP private provenance exceeds size limit")
+    return normalized_rows
+
+
+def _whoop_package_as_of(
+    scope: Mapping[str, Any],
+) -> date:
+    parameters = scope.get("parameters")
+    if not isinstance(parameters, Mapping):
+        raise ValueError("WHOOP package parameters are invalid")
+    raw = parameters.get("as_of")
+    if type(raw) is not str or set(parameters) != {"as_of"}:
+        raise ValueError("WHOOP package as_of is invalid")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise ValueError("WHOOP package as_of is invalid") from None
+
+
+def _semantic_whoop_public_result(
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    semantic = dict(result)
+    semantic.pop("retention_window", None)
+    return semantic
+
+
+def _whoop_rows_from_private_provenance(
+    private_provenance: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    recovery_rows: list[dict[str, Any]] = []
+    day_strain_rows: list[dict[str, Any]] = []
+    for item in private_provenance:
+        metric = str(item["metric"])
+        components: dict[str, Any] = {}
+        cycle_id = item.get("cycle_id")
+        if cycle_id is not None:
+            components["cycle_id"] = {"qualifier": cycle_id}
+        if metric == "day_strain":
+            components["cycle_updated_at"] = {
+                "qualifier": item["revision_at"]
+            }
+        row = {
+            "id": item["record_id"],
+            "provider": WHOOP_UPSTREAM_PROVIDER,
+            "category": metric,
+            "recorded_at": item["observed_at"],
+            "value": item["raw_value"],
+            "components": components,
+        }
+        if metric == "recovery":
+            recovery_rows.append(row)
+        else:
+            day_strain_rows.append(row)
+    return recovery_rows, day_strain_rows
+
+
+def _validate_unrepresentable_whoop_signal(
+    value: Any,
+    *,
+    metric: str,
+    reason: str,
+) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "status",
+        "source_category",
+        "label",
+        "freshness",
+        "stale_days",
+        "confidence",
+        "reason",
+    }:
+        raise ValueError(
+            "WHOOP public package does not match private provenance"
+        )
+    if (
+        metric
+        not in _WHOOP_UNREPRESENTABLE_FAILURE_METRICS.get(
+            reason,
+            frozenset(),
+        )
+        or value.get("status") != "insufficient_data"
+        or value.get("source_category") != metric
+        or value.get("confidence") != "low"
+        or value.get("reason") != reason
+    ):
+        raise ValueError(
+            "WHOOP public package does not match private provenance"
+        )
+
+    label = value.get("label")
+    freshness = value.get("freshness")
+    stale_days = value.get("stale_days")
+    if reason in _WHOOP_BASE_FAILURE_REASONS:
+        if (
+            label is not None
+            or freshness != "unknown"
+            or stale_days is not None
+        ):
+            raise ValueError(
+                "WHOOP public package does not match private provenance"
+            )
+        return
+
+    if reason == "unparseable_raw_value":
+        if label is not None:
+            raise ValueError(
+                "WHOOP public package does not match private provenance"
+            )
+    elif label is not None and label not in {
+        whoop_label(metric, probe)
+        for probe in _WHOOP_LABEL_PROBES[metric]
+    }:
+        raise ValueError(
+            "WHOOP public package does not match private provenance"
+        )
+
+    if freshness == "current_day":
+        valid_freshness = stale_days == 0 and type(stale_days) is int
+    elif freshness == "stale":
+        valid_freshness = type(stale_days) is int and stale_days > 0
+    else:
+        valid_freshness = False
+    if not valid_freshness:
+        raise ValueError(
+            "WHOOP public package does not match private provenance"
+        )
+
+
+def _validate_whoop_package_consistency(
+    public_result: Mapping[str, Any],
+    private_provenance: Sequence[Mapping[str, Any]],
+    *,
+    as_of: date,
+    timezone: str,
+) -> None:
+    recovery_rows, day_strain_rows = (
+        _whoop_rows_from_private_provenance(private_provenance)
+    )
+    public_limitations = public_result.get("limitations")
+    if not isinstance(public_limitations, list) or not all(
+        type(item) is str for item in public_limitations
+    ):
+        raise ValueError("WHOOP package limitations are invalid")
+    public_signals = {
+        metric: public_result.get(metric)
+        for metric in _WHOOP_METRICS
+    }
+    failure_reasons = {
+        metric: (
+            signal.get("reason")
+            if isinstance(signal, Mapping)
+            else None
+        )
+        for metric, signal in public_signals.items()
+    }
+    unrepresentable = {
+        metric: str(reason)
+        for metric, reason in failure_reasons.items()
+        if reason in _WHOOP_UNREPRESENTABLE_FAILURE_METRICS
+    }
+    provenance_metrics = {
+        str(row["metric"])
+        for row in private_provenance
+    }
+    if provenance_metrics & set(unrepresentable):
+        raise ValueError(
+            "WHOOP public package does not match private provenance"
+        )
+
+    calculated = calculate_whoop_recovery_package(
+        recovery_rows,
+        day_strain_rows,
+        as_of=as_of,
+        timezone=parse_timezone(timezone),
+        recovery_truncated=(
+            failure_reasons["recovery"] == "truncated_source"
+        ),
+        day_strain_truncated=(
+            failure_reasons["day_strain"] == "truncated_source"
+        ),
+    ).public
+    if set(public_result) != set(calculated):
+        raise ValueError(
+            "WHOOP public package does not match the canonical schema"
+        )
+    for key in (
+        "status",
+        "date",
+        "timezone",
+        "confidence",
+        "cycle_linkage",
+        "level",
+        "routine_basis",
+        "actions",
+        "walk",
+    ):
+        if public_result.get(key) != calculated.get(key):
+            raise ValueError(
+                "WHOOP public package does not match private provenance"
+            )
+    for metric, signal in public_signals.items():
+        reason = unrepresentable.get(metric)
+        if reason is None:
+            if signal != calculated.get(metric):
+                raise ValueError(
+                    "WHOOP public package does not match private provenance"
+                )
+            continue
+        _validate_unrepresentable_whoop_signal(
+            signal,
+            metric=metric,
+            reason=reason,
+        )
+
+    expected_limitations = set(calculated["limitations"])
+    for metric, reason in unrepresentable.items():
+        expected_limitations.discard(f"no_whoop_{metric}")
+        expected_limitations.add(reason)
+        if reason == "ambiguous_latest_row":
+            expected_limitations.add(
+                "wearable_conflicting_duplicate_rows"
+            )
+    if public_limitations != sorted(expected_limitations):
+        raise ValueError(
+            "WHOOP public package limitations are inconsistent"
+        )
 
 
 def _query_source_record_id(
@@ -892,6 +1460,31 @@ def _query_source_record_id(
         )
     ).hexdigest()
     return f"query:{query_digest}:{observation_digest}"
+
+
+def _whoop_package_query_source_record_id(
+    *,
+    query_digest: str,
+    semantic_public_digest: str,
+    private_provenance_digest: str,
+    retention_policy_revision: str,
+) -> str:
+    identity_digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "schema": _WHOOP_PACKAGE_IDENTITY_SCHEMA,
+                "query_digest": query_digest,
+                "semantic_public_digest": semantic_public_digest,
+                "private_provenance_digest": (
+                    private_provenance_digest
+                ),
+                "retention_policy_revision": (
+                    retention_policy_revision
+                ),
+            }
+        )
+    ).hexdigest()
+    return f"query:{query_digest}:{identity_digest}"
 
 
 def _query_retention_basis(
@@ -1006,6 +1599,21 @@ def _query_retention_basis(
     return min(observations)
 
 
+def _whoop_package_retention_basis(
+    private_provenance: Sequence[Mapping[str, Any]],
+    *,
+    collected_at: datetime,
+) -> datetime:
+    observations = [
+        _whoop_provenance_timestamp(
+            row["observed_at"],
+            field="observed_at",
+        )
+        for row in private_provenance
+    ]
+    return min(observations) if observations else collected_at
+
+
 def _query_payload(
     *,
     scope: Mapping[str, Any],
@@ -1033,6 +1641,44 @@ def _query_payload(
     )
 
 
+def _whoop_package_query_payload(
+    *,
+    scope: Mapping[str, Any],
+    query_digest: str,
+    public_result: Mapping[str, Any],
+    public_digest: str,
+    private_provenance: Sequence[Mapping[str, Any]],
+    private_provenance_digest: str,
+    semantic_public_digest: str,
+    retention_policy: Mapping[str, Any],
+    collected_at: datetime,
+    retention_basis_at: datetime,
+) -> dict[str, Any]:
+    return _normalize_json(
+        {
+            "schema": _WHOOP_PACKAGE_QUERY_SCHEMA,
+            "schema_version": 2,
+            "query": dict(scope),
+            "query_digest": query_digest,
+            "public_result": dict(public_result),
+            "public_digest": public_digest,
+            "semantic_public_digest": semantic_public_digest,
+            "private_provenance": [
+                dict(row) for row in private_provenance
+            ],
+            "private_provenance_digest": private_provenance_digest,
+            "retention_policy": dict(retention_policy),
+            "collected_at": collected_at.isoformat(),
+            "retention_basis_at": retention_basis_at.isoformat(),
+            "window": {
+                "start": scope["start"],
+                "end": scope["end"],
+            },
+        },
+        max_bytes=_MAX_PAYLOAD_BYTES,
+    )
+
+
 def persist_open_wearables_query_snapshot(
     session: Session,
     *,
@@ -1042,6 +1688,7 @@ def persist_open_wearables_query_snapshot(
     timezone: str,
     parameters: Mapping[str, Any],
     result: Mapping[str, Any],
+    private_provenance: Sequence[Mapping[str, Any]] | None = None,
     collected_at: datetime,
     now: datetime,
 ) -> WearableQuerySnapshot:
@@ -1060,41 +1707,22 @@ def persist_open_wearables_query_snapshot(
             timezone=timezone,
             parameters=parameters,
         )
-        normalized_result = _normalize_query_result(result)
-        retention_basis_at = _query_retention_basis(
-            normalized_result,
-            capability=capability,
-            start=datetime.fromisoformat(str(scope["start"])),
-            end=datetime.fromisoformat(str(scope["end"])),
-            timezone=timezone,
-            collected_at=collected,
+        normalized_result = _normalize_query_result(
+            result,
+            capability=str(scope["capability"]),
         )
-        result_digest = hashlib.sha256(
+        public_digest = hashlib.sha256(
             _canonical_json(normalized_result)
         ).hexdigest()
-        source_record_id = _query_source_record_id(
-            query_digest=query_digest,
-            collected_at=collected,
-            result_digest=result_digest,
-        )
-        payload = _query_payload(
-            scope=scope,
-            query_digest=query_digest,
-            result=normalized_result,
-            result_digest=result_digest,
-            collected_at=collected,
-            retention_basis_at=retention_basis_at,
-        )
-        coverage = _context_coverage(normalized_result)
         policy = _retention_policy(session)
+        expected_policy_binding = (
+            open_wearables_retention_policy_binding(session)
+        )
         retention_window = normalized_result.get("retention_window")
         stored_policy_binding = (
             retention_window.get("retention_policy")
             if isinstance(retention_window, Mapping)
             else None
-        )
-        expected_policy_binding = open_wearables_retention_policy_binding(
-            session
         )
         if (
             stored_policy_binding is not None
@@ -1103,6 +1731,124 @@ def persist_open_wearables_query_snapshot(
             raise ValueError(
                 "wearable retention policy changed before snapshot commit"
             )
+        snapshot_schema_version = 1
+        private_provenance_digest: str | None = None
+        if scope["capability"] == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+            as_of = _whoop_package_as_of(scope)
+            semantic_public_result = _semantic_whoop_public_result(
+                normalized_result
+            )
+            semantic_public_digest = hashlib.sha256(
+                _canonical_json(semantic_public_result)
+            ).hexdigest()
+            normalized_private_provenance = (
+                _normalize_whoop_private_provenance(
+                    private_provenance,
+                    start=datetime.fromisoformat(str(scope["start"])),
+                    end=datetime.fromisoformat(str(scope["end"])),
+                    timezone=timezone,
+                    as_of=as_of,
+                    collected_at=collected,
+                )
+            )
+            _validate_whoop_package_consistency(
+                semantic_public_result,
+                normalized_private_provenance,
+                as_of=as_of,
+                timezone=timezone,
+            )
+            private_provenance_digest = hashlib.sha256(
+                _canonical_json(normalized_private_provenance)
+            ).hexdigest()
+            retention_basis_at = _whoop_package_retention_basis(
+                normalized_private_provenance,
+                collected_at=collected,
+            )
+            source_record_id = _whoop_package_query_source_record_id(
+                query_digest=query_digest,
+                semantic_public_digest=semantic_public_digest,
+                private_provenance_digest=private_provenance_digest,
+                retention_policy_revision=str(
+                    expected_policy_binding["revision"]
+                ),
+            )
+            payload = _whoop_package_query_payload(
+                scope=scope,
+                query_digest=query_digest,
+                public_result=normalized_result,
+                public_digest=public_digest,
+                private_provenance=normalized_private_provenance,
+                private_provenance_digest=private_provenance_digest,
+                semantic_public_digest=semantic_public_digest,
+                retention_policy=expected_policy_binding,
+                collected_at=collected,
+                retention_basis_at=retention_basis_at,
+            )
+            quality_flags = {
+                "query_digest": query_digest,
+                "public_digest": public_digest,
+                "semantic_public_digest": semantic_public_digest,
+                "private_provenance_digest": (
+                    private_provenance_digest
+                ),
+                "retention_policy_revision": (
+                    expected_policy_binding["revision"]
+                ),
+                "snapshot_schema_version": 2,
+            }
+            derived_from = {
+                "source": "open-wearables",
+                "mode": "bounded-query-package-mirror",
+                "capability": WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                "query_digest": query_digest,
+                "public_digest": public_digest,
+                "semantic_public_digest": semantic_public_digest,
+                "private_provenance_digest": (
+                    private_provenance_digest
+                ),
+                "retention_policy_revision": (
+                    expected_policy_binding["revision"]
+                ),
+                "snapshot_schema_version": 2,
+            }
+            snapshot_schema_version = 2
+        else:
+            if private_provenance is not None:
+                raise ValueError(
+                    "private_provenance is only supported for the "
+                    "WHOOP recovery package"
+                )
+            retention_basis_at = _query_retention_basis(
+                normalized_result,
+                capability=str(scope["capability"]),
+                start=datetime.fromisoformat(str(scope["start"])),
+                end=datetime.fromisoformat(str(scope["end"])),
+                timezone=timezone,
+                collected_at=collected,
+            )
+            source_record_id = _query_source_record_id(
+                query_digest=query_digest,
+                collected_at=collected,
+                result_digest=public_digest,
+            )
+            payload = _query_payload(
+                scope=scope,
+                query_digest=query_digest,
+                result=normalized_result,
+                result_digest=public_digest,
+                collected_at=collected,
+                retention_basis_at=retention_basis_at,
+            )
+            quality_flags = {
+                "query_digest": query_digest,
+                "result_digest": public_digest,
+            }
+            derived_from = {
+                "source": "open-wearables",
+                "mode": "bounded-query-mirror",
+                "query_digest": query_digest,
+            }
+        coverage = _context_coverage(normalized_result)
         event = session.scalar(
             select(WellnessEvent).where(
                 WellnessEvent.source_provider
@@ -1125,7 +1871,7 @@ def persist_open_wearables_query_snapshot(
                 )
             event = WellnessEvent(
                 event_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
-                schema_version=1,
+                schema_version=snapshot_schema_version,
                 observed_at=retention_basis_at,
                 recorded_at=collected,
                 timezone=timezone,
@@ -1133,10 +1879,7 @@ def persist_open_wearables_query_snapshot(
                 source_device=None,
                 source_record_id=source_record_id,
                 capture_method="import",
-                quality_flags={
-                    "query_digest": query_digest,
-                    "result_digest": result_digest,
-                },
+                quality_flags=quality_flags,
                 confidence=None,
                 coverage=coverage,
                 sensitivity="wearable",
@@ -1145,11 +1888,7 @@ def persist_open_wearables_query_snapshot(
                 expires_at=expires_at,
                 payload=payload,
                 raw_object_id=None,
-                derived_from={
-                    "source": "open-wearables",
-                    "mode": "bounded-query-mirror",
-                    "query_digest": query_digest,
-                },
+                derived_from=derived_from,
             )
             try:
                 with session.begin_nested():
@@ -1188,6 +1927,7 @@ def commit_open_wearables_query_snapshot(
     timezone: str,
     parameters: Mapping[str, Any],
     result: Mapping[str, Any],
+    private_provenance: Sequence[Mapping[str, Any]] | None = None,
     collected_at: datetime,
     now: datetime,
 ) -> WearableQuerySnapshot:
@@ -1208,6 +1948,7 @@ def commit_open_wearables_query_snapshot(
             timezone=timezone,
             parameters=parameters,
             result=result,
+            private_provenance=private_provenance,
             collected_at=collected_at,
             now=now,
         )
@@ -1222,15 +1963,47 @@ def wearable_query_snapshot_from_event(
     """Validate and detach one retained bounded query event."""
 
     current = _aware_utc(now, field="now")
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return None
+    if (
+        event.schema_version == 1
+        and payload.get("schema") == _QUERY_SCHEMA
+    ):
+        return _wearable_query_snapshot_v1_from_event(
+            event,
+            payload=payload,
+            current=current,
+        )
+    if (
+        event.schema_version == 2
+        and payload.get("schema") == _WHOOP_PACKAGE_QUERY_SCHEMA
+    ):
+        return _wearable_query_snapshot_v2_from_event(
+            event,
+            payload=payload,
+            current=current,
+        )
+    return None
+
+
+def _wearable_query_snapshot_v1_from_event(
+    event: WellnessEvent,
+    *,
+    payload: Mapping[str, Any],
+    current: datetime,
+) -> WearableQuerySnapshot | None:
     try:
-        payload = event.payload
-        if not isinstance(payload, Mapping):
-            return None
         scope = payload["query"]
         result = payload["result"]
         if not isinstance(scope, Mapping) or not isinstance(result, Mapping):
             return None
         capability = str(scope["capability"])
+        if (
+            capability.strip().casefold()
+            == WHOOP_RECOVERY_PACKAGE_CAPABILITY
+        ):
+            return None
         timezone = str(scope["timezone"])
         start = _aware_utc(
             datetime.fromisoformat(str(scope["start"])),
@@ -1250,7 +2023,10 @@ def wearable_query_snapshot_from_event(
             timezone=timezone,
             parameters=parameters,
         )
-        normalized_result = _normalize_query_result(result)
+        normalized_result = _normalize_query_result(
+            result,
+            capability=capability,
+        )
         result_digest = hashlib.sha256(
             _canonical_json(normalized_result)
         ).hexdigest()
@@ -1330,6 +2106,192 @@ def wearable_query_snapshot_from_event(
         collected_at=collected_at,
         retention_basis_at=retention_basis_at,
         coverage=event.coverage,
+        schema_version=1,
+        private_provenance_digest=None,
+    )
+
+
+def _wearable_query_snapshot_v2_from_event(
+    event: WellnessEvent,
+    *,
+    payload: Mapping[str, Any],
+    current: datetime,
+) -> WearableQuerySnapshot | None:
+    try:
+        scope = payload["query"]
+        public_result = payload["public_result"]
+        private_provenance = payload["private_provenance"]
+        if (
+            not isinstance(scope, Mapping)
+            or not isinstance(public_result, Mapping)
+            or not isinstance(private_provenance, list)
+        ):
+            return None
+        capability = str(scope["capability"])
+        if capability != WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+            return None
+        timezone = str(scope["timezone"])
+        start = _aware_utc(
+            datetime.fromisoformat(str(scope["start"])),
+            field="query.start",
+        )
+        end = _aware_utc(
+            datetime.fromisoformat(str(scope["end"])),
+            field="query.end",
+        )
+        parameters = scope["parameters"]
+        if not isinstance(parameters, Mapping):
+            return None
+        expected_scope, query_digest = _normalize_query_scope(
+            capability=capability,
+            start=start,
+            end=end,
+            timezone=timezone,
+            parameters=parameters,
+        )
+        normalized_result = _normalize_query_result(
+            public_result,
+            capability=capability,
+        )
+        as_of = _whoop_package_as_of(expected_scope)
+        semantic_public_result = _semantic_whoop_public_result(
+            normalized_result
+        )
+        public_digest = hashlib.sha256(
+            _canonical_json(normalized_result)
+        ).hexdigest()
+        semantic_public_digest = hashlib.sha256(
+            _canonical_json(semantic_public_result)
+        ).hexdigest()
+        collected_at = _aware_utc(
+            datetime.fromisoformat(str(payload["collected_at"])),
+            field="collected_at",
+        )
+        normalized_private_provenance = (
+            _normalize_whoop_private_provenance(
+                private_provenance,
+                start=start,
+                end=end,
+                timezone=timezone,
+                as_of=as_of,
+                collected_at=collected_at,
+            )
+        )
+        _validate_whoop_package_consistency(
+            semantic_public_result,
+            normalized_private_provenance,
+            as_of=as_of,
+            timezone=timezone,
+        )
+        private_provenance_digest = hashlib.sha256(
+            _canonical_json(normalized_private_provenance)
+        ).hexdigest()
+        retention_basis_at = _whoop_package_retention_basis(
+            normalized_private_provenance,
+            collected_at=collected_at,
+        )
+        retention_policy = _normalize_retention_policy_binding_value(
+            payload["retention_policy"]
+        )
+        result_retention_window = normalized_result.get(
+            "retention_window"
+        )
+        if isinstance(result_retention_window, Mapping):
+            result_policy = result_retention_window.get(
+                "retention_policy"
+            )
+            if result_policy != retention_policy:
+                return None
+        expected_source_record_id = (
+            _whoop_package_query_source_record_id(
+                query_digest=query_digest,
+                semantic_public_digest=semantic_public_digest,
+                private_provenance_digest=private_provenance_digest,
+                retention_policy_revision=str(
+                    retention_policy["revision"]
+                ),
+            )
+        )
+        expected_payload = _whoop_package_query_payload(
+            scope=expected_scope,
+            query_digest=query_digest,
+            public_result=normalized_result,
+            public_digest=public_digest,
+            private_provenance=normalized_private_provenance,
+            private_provenance_digest=private_provenance_digest,
+            semantic_public_digest=semantic_public_digest,
+            retention_policy=retention_policy,
+            collected_at=collected_at,
+            retention_basis_at=retention_basis_at,
+        )
+        expected_quality_flags = {
+            "query_digest": query_digest,
+            "public_digest": public_digest,
+            "semantic_public_digest": semantic_public_digest,
+            "private_provenance_digest": private_provenance_digest,
+            "retention_policy_revision": retention_policy["revision"],
+            "snapshot_schema_version": 2,
+        }
+        expected_derived_from = {
+            "source": "open-wearables",
+            "mode": "bounded-query-package-mirror",
+            "capability": WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            "query_digest": query_digest,
+            "public_digest": public_digest,
+            "semantic_public_digest": semantic_public_digest,
+            "private_provenance_digest": private_provenance_digest,
+            "retention_policy_revision": retention_policy["revision"],
+            "snapshot_schema_version": 2,
+        }
+        if (
+            end <= start
+            or event.event_type != OPEN_WEARABLES_QUERY_EVENT_TYPE
+            or event.schema_version != 2
+            or event.source_provider
+            != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+            or event.source_record_id != expected_source_record_id
+            or event.timezone != timezone
+            or event.source_device is not None
+            or event.capture_method != "import"
+            or event.sensitivity != "wearable"
+            or event.consent_scope != "personal"
+            or event.raw_object_id is not None
+            or _database_utc(event.observed_at) != retention_basis_at
+            or _database_utc(event.recorded_at) != collected_at
+            or event.coverage != _context_coverage(normalized_result)
+            or event.quality_flags != expected_quality_flags
+            or event.derived_from != expected_derived_from
+            or payload.get("schema_version") != 2
+            or payload.get("query_digest") != query_digest
+            or payload.get("public_digest") != public_digest
+            or payload.get("semantic_public_digest")
+            != semantic_public_digest
+            or payload.get("private_provenance_digest")
+            != private_provenance_digest
+            or payload.get("retention_basis_at")
+            != retention_basis_at.isoformat()
+            or _canonical_json(payload) != _canonical_json(expected_payload)
+            or (
+                event.expires_at is not None
+                and _database_utc(event.expires_at) <= current
+            )
+        ):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return WearableQuerySnapshot(
+        event_id=event.id,
+        capability=capability,
+        query_digest=query_digest,
+        result=normalized_result,
+        start=start,
+        end=end,
+        timezone=timezone,
+        collected_at=collected_at,
+        retention_basis_at=retention_basis_at,
+        coverage=event.coverage,
+        schema_version=2,
+        private_provenance_digest=private_provenance_digest,
     )
 
 

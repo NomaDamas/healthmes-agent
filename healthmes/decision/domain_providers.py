@@ -128,6 +128,10 @@ from healthmes.wearables.search import (
     normalize_retained_wearable_workouts,
     validate_wearable_search_request,
 )
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+)
 
 WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
 CalendarSourceResolver = Callable[[], Sequence[CalendarSource]]
@@ -142,6 +146,17 @@ _DATE_PARAMETER = ContextParameterSpec(
     min_length=10,
     max_length=10,
     format=ContextParameterFormat.DATE,
+)
+_REQUIRED_DATE_PARAMETER = _DATE_PARAMETER.model_copy(
+    update={"required": True}
+)
+_PACKAGE_RECORD_ID_PARAMETER = ContextParameterSpec(
+    name="package_record_id",
+    value_type=ContextParameterType.STRING,
+    min_length=36,
+    max_length=36,
+    format=ContextParameterFormat.UUID,
+    accepts_related_record_ref=True,
 )
 _LOOKBACK_DAYS_PARAMETER = ContextParameterSpec(
     name="lookback_days",
@@ -502,6 +517,7 @@ _WEARABLE_NESTED_FIELDS = (
     "active_calories_kcal",
     "active_minutes",
     "actual_sleep",
+    "advance_minutes",
     "avg_bpm",
     "avg_heart_rate_bpm",
     "avg_hrv_rmssd_ms",
@@ -515,6 +531,7 @@ _WEARABLE_NESTED_FIELDS = (
     "calories_kcal",
     "category",
     "charge",
+    "choices_minutes",
     "component",
     "components",
     "confidence",
@@ -522,6 +539,7 @@ _WEARABLE_NESTED_FIELDS = (
     "current",
     "date",
     "deep_minutes",
+    "default_minutes",
     "delta",
     "delta_pct",
     "distance_meters",
@@ -543,6 +561,8 @@ _WEARABLE_NESTED_FIELDS = (
     "intensity_minutes",
     "interruptions_count",
     "is_daily_total",
+    "kind",
+    "label",
     "last_night",
     "light",
     "light_minutes",
@@ -579,6 +599,7 @@ _WEARABLE_NESTED_FIELDS = (
     "sleep_duration_seconds",
     "sleep_efficiency_percent",
     "source",
+    "source_category",
     "source_ref_id",
     "stale_days",
     "start",
@@ -586,6 +607,7 @@ _WEARABLE_NESTED_FIELDS = (
     "start_time",
     "stages",
     "status",
+    "state",
     "steps",
     "stress",
     "summary_kind",
@@ -611,6 +633,8 @@ _WEARABLE_NESTED_FIELDS = (
     "zone_offset",
     "z_score",
     "row_digest",
+    "pace",
+    "rest_is_option",
 )
 _WEARABLE_IDENTITY_FIELDS = ("source",)
 _WEARABLE_PUBLIC_RECORD_FIELDS = frozenset(_WEARABLE_NESTED_FIELDS) - {
@@ -690,15 +714,29 @@ _NUTRITION_HISTORY_SCAN_MULTIPLIER = 20
 _NUTRITION_HISTORY_MIN_SCAN = 100
 _NUTRITION_HISTORY_MAX_SCAN = 5_000
 _WEARABLE_LIMITATION_CODES = (
+    "ambiguous_latest_row",
+    "cycle_id_mismatch",
+    "cycle_id_missing",
+    "no_whoop_day_strain",
+    "no_whoop_recovery",
+    "not_current_local_day",
     "open_wearables_context_unavailable",
     "open_wearables_context_timeout",
     "open_wearables_detail_unavailable",
     "open_wearables_detail_timeout",
+    "primary_signal_unavailable",
+    "raw_value_out_of_range",
+    "source_record_id_missing",
+    "truncated_source",
+    "unparseable_cycle_updated_at",
+    "unparseable_raw_value",
+    "unparseable_recorded_at",
     "wearable_conflicting_duplicate_rows",
     "wearable_payload_limit_reached",
     "wearable_readiness_evidence_ids_unavailable",
     "wearable_query_snapshot_fallback_used",
     "wearable_query_outside_retention_window",
+    "wearable_related_snapshot_unavailable",
     "wearable_provider_attribution_unavailable",
     "wearable_retention_window_trimmed",
     "wearable_rows_discarded",
@@ -709,6 +747,8 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_stream_attribution_unavailable",
     "wearable_summary_window_partial",
     "wearable_upstream_page_limit_reached",
+    "whoop_day_strain_source_truncated",
+    "whoop_recovery_source_truncated",
 )
 _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
     {
@@ -1056,6 +1096,14 @@ def _wearable_fetch_with_required_provider(
         stream_attribution_unavailable=(
             fetched.stream_attribution_unavailable
         ),
+        package=(
+            dict(fetched.package)
+            if isinstance(fetched.package, Mapping)
+            else None
+        ),
+        private_provenance=tuple(
+            dict(row) for row in fetched.private_provenance
+        ),
     )
 
 
@@ -1067,6 +1115,8 @@ def _wearable_fetch_with_current_retention(
     end: datetime,
     retained_after: datetime | None,
 ) -> WearableSearchFetch:
+    if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+        return fetched
     if query.capability == "wearable.health-scores":
         normalized = normalize_retained_wearable_health_scores(
             fetched.records,
@@ -1679,11 +1729,14 @@ def _without_raw(value: Any) -> Any:
 def _payload(
     raw: Mapping[str, Any],
     query: ContextQuery,
+    *,
+    payload_envelope_fields: Sequence[str] = (),
 ) -> dict[str, Any]:
+    allowed_envelope_fields = set(payload_envelope_fields)
     cleaned = {
         str(key): _json_value(value)
         for key, value in raw.items()
-        if key not in _ENVELOPE_KEYS
+        if key not in _ENVELOPE_KEYS or key in allowed_envelope_fields
     }
     cleaned = _without_raw(cleaned)
     if not query.fields:
@@ -2117,6 +2170,7 @@ def _result(
     observed_start: datetime | None = None,
     observed_end: datetime | None = None,
     collected_at: datetime | None = None,
+    payload_envelope_fields: Sequence[str] = (),
 ) -> ContextResult:
     status = _status(raw)
     limitations = {
@@ -2132,7 +2186,11 @@ def _result(
         payload = {}
         refs = ()
     else:
-        payload = _payload(raw, query)
+        payload = _payload(
+            raw,
+            query,
+            payload_envelope_fields=payload_envelope_fields,
+        )
     ref_start, ref_end, ref_collected = _source_ref_times(refs)
     if refs:
         observed_start = ref_start
@@ -2243,6 +2301,8 @@ def _validate_query(
     if query.privacy_level not in capability.privacy_levels:
         raise ValueError("unsupported context privacy level")
     unsupported_fields = set(query.fields) - set(capability.output_fields)
+    if query.fields and "fields" not in capability.query_fields:
+        unsupported_fields.update(query.fields)
     if unsupported_fields:
         raise ValueError("unsupported context output fields")
     unsupported_parameters = set(query.parameters) - set(
@@ -3261,6 +3321,46 @@ class WearableContextProvider:
                 freshness_expectation="Latest daily stress or resilience observation.",
             ),
             ContextCapability(
+                capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                description=(
+                    "Sake-compatible WHOOP recovery and cycle day-strain "
+                    "package for one exact local date. Row selection, "
+                    "revision handling, cycle linkage, labels, and bounded "
+                    "actions are provider-owned."
+                ),
+                granularities=("day",),
+                query_fields=("timezone",),
+                output_fields=(
+                    "status",
+                    "date",
+                    "timezone",
+                    "confidence",
+                    "recovery",
+                    "day_strain",
+                    "cycle_linkage",
+                    "level",
+                    "routine_basis",
+                    "actions",
+                    "walk",
+                    "limitations",
+                ),
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                parameters=("date", "package_record_id"),
+                parameter_specs=(
+                    _REQUIRED_DATE_PARAMETER,
+                    _PACKAGE_RECORD_ID_PARAMETER,
+                ),
+                max_lookback_days=1,
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "One validated local WHOOP package mirrored as a "
+                    "HealthMes snapshot."
+                ),
+            ),
+            ContextCapability(
                 capability="wearable.metric-detail",
                 description=(
                     "Bounded allowlisted readiness metric blocks with optional "
@@ -3723,11 +3823,21 @@ class WearableContextProvider:
         now: datetime,
     ) -> ContextResult:
         start, end = self._detail_bounds(query, now=now)
+        whoop_as_of = (
+            _query_day(query, now=now)
+            if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY
+            else None
+        )
         parameters = {
             key: value
             for key, value in query.parameters.items()
-            if key not in {"cursor", "date"}
+            if key not in {"cursor", "date", "package_record_id"}
         }
+        snapshot_parameters = (
+            {"as_of": whoop_as_of.isoformat()}
+            if whoop_as_of is not None
+            else parameters
+        )
         retention_policy = self._current_retention_policy(session)
         retained_after = _wearable_retention_cutoff(
             retention_policy,
@@ -3740,8 +3850,73 @@ class WearableContextProvider:
             timezone=query.timezone,
             parameters=parameters,
             retained_after=retained_after,
+            as_of=whoop_as_of,
         )
         validate_wearable_search_request(request)
+
+        package_record_id = query.parameters.get("package_record_id")
+        if package_record_id is not None:
+            if query.capability != WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+                raise ValueError(
+                    "package_record_id is only supported by the WHOOP package"
+                )
+            try:
+                package_event_id = uuid.UUID(str(package_record_id))
+            except ValueError as exc:
+                raise ValueError(
+                    "package_record_id must be a UUID"
+                ) from exc
+            retained = retained_open_wearables_query_snapshot_by_event_id(
+                session,
+                event_id=package_event_id,
+                capability=query.capability,
+                start=start,
+                end=end,
+                timezone=query.timezone,
+                parameters=snapshot_parameters,
+                now=now,
+            )
+            if retained is None:
+                return ContextResult(
+                    query_id=query.query_id,
+                    provider_id=query.provider_id,
+                    capability=query.capability,
+                    status=ContextStatus.UNAVAILABLE,
+                    freshness=ContextFreshness(
+                        status=FreshnessStatus.UNAVAILABLE
+                    ),
+                    coverage=ContextCoverage(
+                        status=CoverageStatus.UNAVAILABLE
+                    ),
+                    limitations=[
+                        "wearable_related_snapshot_unavailable"
+                    ],
+                )
+            try:
+                return self._detail_result(
+                    query,
+                    retained,
+                    provenance_mode="retained_related_record",
+                    now=now,
+                    expected_retention_policy=retention_policy,
+                    allow_cursor=False,
+                )
+            except ValueError:
+                return ContextResult(
+                    query_id=query.query_id,
+                    provider_id=query.provider_id,
+                    capability=query.capability,
+                    status=ContextStatus.UNAVAILABLE,
+                    freshness=ContextFreshness(
+                        status=FreshnessStatus.UNAVAILABLE
+                    ),
+                    coverage=ContextCoverage(
+                        status=CoverageStatus.UNAVAILABLE
+                    ),
+                    limitations=[
+                        "wearable_related_snapshot_unavailable"
+                    ],
+                )
 
         supplied_cursor = query.parameters.get("cursor")
         if supplied_cursor is not None:
@@ -3769,7 +3944,7 @@ class WearableContextProvider:
                         start=start,
                         end=end,
                         timezone=query.timezone,
-                        parameters=parameters,
+                        parameters=snapshot_parameters,
                         now=now,
                     )
                 )
@@ -3799,7 +3974,7 @@ class WearableContextProvider:
                 start=start,
                 end=end,
                 timezone=query.timezone,
-                parameters=parameters,
+                parameters=snapshot_parameters,
                 now=now,
                 candidate_limit=_LEGACY_WEARABLE_CURSOR_CANDIDATES,
             )
@@ -3899,51 +4074,88 @@ class WearableContextProvider:
                 _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS
                 & stored_limitations
             )
-            stored_result: dict[str, Any] = {
-                "status": (
-                    "partial"
-                    if incomplete_result
-                    else "empty_success"
-                    if not fetched.records
-                    else "ok"
-                ),
-                "records": list(fetched.records),
-                "limitations": sorted(stored_limitations),
-                "retention_window": _wearable_retention_window(
-                    start=start,
-                    end=end,
-                    effective_now=now,
-                    retention_policy=retention_policy,
-                ),
-            }
-            if query.capability == "wearable.timeseries":
-                stored_result["stream_attribution_status"] = (
-                    "unavailable"
-                    if fetched.stream_attribution_unavailable
-                    else "verified"
+            if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+                if fetched.package is None:
+                    limitations.add("open_wearables_detail_unavailable")
+                    snapshot = None
+                    store_limitation = ""
+                else:
+                    stored_result = dict(fetched.package)
+                    stored_result["retention_window"] = (
+                        _wearable_retention_window(
+                            start=start,
+                            end=end,
+                            effective_now=now,
+                            retention_policy=retention_policy,
+                        )
+                    )
+                    snapshot, store_limitation = (
+                        self._store_detail_snapshot(
+                            session,
+                            query=query,
+                            start=start,
+                            end=end,
+                            parameters=snapshot_parameters,
+                            result=stored_result,
+                            private_provenance=(
+                                fetched.private_provenance
+                            ),
+                            collected_at=now,
+                            now=now,
+                        )
+                    )
+            else:
+                stored_result = {
+                    "status": (
+                        "partial"
+                        if incomplete_result
+                        else "empty_success"
+                        if not fetched.records
+                        else "ok"
+                    ),
+                    "records": list(fetched.records),
+                    "limitations": sorted(stored_limitations),
+                    "retention_window": _wearable_retention_window(
+                        start=start,
+                        end=end,
+                        effective_now=now,
+                        retention_policy=retention_policy,
+                    ),
+                }
+                if query.capability == "wearable.timeseries":
+                    stored_result["stream_attribution_status"] = (
+                        "unavailable"
+                        if fetched.stream_attribution_unavailable
+                        else "verified"
+                    )
+                if not incomplete_result:
+                    stored_result["coverage"] = {"ratio": 1.0}
+                snapshot, store_limitation = (
+                    self._store_detail_snapshot(
+                        session,
+                        query=query,
+                        start=start,
+                        end=end,
+                        parameters=snapshot_parameters,
+                        result=stored_result,
+                        collected_at=now,
+                        now=now,
+                    )
                 )
-            if not incomplete_result:
-                stored_result["coverage"] = {"ratio": 1.0}
-            snapshot, store_limitation = self._store_detail_snapshot(
-                session,
-                query=query,
-                start=start,
-                end=end,
-                parameters=parameters,
-                result=stored_result,
-                collected_at=now,
-                now=now,
-            )
             if snapshot is not None:
-                current_policy = self._current_retention_policy(
-                    session
-                )
+                current_policy = self._current_retention_policy(session)
                 if current_policy == retention_policy:
                     return self._detail_result(
                         query,
                         snapshot,
                         provenance_mode="live_upstream_mirrored",
                         now=now,
+                        extra_limitations=(
+                            tuple(stored_limitations)
+                            if query.capability
+                            == WHOOP_RECOVERY_PACKAGE_CAPABILITY
+                            else ()
+                        ),
                         expected_retention_policy=current_policy,
                     )
                 limitations.add(
@@ -3963,11 +4175,28 @@ class WearableContextProvider:
             start=start,
             end=end,
             timezone=query.timezone,
-            parameters=parameters,
+            parameters=snapshot_parameters,
             now=now,
         )
         if retained is not None:
             limitations.add("wearable_query_snapshot_fallback_used")
+            if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+                try:
+                    return self._detail_result(
+                        query,
+                        retained,
+                        provenance_mode="retained_local_mirror",
+                        now=now,
+                        extra_limitations=tuple(limitations),
+                        expected_retention_policy=retention_policy,
+                        allow_cursor=False,
+                    )
+                except ValueError:
+                    limitations.add(
+                        "wearable_snapshot_persistence_failed"
+                    )
+                    retained = None
+        if retained is not None:
             fallback_result = dict(retained.result)
             fallback_records = fallback_result.get("records")
             fallback_fetch = _wearable_fetch_with_required_provider(
@@ -4023,7 +4252,7 @@ class WearableContextProvider:
                     query=query,
                     start=start,
                     end=end,
-                    parameters=parameters,
+                    parameters=snapshot_parameters,
                     result=fallback_result,
                     collected_at=retained.collected_at,
                     now=now,
@@ -4078,6 +4307,9 @@ class WearableContextProvider:
         *,
         now: datetime,
     ) -> tuple[datetime, datetime]:
+        if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+            day = _query_day(query, now=now)
+            return local_day_bounds(day, query.timezone)
         if query.start is not None and query.end is not None:
             return _as_utc(query.start), _as_utc(query.end)
         day = _query_day(query, now=now)
@@ -4096,6 +4328,7 @@ class WearableContextProvider:
         end: datetime,
         parameters: Mapping[str, Any],
         result: Mapping[str, Any],
+        private_provenance: Sequence[Mapping[str, Any]] | None = None,
         collected_at: datetime,
         now: datetime,
     ) -> tuple[WearableQuerySnapshot | None, str]:
@@ -4110,6 +4343,7 @@ class WearableContextProvider:
                     timezone=query.timezone,
                     parameters=parameters,
                     result=result,
+                    private_provenance=private_provenance,
                     collected_at=collected_at,
                     now=now,
                 )
@@ -4146,6 +4380,7 @@ class WearableContextProvider:
                 timezone=query.timezone,
                 parameters=parameters,
                 result=result,
+                private_provenance=private_provenance,
                 collected_at=collected_at,
                 now=now,
             )
@@ -4182,6 +4417,54 @@ class WearableContextProvider:
                 str(retention_window["effective_end"])
             )
         )
+        if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+            if snapshot.schema_version != 2:
+                raise ValueError(
+                    "WHOOP package snapshot schema is invalid"
+                )
+            raw = {
+                key: value
+                for key, value in stored.items()
+                if key != "retention_window"
+            }
+            raw["freshness"] = {
+                "recorded_at": snapshot.collected_at.isoformat(),
+                "status": provenance_mode,
+            }
+            if raw.get("status") == "ok":
+                # Coverage is a ContextResult envelope field, not part of
+                # Sake's canonical public WHOOP package schema.
+                raw["coverage"] = {"ratio": 1.0}
+            freshness = _freshness(
+                raw,
+                now=now,
+                timezone=query.timezone,
+            )
+            source_ref = SourceRef(
+                domain="wearable",
+                resource_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
+                record_id=str(snapshot.event_id),
+                source_provider=(
+                    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+                ),
+                observed_start=effective_start,
+                observed_end=effective_end,
+                collected_at=snapshot.collected_at,
+                schema_version=snapshot.schema_version,
+                derived_by=WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+                freshness=freshness.status,
+                coverage=snapshot.coverage,
+                sensitivity="wearable",
+            )
+            return _result(
+                query,
+                raw,
+                refs=(source_ref,),
+                refs_complete=True,
+                now=now,
+                extra_limitations=extra_limitations,
+                payload_envelope_fields=("limitations",),
+            )
         raw_records = stored.get("records")
         public_records = [
             _normalized_public_wearable_record(record)

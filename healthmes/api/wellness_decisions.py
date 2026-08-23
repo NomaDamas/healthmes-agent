@@ -26,6 +26,7 @@ from healthmes.activity.locking import (
 from healthmes.api.errors import APIError
 from healthmes.decision import (
     DECISION_DOMAINS,
+    DecisionAction,
     DecisionContextHints,
     DecisionEngineBusyError,
     DecisionEngineClosedError,
@@ -88,7 +89,7 @@ _SERVICE_UNAVAILABLE_REASON_CODES = frozenset(
 
 
 class WellnessDecisionTimeHints(BaseModel):
-    """Narrow caller-provided time constraints, never routing instructions."""
+    """Bounded caller facts that constrain one decision turn."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -96,6 +97,15 @@ class WellnessDecisionTimeHints(BaseModel):
     start: AwareDatetime | None = None
     end: AwareDatetime | None = None
     lookback_days: int | None = Field(default=None, ge=1, le=90)
+    related_record_ids: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=32,
+        description=(
+            "Opaque record IDs returned by an earlier decision. Clients echo "
+            "a prior record under its documented hint key; HealthMes validates "
+            "ownership, scope, retention, and provider use."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_range(self) -> WellnessDecisionTimeHints:
@@ -112,6 +122,7 @@ class WellnessDecisionTimeHints(BaseModel):
             start=self.start,
             end=self.end,
             lookback_days=self.lookback_days,
+            related_record_ids=self.related_record_ids,
         )
 
 
@@ -137,7 +148,9 @@ class WellnessDecisionOutput(BaseModel):
     status: DecisionStatus
     answer: str | None = None
     proposed_action: bool
+    actions: list[DecisionAction]
     source_refs: list[SourceRef]
+    related_record_ids: dict[str, str]
     limitations: list[str]
     clarification_question: str | None = None
     confidence: float | None = None

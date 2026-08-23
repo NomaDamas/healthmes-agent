@@ -14,9 +14,21 @@ from pathlib import Path
 
 import pytest
 
+from healthmes.mcp_server.wellness_skills import (
+    REVIEWED_WELLNESS_SKILLS,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MCP_TOOL_PY = REPO_ROOT / "vendor" / "hermes-agent" / "tools" / "mcp_tool.py"
 SKILL_MDS = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
+WHOOP_SKILL_MD = REPO_ROOT / "skills" / "healthmes-whoop-recovery" / "SKILL.md"
+PACKAGED_WHOOP_SKILL_MD = (
+    REPO_ROOT
+    / "healthmes"
+    / "_wellness_skills"
+    / "healthmes-whoop-recovery"
+    / "SKILL.md"
+)
 EXTENDING_DOC = REPO_ROOT / "docs" / "EXTENDING.md"
 EXPERT_ONBOARDING_DOC = REPO_ROOT / "docs" / "EXPERT-ONBOARDING.ko.md"
 
@@ -77,6 +89,7 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-sleep",
         "healthmes-stress",
         "healthmes-wellness-decision",
+        "healthmes-whoop-recovery",
     ]
 
 
@@ -86,6 +99,31 @@ def test_product_skills_never_call_open_wearables_directly() -> None:
         assert "mcp__open_wearables__" not in text, (
             f"{skill_md} bypasses the HealthMes MCP boundary"
         )
+
+
+def test_whoop_skill_uses_reviewed_common_wearable_contract() -> None:
+    text = WHOOP_SKILL_MD.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    assert "healthmes-whoop-recovery" in REVIEWED_WELLNESS_SKILLS
+    assert "mcp__healthmes__search_wearable" in text
+    assert "wearable.whoop-recovery-package" in text
+    assert "get_whoop_recovery_context" not in text
+    assert "record_decision" not in text
+    assert "Recovery label | Day-strain label | Level" not in text
+    assert "0 <= value <= 33" not in text
+    assert "34 <= value <= 66" not in text
+    assert "67 <= value <= 100" not in text
+    assert "Never reconstruct provider thresholds" in text
+    assert 'state: "selected"' in text
+    assert "does not mean the walk happened or was completed" in normalized
+    assert "without creating a completion record" in normalized
+    assert "one personal water bottle" in normalized
+    assert "sleep preparation 30 minutes earlier" in normalized
+
+
+def test_packaged_whoop_skill_matches_authoring_copy() -> None:
+    assert PACKAGED_WHOOP_SKILL_MD.read_bytes() == WHOOP_SKILL_MD.read_bytes()
 
 
 def test_authoring_docs_keep_decision_and_command_audits_separate() -> None:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -15,9 +16,13 @@ from healthmes.wearables.search import (
     normalize_retained_wearable_workouts,
     validate_wearable_search_request,
 )
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+)
 
 START = datetime(2026, 8, 10, tzinfo=UTC)
 END = START + timedelta(days=1)
+WHOOP_AS_OF = date(2026, 8, 22)
 
 
 def test_retained_timeseries_exact_boundary_remains_unattributed() -> None:
@@ -92,6 +97,7 @@ def _request(
     start: datetime = START,
     end: datetime = END,
     retained_after: datetime | None = None,
+    as_of: date | None = None,
     **parameters: str,
 ) -> WearableSearchRequest:
     return WearableSearchRequest(
@@ -101,7 +107,222 @@ def _request(
         timezone="UTC",
         parameters=parameters,
         retained_after=retained_after,
+        as_of=as_of,
     )
+
+
+class WhoopPackageClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def get_health_scores(
+        self,
+        user_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        assert user_id == "private-user-id"
+        self.calls.append({"user_id": user_id, **kwargs})
+        category = kwargs["category"]
+        if category == "recovery":
+            row = {
+                "id": "whoop-recovery-row",
+                "user_id": user_id,
+                "provider": "whoop",
+                "category": "recovery",
+                "recorded_at": "2026-08-22T07:00:00+09:00",
+                "value": 70,
+                "components": {
+                    "cycle_id": {"qualifier": "cycle-2026-08-22"}
+                },
+            }
+        else:
+            row = {
+                "id": "whoop-day-strain-row",
+                "user_id": user_id,
+                "provider": "whoop",
+                "category": "day_strain",
+                "recorded_at": "2026-08-22T18:00:00+09:00",
+                "value": 14,
+                "components": {
+                    "cycle_id": {"qualifier": "cycle-2026-08-22"},
+                    "cycle_updated_at": {
+                        "qualifier": "2026-08-22T09:05:00+00:00"
+                    },
+                },
+            }
+        return {
+            "data": [row],
+            "pagination": {"has_more": False},
+        }
+
+
+async def test_whoop_package_fetches_exact_local_window_and_raw_signals() -> None:
+    client = WhoopPackageClient()
+    fetched = await BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        WearableSearchRequest(
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            start=datetime(2026, 8, 21, 15, tzinfo=UTC),
+            end=datetime(2026, 8, 22, 15, tzinfo=UTC),
+            timezone="Asia/Seoul",
+            parameters={},
+            as_of=WHOOP_AS_OF,
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.package is not None
+    assert fetched.package["status"] == "ok"
+    assert fetched.package["date"] == WHOOP_AS_OF.isoformat()
+    assert fetched.package["recovery"]["label"] == "green"
+    assert fetched.package["day_strain"]["label"] == "high"
+    assert fetched.package["level"] == "enhanced"
+    assert {
+        item["metric_definition"]
+        for item in fetched.private_provenance
+    } == {
+        "whoop.recovery-score.0-to-100.v1",
+        "whoop.cycle-cumulative-day-strain.0-to-21.v1",
+    }
+    assert [call["category"] for call in client.calls] == [
+        "recovery",
+        "day_strain",
+    ]
+    assert {
+        call["start_date"] for call in client.calls
+    } == {"2026-08-19T15:00:00+00:00"}
+    assert {
+        call["end_date"] for call in client.calls
+    } == {"2026-08-22T15:00:00+00:00"}
+    assert {call["provider"] for call in client.calls} == {"whoop"}
+    assert {call["offset"] for call in client.calls} == {0}
+    assert {call["limit"] for call in client.calls} == {100}
+
+    public = json.dumps(fetched.package, sort_keys=True)
+    for private_value in (
+        "private-user-id",
+        "whoop-recovery-row",
+        "whoop-day-strain-row",
+        "cycle-2026-08-22",
+        "70",
+        "14",
+        "metric_definition",
+    ):
+        assert private_value not in public
+
+
+class IndependentlyTruncatedWhoopClient(WhoopPackageClient):
+    async def get_health_scores(
+        self,
+        user_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if kwargs["category"] == "recovery":
+            self.calls.append({"user_id": user_id, **kwargs})
+            return {
+                "data": [],
+                "pagination": {"has_more": True},
+            }
+        return await super().get_health_scores(user_id, **kwargs)
+
+
+async def test_whoop_package_tracks_each_signal_truncation_independently() -> None:
+    client = IndependentlyTruncatedWhoopClient()
+    fetched = await BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            as_of=WHOOP_AS_OF,
+        )
+    )
+
+    assert fetched.package is not None
+    assert fetched.package["status"] == "insufficient_data"
+    assert fetched.package["recovery"]["reason"] == "truncated_source"
+    assert fetched.package["day_strain"]["status"] == "ok"
+    assert "whoop_recovery_source_truncated" in fetched.package[
+        "limitations"
+    ]
+    assert "whoop_day_strain_source_truncated" not in fetched.package[
+        "limitations"
+    ]
+    assert fetched.upstream_truncated is True
+    assert [call["category"] for call in client.calls] == [
+        "recovery",
+        "day_strain",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("as_of", "parameters"),
+    (
+        (None, {}),
+        ("2026-08-22", {}),
+        (datetime(2026, 8, 22, tzinfo=UTC), {}),
+        (WHOOP_AS_OF, {"cursor": "not-supported"}),
+        (WHOOP_AS_OF, {"category": "recovery"}),
+        (WHOOP_AS_OF, {"as_of": "2026-08-22"}),
+    ),
+)
+async def test_whoop_package_rejects_non_exact_or_extra_parameters(
+    as_of: object,
+    parameters: dict[str, str],
+) -> None:
+    resolver_calls = 0
+
+    def resolve_user() -> str:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return "private-user-id"
+
+    search = BoundedOpenWearablesSearch(
+        WhoopPackageClient(),  # type: ignore[arg-type]
+        resolve_user,
+    )
+
+    with pytest.raises(ValueError):
+        await search(
+            WearableSearchRequest(
+                capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                start=START,
+                end=END,
+                timezone="UTC",
+                parameters=parameters,
+                as_of=as_of,  # type: ignore[arg-type]
+            )
+        )
+
+    assert resolver_calls == 0
+
+
+class UserIdEchoWhoopClient(WhoopPackageClient):
+    async def get_health_scores(
+        self,
+        user_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        payload = await super().get_health_scores(user_id, **kwargs)
+        payload["data"][0]["id"] = user_id
+        return payload
+
+
+async def test_whoop_package_never_returns_the_private_user_id() -> None:
+    search = BoundedOpenWearablesSearch(
+        UserIdEchoWhoopClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="private user identifier"):
+        await search(
+            _request(
+                WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                as_of=WHOOP_AS_OF,
+            )
+        )
 
 
 class SanitizingClient:

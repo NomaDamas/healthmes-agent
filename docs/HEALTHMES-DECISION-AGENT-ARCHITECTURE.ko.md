@@ -271,7 +271,7 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
   "schema": "healthmes.decision-draft.v2",
   "decision": {
     "status": "completed",
-    "answer": "Take a restorative break before continuing.",
+    "answer": "Your recovery is green with moderate day strain. Start with a 10-minute easy walk, drink water, and begin bedtime preparation 30 minutes earlier.",
     "record_summary": null,
     "record_summary_code": "take_restorative_break",
     "proposed_action": true,
@@ -296,15 +296,34 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
 - 짝이 없는 function call/output
 - 실제 결과에 없는 source ref
 - status와 answer/clarification invariant 불일치
-- persisted answer와 `record_summary_code`의 canonical 문장 불일치
+- 저장 의도와 호환되지 않는 `record_summary_code`
+- v2에서 `record_summary`가 `null`이 아닌 응답
 - response size 또는 요청 deadline 초과
 
 `healthmes.decision-draft.v2`는 저장 대상 결론의 단일 정본을
 `record_summary_code`로 둔다. `action`, `risk`, `explicit_tracking`이면 Hermes는
-runtime prompt에 명시된 allowlist에서 code를 고르고 `answer`를 그 code의
-canonical 문장과 정확히 같게 반환해야 한다. 따라서 최초 응답과 재시작 후 복구가
-서로 반대 의미가 될 수 없다. `record_summary`는 과거 runtime을 설명하기 위한
-legacy transient field이며 v2에서는 `null`이어야 하고 장기 저장하지 않는다.
+runtime prompt에 명시된 allowlist에서 code를 고른다. `answer`는 해당 code와
+의미가 일치하는 상세한 **현재 turn 응답**이며, canonical 문장으로 축약하지 않는다.
+`record_summary`는 과거 runtime을 설명하기 위한 legacy transient field이며
+v2에서는 `null`이어야 하고 장기 저장하지 않는다.
+
+```text
+live DecisionResult
+  -> LLM의 상세 answer + actions + source_refs + related_record_ids
+
+DecisionRecord v7
+  -> answer 원문 미저장
+  -> allowlisted record_summary_code + bounded actions + source_refs
+
+receipt/record replay
+  -> code로 렌더링한 canonical 짧은 answer
+  -> decision_response_compacted limitation
+  -> actions + source_refs + related_record_ids 복구
+```
+
+따라서 최초 응답과 replay의 문장은 서로 같을 필요가 없다. 대신 저장된 code가
+최초 답변의 결론과 모순되지 않아야 하며, 상세 답변을 저장하지 않는 privacy
+경계 때문에 replay는 의도적으로 compact하다.
 
 ## 7. 조건부 Finalization
 
@@ -355,11 +374,12 @@ explicit_tracking
   track_for_review             -> Keep this wellness item tracked for later review.
 ```
 
-저장 대상 결정은 최초 `DecisionResult`와 복구 결과 모두 같은 canonical 문장을
-사용한다. 자유 형식 상세 설명이 필요한 단순 조회는 `none`으로 반환해 저장하지
-않는다. 장기 레코드는 code, source_refs와 최소 runtime metadata만 남긴다. 과거
-payload v1-v5는 read compatibility를 유지하지만 새 쓰기는
-`healthmes.decision-private.v6` 형식을 사용한다.
+최초 `DecisionResult`는 상세 답변을 반환하지만 장기 레코드는 그 답변을 복제하지
+않는다. replay는 저장된 code의 canonical 문장을 반환하고
+`decision_response_compacted`를 표시한다. 장기 레코드는 code, bounded actions,
+source_refs와 최소 runtime metadata만 남긴다. 과거 payload v1-v6는 read
+compatibility를 유지하지만 새 쓰기는 `healthmes.decision-private.v7` 형식을
+사용한다.
 
 finalizer는 다음을 하나의 bounded write 절차로 처리한다.
 
@@ -439,43 +459,230 @@ HealthMes /health + /mcp ready
 Hermes가 HealthMes MCP를 필요로 하면서 HealthMes startup이 Hermes를 기다리는
 순환 의존을 제거한다.
 
-## 10. 최신 main의 WHOOP 기능 통합 원칙
+## 10. WHOOP Recovery 기능의 공통 경로
 
-2026-08-22 기준 최신 `main`은 WHOOP Cycle `day_strain`, 전용 recovery context,
-WHOOP Skill과 별도 decision provenance 저장을 추가했다. 이 변경은 현재 #138
-제품 코드에 아직 병합되지 않았다.
+Sake가 만든 WHOOP Recovery + Cycle `day_strain` 기능은 별도 WHOOP 판단 경로로
+남기지 않고 #138의 공통 wearable 경로로 이관했다.
 
-기능 자체는 유지해야 하지만 기존 형태를 그대로 병합하면 #138의 단일 runtime
-불변조건을 깨뜨린다.
+### 이전과 현재
 
 ```text
-그대로 병합하면
-WHOOP Skill -> 전용 context -> Skill이 직접 저장
-
-#138에 맞게 적응하면
+이전
 WHOOP Skill
-  -> search_wearable
-  -> wearable.whoop-recovery-package
-  -> WearableContextProvider
-  -> Recovery + day_strain + Cycle linkage + source_refs
-  -> DecisionFinalizer
+  -> WHOOP 전용 context 도구
+  -> WHOOP 전용 판단 저장 요청
+
+현재
+WHOOP Skill
+  -> HealthMes MCP search_wearable
+       capability="wearable.whoop-recovery-package"
+  -> 결정론적 WearableContextProvider
+  -> Open Wearables Recovery + Cycle day_strain
+  -> HealthMes WHOOP package snapshot v2
+  -> 해당 WHOOP package의 canonical SourceRef 정확히 하나
+  -> Hermes LLM의 다른 domain과 종합
+  -> DecisionFinalizer 검증과 조건부 저장
 ```
 
-통합 시 다음을 지킨다.
+현재 구조에는 WHOOP 전용 제품 MCP, WHOOP 전용 HealthMes 저장소, WHOOP 검색
+subagent가 없다. `healthmes-whoop-recovery` Skill도 데이터를 계산하거나 저장하지
+않는다. Skill은 LLM에게 공통 `search_wearable` capability를 언제, 어떤 제한으로
+호출할지 알려주는 읽기 전용 지침이다.
 
-- Open Wearables의 WHOOP ingest와 정규화 계산은 유지한다.
-- `day_strain`을 wearable health-score allowlist와 typed contract에 추가한다.
-- 동일 Cycle인지 확인하는 fail-closed 계산을 Provider capability로 옮긴다.
-- WHOOP 전용 MCP decision tool은 추가하지 않는다.
-- Skill은 LLM이 읽는 절차 문서로만 남기고 직접 persistence를 지시하지 않는다.
-- 별도 provenance 컬럼을 중복 추가하지 않고 기존 private
-  `decision_payload.source_refs`와 source attestation을 확장한다.
-- 자유 형식 판단을 저장하는 writer는 `DecisionFinalizer` 하나로 유지한다.
+### LLM과 Provider의 책임
 
-이 통합 전까지 #138의 알려진 기능 공백은 WHOOP의 정확한 Recovery + 현재
-day-strain package다. 이는 일반 wearable search나 단일 LLM loop가 없어서가
-아니라, 최신 `main`의 새 domain 계산을 아직 Provider capability로 옮기지 않았기
-때문이다.
+| 책임 | Hermes LLM | `WearableContextProvider` |
+|---|---|---|
+| WHOOP Skill을 읽을지 결정 | 담당 | 담당하지 않음 |
+| recovery package capability 선택 | 담당 | 담당하지 않음 |
+| 정확한 upstream 행 선택 | 담당하지 않음 | local day, timestamp, revision 규칙으로 선택 |
+| Recovery와 day strain의 Cycle 일치 검사 | 담당하지 않음 | 불일치·누락 시 fail closed |
+| WHOOP 등급과 action package 계산 | 재계산 금지 | Sake 규칙으로 결정론적 계산 |
+| 다른 wellness domain과 최종 종합 | 담당 | 담당하지 않음 |
+| 저장 여부 | 주장만 가능 | 계산하지 않음; `DecisionFinalizer`가 확정 |
+
+LLM에는 다음 **공개 package**만 반환한다.
+
+```text
+status, date, timezone, confidence
+recovery label과 freshness
+day_strain label과 freshness
+cycle_linkage status
+level
+허용된 walk 선택지와 bounded actions
+limitations
+해당 WHOOP package의 canonical HealthMes SourceRef 정확히 하나
+```
+
+공개 top-level key 집합은 Sake 계산 결과의 canonical schema와 정확히 같아야
+한다. snapshot envelope의 `retention_window`는 semantic public package에서
+제외한다. 따라서 `raw_scores`나 다른 임의 별칭을 추가해 raw 값을 우회 공개할 수
+없다.
+WHOOP package는 recovery, day strain, Cycle linkage, level, actions와 limitations가
+함께 검증되는 원자적 계약이다. 따라서 `fields` projection을 허용하지 않으며,
+일부 필드 요청은 Provider 실행 전에 `query_fields_unsupported`로 거부한다.
+
+두 종류의 limitation도 섞지 않는다.
+
+```text
+Sake 계산 limitation
+  -> canonical public package의 limitations
+  -> signal 누락, Cycle 불일치, stale row, source truncation
+
+HealthMes runtime limitation
+  -> ContextResult.limitations envelope
+  -> upstream timeout, retained fallback, retention trim, snapshot write 실패
+```
+
+runtime limitation 때문에 저장된 Sake package를 다시 쓰거나 그 semantic identity를
+바꾸지 않는다. live 조회와 retained snapshot이 같은 계산 결과를 가리키면 package는
+동일하고, 해당 조회 턴의 실행 상태만 `ContextResult`에서 달라진다.
+
+upstream provenance의 `source_provider=open-wearables`,
+`upstream_provider=whoop`, raw record ID, metric definition, Cycle ID, revision
+timestamp, raw score와 derivation algorithm은 LLM에 노출하지 않는다. 이 값은
+HealthMes snapshot v2의 private provenance에 보존한다. 다만 LLM에 반환되는
+canonical `SourceRef`에는 HealthMes mirror provider, snapshot event UUID, 관찰
+범위와 `collected_at` 같은 snapshot 추적 정보가 포함된다.
+
+`decision_record.evidence_refs`는 `main`의 schema와 과거 레코드 read compatibility를
+위해 nullable 상태로 남긴다. 새 WHOOP 판단은 이를 별도 저장 경로로 사용하지
+않으며, snapshot private provenance와 DecisionRecord v7 source attestation이
+활성 정본이다.
+
+WHOOP snapshot payload schema는 v2이고 semantic identity schema는 v3이다.
+Identity는 다음 네 값을 결합한다.
+
+```text
+query_digest
++ semantic_public_digest
++ private_provenance_digest
++ retention_policy_revision
+```
+
+`semantic_public_digest`에서는 동적인 `retention_window`를 제외한다.
+`collected_at`은 freshness, audit와 provenance timestamp 검증에는 사용하지만
+semantic identity에는 포함하지 않는다. 따라서 같은 query, 공개 의미, 원본 행과
+retention policy로 나중에 다시 수집하면 기존 snapshot을 재사용하고, 같은 화면
+결과라도 원본 행이나 revision이 바뀌면 다른 snapshot으로 추적한다.
+
+성공한 각 WHOOP package tool result는 해당 snapshot event를 가리키는 canonical
+WHOOP `SourceRef`를 정확히 하나 반환한다. 복합 판단에서는 Activity, Nutrition,
+Calendar 등 다른 domain의 SourceRef가 함께 사용될 수 있다.
+
+### 이전 package를 정확히 다시 사용하는 follow-up
+
+```text
+REST 또는 Channel request
+  -> related_record_ids에 이전 WHOOP snapshot UUID
+  -> 해당 턴 전용 rr_<16hex> alias 생성
+  -> Hermes에는 UUID 대신 alias만 노출
+  -> search_wearable(package_record_id=alias)
+  -> HealthMes가 provider 호출 직전에 원래 UUID로 복원
+  -> retained snapshot을 exact 조회
+  -> 없거나 scope가 다르면 UNAVAILABLE
+  -> 최신 snapshot으로 자동 대체하지 않음
+```
+
+선택된 걷기를 저장할 때는 request hint, 최종 WHOOP `SourceRef.record_id`, 실제
+실행된 effective query의 `package_record_id`를 모두 비교한다. date-only query와
+다른 package를 조회한 trace는 exact follow-up으로 인정하지 않는다.
+
+`rr_` 값은 이전 응답에 영구 저장되는 ID가 아니라 요청마다 만드는 턴 전용
+별칭이다. 공개 REST의 `hints.related_record_ids`와 Channel 계약은 같은
+`DecisionContextHints`로 수렴한다. 성공 응답은 canonical WHOOP SourceRef가 정확히
+하나일 때 `related_record_ids.whoop_recovery_package`를 함께 반환한다. UI는 이
+map을 그대로 다음 요청의 `hints.related_record_ids`로 되돌려 보내며, SourceRef를
+직접 해석하거나 실제 UUID를 질문 문자열에 넣거나 `rr_` alias를 만들지 않는다.
+
+```json
+{
+  "question": "이전 제안대로 20분 걸을게",
+  "hints": {
+    "related_record_ids": {
+      "whoop_recovery_package": "previous-whoop-snapshot-uuid"
+    }
+  }
+}
+```
+
+Channel E2E는 최초 추천 응답의 `related_record_ids`를 받은 뒤 더 최신 snapshot을
+추가하고, 20분 선택 turn에서 이전 snapshot을 exact 재조회하는 흐름을 검증한다.
+두 turn은 각각 immutable DecisionRecord v7을 만들며, 새 service instance의
+receipt replay는 LLM을 다시 호출하지 않고 compact 응답과 같은 related-record ID를
+복구한다. REST 테스트는 응답 map 노출과 입력 map 전달을 각각 검증한다.
+
+### 보존된 Sake 의미
+
+이관은 다음 의미를 바꾸지 않는다.
+
+- Recovery는 `0..33=red`, `34..66=yellow`, `67..100=green`이며 `33.5`,
+  `66.5` 같은 경계 사이 값은 invalid다.
+- Cycle day strain은 `[0,10)=light`, `[10,14)=moderate`,
+  `[14,18)=high`, `[18,21]=all_out`이다.
+- Recovery의 최신 행은 `recorded_at`, day strain의 최신 revision은
+  `cycle_updated_at`으로 고른다.
+- `recorded_at`은 원본 관찰 시각이고 `cycle_updated_at`은 Cycle revision
+  시각이므로, 두 값은 각각 파싱·미래시각 검증하되 서로의 선후관계를 강제하지
+  않는다. 이는 기존 Sake/Open Wearables가 허용한 과거·import 데이터의 의미를
+  보존한다.
+- 요청한 local day의 행이 과거 행보다 우선한다. 같은 최신 시각의 행이 둘이면
+  내용이 같아도 `ambiguous_latest_row`로 처리한다.
+- Recovery와 day strain은 같은 `cycle_id`여야 한다. Workout `strain`은 Cycle
+  누적 `day_strain`을 대체하지 못한다.
+- 두 upstream 조회의 truncation은 독립적으로 검사한다.
+- upstream 조회 범위는 요청일 이틀 전부터 요청일 종료까지 유지해, stale 행과
+  요청일 행의 우선순위를 같은 기준으로 판별한다.
+- `basic`은 10분 걷기가 기본이고 10/20/30분을 선택할 수 있다.
+- `enhanced`는 20분 걷기가 기본이고 10/20/30분을 선택할 수 있다.
+- `priority`는 가벼운 10분 걷기 또는 휴식만 허용한다.
+- 물 마시기와 평소보다 30분 이른 취침 준비는 항상 package에 포함한다.
+- `selected`는 사용자가 선택했다는 뜻이며 완료했다는 뜻이 아니다.
+
+`DecisionFinalizer`는 최종 action이 provider가 반환한 package와 일치하는지
+검증한다. 허용되는 변경은 제공된 걷기 선택지 하나를 `selected`로 바꾸는 경우뿐이다.
+package에 없던 시간, 임의 action 또는 완료 상태는 저장하지 않는다. 단순 조회는
+저장하지 않고, 검증된 행동·위험·명시적 추적만 기존 compact DecisionRecord 경계로
+보낸다.
+
+### Canonical provider identity
+
+Sake 리뷰에서 지적된 대소문자·공백 차이의 중복 저장 가능성은
+DB마다 Unicode 소문자화가 다르지 않은 **portable ASCII provider ID** 계약으로
+해결한다.
+
+```text
+입력 허용
+  앞뒤 ASCII space(U+0020)는 제거
+  본문은 ASCII 문자만 사용
+  길이 1..64
+  첫 글자는 A-Z, a-z 또는 0-9
+  나머지는 A-Z, a-z, 0-9, ".", "_", "-"
+
+저장 형식
+  앞뒤 ASCII space 없음
+  A-Z는 a-z로 변환
+  첫 글자는 a-z 또는 0-9
+  나머지는 a-z, 0-9, ".", "_", "-"
+```
+
+지원되는 write adapter는 DB 조회와 길이 검사 전에 이 공통 helper로 정규화한다.
+1..64자 제한은 공백 제거 후 canonical 본문에 적용하므로 raw caller form의 총길이는
+64를 넘을 수 있다. `casefold()`는 사용하지 않으며, Unicode 문자, NUL,
+tab/newline, canonical 본문 65자 이상 값은 거부한다. migration은 유효한 기존
+ASCII 대문자·공백 값만 정규화한다. 잘못된 기존 값이나 canonical collision이
+하나라도 있으면 행, Alembic revision, 임시 index와 constraint를 변경하지 않고
+전체 upgrade를 실패시킨다. DB check constraint는 비정규 직접 쓰기를 자동
+변환하지 않고 거부한다.
+
+raw-first ingest의 `raw_ingest_event.source`와 연결된
+`wellness_event.source_provider`도 같은 migration transaction에서 같은 규칙으로
+변경한다. 두 DB의 UUID 문자열 표기 차이를 제거해 연결을 검사하고, canonical
+provider가 서로 다르면 원자적으로 실패한다.
+
+idempotency key는 canonical provider와 `source_record_id`의 조합이다. 따라서
+`WHOOP`, ` whoop `, `whoop`은 하나의 원본 identity가 되며, migration과 재시도도
+같은 규칙을 사용한다.
 
 ## 11. 확장 원칙
 

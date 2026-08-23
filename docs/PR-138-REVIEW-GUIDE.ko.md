@@ -1,15 +1,15 @@
 # PR #138 구현 및 코드 리뷰 가이드
 
-> **작성일:** 2026-08-22
+> **작성일:** 2026-08-23
 >
 > **대상:** PR #138 `feat: add HealthMes Decision Agent and unified wellness inputs`
 >
-> **제품 코드 기준점:** `1acd2221`
+> **WHOOP baseline 병합 기준점:** `3b81e956`
 >
 > **이번 갱신 이전 리뷰 문서 기준점:** `c8640707`
 >
-> **최신 main 비교 기준:** `103b7269`이며 아직 PR #138에 병합하지 않았다.
-> 2026-08-22 현재 GitHub 상태는 `CONFLICTING / DIRTY`다.
+> **Sake 기능 기준점:** recovery package `103b7269`, Open Wearables Cycle
+> `day_strain` 수집 `1726fd8a`.
 >
 > **목적:** Sake와 후속 리뷰어가 PR의 대목표, 실제 실행 경로, 저장 경계,
 > 핵심 불변조건과 검증 지점을 빠르게 확인하도록 한다.
@@ -51,6 +51,18 @@ HealthMes 코드는 조회 허용 범위, 보존기간, 시간대, 정확한 계
 엄밀한 데이터 조회를 혼자 보장하지는 않는다.** 정확한 행, 기간, 중복 제거,
 freshness, retention과 `source_refs`는 HealthMes의 결정론적 조회 코드가
 보장한다.
+
+Sake의 WHOOP 기능도 같은 경계를 따른다.
+
+```text
+WHOOP Skill
+  -> search_wearable("wearable.whoop-recovery-package")
+  -> WearableContextProvider
+  -> Open Wearables Recovery + Cycle day_strain
+  -> snapshot v2와 해당 WHOOP package의 SourceRef 정확히 하나
+  -> Hermes LLM 종합
+  -> DecisionFinalizer 검증과 조건부 저장
+```
 
 ## 1. 아키텍처가 어떻게 바뀌었나
 
@@ -312,110 +324,199 @@ PUT  /v1/inputs/{source_id}/settings
 
 데스크톱과 모바일의 오래된 설정 덮어쓰기는 ETag/`If-Match` CAS로 방지한다.
 
-## 8. 최신 main 충돌과 통합 방안
+## 8. Sake WHOOP 기능의 공통 migration
 
-### 현재 확인된 충돌
-
-공통 조상 `d89b314a` 기준으로 #138과 최신 `main`이 함께 수정한 파일은 11개다.
-Git merge가 직접 표시한 텍스트 충돌은 다음 6개다.
+### Before / After
 
 ```text
-README.md
-healthmes/mcp_server/server.py
-tests/glue/test_bootstrap.py
-tests/glue/test_skills_docs.py
-tests/mcp_server/test_tools_store.py
-tests/store/test_alembic.py
-```
-
-자동 병합되더라도 의미 검토가 필요한 공통 수정 파일은 다음 5개다.
-
-```text
-healthmes/store/models.py
-skills/healthmes-sleep/SKILL.md
-tests/api/test_decisions.py
-tests/mcp_server/test_server_app.py
-tests/store/test_models.py
-```
-
-`main`이 추가한 중요한 제품 변경은 다음과 같다.
-
-- Open Wearables의 WHOOP Cycle `day_strain` 수집·정규화
-- WHOOP recovery와 같은 Cycle의 day strain을 결합하는 전용 context
-- `healthmes-whoop-recovery` Skill
-- 범용 decision writer에 별도 `evidence_refs` 저장
-- Alembic revision `f4a5b6c7d8e`
-- 이중 라이선스와 README 변경
-
-### 가장 큰 의미적 충돌
-
-```text
-최신 main
+Before
 WHOOP Skill
-  -> WHOOP 전용 context 도구
-  -> Skill이 범용 decision writer 직접 호출
+  -> WHOOP 전용 context
+  -> Skill이 별도 persistence 흐름을 지시
 
-#138
-HealthMesDecisionService
-  -> Hermes 단일 LLM loop
-  -> search_wearable
-  -> 공통 source_refs 검증
-  -> DecisionFinalizer만 저장
+After
+WHOOP Skill
+  -> HealthMes search_wearable
+       capability="wearable.whoop-recovery-package"
+  -> WearableContextProvider의 결정론적 계산
+  -> Open Wearables Recovery + Cycle day_strain
+  -> HealthMes snapshot v2와 해당 package의 SourceRef 정확히 하나
+  -> Hermes LLM의 다른 domain과 종합
+  -> DecisionFinalizer 검증/조건부 persistence
 ```
 
-두 방식을 그대로 남기면 같은 질문에 대해 조회 도구와 저장 주체가 둘이 된다.
-이는 #138이 제거한 이중 reasoning/persistence 경로를 되살린다.
+WHOOP 전용 제품 MCP, 전용 HealthMes 저장소, 전용 검색 subagent는 추가하지 않았다.
+Skill은 조회 지침만 제공하고 저장 도구를 직접 호출하지 않는다. LLM은 capability와
+추가 domain을 선택하지만 정확한 WHOOP 행, revision, Cycle, label과 action
+package는 Provider 코드가 계산한다.
 
-또한 현재 #138 코드 자체에는 다음 두 WHOOP 공백이 있다.
+### 공개 package와 private provenance
 
-- bounded wearable health-score category에 `day_strain`이 없다.
-- `wearable.recovery`는 HRV, charge와 어제 load를 반환하지만 같은 WHOOP Cycle의
-  Recovery + 현재 day strain package를 정확히 반환하지 않는다.
+| LLM에 공개 | snapshot v2 내부에만 보존 |
+|---|---|
+| status, local date, timezone, confidence | source/upstream provider |
+| Recovery/day strain label과 freshness | raw record ID와 resource type |
+| Cycle linkage 상태와 recovery level | metric definition |
+| walk 선택지, bounded actions, limitations | Cycle ID와 revision timestamp |
+| 해당 WHOOP package의 HealthMes `SourceRef` 정확히 하나 | raw score와 derivation algorithm |
 
-이는 #138의 단일-runtime 설계가 잘못됐다는 뜻이 아니라, #138이 갈라진 뒤
-`main`에 추가된 WHOOP 기능을 아직 공통 Provider 계약으로 옮기지 않았다는 뜻이다.
+LLM과 DecisionRecord는 Open Wearables 원본 행을 직접 참조하지 않는다. HealthMes
+snapshot event 하나가 공개 source boundary다. private provenance는 원본
+추적·replay·retention·변조 탐지에 사용하고 일반 prompt나 action metadata에는
+노출하지 않는다. 단, canonical SourceRef에는 upstream provider가 아니라 HealthMes
+mirror provider와 snapshot event UUID, 관찰 범위, `collected_at`이 포함된다.
+복합 판단 전체에는 다른 domain의 SourceRef가 함께 있을 수 있다.
 
-### 병합 시 해결 원칙
+`main`에서 들어온 nullable `decision_record.evidence_refs` 컬럼과 migration은 기존
+schema·과거 레코드 호환을 위해 보존한다. 그러나 새 WHOOP 경로는 이 컬럼을 쓰는
+별도 writer를 갖지 않는다. 활성 경로의 원본 근거는 snapshot v2의
+`private_provenance`, 공개 package의 canonical `SourceRef`, DecisionRecord v7의
+검증된 source attestation에만 기록된다.
+
+public package의 top-level key는 Sake 계산 함수가 반환하는 canonical schema와
+정확히 같아야 한다. `retention_window`는 snapshot envelope metadata로만 별도
+보존한다. `raw_scores`, `score_breakdown`, `provider_payload`처럼 이름만 바꾼
+추가 필드도 public package와 LLM payload에 들어갈 수 없다.
+WHOOP package는 각 필드가 함께 검증되는 원자적 결과이므로 `fields` projection을
+지원하지 않는다. 일부 키만 요청하면 Context Access Layer가 Provider 호출 전에
+`query_fields_unsupported`로 거부한다.
+
+`public package.limitations`에는 Sake 계산이 설명하는 signal 한계만 들어간다.
+예를 들면 `cycle_id_mismatch`, `not_current_local_day`,
+`whoop_recovery_source_truncated`다. Open Wearables 호출 timeout, local mirror
+fallback, snapshot writer 실패, retention trim 같은 HealthMes 실행 상태는 package를
+변형하지 않고 바깥 `ContextResult.limitations`에만 기록한다. 따라서 같은 Sake
+계산 결과는 live 조회와 retained snapshot 조회에서 같은 canonical package를
+유지하면서, 해당 턴의 runtime 상태만 별도 envelope로 설명한다.
+
+### Semantic identity와 exact follow-up
 
 ```text
-healthmes-whoop-recovery Skill
-  -> LLM이 Skill catalog에서 읽음
-  -> search_wearable(
-       capability="wearable.whoop-recovery-package"
-     )
-  -> WearableContextProvider
-  -> Recovery + day_strain + Cycle linkage + source_refs
-  -> LLM DecisionDraft
-  -> #138 DecisionFinalizer
+WHOOP snapshot payload schema = v2
+WHOOP semantic identity schema = v3
+
+identity =
+  query_digest
+  + semantic_public_digest
+  + private_provenance_digest
+  + retention_policy_revision
 ```
 
-1. Open Wearables의 WHOOP 수집, 정규화, freshness, Cycle matching과 fail-closed
-   계산은 유지한다.
-2. #138 wearable allowlist와 typed contract에 `day_strain`을 추가한다.
-3. WHOOP 전용 계산은 `WearableContextProvider`의 capability로 옮긴다.
-4. 일곱 번째 제품 decision tool을 추가하지 않고 기존 `search_wearable`을
-   사용한다.
-5. WHOOP Skill은 조회 절차를 설명하되 판단을 직접 저장하지 않는다.
-6. provenance는 #138의 private `decision_payload.source_refs`와 source
-   attestation에 통합한다. 별도 `evidence_refs` 저장 경로를 중복 추가하지 않는다.
-7. `e3f4a5b6c7d8`에서 갈라진 Alembic 계보는 후속 adapted revision 또는 merge
-   revision으로 단일 head를 만든다.
-8. 라이선스와 README 변경은 보존하되 #138의 단일 ingress 설명과 충돌하지 않게
-   합친다.
+동적인 `retention_window`와 `collected_at`은 semantic identity에 포함하지 않는다.
+`collected_at`은 freshness, audit와 provenance timestamp 검증에 사용한다.
 
-### #138의 현재 문제를 정확히 요약하면
+```text
+이전 WHOOP snapshot UUID
+  -> REST/Channel DecisionContextHints의 related_record_ids
+  -> 턴 전용 rr_<16hex> alias
+  -> Hermes search_wearable(package_record_id=alias)
+  -> provider 직전에 원래 UUID 복원
+  -> exact retained snapshot 또는 UNAVAILABLE
+  -> 최신 snapshot으로 대체 금지
+```
 
-| 문제 | 성격 | 해결 |
-|---|---|---|
-| 최신 `main`과 Git 충돌 | 통합 미완료 | 위 6개 텍스트 충돌을 의도 기반으로 해결 |
-| WHOOP day strain 미지원 | 기능 격차 | 공통 wearable capability로 흡수 |
-| main의 Skill 직접 저장 | 아키텍처 회귀 위험 | `DecisionFinalizer` 단일 writer 유지 |
-| 별도 `evidence_refs` 컬럼 | provenance 중복 위험 | 기존 private payload/attestation으로 통합 |
-| LLM이 관련 domain을 빠뜨릴 가능성 | 모델 품질 위험 | eval·telemetry 추가, 필요 시 #193 |
+사용자가 걷기 선택지를 고른 follow-up은 요청 hint의 snapshot UUID, 최종
+`SourceRef.record_id`, 실제 실행된 `effective_query.parameters.package_record_id`
+세 값이 모두 같아야 저장된다. 날짜만 다시 조회했거나 다른 package ID를 조회한
+turn은 같은 공개 결과를 반환했더라도 선택 행동을 저장할 수 없다.
 
-이 문서 변경에서는 `main`을 실제로 병합하거나 제품 코드를 수정하지 않는다.
-따라서 문서 반영 후에도 PR #138의 GitHub merge 상태는 충돌 해결 커밋이 들어가기
-전까지 `CONFLICTING`이다.
+`tests/decision/test_whoop_migration_e2e.py`는 최초 snapshot으로 상세 추천을 받은
+뒤 더 최신 snapshot을 추가하고, 첫 응답의 `related_record_ids`를 Channel
+follow-up에 전달해 정확히 이전 snapshot의 20분 걷기를 선택한다. 두 turn은 각각
+immutable compact v7 record를 만들고, 새 service instance의 receipt replay는
+LLM 재호출 없이 canonical compact 답변, actions, source refs와 같은
+related-record ID를 복구한다. 공개 REST도 `related_record_ids`를 응답에 노출하고
+입력의 `hints.related_record_ids`를 내부 `DecisionContextHints`까지 그대로
+전달한다. 따라서 UI는 이전 응답 map을 다음 요청에 이렇게 되돌려 보내면 된다.
+
+```json
+{
+  "question": "20분으로 할게",
+  "hints": {
+    "related_record_ids": {
+      "whoop_recovery_package": "previous-whoop-snapshot-uuid"
+    }
+  }
+}
+```
+
+클라이언트는 `rr_...` alias를 만들거나 저장하지 않는다. 그 값은 HealthMes가
+요청마다 생성해 Hermes에만 노출한다. REST 전달 회귀는
+`tests/api/test_wellness_decisions.py`, exact package 선택과 저장 E2E는
+`tests/decision/test_whoop_migration_e2e.py`가 각각 검증한다.
+
+### Sake 의미 보존 검증 기준
+
+| 검증 항목 | 반드시 유지할 의미 |
+|---|---|
+| Recovery 경계 | `0..33 red`, `34..66 yellow`, `67..100 green`; `33.5`, `66.5` invalid |
+| Day strain 경계 | `[0,10) light`, `[10,14) moderate`, `[14,18) high`, `[18,21] all_out` |
+| 최신 Recovery | 요청 local day 우선, 그 안에서 `recorded_at` 최신 |
+| 최신 day strain | 요청 local day 우선, 그 안에서 `cycle_updated_at` 최신 |
+| 시각 의미 | `recorded_at`은 관찰 시각, `cycle_updated_at`은 Cycle revision 시각이며 둘의 선후관계는 강제하지 않음 |
+| 동률 | exact duplicate도 `ambiguous_latest_row` |
+| Cycle | Recovery와 day strain의 `cycle_id`가 같아야 usable |
+| Metric | Workout `strain`은 Cycle `day_strain`을 대체하지 못함 |
+| Pagination | 두 upstream 조회의 truncation을 독립 처리 |
+| 조회 창 | 요청일 이틀 전부터 요청일 종료까지 |
+| `basic` | 기본 10분, 선택 10/20/30분 |
+| `enhanced` | 기본 20분, 선택 10/20/30분 |
+| `priority` | 가벼운 10분 걷기 또는 휴식만 |
+| 공통 행동 | 물 마시기와 30분 이른 취침 준비 항상 포함 |
+| 선택 상태 | `selected`는 선택이며 완료가 아님 |
+
+실제 dogfood migration 검증은 같은 사용자·timezone·요청일의 Sake fixture 또는
+실데이터를 이전 계산과 새 capability에 입력해 다음을 비교한다.
+
+1. 선택된 Recovery/day strain 원본 record ID와 Cycle ID
+2. 선택된 revision과 freshness
+3. Recovery/day strain label과 recovery level
+4. 기본 걷기, 허용 선택지, 물과 취침 준비 action
+5. insufficient-data와 limitation 사유
+
+공개 결과가 같더라도 private provenance의 원본 record ID, metric definition,
+Cycle/revision과 raw score가 누락되면 migration 통과가 아니다.
+
+이번 PR은 위 기준을 synthetic fixture, 경계값, 실패 조건, exact follow-up E2E로
+자동 검증했다. 실제 Sake 개인 WHOOP export나 production 계정에는 접근하지
+않았으므로 **실데이터 dogfood를 수행했다고 주장하지 않는다.** Sake 재리뷰에서는
+코드상 의미 보존과 함께, 사용 가능한 동일 실데이터 fixture가 있다면 이전 경로와
+새 capability의 결과를 위 다섯 항목으로 비교해야 한다.
+
+### Finalizer와 idempotency
+
+`DecisionFinalizer`는 action 전체가 package와 같거나, 제공된 걷기 하나만
+`selected`로 바뀐 경우만 허용한다. package에 없는 20/30분, 임의 action과 완료
+상태는 거부한다. 단순 질문은 저장하지 않고 저장 조건을 만족한 결과만 compact
+DecisionRecord로 남긴다.
+
+Sake 리뷰의 idempotency 지적은 `source_provider`를 portable ASCII ID로 강제해
+해결한다.
+
+```text
+허용 입력: 앞뒤 ASCII space + 1..64자 ASCII provider ID
+첫 글자:   A-Z, a-z, 0-9
+나머지:    A-Z, a-z, 0-9, ".", "_", "-"
+저장 형식: 앞뒤 space 없음 + ASCII lowercase
+```
+
+길이 1..64는 앞뒤 ASCII space를 제거한 **본문**에 적용한다. 따라서 공백을
+포함한 raw 입력의 총길이가 64보다 길어도 canonical 본문이 64자면 허용한다.
+지원되는 write adapter는 이 공통 helper를 idempotency 조회와 길이 검사보다 먼저
+실행한다. Unicode case-folding은 DB마다 결과가 달라질 수 있으므로 사용하지
+않는다. Unicode, NUL, tab/newline, invalid 기호와 canonical 본문 65자 이상 값은
+거부한다. migration은 유효한 legacy ASCII 값만 정규화한다. invalid row 또는
+canonical collision이 있으면 원본 행, Alembic revision, index와 constraint를
+그대로 둔 채 전체 upgrade가 원자적으로 실패한다. DB check constraint는 비정규
+직접 쓰기를 자동 변환하지 않고 거부한다.
+
+`raw_ingest_event.source`와 이를 가리키는
+`wellness_event.source_provider`도 같은 Alembic transaction에서 함께
+canonicalize한다. SQLite compact UUID와 PostgreSQL dashed UUID를 같은 ID로
+비교하며, 연결된 두 provider가 정규화 후 다르면 전체 migration을 실패시킨다.
+
+canonical provider + `source_record_id`가 동일 원본 identity다. 대소문자나 앞뒤
+ASCII space만 다른 provider 값이 중복 원본을 만들면 안 된다.
 
 ## 9. Sake 권장 리뷰 순서
 
@@ -433,11 +534,15 @@ healthmes-whoop-recovery Skill
    - `healthmes/decision/access.py`
    - `healthmes/decision/providers.py`
    - `healthmes/decision/domain_providers.py`
+   - `healthmes/wearables/search.py`
+   - `healthmes/wearables/provenance.py`
+   - `healthmes/wearables/whoop_recovery.py`
 4. **Skill catalog**
    - `healthmes/mcp_server/wellness_skills.py`
    - `skills/healthmes-wellness-decision/SKILL.md`
    - `skills/healthmes-caffeine/SKILL.md`
    - `skills/healthmes-nutrition-decision/SKILL.md`
+   - `skills/healthmes-whoop-recovery/SKILL.md`
 5. **결과 검증과 저장**
    - `healthmes/decision/finalizer.py`
    - `healthmes/store/decision_records.py`
@@ -453,6 +558,8 @@ healthmes-whoop-recovery Skill
    - `tests/decision/test_responses.py`
    - `tests/decision/test_search_sessions.py`
    - `tests/decision/test_providers.py`
+   - `tests/wearables/test_whoop_recovery.py`
+   - `tests/wearables/test_provenance.py`
    - `tests/api/test_wellness_decisions.py`
    - `tests/glue/test_single_wellness_runtime_repository.py`
 
@@ -464,14 +571,54 @@ healthmes-whoop-recovery Skill
 - decision profile에는 위 여섯 read-only HealthMes MCP tool만 보여야 한다.
 - Skill은 지침이고 Provider는 조회 코드다.
 - Provider가 최종 wellness 결론을 만들거나 agent를 spawn하면 안 된다.
+- WHOOP Skill은 공통 `search_wearable` capability만 사용하고 persistence를 직접
+  시작하면 안 된다.
+- WHOOP 원본 provenance는 snapshot v2 안에 비공개로 보존하고 LLM에는 public
+  package와 해당 WHOOP package의 canonical HealthMes `SourceRef` 하나만 보여야
+  한다. 복합 판단의 다른 domain SourceRef는 별개다.
+- Sake 계산 limitation은 public package에 보존하되 HealthMes runtime limitation은
+  `ContextResult.limitations`에만 있어야 한다.
+- WHOOP 행·revision·Cycle·label·action 계산을 LLM 또는 Skill이 재구현하면 안 된다.
+- `source_provider`는 1..64자의 canonical portable ASCII identity여야 한다.
+- 과거 package follow-up의 `rr_` alias는 턴 전용이어야 하고 exact snapshot이
+  없으면 최신 package로 대체하면 안 된다.
 - direct Open Wearables MCP, native Hermes tools와 mutation tools가 decision
   profile에 노출되면 안 된다.
 - tool transcript와 canonical search trace가 정확히 일치해야 한다.
 - 최종 `used_source_ref_ids`는 실제 반환 ref의 부분집합이어야 한다.
+- live 상세 answer는 반환되지만 DecisionRecord에 저장되면 안 된다.
+- replay는 canonical compact answer와 `decision_response_compacted`를 반환해야
+  하며 actions, source refs와 `related_record_ids`는 보존해야 한다.
 - 단순 조회는 DecisionRecord를 만들지 않아야 한다.
 - UI와 `vendor/hermes-agent/`는 이 PR에서 변경하면 안 된다.
 
 ## 11. 검증 결과
+
+### WHOOP 공통 migration 최종 검증
+
+- 분할 전체 Python 회귀:
+  - backup 제외 `3955 passed, 99 skipped`
+  - backup `419 passed, 1 skipped`
+  - 합계 `4374 passed, 100 skipped`
+- Decision/WHOOP/API/Skill 집중 suite: `368 passed`
+- 상세 live 응답, exact 이전 package 선택, v7 저장과 compact replay E2E:
+  `1 passed`
+- Ruff, compileall, `git diff --check`: 통과
+- Alembic:
+  - 단일 head `b7c8d9e0f1a2`
+  - PostgreSQL·SQLite offline SQL render 통과
+  - 빈 SQLite 실제 `upgrade head`와 `current` 통과
+- authoring/packaged `healthmes-whoop-recovery` Skill byte identity: 통과
+- 이번 WHOOP migration working tree에서 `vendor/hermes-agent/`,
+  `vendor/open-wearables/`, 디바이스 UI를 직접 수정한 파일: 없음
+- PR 기준선 `ba2b5ea7` 이후 `vendor/open-wearables/`에는 최신 `main`의
+  WHOOP Cycle `day_strain` 구현 8개 파일이 merge commit `3b81e956`을 통해
+  승계됐다. 최종 vendor tree는 `origin/main@103b7269`과 동일하며 migration이
+  vendor 코드를 재구현하거나 변형하지 않았다.
+- 실제 개인 WHOOP dogfood: 미수행. Sake 실데이터 또는 동등한 승인 fixture가
+  있어야 별도 검증 가능
+
+### 기존 PR #138 기준선 검증
 
 - macOS lifecycle: `166 passed, 1 skipped`
 - 격리 Linux/procps-ng: targeted `2 passed`, full lifecycle `167 passed`

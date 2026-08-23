@@ -29,6 +29,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from alembic import command
 from healthmes.config import Settings
 from healthmes.schedule_proposals import resolution_token, verify_resolution_token
+from healthmes.source_providers import (
+    RAW_INGEST_SOURCE_CHECK_EXPRESSION,
+    SOURCE_PROVIDER_CHECK_EXPRESSION,
+)
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import (
     Base,
@@ -166,6 +170,60 @@ def _render_offline_decision_policy_constraint_downgrade(
     return buffer.getvalue()
 
 
+def _wellness_event_values(
+    *,
+    event_id: str,
+    source_provider: str,
+    source_record_id: str,
+    event_type: str = "subjective_energy",
+    payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    observed_at = datetime(2026, 8, 22, 9, tzinfo=UTC)
+    return {
+        "id": event_id,
+        "event_type": event_type,
+        "schema_version": 1,
+        "observed_at": observed_at,
+        "recorded_at": observed_at,
+        "timezone": "UTC",
+        "source_provider": source_provider,
+        "source_device": None,
+        "source_record_id": source_record_id,
+        "capture_method": "import",
+        "quality_flags": None,
+        "confidence": None,
+        "coverage": None,
+        "sensitivity": "wellness",
+        "consent_scope": "personal",
+        "retention_policy_id": None,
+        "expires_at": None,
+        "payload": payload or {"score": 4},
+        "raw_object_id": None,
+        "derived_from": None,
+    }
+
+
+def _raw_ingest_event_values(
+    *,
+    event_id: str,
+    source: str,
+) -> dict[str, object]:
+    received_at = datetime(2026, 8, 22, 9, tzinfo=UTC)
+    return {
+        "id": event_id,
+        "received_at": received_at,
+        "source": source,
+        "content_type": "application/octet-stream",
+        "path": f"raw_ingest/2026/08/22/{event_id}.bin",
+        "size_bytes": 1,
+        "sha256": "0" * 64,
+        "parse_status": "stored_unparsed",
+        "forward_status": "not_applicable",
+        "forward_detail": None,
+        "records_forwarded": 0,
+    }
+
+
 def _render_offline_calendar_generation_downgrade(
     database_url: str,
 ) -> str:
@@ -265,7 +323,7 @@ def _render_offline_decision_receipt_basis_upgrade(
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert len(script.get_heads()) == 1
+    assert script.get_heads() == ["b7c8d9e0f1a2"]
 
 
 def test_migration_keeps_existing_application_loggers_enabled():
@@ -306,6 +364,60 @@ class TestOfflineRender:
             "ALTER TABLE storage_object ADD COLUMN file_cleanup_identity JSONB"
             in rendered
         )
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            (
+                "postgresql+psycopg://"
+                "healthmes:healthmes@localhost:5432/healthmes"
+            ),
+        ),
+    )
+    def test_wellness_provider_canonicalization_renders_cross_dialect(
+        self,
+        database_url,
+    ) -> None:
+        rendered = _render_offline_upgrade(database_url)
+        compact = " ".join(rendered.split())
+
+        assert (
+            "CREATE UNIQUE INDEX "
+            "ux_wellness_event_canonical_source_collision_guard "
+            "ON wellness_event (replace("
+        ) in compact
+        assert ", source_record_id)" in compact
+        assert "lower(" not in compact.split(
+            "-- Running upgrade a6b7c8d9e0f1 -> b7c8d9e0f1a2",
+            maxsplit=1,
+        )[1]
+        assert (
+            "UPDATE wellness_event "
+            "SET source_provider = CASE WHEN "
+            "length(trim(source_provider)) BETWEEN 1 AND 64"
+        ) in compact
+        assert "THEN replace(" in compact
+        assert "ELSE NULL END" in compact
+        assert (
+            "source_provider = trim(source_provider) "
+            "AND length(source_provider) BETWEEN 1 AND 64 "
+            "AND source_provider = substr(source_provider, 1, 64)"
+        ) in compact
+        assert (
+            "UPDATE raw_ingest_event "
+            "SET source = CASE WHEN "
+            "length(trim(source)) BETWEEN 1 AND 64"
+        ) in compact
+        assert (
+            "replace(CAST(raw_ingest_event.id AS TEXT), '-', '') "
+            "= replace(wellness_event.source_record_id, '-', '')"
+        ) in compact
+        assert (
+            "source = trim(source) "
+            "AND length(source) BETWEEN 1 AND 64 "
+            "AND source = substr(source, 1, 64)"
+        ) in compact
 
     def test_sqlite_offline_render_executes_cleanup_batch_once(
         self,
@@ -351,7 +463,7 @@ class TestOfflineRender:
             "file_cleanup_completed_at",
         } <= columns
         assert "storage_object_file_cleanup_consistent" in table_sql
-        assert "e5f6a7b8c9d0" in revisions
+        assert "b7c8d9e0f1a2" in revisions
 
     def test_decision_policy_constraint_normalization_renders_for_sqlite(
         self,
@@ -837,6 +949,451 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    def test_wellness_provider_migration_normalizes_and_enforces_check(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'canonical-provider.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        engine = sa.create_engine(database_url)
+        event_id = uuid.uuid4().hex
+        raw_id = uuid.uuid4().hex
+        try:
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            raw = sa.Table(
+                "raw_ingest_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    raw.insert().values(
+                        **_raw_ingest_event_values(
+                            event_id=raw_id,
+                            source=" Manual ",
+                        )
+                    )
+                )
+                connection.execute(
+                    event.insert().values(
+                        **_wellness_event_values(
+                            event_id=event_id,
+                            source_provider=" Manual ",
+                            source_record_id=str(uuid.UUID(raw_id)),
+                            event_type="raw_ingest",
+                        )
+                    )
+                )
+            assert "evidence_refs" in {
+                column["name"]
+                for column in sa.inspect(engine).get_columns(
+                    "decision_record"
+                )
+            }
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            checks = {
+                check["name"]: " ".join(
+                    check["sqltext"].split()
+                )
+                for check in inspector.get_check_constraints(
+                    "wellness_event"
+                )
+            }
+            assert checks == {
+                "ck_wellness_event_source_provider_canonical": (
+                    " ".join(
+                        SOURCE_PROVIDER_CHECK_EXPRESSION.split()
+                    )
+                )
+            }
+            raw_checks = {
+                check["name"]: " ".join(
+                    check["sqltext"].split()
+                )
+                for check in inspector.get_check_constraints(
+                    "raw_ingest_event"
+                )
+            }
+            assert raw_checks == {
+                "ck_raw_ingest_event_source_canonical": (
+                    " ".join(
+                        RAW_INGEST_SOURCE_CHECK_EXPRESSION.split()
+                    )
+                )
+            }
+            assert "evidence_refs" in {
+                column["name"]
+                for column in inspector.get_columns("decision_record")
+            }
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            raw = sa.Table(
+                "raw_ingest_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(event.c.source_provider).where(
+                        event.c.id == event_id
+                    )
+                ) == "manual"
+                assert connection.scalar(
+                    sa.select(raw.c.source).where(raw.c.id == raw_id)
+                ) == "manual"
+                assert connection.scalar(
+                    sa.select(event.c.source_record_id).where(
+                        event.c.id == event_id
+                    )
+                ) == str(uuid.UUID(raw_id))
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b7c8d9e0f1a2"
+            with engine.begin() as connection:
+                with pytest.raises(sa.exc.IntegrityError):
+                    connection.execute(
+                        event.insert().values(
+                            **_wellness_event_values(
+                                event_id=uuid.uuid4().hex,
+                                source_provider="Manual",
+                                source_record_id=(
+                                    "canonical-check-rejection"
+                                ),
+                            )
+                        )
+                    )
+        finally:
+            engine.dispose()
+
+    def test_raw_provider_invalid_value_fails_atomically(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'invalid-raw-provider.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        engine = sa.create_engine(database_url)
+        raw_id = uuid.uuid4().hex
+        wellness_id = uuid.uuid4().hex
+        try:
+            raw = sa.Table(
+                "raw_ingest_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    raw.insert().values(
+                        **_raw_ingest_event_values(
+                            event_id=raw_id,
+                            source="ÄPFEL",
+                        )
+                    )
+                )
+                connection.execute(
+                    event.insert().values(
+                        **_wellness_event_values(
+                            event_id=wellness_id,
+                            source_provider=" Manual ",
+                            source_record_id="unrelated-valid-event",
+                        )
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(sa.exc.IntegrityError):
+            command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert not inspector.get_check_constraints(
+                "raw_ingest_event"
+            )
+            assert not inspector.get_check_constraints("wellness_event")
+            raw = sa.Table(
+                "raw_ingest_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(raw.c.source).where(raw.c.id == raw_id)
+                ) == "ÄPFEL"
+                assert connection.scalar(
+                    sa.select(event.c.source_provider).where(
+                        event.c.id == wellness_id
+                    )
+                ) == " Manual "
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a6b7c8d9e0f1"
+        finally:
+            engine.dispose()
+
+    def test_linked_raw_provider_mismatch_fails_without_mutation(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'raw-provider-mismatch.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        engine = sa.create_engine(database_url)
+        raw_id = uuid.uuid4().hex
+        wellness_id = uuid.uuid4().hex
+        try:
+            raw = sa.Table(
+                "raw_ingest_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    raw.insert().values(
+                        **_raw_ingest_event_values(
+                            event_id=raw_id,
+                            source="Whoop",
+                        )
+                    )
+                )
+                connection.execute(
+                    event.insert().values(
+                        **_wellness_event_values(
+                            event_id=wellness_id,
+                            source_provider="Garmin",
+                            source_record_id=str(uuid.UUID(raw_id)),
+                            event_type="raw_ingest",
+                        )
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(sa.exc.IntegrityError):
+            command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert not inspector.get_check_constraints(
+                "raw_ingest_event"
+            )
+            assert not inspector.get_check_constraints("wellness_event")
+            raw = sa.Table(
+                "raw_ingest_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(raw.c.source).where(raw.c.id == raw_id)
+                ) == "Whoop"
+                assert connection.scalar(
+                    sa.select(event.c.source_provider).where(
+                        event.c.id == wellness_id
+                    )
+                ) == "Garmin"
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a6b7c8d9e0f1"
+        finally:
+            engine.dispose()
+
+    @pytest.mark.parametrize(
+        "source_provider",
+        ("ÄPFEL", "K", "manual\x00A"),
+    )
+    def test_wellness_provider_invalid_unicode_fails_atomically(
+        self,
+        tmp_path,
+        source_provider,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / f'invalid-provider-{ord(source_provider[0])}.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        engine = sa.create_engine(database_url)
+        event_id = uuid.uuid4().hex
+        try:
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    event.insert().values(
+                        **_wellness_event_values(
+                            event_id=event_id,
+                            source_provider=source_provider,
+                            source_record_id="invalid-provider-migration",
+                        )
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(sa.exc.IntegrityError):
+            command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert (
+                "ck_wellness_event_source_provider_canonical"
+                not in {
+                    check["name"]
+                    for check in inspector.get_check_constraints(
+                        "wellness_event"
+                    )
+                }
+            )
+            assert (
+                "ux_wellness_event_canonical_source_collision_guard"
+                not in {
+                    index["name"]
+                    for index in inspector.get_indexes(
+                        "wellness_event"
+                    )
+                }
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(event.c.source_provider).where(
+                        event.c.id == event_id
+                    )
+                ) == source_provider
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a6b7c8d9e0f1"
+        finally:
+            engine.dispose()
+
+    def test_wellness_provider_collision_fails_without_mutation(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'provider-collision.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        engine = sa.create_engine(database_url)
+        ids = (uuid.uuid4().hex, uuid.uuid4().hex)
+        try:
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    event.insert(),
+                    [
+                        _wellness_event_values(
+                            event_id=ids[0],
+                            source_provider="Manual",
+                            source_record_id="canonical-collision-1",
+                        ),
+                        _wellness_event_values(
+                            event_id=ids[1],
+                            source_provider="manual",
+                            source_record_id="canonical-collision-1",
+                        ),
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(sa.exc.IntegrityError):
+            command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert (
+                "ck_wellness_event_source_provider_canonical"
+                not in {
+                    check["name"]
+                    for check in inspector.get_check_constraints(
+                        "wellness_event"
+                    )
+                }
+            )
+            assert (
+                "ux_wellness_event_canonical_source_collision_guard"
+                not in {
+                    index["name"]
+                    for index in inspector.get_indexes(
+                        "wellness_event"
+                    )
+                }
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                providers = connection.scalars(
+                    sa.select(event.c.source_provider)
+                    .where(event.c.id.in_(ids))
+                    .order_by(event.c.source_provider)
+                ).all()
+                assert providers == ["Manual", "manual"]
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a6b7c8d9e0f1"
+        finally:
+            engine.dispose()
+
     def test_storage_cleanup_upgrade_leaves_legacy_purges_pending(
         self,
         tmp_path,
@@ -1083,7 +1640,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             engine.dispose()
 
@@ -1153,7 +1710,7 @@ class TestSqliteUpgrade:
             with engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
                 assert (
                     connection.scalar(
                         sa.select(
@@ -1272,7 +1829,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
                 row = connection.execute(
                     sa.select(current_storage_object).where(
                         current_storage_object.c.id == object_id
@@ -1416,9 +1973,16 @@ class TestSqliteUpgrade:
             assert "file_cleanup_completed_at" not in columns
             assert "file_cleanup_identity" not in columns
             with engine.connect() as connection:
-                assert connection.scalar(
-                    sa.text("SELECT version_num FROM alembic_version")
-                ) == "c3d4e5f6a7b8"
+                assert set(
+                    connection.scalars(
+                        sa.text(
+                            "SELECT version_num FROM alembic_version"
+                        )
+                    )
+                ) == {
+                    "c3d4e5f6a7b8",
+                    "f4a5b6c7d8e",
+                }
                 assert connection.scalar(
                     sa.select(storage_object.c.purged_at).where(
                         storage_object.c.id == object_id
@@ -1820,7 +2384,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             engine.dispose()
 
@@ -3604,7 +4168,7 @@ class TestSqliteUpgrade:
                 assert row.revision == 7
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             engine.dispose()
 
@@ -3635,9 +4199,16 @@ class TestSqliteUpgrade:
                         policy.c.id == policy_id
                     )
                 ) == 7
-                assert connection.scalar(
-                    sa.text("SELECT version_num FROM alembic_version")
-                ) == "d4e5f6a7b8c9"
+                assert set(
+                    connection.scalars(
+                        sa.text(
+                            "SELECT version_num FROM alembic_version"
+                        )
+                    )
+                ) == {
+                    "d4e5f6a7b8c9",
+                    "f4a5b6c7d8e",
+                }
         finally:
             engine.dispose()
 
@@ -3674,7 +4245,10 @@ class TestSqliteUpgrade:
         engine = sa.create_engine(database_url)
         Base.metadata.create_all(engine)
         config = _config(database_url)
-        command.stamp(config, "d4e5f6a7b8c9")
+        command.stamp(
+            config,
+            ["d4e5f6a7b8c9", "f4a5b6c7d8e"],
+        )
         policy_id = uuid.uuid4().hex
         policy = sa.Table(
             "decision_domain_policy",
@@ -3744,7 +4318,7 @@ class TestSqliteUpgrade:
                 ) == 3
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             engine.dispose()
 
@@ -4513,7 +5087,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             engine.dispose()
 
@@ -4632,6 +5206,246 @@ class TestSqliteUpgrade:
                 ) == "b2c3d4e5f6a7"
         finally:
             engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_wellness_provider_migration_is_atomic() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+
+    def schema_context(label: str) -> tuple[str, str, Config]:
+        schema = f"hm_provider_{label}_{uuid.uuid4().hex}"
+        quoted = admin_engine.dialect.identifier_preparer.quote(schema)
+        separator = "&" if "?" in database_url else "?"
+        schema_url = (
+            f"{database_url}{separator}options=-csearch_path={schema}"
+        )
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted}"))
+        return quoted, schema_url, _config(schema_url)
+
+    schemas: list[str] = []
+    try:
+        quoted, schema_url, config = schema_context("success")
+        schemas.append(quoted)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        scoped_engine = sa.create_engine(schema_url)
+        raw_id = uuid.uuid4()
+        wellness_id = uuid.uuid4()
+        try:
+            metadata = sa.MetaData()
+            raw = sa.Table(
+                "raw_ingest_event",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    raw.insert().values(
+                        **_raw_ingest_event_values(
+                            event_id=str(raw_id),
+                            source=" WHOOP ",
+                        )
+                    )
+                )
+                connection.execute(
+                    event.insert().values(
+                        **_wellness_event_values(
+                            event_id=str(wellness_id),
+                            source_provider=" Whoop ",
+                            source_record_id=str(raw_id),
+                            event_type="raw_ingest",
+                        )
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "wellness_event"
+                )
+            } == {"ck_wellness_event_source_provider_canonical"}
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "raw_ingest_event"
+                )
+            } == {"ck_raw_ingest_event_source_canonical"}
+            metadata = sa.MetaData()
+            raw = sa.Table(
+                "raw_ingest_event",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(raw.c.source).where(raw.c.id == raw_id)
+                ) == "whoop"
+                row = connection.execute(
+                    sa.select(
+                        event.c.source_provider,
+                        event.c.source_record_id,
+                    ).where(event.c.id == wellness_id)
+                ).one()
+                assert row.source_provider == "whoop"
+                assert row.source_record_id == str(raw_id)
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b7c8d9e0f1a2"
+        finally:
+            scoped_engine.dispose()
+
+        quoted, schema_url, config = schema_context("collision")
+        schemas.append(quoted)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        scoped_engine = sa.create_engine(schema_url)
+        collision_ids = (uuid.uuid4(), uuid.uuid4())
+        try:
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    event.insert(),
+                    [
+                        _wellness_event_values(
+                            event_id=str(collision_ids[0]),
+                            source_provider="WHOOP",
+                            source_record_id="same-upstream-row",
+                        ),
+                        _wellness_event_values(
+                            event_id=str(collision_ids[1]),
+                            source_provider="whoop",
+                            source_record_id="same-upstream-row",
+                        ),
+                    ],
+                )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(sa.exc.IntegrityError):
+            command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert not inspector.get_check_constraints("wellness_event")
+            assert (
+                "ux_wellness_event_canonical_source_collision_guard"
+                not in {
+                    item["name"]
+                    for item in inspector.get_indexes("wellness_event")
+                }
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert set(
+                    connection.scalars(
+                        sa.select(event.c.source_provider).where(
+                            event.c.id.in_(collision_ids)
+                        )
+                    )
+                ) == {"WHOOP", "whoop"}
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a6b7c8d9e0f1"
+        finally:
+            scoped_engine.dispose()
+
+        quoted, schema_url, config = schema_context("invalid")
+        schemas.append(quoted)
+        command.upgrade(config, "a6b7c8d9e0f1")
+        scoped_engine = sa.create_engine(schema_url)
+        invalid_id = uuid.uuid4()
+        valid_id = uuid.uuid4()
+        try:
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    event.insert(),
+                    [
+                        _wellness_event_values(
+                            event_id=str(invalid_id),
+                            source_provider="WHÖÖP",
+                            source_record_id="invalid-provider",
+                        ),
+                        _wellness_event_values(
+                            event_id=str(valid_id),
+                            source_provider=" Manual ",
+                            source_record_id="valid-provider",
+                        ),
+                    ],
+                )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(sa.exc.IntegrityError):
+            command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert not inspector.get_check_constraints("wellness_event")
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                rows = dict(
+                    connection.execute(
+                        sa.select(
+                            event.c.id,
+                            event.c.source_provider,
+                        ).where(event.c.id.in_((invalid_id, valid_id)))
+                    )
+                )
+                assert rows == {
+                    invalid_id: "WHÖÖP",
+                    valid_id: " Manual ",
+                }
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a6b7c8d9e0f1"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            for quoted in reversed(schemas):
+                connection.execute(
+                    sa.text(f"DROP SCHEMA IF EXISTS {quoted} CASCADE")
+                )
+        admin_engine.dispose()
 
 
 @pytest.mark.skipif(
@@ -4887,7 +5701,7 @@ def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
                 assert row.revision == 9
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             scoped_engine.dispose()
 
@@ -5009,7 +5823,7 @@ def test_postgres_multi_revision_failure_rolls_back_earlier_downgrade() -> None:
             with scoped_engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             scoped_engine.dispose()
     finally:
@@ -6216,7 +7030,7 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             scoped_engine.dispose()
     finally:
@@ -6310,7 +7124,7 @@ def test_postgres_receipt_hardening_repairs_nullable_requested_at() -> None:
                 assert row.lease_generation == 1
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             scoped_engine.dispose()
     finally:
@@ -6449,7 +7263,7 @@ def test_postgres_receipt_basis_repairs_future_requested_at() -> None:
                 assert row.expires_at == identity_expires_at
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e5f6a7b8c9d0"
+                ) == "b7c8d9e0f1a2"
         finally:
             scoped_engine.dispose()
     finally:

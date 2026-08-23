@@ -83,7 +83,9 @@ reference IDs, state material limitations, and never add prose or a code fence
 outside the JSON object.
 
 For `action`, `risk`, or `explicit_tracking`, select only a
-`record_summary_code` listed in the runtime prompt and set `answer` to that
-code's exact canonical sentence. The code is the single persisted conclusion
-used for both the live result and recovery. Set the legacy `record_summary`
-field to `null`; it is not a persistence authority.
+`record_summary_code` listed in the runtime prompt. Keep `answer` as the
+concise, detailed response for the current turn and keep its conclusion
+consistent with that code. HealthMes stores the code, not the free-form
+answer, and renders a canonical compact sentence during receipt or record
+replay. Set the legacy `record_summary` field to `null`; it is not a
+persistence authority.

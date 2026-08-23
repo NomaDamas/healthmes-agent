@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import uuid
 from collections import OrderedDict
@@ -42,12 +43,18 @@ from healthmes.decision.contracts import (
     ToolCallStatus,
 )
 from healthmes.decision.providers import (
+    ContextParameterSpec,
     UnknownCapabilityError,
     UnknownProviderError,
+    validate_context_parameters,
 )
 from healthmes.decision.validation import strict_model_validate
 
 DECISION_SEARCH_SESSION_ID_PATTERN = r"^dss_[A-Za-z0-9_-]{43}$"
+DECISION_RELATED_RECORD_REF_PATTERN = r"^rr_[0-9a-f]{16}$"
+_RELATED_RECORD_DOMAIN_ALIASES = {
+    "whoop_recovery_package": "wearable",
+}
 
 AccessPolicyResolver = Callable[[DecisionRequest], ContextAccessPolicy]
 
@@ -122,6 +129,16 @@ class DecisionSearchReadOnlyError(RuntimeError):
     """Raised when a search provider attempts to mutate retained data."""
 
 
+class DecisionSearchRelatedRecord(BaseModel):
+    """One model-visible alias for a server-owned related record."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reference: str = Field(pattern=DECISION_RELATED_RECORD_REF_PATTERN)
+    domain: str = Field(min_length=1, max_length=64)
+    hint_keys: tuple[str, ...] = Field(min_length=1, max_length=32)
+
+
 class DecisionSearchSessionHandle(BaseModel):
     """Opaque handle returned to the server-owned decision runtime."""
 
@@ -129,6 +146,9 @@ class DecisionSearchSessionHandle(BaseModel):
 
     session_id: str = Field(pattern=DECISION_SEARCH_SESSION_ID_PATTERN)
     expires_at: AwareDatetime
+    runtime_question: str = Field(min_length=1, max_length=4_000)
+    has_related_records: bool = False
+    related_records: tuple[DecisionSearchRelatedRecord, ...] = ()
 
 
 class DecisionSearchBudgetUsage(BaseModel):
@@ -182,6 +202,7 @@ class _DecisionSearchSession:
     created_at: datetime
     expires_at: datetime
     deadline: float
+    related_records: tuple[_DecisionSearchRelatedRecordBinding, ...] = ()
     state: DecisionSearchSessionState = DecisionSearchSessionState.ACTIVE
     ended_at: datetime | None = None
     in_flight: int = 0
@@ -200,6 +221,15 @@ class _TerminalSession:
     state: DecisionSearchSessionState
     ended_monotonic: float
     snapshot: DecisionSearchSessionSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DecisionSearchRelatedRecordBinding:
+    reference: str
+    domain: str | None
+    identity: str
+    record_ids: tuple[str, ...]
+    hint_keys: tuple[str, ...]
 
 
 _READ_ONLY_MUTATORS = frozenset(
@@ -364,6 +394,11 @@ class DecisionContextSearchSessionService:
         policy = self._resolve_policy(canonical_request)
         now = _utc(self._clock())
         current_monotonic = self._monotonic()
+        related_records = _related_record_bindings(
+            self.access_layer,
+            request=canonical_request,
+            policy=policy,
+        )
         access_turn = self.access_layer.start_turn(
             canonical_request,
             policy=policy,
@@ -383,6 +418,7 @@ class DecisionContextSearchSessionService:
                 created_at=now,
                 expires_at=now + timedelta(seconds=self._ttl_seconds),
                 deadline=current_monotonic + self._ttl_seconds,
+                related_records=related_records,
             )
             record.context_bytes = self._base_snapshot_size(record)
             if (
@@ -396,6 +432,22 @@ class DecisionContextSearchSessionService:
         return DecisionSearchSessionHandle(
             session_id=session_id,
             expires_at=record.expires_at,
+            runtime_question=_alias_related_record_ids(
+                canonical_request.question,
+                bindings=related_records,
+            ),
+            has_related_records=bool(
+                canonical_request.hints.related_record_ids
+            ),
+            related_records=tuple(
+                DecisionSearchRelatedRecord(
+                    reference=item.reference,
+                    domain=item.domain,
+                    hint_keys=item.hint_keys,
+                )
+                for item in related_records
+                if item.domain is not None
+            ),
         )
 
     async def search(
@@ -570,10 +622,14 @@ class DecisionContextSearchSessionService:
             raise DecisionSearchQueryError() from exc
         if descriptor.metadata.domain != domain.strip().casefold():
             raise DecisionSearchQueryError()
-        self._validate_selected_records(
-            record.request,
-            parameters=parameters,
-            capability=capability_spec,
+        requested_parameters, effective_parameters = (
+            self._resolve_selected_records(
+                record,
+                domain=descriptor.metadata.domain,
+                capability=capability_spec.capability,
+                parameter_specs=capability_spec.parameter_specs,
+                parameters=parameters,
+            )
         )
         try:
             query = ContextQuery(
@@ -586,7 +642,11 @@ class DecisionContextSearchSessionService:
                 fields=list(fields),
                 privacy_level=privacy_level,
                 limit=limit,
-                parameters=dict(parameters),
+                parameters=requested_parameters,
+            )
+            provider_query = query.model_copy(
+                update={"parameters": effective_parameters},
+                deep=True,
             )
         except Exception as exc:
             raise DecisionSearchQueryError() from exc
@@ -595,6 +655,7 @@ class DecisionContextSearchSessionService:
         self._require_failed_trace_capacity(
             record,
             query=query,
+            effective_query=provider_query,
             started_at=started_at,
         )
         with record.result_lock:
@@ -604,12 +665,13 @@ class DecisionContextSearchSessionService:
             policy_before = self._resolve_policy(record.request)
         except DecisionSearchPolicyError as exc:
             result = record.access_turn.deny(
-                query,
+                provider_query,
                 reason_codes=(exc.code,),
             )
             return self._store_result(
                 record,
                 query=query,
+                fallback_effective_query=provider_query,
                 result=result,
                 started_at=started_at,
                 finished_at=_utc(self._clock()),
@@ -625,6 +687,7 @@ class DecisionContextSearchSessionService:
             self._store_expired_call(
                 record,
                 query=query,
+                fallback_effective_query=provider_query,
                 started_at=started_at,
             )
             raise ExpiredDecisionSearchSessionError()
@@ -634,7 +697,7 @@ class DecisionContextSearchSessionService:
                 async with asyncio.timeout(remaining):
                     result = await record.access_turn.query(
                         session,
-                        query,
+                        provider_query,
                         ensure_active=lambda: self._ensure_active(record),
                     )
                     try:
@@ -643,7 +706,7 @@ class DecisionContextSearchSessionService:
                         )
                     except DecisionSearchPolicyError as exc:
                         result = record.access_turn.deny(
-                            query,
+                            provider_query,
                             reason_codes=(exc.code,),
                             effective_query=(
                                 record.access_turn.effective_query_for(
@@ -661,7 +724,7 @@ class DecisionContextSearchSessionService:
                             != policy_fingerprint
                         ):
                             result = record.access_turn.deny(
-                                query,
+                                provider_query,
                                 reason_codes=(
                                     "domain_consent_changed",
                                 ),
@@ -677,7 +740,7 @@ class DecisionContextSearchSessionService:
             finished_at = _utc(self._clock())
             effective_query = (
                 record.access_turn.effective_query_for(query.query_id)
-                or query
+                or provider_query
             )
             audit = _failed_access_audit(
                 query,
@@ -705,7 +768,7 @@ class DecisionContextSearchSessionService:
                 finished_at = _utc(self._clock())
                 effective_query = (
                     record.access_turn.effective_query_for(query.query_id)
-                    or query
+                    or provider_query
                 )
                 audit = next(
                     (
@@ -733,6 +796,7 @@ class DecisionContextSearchSessionService:
             self._store_expired_call(
                 record,
                 query=query,
+                fallback_effective_query=provider_query,
                 started_at=started_at,
             )
             raise ExpiredDecisionSearchSessionError() from exc
@@ -740,6 +804,7 @@ class DecisionContextSearchSessionService:
             self._store_expired_call(
                 record,
                 query=query,
+                fallback_effective_query=provider_query,
                 started_at=started_at,
             )
             raise
@@ -751,7 +816,7 @@ class DecisionContextSearchSessionService:
             finished_at = _utc(self._clock())
             effective_query = (
                 record.access_turn.effective_query_for(query.query_id)
-                or query
+                or provider_query
             )
             audit = next(
                 (
@@ -780,12 +845,13 @@ class DecisionContextSearchSessionService:
             raise
         except Exception:
             result = record.access_turn.deny(
-                query,
+                provider_query,
                 reason_codes=("provider_execution_failed",),
             )
         return self._store_result(
             record,
             query=query,
+            fallback_effective_query=provider_query,
             result=result,
             started_at=started_at,
             finished_at=_utc(self._clock()),
@@ -796,6 +862,7 @@ class DecisionContextSearchSessionService:
         record: _DecisionSearchSession,
         *,
         query: ContextQuery,
+        fallback_effective_query: ContextQuery,
         result: ContextResult,
         started_at: datetime,
         finished_at: datetime,
@@ -813,7 +880,7 @@ class DecisionContextSearchSessionService:
             raise RuntimeError("context search result is missing access audit")
         effective_query = (
             record.access_turn.effective_query_for(query.query_id)
-            or query
+            or fallback_effective_query
         )
         status = (
             ToolCallStatus.DENIED
@@ -906,19 +973,79 @@ class DecisionContextSearchSessionService:
             raise DecisionSearchPolicyError("caller_not_policy_owner")
         return policy
 
+    def _resolve_selected_records(
+        self,
+        record: _DecisionSearchSession,
+        *,
+        domain: str,
+        capability: str,
+        parameter_specs: tuple[ContextParameterSpec, ...],
+        parameters: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        requested = dict(parameters)
+        effective = dict(parameters)
+        bindings = {
+            item.reference: item for item in record.related_records
+        }
+        for spec in parameter_specs:
+            if not spec.accepts_related_record_ref:
+                continue
+            value = effective.get(spec.name)
+            if not (
+                isinstance(value, str)
+                and re.fullmatch(
+                    DECISION_RELATED_RECORD_REF_PATTERN,
+                    value,
+                )
+            ):
+                continue
+            binding = bindings.get(value)
+            if (
+                binding is None
+                or binding.domain != domain
+                or (
+                    spec.name == "package_record_id"
+                    and "whoop_recovery_package"
+                    not in binding.hint_keys
+                )
+            ):
+                raise DecisionSearchQueryError()
+            effective[spec.name] = _provider_related_record_id(
+                binding,
+                parameter_spec=spec,
+            )
+        try:
+            effective = validate_context_parameters(
+                effective,
+                parameter_specs,
+            )
+        except ValueError as exc:
+            raise DecisionSearchQueryError() from exc
+        self._validate_selected_records(
+            record.request,
+            parameters=effective,
+            parameter_specs=parameter_specs,
+        )
+        if (
+            "package_record_id" in effective
+            and capability != "wearable.whoop-recovery-package"
+        ):
+            raise DecisionSearchQueryError()
+        return requested, effective
+
     def _validate_selected_records(
         self,
         request: DecisionRequest,
         *,
         parameters: Mapping[str, Any],
-        capability,
+        parameter_specs: tuple[ContextParameterSpec, ...],
     ) -> None:
         selected = {
             _canonical_uuid(value)
             for value in request.hints.related_record_ids.values()
             if _canonical_uuid(value) is not None
         }
-        for spec in capability.parameter_specs:
+        for spec in parameter_specs:
             if not spec.accepts_related_record_ref:
                 continue
             value = parameters.get(spec.name)
@@ -979,12 +1106,13 @@ class DecisionContextSearchSessionService:
         record: _DecisionSearchSession,
         *,
         query: ContextQuery,
+        effective_query: ContextQuery,
         started_at: datetime,
     ) -> None:
         error_code = "decision_search_tool_call_cancelled"
         failure = ToolCallRecord(
             query=query,
-            effective_query=query,
+            effective_query=effective_query,
             status=ToolCallStatus.FAILED,
             started_at=started_at,
             finished_at=started_at,
@@ -1001,7 +1129,7 @@ class DecisionContextSearchSessionService:
             ) + (
                 _failed_access_audit(
                     query,
-                    effective_query=query,
+                    effective_query=effective_query,
                     occurred_at=started_at,
                     error_code=error_code,
                 ),
@@ -1102,13 +1230,14 @@ class DecisionContextSearchSessionService:
         record: _DecisionSearchSession,
         *,
         query: ContextQuery,
+        fallback_effective_query: ContextQuery,
         started_at: datetime,
     ) -> None:
         error_code = "decision_search_session_expired"
         finished_at = _utc(self._clock())
         effective_query = (
             record.access_turn.effective_query_for(query.query_id)
-            or query
+            or fallback_effective_query
         )
         self._store_failed_call(
             record,
@@ -1444,6 +1573,151 @@ def _canonical_uuid(value: str) -> str | None:
         return str(uuid.UUID(candidate))
     except (AttributeError, ValueError):
         return None
+
+
+def _related_record_bindings(
+    access_layer: ContextAccessLayer,
+    *,
+    request: DecisionRequest,
+    policy: ContextAccessPolicy,
+) -> tuple[_DecisionSearchRelatedRecordBinding, ...]:
+    allowed_domains = {
+        descriptor.metadata.domain
+        for descriptor in access_layer.registry.discover()
+        if (
+            (grant := policy.grant(descriptor.metadata.domain))
+            is not None
+            and grant.enabled
+            and request.caller.execution_scope in grant.execution_scopes
+        )
+    }
+    candidates: dict[str, dict[str, Any]] = {}
+    for key, record_id in sorted(
+        request.hints.related_record_ids.items()
+    ):
+        canonical_id = _canonical_uuid(record_id)
+        identity = (
+            f"uuid:{uuid.UUID(canonical_id).hex}"
+            if canonical_id is not None
+            else f"text:{record_id}"
+        )
+        candidate = candidates.setdefault(
+            identity,
+            {
+                "domains": set(),
+                "hint_keys": set(),
+                "record_ids": [],
+            },
+        )
+        aliased_domain = _RELATED_RECORD_DOMAIN_ALIASES.get(key)
+        matching_domains = (
+            (aliased_domain,)
+            if aliased_domain in allowed_domains
+            else tuple(
+                domain
+                for domain in sorted(allowed_domains)
+                if (
+                    key == domain
+                    or key.startswith(f"{domain}_")
+                    or key.endswith(f"_{domain}")
+                )
+            )
+        )
+        candidate["domains"].update(matching_domains)
+        candidate["hint_keys"].add(key)
+        variants = [record_id]
+        if canonical_id is not None:
+            parsed = uuid.UUID(canonical_id)
+            variants.extend((canonical_id, parsed.hex, parsed.urn))
+        for variant in variants:
+            if variant not in candidate["record_ids"]:
+                candidate["record_ids"].append(variant)
+
+    bindings: list[_DecisionSearchRelatedRecordBinding] = []
+    used_references: set[str] = set()
+    for identity in sorted(candidates):
+        candidate = candidates[identity]
+        while True:
+            reference = f"rr_{uuid.uuid4().hex[:16]}"
+            if reference not in used_references:
+                used_references.add(reference)
+                break
+        domains = candidate["domains"]
+        bindings.append(
+            _DecisionSearchRelatedRecordBinding(
+                reference=reference,
+                domain=(
+                    next(iter(domains))
+                    if len(domains) == 1
+                    else None
+                ),
+                identity=identity,
+                record_ids=tuple(candidate["record_ids"]),
+                hint_keys=tuple(sorted(candidate["hint_keys"])),
+            )
+        )
+    return tuple(bindings)
+
+
+def _alias_related_record_ids(
+    value: str,
+    *,
+    bindings: tuple[_DecisionSearchRelatedRecordBinding, ...],
+) -> str:
+    aliased = value
+    replacements: list[tuple[str, str, bool]] = []
+    for binding in bindings:
+        case_insensitive = binding.identity.startswith("uuid:")
+        replacements.extend(
+            (
+                record_id,
+                binding.reference,
+                case_insensitive,
+            )
+            for record_id in binding.record_ids
+        )
+    replacements.sort(
+        key=lambda item: (
+            -len(item[0]),
+            item[0].casefold(),
+            item[0],
+        )
+    )
+    seen: set[tuple[str, bool]] = set()
+    for record_id, reference, case_insensitive in replacements:
+        identity = (
+            record_id.casefold() if case_insensitive else record_id
+        )
+        dedupe_key = (identity, case_insensitive)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        aliased = re.sub(
+            re.escape(record_id),
+            reference,
+            aliased,
+            flags=re.IGNORECASE if case_insensitive else 0,
+        )
+    return aliased
+
+
+def _provider_related_record_id(
+    binding: _DecisionSearchRelatedRecordBinding,
+    *,
+    parameter_spec: ContextParameterSpec,
+) -> str:
+    for record_id in binding.record_ids:
+        try:
+            validated = validate_context_parameters(
+                {parameter_spec.name: record_id},
+                (parameter_spec,),
+            )
+        except ValueError:
+            continue
+        value = validated[parameter_spec.name]
+        if isinstance(value, str):
+            return value
+    raise DecisionSearchQueryError()
 
 
 def _encoded_size(value: BaseModel) -> int:

@@ -748,6 +748,170 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
     assert len(list(session.scalars(select(WellnessEvent)))) == 1
 
 
+def test_wellness_event_source_provider_is_canonical_and_idempotent(
+    client: TestClient,
+    session,
+) -> None:
+    observed = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    payload = {
+        "event_type": "subjective_energy",
+        "observed_at": observed.isoformat(),
+        "source_provider": "  Manual  ",
+        "source_record_id": "canonical-energy-1",
+        "data_class": "normalized",
+        "payload": {"score": 4},
+    }
+
+    first = client.post("/v1/wellness-events", json=payload)
+    payload["source_provider"] = "manual"
+    second = client.post("/v1/wellness-events", json=payload)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["source_provider"] == "manual"
+    stored = list(session.scalars(select(WellnessEvent)))
+    assert len(stored) == 1
+    assert stored[0].source_provider == "manual"
+
+
+def test_wellness_event_provider_length_is_checked_after_ascii_space_trim(
+    client: TestClient,
+) -> None:
+    provider = "A" * 64
+
+    response = client.post(
+        "/v1/wellness-events",
+        json={
+            "event_type": "subjective_energy",
+            "observed_at": datetime(
+                2026,
+                8,
+                1,
+                9,
+                tzinfo=UTC,
+            ).isoformat(),
+            "source_provider": f" {provider} ",
+            "source_record_id": "canonical-length-boundary",
+            "data_class": "normalized",
+            "payload": {"score": 4},
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["source_provider"] == provider.lower()
+
+
+def test_wellness_event_canonical_source_key_rejects_conflicting_payload(
+    client: TestClient,
+) -> None:
+    payload = {
+        "event_type": "subjective_energy",
+        "observed_at": datetime(2026, 8, 1, 9, tzinfo=UTC).isoformat(),
+        "source_provider": "Manual",
+        "source_record_id": "canonical-conflict-1",
+        "data_class": "normalized",
+        "payload": {"score": 4},
+    }
+    first = client.post("/v1/wellness-events", json=payload)
+    payload["source_provider"] = " manual "
+    payload["payload"] = {"score": 2}
+    conflicting = client.post("/v1/wellness-events", json=payload)
+
+    assert first.status_code == 201
+    assert conflicting.status_code == 409
+    assert (
+        conflicting.json()["error"]["code"]
+        == "wellness_event_conflict"
+    )
+
+
+def test_wellness_event_integrity_retry_uses_canonical_source_key(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    payload = {
+        "event_type": "subjective_energy",
+        "observed_at": datetime(2026, 8, 1, 9, tzinfo=UTC).isoformat(),
+        "source_provider": "manual",
+        "source_record_id": "canonical-race-1",
+        "data_class": "normalized",
+        "payload": {"score": 4},
+    }
+    first = client.post("/v1/wellness-events", json=payload)
+    assert first.status_code == 201
+
+    real_scalar = Session.scalar
+    hid_idempotency_lookup = False
+
+    def hide_first_wellness_event_lookup(
+        db_session,
+        statement,
+        *args,
+        **kwargs,
+    ):
+        nonlocal hid_idempotency_lookup
+        descriptions = getattr(statement, "column_descriptions", ())
+        is_wellness_lookup = (
+            descriptions
+            and descriptions[0].get("entity") is WellnessEvent
+        )
+        if is_wellness_lookup and not hid_idempotency_lookup:
+            hid_idempotency_lookup = True
+            return None
+        return real_scalar(db_session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "scalar", hide_first_wellness_event_lookup)
+    payload["source_provider"] = " Manual "
+    retried = client.post("/v1/wellness-events", json=payload)
+
+    assert hid_idempotency_lookup is True
+    assert retried.status_code == 201
+    assert retried.json()["id"] == first.json()["id"]
+    assert retried.json()["source_provider"] == "manual"
+
+
+@pytest.mark.parametrize(
+    "source_provider",
+    (
+        "   ",
+        "-manual",
+        "\tmanual\t",
+        "ÄPFEL",
+        "CAFÉ",
+        "Σ",
+        "straße",
+        "K",
+        "manual\x00a",
+        "a" * 65,
+    ),
+)
+def test_wellness_event_rejects_invalid_source_provider(
+    client: TestClient,
+    source_provider: str,
+) -> None:
+    response = client.post(
+        "/v1/wellness-events",
+        json={
+            "event_type": "subjective_energy",
+            "observed_at": datetime(
+                2026,
+                8,
+                1,
+                9,
+                tzinfo=UTC,
+            ).isoformat(),
+            "source_provider": source_provider,
+            "source_record_id": "blank-provider",
+            "data_class": "normalized",
+            "payload": {"score": 4},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_source_provider"
+
+
 def test_wellness_event_waits_for_concurrent_retention_shrink(
     client: TestClient,
     session: Session,

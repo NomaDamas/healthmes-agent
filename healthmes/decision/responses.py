@@ -53,6 +53,7 @@ from healthmes.decision.hermes_profile import (
 from healthmes.decision.search import (
     ContextSearchResult,
     DecisionContextSearchSessionService,
+    DecisionSearchRelatedRecord,
     DecisionSearchSessionSnapshot,
 )
 from healthmes.decision.validation import (
@@ -288,21 +289,12 @@ class HermesDecisionDraftEnvelope(BaseModel):
     decision: DecisionDraft
 
     @model_validator(mode="after")
-    def require_canonical_persisted_answer(
+    def require_null_legacy_summary(
         self,
     ) -> HermesDecisionDraftEnvelope:
         if self.decision.record_summary is not None:
             raise ValueError(
                 "decision-draft.v2 requires record_summary to be null"
-            )
-        code = self.decision.record_summary_code
-        if (
-            code is not None
-            and self.decision.answer != decision_record_summary(code)
-        ):
-            raise ValueError(
-                "persisted decision answer must match its canonical "
-                "record_summary_code"
             )
         return self
 
@@ -1757,6 +1749,21 @@ class HermesResponsesDecisionAgent:
             response_request = _responses_request(
                 request,
                 decision_session_id=handle.session_id,
+                runtime_question=getattr(
+                    handle,
+                    "runtime_question",
+                    request.question,
+                ),
+                has_related_records=bool(
+                    getattr(
+                        handle,
+                        "has_related_records",
+                        request.hints.related_record_ids,
+                    )
+                ),
+                related_records=tuple(
+                    getattr(handle, "related_records", ())
+                ),
                 model=self._model,
                 profile_digest=self._profile_digest,
                 tool_allowlist=self._tool_allowlist,
@@ -2122,6 +2129,9 @@ def _responses_request(
     request: DecisionRequest,
     *,
     decision_session_id: str,
+    runtime_question: str,
+    has_related_records: bool,
+    related_records: tuple[DecisionSearchRelatedRecord, ...],
     model: str,
     profile_digest: str | None,
     tool_allowlist: frozenset[str],
@@ -2130,7 +2140,7 @@ def _responses_request(
         "schema": "healthmes.decision-request.v1",
         "request_id": str(request.request_id),
         "turn_id": str(request.turn_id),
-        "question": request.question,
+        "question": runtime_question,
         "requested_at": request.requested_at.isoformat(),
         "timezone": request.timezone,
         "requested_privacy_level": request.requested_privacy_level.value,
@@ -2139,7 +2149,29 @@ def _responses_request(
             "channel": request.caller.channel,
             "execution_scope": request.caller.execution_scope.value,
         },
-        "hints": request.hints.model_dump(mode="json", round_trip=True),
+        "hints": {
+            "local_date": (
+                request.hints.local_date.isoformat()
+                if request.hints.local_date is not None
+                else None
+            ),
+            "start": (
+                request.hints.start.isoformat()
+                if request.hints.start is not None
+                else None
+            ),
+            "end": (
+                request.hints.end.isoformat()
+                if request.hints.end is not None
+                else None
+            ),
+            "lookback_days": request.hints.lookback_days,
+            "has_related_records": has_related_records,
+            "related_records": [
+                item.model_dump(mode="json", round_trip=True)
+                for item in related_records
+            ],
+        },
         "budget": request.budget.model_dump(mode="json", round_trip=True),
         "decision_session_id": decision_session_id,
     }
@@ -2184,11 +2216,15 @@ def _responses_request(
         "MCP server, mutation tools, memory, filesystem, network, shell, "
         "skills_list, or skill_view. Use tool results as authoritative. "
         "Missing, partial, stale, denied, and unavailable data are not zero. "
+        "Related records are exposed only as turn-scoped rr_ aliases in "
+        "hints.related_records. Use an alias only for a matching domain and "
+        "hint_key, pass it unchanged to a declared related-record parameter "
+        "such as package_record_id, and never invent or transform an alias. "
         "After any tool calls, return exactly one JSON object and no markdown "
         "or prose. The object must have exactly two keys: "
         '{"schema":"healthmes.decision-draft.v2","decision":...}. '
         "The decision value must contain only DecisionDraft fields: status, "
-        "answer, record_summary, record_summary_code, proposed_action, "
+        "answer, record_summary, record_summary_code, proposed_action, actions, "
         "persistence_intent, "
         "used_source_ref_ids, limitations, clarification_question, "
         "confidence, uncertainty, and follow_up_question. "
@@ -2207,11 +2243,26 @@ def _responses_request(
             separators=(",", ":"),
             sort_keys=True,
         )
-        + ". For a persisted decision, answer MUST exactly equal the sentence "
-        "mapped from record_summary_code; that code is the single canonical "
-        "conclusion rendered by HealthMes during both the live response and "
-        "later recovery. record_summary is a legacy transient hint and must "
-        "be null. "
+        + ". For a persisted decision, answer is the detailed user-facing "
+        "response for this live turn. It must be consistent with the selected "
+        "record_summary_code but must not be replaced by the compact mapped "
+        "sentence. HealthMes stores only the code and renders its canonical "
+        "sentence during receipt or record replay; it does not store the live "
+        "answer. record_summary is a legacy transient hint and must be null. "
+        "actions must be an array with at most five entries and must "
+        "be empty when proposed_action=false. Each entry must contain only "
+        "kind, state, duration_minutes, and advance_minutes. Allowed entries "
+        "are: walk with state recommended, offered, or selected and "
+        "duration_minutes exactly 10, 20, or 30 with advance_minutes null; "
+        "drink_water with state recommended and both minute fields null; "
+        "sleep_preparation with state recommended, advance_minutes=30, and "
+        "duration_minutes null. Do not repeat the same action option and "
+        "include at most one selected walk. selected means the user selected "
+        "an offered walk duration; it never means the action was completed. "
+        "Never include raw health values, source IDs, cycle IDs, free-form "
+        "action text, or completion tracking inside actions. Existing "
+        "recommendations that cannot be represented by this allowlist may use "
+        "proposed_action=true with actions=[]. "
         "Use only source reference IDs returned by tools. "
         "A proposed action requires at least one source reference. Ask one "
         "concrete clarification question when a required candidate amount, "

@@ -56,6 +56,7 @@ from healthmes.engine.alert_visibility import (
     expire_trigger_event_answers,
     lock_trigger_events_for_retention,
 )
+from healthmes.source_providers import canonical_source_provider
 from healthmes.storage.staging import reconcile_staging_files
 from healthmes.store import (
     AppUsageSample,
@@ -820,6 +821,8 @@ def classify_storage_object(
 def index_raw_ingest(
     session: Session, settings: Settings, raw: RawIngestEvent
 ) -> WellnessEvent:
+    source_provider = canonical_source_provider(raw.source)
+    raw.source = source_provider
     obj = register_storage_object(
         session,
         settings,
@@ -832,7 +835,7 @@ def index_raw_ingest(
     )
     existing = session.scalar(
         select(WellnessEvent).where(
-            WellnessEvent.source_provider == raw.source,
+            WellnessEvent.source_provider == source_provider,
             WellnessEvent.source_record_id == str(raw.id),
         )
     )
@@ -843,7 +846,7 @@ def index_raw_ingest(
         event_type="raw_ingest",
         observed_at=raw.received_at,
         recorded_at=raw.received_at,
-        source_provider=raw.source,
+        source_provider=source_provider,
         source_record_id=str(raw.id),
         capture_method="import",
         retention_policy_id=obj.retention_policy_id,

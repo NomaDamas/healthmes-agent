@@ -58,6 +58,7 @@ HERMES_DECISION_SEARCH_PARAMETER_MAP: Mapping[
     },
     "search_wearable": {
         "date": "date",
+        "package_record_id": "package_record_id",
         "cursor": "cursor",
         "kind": "kind",
         "metric": "metric",
@@ -68,6 +69,7 @@ HERMES_DECISION_SEARCH_PARAMETER_MAP: Mapping[
     },
 }
 HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY: Mapping[str, str] = {
+    "wearable.whoop-recovery-package": "day",
     "wearable.health-scores": "record",
     "wearable.workouts": "record",
     "wearable.timeseries": "series",
@@ -92,7 +94,7 @@ HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256 = {
         "989c29458d67f6e9089749b7eb41c3ac8d68843fa0ed0a8327857cfb0a3631a8"
     ),
     "search_wearable": (
-        "5208542abe23e47d7c2316c5308fc9df691f1f1713fe1f956c8b7639fac3ec24"
+        "7ef2a322f5f11452cc4968ffd11e001caf947edb4a27098eeb81736f11f78d28"
     ),
 }
 

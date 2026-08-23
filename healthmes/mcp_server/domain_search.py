@@ -75,6 +75,22 @@ OpaqueCursor = Annotated[
         ),
     ),
 ]
+RelatedRecordOrUuid = Annotated[
+    str,
+    Field(
+        min_length=19,
+        max_length=36,
+        pattern=(
+            r"^(?:rr_[0-9a-f]{16}|"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12})$"
+        ),
+        description=(
+            "A turn-scoped related-record alias supplied in the decision "
+            "request, or a canonical UUID for trusted direct callers."
+        ),
+    ),
+]
 LookbackDays = Annotated[int, Field(ge=1, le=90)]
 MinimumMinutes = Annotated[int, Field(ge=1, le=1_440)]
 PrivacySelection = Literal["aggregate", "identity"]
@@ -192,6 +208,7 @@ WearableCapability = Literal[
     "wearable.sleep",
     "wearable.recovery",
     "wearable.stress",
+    "wearable.whoop-recovery-package",
     "wearable.metric-detail",
     "wearable.health-scores",
     "wearable.summaries",
@@ -217,6 +234,7 @@ WearableMetric = Literal[
 WearableHealthScoreCategory = Literal[
     "activity",
     "body_battery",
+    "day_strain",
     "readiness",
     "recovery",
     "resilience",
@@ -259,10 +277,18 @@ WearableField = Literal[
     "stress",
     "charge",
     "yesterday_load",
+    "timezone",
+    "recovery",
+    "day_strain",
+    "cycle_linkage",
+    "level",
+    "routine_basis",
+    "actions",
+    "walk",
+    "limitations",
     "count",
     "records",
     "window",
-    "provenance_mode",
 ]
 
 ServiceResolver = Callable[[], DecisionContextSearchSessionService]
@@ -484,6 +510,7 @@ def register_domain_search_tools(
         start: IsoDateTime | None = None,
         end: IsoDateTime | None = None,
         date: IsoDate | None = None,
+        package_record_id: RelatedRecordOrUuid | None = None,
         cursor: OpaqueCursor | None = None,
         kind: WearableKind | None = None,
         metric: WearableMetric | None = None,
@@ -514,6 +541,7 @@ def register_domain_search_tools(
             limit=limit,
             parameters={
                 "date": date,
+                "package_record_id": package_record_id,
                 "cursor": cursor,
                 "kind": kind,
                 "metric": metric,

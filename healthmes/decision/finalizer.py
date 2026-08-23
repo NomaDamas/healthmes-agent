@@ -29,6 +29,7 @@ from sqlalchemy import event, or_, select, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from healthmes.activity.locking import (
     activity_write_lock,
@@ -48,8 +49,12 @@ from healthmes.decision.access import (
 )
 from healthmes.decision.agent import DecisionAgentRun, SessionFactory
 from healthmes.decision.contracts import (
+    MAX_DECISION_ACTIONS,
     ContextQuery,
     ContextStatus,
+    DecisionAction,
+    DecisionActionKind,
+    DecisionActionState,
     DecisionPersistenceIntent,
     DecisionRecordSummaryCode,
     DecisionRequest,
@@ -63,6 +68,7 @@ from healthmes.decision.contracts import (
     ToolCallStatus,
     decision_record_summary,
     decision_record_summary_code_is_allowed,
+    validate_decision_actions,
     validate_record_summary_for_storage,
 )
 from healthmes.decision.validation import (
@@ -74,17 +80,27 @@ from healthmes.storage import (
     apply_decision_retention,
     purge_expired_decision_records,
 )
-from healthmes.store import DecisionKind, DecisionRecord
+from healthmes.store import DecisionKind, DecisionRecord, WellnessEvent
 from healthmes.timezones import parse_timezone
 from healthmes.timing import steady_time
+from healthmes.wearables.provenance import (
+    OPEN_WEARABLES_QUERY_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    wearable_query_snapshot_from_event,
+)
+from healthmes.wearables.whoop_recovery import (
+    WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    WHOOP_RECOVERY_SNAPSHOT_DERIVER,
+)
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
-DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v6"
+DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v7"
 _LEGACY_DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V2 = "healthmes.decision-private.v2"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V3 = "healthmes.decision-private.v3"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V4 = "healthmes.decision-private.v4"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V5 = "healthmes.decision-private.v5"
+_LEGACY_DECISION_PAYLOAD_SCHEMA_V6 = "healthmes.decision-private.v6"
 _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
 _FINGERPRINT_CONTEXT = b"healthmes-decision-request-fingerprint-v1\x00"
 _MIN_FINGERPRINT_KEY_BYTES = 32
@@ -94,6 +110,9 @@ _STORED_REVALIDATION_PARAMETERS = {
     ("calendar", "calendar.busy-intervals"): frozenset({"date"}),
     ("calendar", "calendar.available-windows"): frozenset(
         {"date", "minimum_minutes"}
+    ),
+    ("wearable", WHOOP_RECOVERY_PACKAGE_CAPABILITY): frozenset(
+        {"date", "package_record_id"}
     ),
 }
 _MAX_STORED_JSON_BYTES = 2_000_000
@@ -109,6 +128,7 @@ _FINALIZATION_OUTCOME_UNKNOWN = "decision_finalization_outcome_unknown"
 _FINALIZATION_CAPACITY_EXHAUSTED = (
     "decision_finalization_capacity_exhausted"
 )
+_WHOOP_RELATED_RECORD_KEY = "whoop_recovery_package"
 _SQLITE_BUSY_TIMEOUT_INFO_KEY = (
     "healthmes_decision_finalization_sqlite_busy_timeout"
 )
@@ -468,7 +488,7 @@ class _StoredDecisionOutcome(BaseModel):
 
 
 class _StoredDecisionOutcomeV6(BaseModel):
-    """Current outcome stores only an allowlisted conclusion code."""
+    """Legacy outcome storing only an allowlisted conclusion code."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -597,7 +617,7 @@ class _StoredDecisionPayloadV5(BaseModel):
 
 
 class _StoredDecisionPayloadV6(BaseModel):
-    """Current payload retaining only an allowlisted safe conclusion code."""
+    """Legacy payload retaining only an allowlisted safe conclusion code."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -650,6 +670,78 @@ class _StoredDecisionPayloadV6(BaseModel):
         return self
 
 
+class _StoredDecisionOutcomeV7(_StoredDecisionOutcomeV6):
+    """Current compact outcome with bounded generic action metadata."""
+
+    actions: tuple[DecisionAction, ...] = Field(
+        default=(),
+        max_length=MAX_DECISION_ACTIONS,
+    )
+
+    @model_validator(mode="after")
+    def validate_action_metadata(self) -> _StoredDecisionOutcomeV7:
+        validate_decision_actions(list(self.actions))
+        if self.actions and not self.proposed_action:
+            raise ValueError(
+                "stored action metadata requires proposed_action"
+            )
+        return self
+
+
+class _StoredDecisionPayloadV7(BaseModel):
+    """Current payload preserving only allowlisted action metadata."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["healthmes.decision-private.v7"] = Field(
+        alias="schema"
+    )
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request: _StoredDecisionRequestMetadata
+    persistence_intent: DecisionPersistenceIntent
+    outcome: _StoredDecisionOutcomeV7
+    run: _StoredRun
+    source_refs: tuple[SourceRef, ...]
+    source_attestations: tuple[_StoredSourceAttestationV5, ...]
+    access_trace: tuple[AccessAuditEntry, ...]
+
+    @model_validator(mode="after")
+    def validate_persistence_contract(
+        self,
+    ) -> _StoredDecisionPayloadV7:
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.NONE,
+            DecisionPersistenceIntent.MUTATION,
+        }:
+            raise ValueError(
+                "stored decisions require a read-only persistence intent"
+            )
+        action_or_risk = self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        }
+        if self.outcome.proposed_action is not action_or_risk:
+            raise ValueError(
+                "stored persistence intent conflicts with proposed_action"
+            )
+        if action_or_risk and not self.source_refs:
+            raise ValueError(
+                "stored action and risk outcomes require source refs"
+            )
+        if not decision_record_summary_code_is_allowed(
+            persistence_intent=self.persistence_intent,
+            code=self.outcome.summary_code,
+        ):
+            raise ValueError(
+                "stored summary code conflicts with persistence intent"
+            )
+        return self
+
+
 StoredDecisionPayload = (
     _StoredDecisionPayloadV1
     | _StoredDecisionPayloadV2
@@ -657,6 +749,7 @@ StoredDecisionPayload = (
     | _StoredDecisionPayloadV4
     | _StoredDecisionPayloadV5
     | _StoredDecisionPayloadV6
+    | _StoredDecisionPayloadV7
 )
 
 
@@ -1628,6 +1721,18 @@ class DecisionFinalizer:
                 persistence_required=False,
             )
 
+        whoop_action_error = _whoop_recovery_trace_contract_error(
+            canonical_request,
+            canonical_run,
+            used_ids=frozenset(used_ids),
+        )
+        if whoop_action_error is not None:
+            return _failure_result(
+                canonical_run,
+                code=whoop_action_error,
+                persistence_required=canonical_run.draft.proposed_action,
+            )
+
         persistence_contract_error = _persistence_contract_error(
             canonical_request,
             canonical_run,
@@ -1691,6 +1796,14 @@ class DecisionFinalizer:
                                 calendar_snapshot
                             ),
                         )
+                    )
+                    _require_canonical_whoop_recovery_actions(
+                        session,
+                        canonical_request,
+                        actions=canonical_run.draft.actions,
+                        source_refs=validated_refs,
+                        now=_as_utc(self._clock()),
+                        require_followup_binding=True,
                     )
                     self._require_calendar_visibility_current(
                         calendar_snapshot
@@ -1903,6 +2016,14 @@ class DecisionFinalizer:
                                         ),
                                     )
                                 )
+                                _require_canonical_whoop_recovery_actions(
+                                    session,
+                                    request,
+                                    actions=run.draft.actions,
+                                    source_refs=validated_refs,
+                                    now=source_validation_now,
+                                    require_followup_binding=True,
+                                )
                                 _ensure_finalization_deadline(deadline)
                                 if (
                                     run.draft.proposed_action
@@ -1930,7 +2051,6 @@ class DecisionFinalizer:
                                     run,
                                     validated_refs,
                                     record_id=record_id,
-                                    answer=record_summary,
                                     extra_limitations=source_limitations,
                                 )
                                 _ensure_finalization_deadline(deadline)
@@ -2076,6 +2196,14 @@ class DecisionFinalizer:
             now=source_validation_now,
             calendar_visibility_snapshot=calendar_snapshot,
             cancellation_check=cancellation_check,
+        )
+        _require_canonical_whoop_recovery_actions(
+            session,
+            request,
+            actions=stored.result.actions,
+            source_refs=validated_refs,
+            now=source_validation_now,
+            require_followup_binding=False,
         )
         if cancellation_check is not None:
             cancellation_check()
@@ -2366,6 +2494,317 @@ def _trace_source_candidates(
     )
 
 
+def _whoop_recovery_trace_contract_error(
+    request: DecisionRequest,
+    run: DecisionAgentRun,
+    *,
+    used_ids: frozenset[str],
+) -> str | None:
+    """Require one canonical WHOOP package when its actions are used."""
+
+    package_results: list[
+        tuple[
+            SourceRef,
+            tuple[DecisionAction, ...],
+            ContextQuery,
+        ]
+    ] = []
+    saw_whoop_trace = False
+    for record in run.tool_trace:
+        result = record.result
+        if (
+            record.query.capability != WHOOP_RECOVERY_PACKAGE_CAPABILITY
+            and (
+                record.effective_query is None
+                or record.effective_query.capability
+                != WHOOP_RECOVERY_PACKAGE_CAPABILITY
+            )
+            and (
+                result is None
+                or result.capability
+                != WHOOP_RECOVERY_PACKAGE_CAPABILITY
+            )
+        ):
+            continue
+        saw_whoop_trace = True
+        if (
+            record.status is not ToolCallStatus.COMPLETED
+            or result is None
+            or result.status
+            not in {ContextStatus.OK, ContextStatus.PARTIAL}
+        ):
+            continue
+        if (
+            len(result.source_refs) != 1
+            or not _is_canonical_whoop_source_ref(
+                result.source_refs[0]
+            )
+        ):
+            return "decision_whoop_recovery_package_invalid"
+        raw_actions = result.payload.get("actions")
+        if not isinstance(raw_actions, list):
+            return "decision_whoop_recovery_package_invalid"
+        try:
+            actions = tuple(
+                DecisionAction.model_validate(action)
+                for action in raw_actions
+            )
+            validate_decision_actions(list(actions))
+        except Exception:
+            return "decision_whoop_recovery_package_invalid"
+        package_results.append(
+            (
+                result.source_refs[0],
+                actions,
+                record.effective_query or record.query,
+            )
+        )
+
+    related_package_id = request.hints.related_record_ids.get(
+        _WHOOP_RELATED_RECORD_KEY
+    )
+    if not saw_whoop_trace and related_package_id is None:
+        return None
+    if not package_results:
+        if run.draft.actions:
+            return "decision_whoop_recovery_package_required"
+        return None
+
+    used_packages = {
+        source_ref.reference_id: (source_ref, actions)
+        for source_ref, actions, _query in package_results
+        if source_ref.reference_id in used_ids
+    }
+    if not used_packages:
+        if run.draft.actions:
+            return "decision_whoop_recovery_source_ref_omitted"
+        return None
+    if len(used_packages) != 1:
+        return "decision_whoop_recovery_source_ref_ambiguous"
+
+    selected_ref, selected_actions = next(iter(used_packages.values()))
+    for source_ref, actions, _query in package_results:
+        if (
+            source_ref.reference_id == selected_ref.reference_id
+            and actions != selected_actions
+        ):
+            return "decision_whoop_recovery_package_invalid"
+    if not run.draft.proposed_action:
+        if run.draft.actions:
+            return "decision_whoop_recovery_action_mismatch"
+        return None
+    if not run.draft.actions:
+        return "decision_whoop_recovery_actions_omitted"
+    if not _matches_whoop_recovery_actions(
+        selected_actions,
+        tuple(run.draft.actions),
+    ):
+        return "decision_whoop_recovery_action_mismatch"
+    if _selected_walk(run.draft.actions) is not None:
+        if related_package_id is None:
+            return "decision_whoop_recovery_followup_binding_missing"
+        if related_package_id != selected_ref.record_id:
+            return "decision_whoop_recovery_followup_binding_mismatch"
+        selected_attempts = tuple(
+            query
+            for source_ref, _actions, query in package_results
+            if source_ref.reference_id == selected_ref.reference_id
+        )
+        for query in selected_attempts:
+            package_record_id = query.parameters.get("package_record_id")
+            if package_record_id is None:
+                return "decision_whoop_recovery_followup_binding_missing"
+            if (
+                package_record_id != selected_ref.record_id
+                or package_record_id != related_package_id
+            ):
+                return "decision_whoop_recovery_followup_binding_mismatch"
+    return None
+
+
+def _is_canonical_whoop_source_ref(source_ref: SourceRef) -> bool:
+    if (
+        source_ref.domain != "wearable"
+        or source_ref.resource_type != OPEN_WEARABLES_QUERY_EVENT_TYPE
+        or source_ref.source_provider
+        != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+        or source_ref.schema_version != 2
+        or source_ref.derived_by != WHOOP_RECOVERY_SNAPSHOT_DERIVER
+    ):
+        return False
+    try:
+        uuid.UUID(source_ref.record_id)
+    except ValueError:
+        return False
+    return True
+
+
+def _selected_walk(
+    actions: Sequence[DecisionAction],
+) -> DecisionAction | None:
+    selected = [
+        action
+        for action in actions
+        if action.state is DecisionActionState.SELECTED
+    ]
+    if not selected:
+        return None
+    if (
+        len(selected) != 1
+        or selected[0].kind is not DecisionActionKind.WALK
+    ):
+        return None
+    return selected[0]
+
+
+def _canonical_whoop_recovery_actions(
+    session: Session,
+    source_ref: SourceRef,
+    *,
+    now: datetime,
+) -> tuple[uuid.UUID, tuple[DecisionAction, ...]]:
+    if not _is_canonical_whoop_source_ref(source_ref):
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_source_ref_invalid"
+        )
+    event_id = uuid.UUID(source_ref.record_id)
+    try:
+        event = session.get(
+            WellnessEvent,
+            event_id,
+            populate_existing=True,
+        )
+    except ObjectDeletedError as exc:
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_source_ref_invalid"
+        ) from exc
+    if event is None:
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_source_ref_invalid"
+        )
+    snapshot = wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=now,
+    )
+    if (
+        snapshot is None
+        or snapshot.event_id != event_id
+        or snapshot.capability != WHOOP_RECOVERY_PACKAGE_CAPABILITY
+        or snapshot.schema_version != 2
+    ):
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_source_ref_invalid"
+        )
+    raw_actions = snapshot.result.get("actions")
+    if not isinstance(raw_actions, list):
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_package_invalid"
+        )
+    try:
+        actions = tuple(
+            DecisionAction.model_validate(action)
+            for action in raw_actions
+        )
+        validate_decision_actions(list(actions))
+    except Exception as exc:
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_package_invalid"
+        ) from exc
+    return event_id, actions
+
+
+def _require_canonical_whoop_recovery_actions(
+    session: Session,
+    request: DecisionRequest,
+    *,
+    actions: Sequence[DecisionAction],
+    source_refs: Sequence[SourceRef],
+    now: datetime,
+    require_followup_binding: bool,
+) -> None:
+    """Recheck WHOOP actions against the exact retained DB snapshot."""
+
+    whoop_refs = tuple(
+        source_ref
+        for source_ref in source_refs
+        if _is_canonical_whoop_source_ref(source_ref)
+    )
+    related_package_id = request.hints.related_record_ids.get(
+        _WHOOP_RELATED_RECORD_KEY
+    )
+    if not whoop_refs:
+        if related_package_id is not None and actions:
+            raise _FinalizationRejected(
+                "decision_whoop_recovery_source_ref_omitted"
+            )
+        return
+    if len(whoop_refs) != 1:
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_source_ref_ambiguous"
+        )
+
+    event_id, package_actions = _canonical_whoop_recovery_actions(
+        session,
+        whoop_refs[0],
+        now=now,
+    )
+    if not actions:
+        return
+    canonical_actions = tuple(actions)
+    if not _matches_whoop_recovery_actions(
+        package_actions,
+        canonical_actions,
+    ):
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_action_mismatch"
+        )
+
+    if _selected_walk(canonical_actions) is None:
+        return
+    if not require_followup_binding:
+        return
+    if related_package_id is None:
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_followup_binding_missing"
+        )
+    if related_package_id != str(event_id):
+        raise _FinalizationRejected(
+            "decision_whoop_recovery_followup_binding_mismatch"
+        )
+
+
+def _matches_whoop_recovery_actions(
+    package: tuple[DecisionAction, ...],
+    draft: tuple[DecisionAction, ...],
+) -> bool:
+    if package == draft:
+        return True
+    if len(package) != len(draft):
+        return False
+
+    selected_changes = 0
+    for expected, proposed in zip(package, draft, strict=True):
+        if expected == proposed:
+            continue
+        if (
+            expected.kind is DecisionActionKind.WALK
+            and proposed.kind is DecisionActionKind.WALK
+            and expected.duration_minutes == proposed.duration_minutes
+            and expected.advance_minutes == proposed.advance_minutes
+            and expected.state
+            in {
+                DecisionActionState.RECOMMENDED,
+                DecisionActionState.OFFERED,
+            }
+            and proposed.state is DecisionActionState.SELECTED
+        ):
+            selected_changes += 1
+            continue
+        return False
+    return selected_changes == 1
+
+
 def _existing_stored_decision(
     session: Session,
     request: DecisionRequest,
@@ -2519,7 +2958,8 @@ def _stored_decision(
                 _StoredDecisionPayloadV3
                 | _StoredDecisionPayloadV4
                 | _StoredDecisionPayloadV5
-                | _StoredDecisionPayloadV6,
+                | _StoredDecisionPayloadV6
+                | _StoredDecisionPayloadV7,
             )
             and row.retention_basis_at is None
         )
@@ -2578,8 +3018,12 @@ def _validate_stored_payload(
         payload = _StoredDecisionPayloadV5.model_validate(
             normalized.value
         )
-    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+    elif schema_name == _LEGACY_DECISION_PAYLOAD_SCHEMA_V6:
         payload = _StoredDecisionPayloadV6.model_validate(
+            normalized.value
+        )
+    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+        payload = _StoredDecisionPayloadV7.model_validate(
             normalized.value
         )
     else:
@@ -2598,6 +3042,24 @@ def _validate_stored_payload(
             "persistence_requested",
             None,
         )
+    if (
+        isinstance(
+            payload,
+            _StoredDecisionPayloadV1 | _StoredDecisionPayloadV2,
+        )
+        and isinstance(normalized.value.get("result"), dict)
+        and "actions" not in normalized.value["result"]
+    ):
+        canonical_payload["result"].pop("actions", None)
+    if (
+        isinstance(
+            payload,
+            _StoredDecisionPayloadV1 | _StoredDecisionPayloadV2,
+        )
+        and isinstance(normalized.value.get("result"), dict)
+        and "related_record_ids" not in normalized.value["result"]
+    ):
+        canonical_payload["result"].pop("related_record_ids", None)
     canonical = normalize_untrusted_json(
         canonical_payload,
         max_bytes=_MAX_STORED_JSON_BYTES,
@@ -2657,10 +3119,14 @@ def _result_from_stored_outcome(
         | _StoredDecisionPayloadV4
         | _StoredDecisionPayloadV5
         | _StoredDecisionPayloadV6
+        | _StoredDecisionPayloadV7
     ),
 ) -> DecisionResult:
     outcome = payload.outcome
-    if isinstance(outcome, _StoredDecisionOutcomeV6):
+    if isinstance(
+        outcome,
+        _StoredDecisionOutcomeV6 | _StoredDecisionOutcomeV7,
+    ):
         answer = decision_record_summary(outcome.summary_code)
     elif isinstance(outcome, _StoredDecisionOutcome):
         answer = outcome.record_summary
@@ -2672,7 +3138,15 @@ def _result_from_stored_outcome(
         status=outcome.status,
         answer=answer,
         proposed_action=outcome.proposed_action,
+        actions=(
+            list(outcome.actions)
+            if isinstance(outcome, _StoredDecisionOutcomeV7)
+            else []
+        ),
         source_refs=list(payload.source_refs),
+        related_record_ids=_result_related_record_ids(
+            payload.source_refs
+        ),
         limitations=_merge_limitations(
             outcome.limitation_codes,
             (_COMPACT_RECOVERY_LIMITATION,),
@@ -2689,7 +3163,10 @@ def _stored_row_summary(
     payload: StoredDecisionPayload,
     result: DecisionResult,
 ) -> str:
-    if isinstance(payload, _StoredDecisionPayloadV6):
+    if isinstance(
+        payload,
+        _StoredDecisionPayloadV6 | _StoredDecisionPayloadV7,
+    ):
         return decision_record_summary(payload.outcome.summary_code)
     if isinstance(
         payload,
@@ -2705,17 +3182,20 @@ def _persisted_result(
     source_refs: Sequence[SourceRef],
     *,
     record_id: uuid.UUID,
-    answer: str,
     extra_limitations: Sequence[str] = (),
 ) -> DecisionResult:
     draft = run.draft
+    if draft.answer is None:
+        raise ValueError("persisted completed decisions require an answer")
     return DecisionResult(
         request_id=run.request_id,
         turn_id=run.turn_id,
         status=draft.status,
-        answer=answer,
+        answer=draft.answer,
         proposed_action=draft.proposed_action,
+        actions=list(draft.actions),
         source_refs=list(source_refs),
+        related_record_ids=_result_related_record_ids(source_refs),
         limitations=_merge_limitations(
             draft.limitations,
             _tool_trace_limitations(run.tool_trace),
@@ -2745,7 +3225,9 @@ def _result_without_persistence(
         status=draft.status,
         answer=draft.answer,
         proposed_action=draft.proposed_action,
+        actions=list(draft.actions),
         source_refs=list(source_refs),
+        related_record_ids=_result_related_record_ids(source_refs),
         limitations=_merge_limitations(
             draft.limitations,
             _tool_trace_limitations(run.tool_trace),
@@ -2981,10 +3463,11 @@ def _decision_payload(
     persistence_intent: DecisionPersistenceIntent,
     source_limitations: Sequence[str],
 ) -> dict[str, Any]:
-    stored_outcome = _StoredDecisionOutcomeV6(
+    stored_outcome = _StoredDecisionOutcomeV7(
         status=result.status,
         summary_code=record_summary_code,
         proposed_action=result.proposed_action,
+        actions=tuple(result.actions),
         limitation_codes=_sanitized_limitation_codes(
             _tool_trace_limitations(run.tool_trace),
             source_limitations,
@@ -3007,7 +3490,7 @@ def _decision_payload(
         attestation.query.query_id
         for attestation in source_attestations
     }
-    payload_model = _StoredDecisionPayloadV6(
+    payload_model = _StoredDecisionPayloadV7(
         schema_name=DECISION_PAYLOAD_SCHEMA,
         request_fingerprint=request_fingerprint,
         request=_StoredDecisionRequestMetadata(
@@ -3189,6 +3672,21 @@ def _public_summary(
     if result.proposed_action:
         return "HealthMes wellness action recorded"
     return "HealthMes wellness decision recorded"
+
+
+def _result_related_record_ids(
+    source_refs: Sequence[SourceRef],
+) -> dict[str, str]:
+    whoop_refs = tuple(
+        source_ref
+        for source_ref in source_refs
+        if _is_canonical_whoop_source_ref(source_ref)
+    )
+    if len(whoop_refs) != 1:
+        return {}
+    return {
+        _WHOOP_RELATED_RECORD_KEY: whoop_refs[0].record_id,
+    }
 
 
 def _unvalidated_text_source_ref(

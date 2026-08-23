@@ -18,6 +18,7 @@ WELLNESS_SKILL_CATALOG_VERSION = "healthmes-wellness-skills.v1"
 MAX_WELLNESS_SKILL_BYTES = 64_000
 REVIEWED_WELLNESS_SKILLS = (
     "healthmes-wellness-decision",
+    "healthmes-whoop-recovery",
     "healthmes-caffeine",
     "healthmes-nutrition-decision",
     "healthmes-sleep",
