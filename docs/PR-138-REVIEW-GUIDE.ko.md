@@ -608,7 +608,9 @@ ASCII space만 다른 provider 값이 중복 원본을 만들면 안 된다.
   - 단일 head `b7c8d9e0f1a2`
   - PostgreSQL·SQLite offline SQL render 통과
   - 빈 SQLite 실제 `upgrade head`와 `current` 통과
-- authoring/packaged `healthmes-whoop-recovery` Skill byte identity: 통과
+- 실제 wheel build 통과. wheel archive의
+  `healthmes/_wellness_skills/healthmes-whoop-recovery/SKILL.md`는 정확히
+  한 번 포함되며 authoring Skill과 byte identity가 같다.
 - 이번 WHOOP migration working tree에서 `vendor/hermes-agent/`,
   `vendor/open-wearables/`, 디바이스 UI를 직접 수정한 파일: 없음
 - PR 기준선 `ba2b5ea7` 이후 `vendor/open-wearables/`에는 최신 `main`의

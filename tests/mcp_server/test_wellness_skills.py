@@ -93,6 +93,17 @@ def test_reviewed_skills_are_packaged_and_available_to_docker_source():
         f"skills/{name}": f"healthmes/_wellness_skills/{name}"
         for name in REVIEWED_WELLNESS_SKILLS
     }
+    for name in REVIEWED_WELLNESS_SKILLS:
+        packaged_source = REPO_ROOT / "healthmes" / "_wellness_skills" / name
+        duplicate_files = tuple(
+            path
+            for path in packaged_source.rglob("*")
+            if path.is_file()
+        )
+        assert not duplicate_files, (
+            f"{packaged_source} duplicates its force-included authoring skill: "
+            f"{duplicate_files}"
+        )
     dockerignore = {
         line.strip()
         for line in (REPO_ROOT / ".dockerignore").read_text(
