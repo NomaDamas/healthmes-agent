@@ -5471,7 +5471,7 @@ def test_postgres_wellness_provider_migration_is_atomic() -> None:
                             event.c.id,
                             event.c.source_provider,
                         ).where(event.c.id.in_((invalid_id, valid_id)))
-                    )
+                    ).all()
                 )
                 assert rows == {
                     invalid_id: "WHÖÖP",
