@@ -388,10 +388,15 @@ class TestOfflineRender:
             "ON wellness_event (replace("
         ) in compact
         assert ", source_record_id)" in compact
-        assert "lower(" not in compact.split(
+        provider_migration = compact.split(
             "-- Running upgrade a6b7c8d9e0f1 -> b7c8d9e0f1a2",
             maxsplit=1,
         )[1]
+        assert "lower(" not in provider_migration
+        assert (
+            "length(trim(source_provider)) - "
+            "length(replace(trim(source_provider), 'A', ''))"
+        ) in provider_migration
         assert (
             "UPDATE wellness_event "
             "SET source_provider = CASE WHEN "
@@ -418,6 +423,44 @@ class TestOfflineRender:
             "AND length(source) BETWEEN 1 AND 64 "
             "AND source = substr(source, 1, 64)"
         ) in compact
+
+    def test_provider_checks_fit_sqlite_parser_stack(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE wellness_provider_probe ("
+                "source_provider TEXT NOT NULL, "
+                f"CHECK ({SOURCE_PROVIDER_CHECK_EXPRESSION})"
+                ")"
+            )
+            connection.execute(
+                "CREATE TABLE raw_provider_probe ("
+                "source TEXT NOT NULL, "
+                f"CHECK ({RAW_INGEST_SOURCE_CHECK_EXPRESSION})"
+                ")"
+            )
+            connection.execute(
+                "INSERT INTO wellness_provider_probe VALUES ('whoop')"
+            )
+            connection.execute(
+                "INSERT INTO raw_provider_probe VALUES ('open-wearables')"
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO wellness_provider_probe "
+                    "VALUES ('WHOOP')"
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO raw_provider_probe VALUES ('WHÖÖP')"
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO wellness_provider_probe VALUES (?)",
+                    ("manual\x00A",),
+                )
+        finally:
+            connection.close()
 
     def test_sqlite_offline_render_executes_cleanup_batch_once(
         self,

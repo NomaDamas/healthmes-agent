@@ -763,6 +763,12 @@ PostgreSQL의 dashed UUID를 같은 원본 ID로 비교하며, 연결된 provide
 canonical provider + `source_record_id`를 원본 identity로 사용하므로 대소문자나
 앞뒤 ASCII space만 다른 동일 WHOOP 원본은 중복 저장되지 않는다.
 
+DB check와 migration의 allowlist 검사는 SQLite parser stack을 넘기는 깊은
+`replace(replace(...))` 표현을 사용하지 않는다. 허용 문자별 출현 수의 얕은 합을
+문자열 길이와 비교하고, 검증을 통과한 legacy 값만 명시적인 A–Z → a–z 치환으로
+정규화한다. 따라서 SQLite와 PostgreSQL 모두 같은 ASCII identity, invalid-row
+거부, collision 감지와 transaction rollback 의미를 유지한다.
+
 ### 실행 전·후 검증
 
 1. 렌더된 Hermes decision config는 제품 MCP로 `healthmes` 하나만 가진다.

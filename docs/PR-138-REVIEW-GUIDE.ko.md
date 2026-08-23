@@ -518,6 +518,15 @@ canonicalize한다. SQLite compact UUID와 PostgreSQL dashed UUID를 같은 ID�
 canonical provider + `source_record_id`가 동일 원본 identity다. 대소문자나 앞뒤
 ASCII space만 다른 provider 값이 중복 원본을 만들면 안 된다.
 
+DB 제약과 migration의 문자 검사는 허용 문자를 제거하는 깊은
+`replace(replace(...))` 체인을 사용하지 않는다. 그 표현은 SQLite에서 schema 생성
+중 parser stack overflow를 일으킬 수 있다. 현재 구현은 각 허용 문자의 출현 수를
+얕은 합으로 계산하고 전체 문자열 길이와 비교한다. migration의 정규화는 DB
+`lower()`가 아니라 A–Z를 a–z로 바꾸는 명시적 ASCII 치환을 유지한다. 따라서
+PostgreSQL의 locale/Unicode 소문자화 차이는 canonical 결과에 들어오지 않는다.
+Unicode, NUL, invalid 문자, collision과 raw/wellness provider 불일치의 원자적
+실패 의미는 그대로 유지한다.
+
 ## 9. Sake 권장 리뷰 순서
 
 1. **단일 제품 진입점**
@@ -608,6 +617,8 @@ ASCII space만 다른 provider 값이 중복 원본을 만들면 안 된다.
   - 단일 head `b7c8d9e0f1a2`
   - PostgreSQL·SQLite offline SQL render 통과
   - 빈 SQLite 실제 `upgrade head`와 `current` 통과
+  - provider 제약의 SQLite parser-stack 회귀, 정상화, invalid/collision 원자적
+    실패와 metadata parity 집중 검증 통과
 - 실제 wheel build 통과. wheel archive의
   `healthmes/_wellness_skills/healthmes-whoop-recovery/SKILL.md`는 정확히
   한 번 포함되며 authoring Skill과 byte identity가 같다.

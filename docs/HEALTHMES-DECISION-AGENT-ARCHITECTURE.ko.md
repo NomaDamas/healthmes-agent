@@ -684,6 +684,12 @@ idempotency key는 canonical provider와 `source_record_id`의 조합이다. 따
 `WHOOP`, ` whoop `, `whoop`은 하나의 원본 identity가 되며, migration과 재시도도
 같은 규칙을 사용한다.
 
+구현상 DB allowlist 검사는 깊게 중첩된 `replace()` 호출이 아니라 허용 문자별
+출현 수의 얕은 합을 문자열 길이와 비교한다. 이는 SQLite parser-stack 한도를
+넘지 않으면서 기존의 portable ASCII 계약을 그대로 지킨다. migration은
+allowlist를 통과한 값에만 명시적인 A–Z → a–z 치환을 적용하므로 PostgreSQL의
+Unicode/locale 동작이 provider identity를 바꾸지 않는다.
+
 ## 11. 확장 원칙
 
 새 wellness domain을 추가할 때 순서는 다음과 같다.

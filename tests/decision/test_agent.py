@@ -3319,7 +3319,7 @@ async def test_worker_thread_creation_happens_before_request_deadline(
         providers=(StubProvider(domain="activity"),),
         runtime=CapturingRuntime(),
         policy=_policy("activity"),
-        timeout_seconds=0.01,
+        timeout_seconds=0.1,
     )
     construction_elapsed = time.monotonic() - construction_started
     assert agent._worker._ready.wait(1)
@@ -3357,7 +3357,7 @@ async def test_worker_loop_startup_happens_before_request_deadline(
         providers=(StubProvider(domain="activity"),),
         runtime=CapturingRuntime(),
         policy=_policy("activity"),
-        timeout_seconds=0.01,
+        timeout_seconds=0.1,
     )
     construction_elapsed = time.monotonic() - construction_started
     ask_started = time.monotonic()

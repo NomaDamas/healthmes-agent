@@ -11,29 +11,45 @@ _SOURCE_PROVIDER_FIRST_ALLOWED = "abcdefghijklmnopqrstuvwxyz0123456789"
 SOURCE_PROVIDER_MAX_LENGTH = 64
 
 
-def _allowed_characters_removed_sql(
+def _allowed_character_count_sql(
     column: str,
     *,
     allowed: str = _SOURCE_PROVIDER_ALLOWED,
 ) -> str:
-    expression = column
-    for character in allowed:
-        expression = f"replace({expression}, '{character}', '')"
-    return expression
+    terms = [
+        (
+            f"(length({column}) - "
+            f"length(replace({column}, '{character}', '')))"
+        )
+        for character in allowed
+    ]
+    # A flat sum avoids SQLite's parser-stack overflow from deeply nested
+    # replace(replace(...)) expressions while preserving the same validation.
+    return " + ".join(terms) if terms else "0"
+
+
+def _contains_only_sql(
+    column: str,
+    *,
+    allowed: str = _SOURCE_PROVIDER_ALLOWED,
+) -> str:
+    return (
+        f"({_allowed_character_count_sql(column, allowed=allowed)}) "
+        f"= length({column})"
+    )
 
 
 def _source_provider_check_expression(column: str) -> str:
+    first_character = f"substr({column}, 1, 1)"
     return (
         f"{column} = trim({column}) "
         f"AND length({column}) BETWEEN 1 AND 64 "
         f"AND {column} = substr({column}, 1, 64) "
-        "AND length("
-        f"{_allowed_characters_removed_sql(
-            f'substr({column}, 1, 1)',
+        f"AND {_contains_only_sql(
+            first_character,
             allowed=_SOURCE_PROVIDER_FIRST_ALLOWED,
-        )}"
-        ") = 0 "
-        f"AND length({_allowed_characters_removed_sql(column)}) = 0"
+        )} "
+        f"AND {_contains_only_sql(column)}"
     )
 
 

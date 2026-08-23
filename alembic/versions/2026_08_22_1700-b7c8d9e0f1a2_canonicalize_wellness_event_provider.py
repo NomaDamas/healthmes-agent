@@ -49,30 +49,43 @@ def _ascii_lower_sql(column: str) -> str:
     return expression
 
 
-def _allowed_characters_removed_sql(
+def _allowed_character_count_sql(
     column: str,
     *,
     allowed: str = _ALLOWED_PROVIDER_CHARACTERS,
 ) -> str:
-    expression = column
-    for character in allowed:
-        expression = f"replace({expression}, '{character}', '')"
-    return expression
+    terms = [
+        (
+            f"(length({column}) - "
+            f"length(replace({column}, '{character}', '')))"
+        )
+        for character in allowed
+    ]
+    # The previous nested replace(replace(...)) form exceeded SQLite's parser
+    # stack. This flat count preserves the same ASCII allowlist semantics.
+    return " + ".join(terms) if terms else "0"
+
+
+def _contains_only_sql(
+    column: str,
+    *,
+    allowed: str = _ALLOWED_PROVIDER_CHARACTERS,
+) -> str:
+    return (
+        f"({_allowed_character_count_sql(column, allowed=allowed)}) "
+        f"= length({column})"
+    )
 
 
 _CHECK_EXPRESSION = (
     "source_provider = trim(source_provider) "
     "AND length(source_provider) BETWEEN 1 AND 64 "
     "AND source_provider = substr(source_provider, 1, 64) "
-    "AND length("
-    f"{_allowed_characters_removed_sql(
+    f"AND {_contains_only_sql(
         'substr(source_provider, 1, 1)',
         allowed=_ALLOWED_FIRST_PROVIDER_CHARACTERS,
-    )}"
-    ") = 0 "
-    "AND length("
-    f"{_allowed_characters_removed_sql('source_provider')}"
-    ") = 0"
+    )} "
+    f"AND {_contains_only_sql('source_provider')}"
 )
 
 
@@ -80,18 +93,14 @@ _VALID_INPUT_EXPRESSION = (
     "length(trim(source_provider)) BETWEEN 1 AND 64 "
     "AND trim(source_provider) = "
     "substr(trim(source_provider), 1, 64) "
-    "AND length("
-    f"{_allowed_characters_removed_sql(
+    f"AND {_contains_only_sql(
         'substr(trim(source_provider), 1, 1)',
         allowed=_ALLOWED_FIRST_INPUT_PROVIDER_CHARACTERS,
-    )}"
-    ") = 0 "
-    "AND length("
-    f"{_allowed_characters_removed_sql(
+    )} "
+    f"AND {_contains_only_sql(
         'trim(source_provider)',
         allowed=_ALLOWED_INPUT_PROVIDER_CHARACTERS,
     )}"
-    ") = 0"
 )
 _CANONICAL_PROVIDER_EXPRESSION = _ascii_lower_sql(
     "trim(source_provider)"
