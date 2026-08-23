@@ -159,11 +159,13 @@ async def test_prepare_freezes_redacted_snapshot_without_calendar_write(
         "target": redacted_digest(fake_backend.approval_target),
         "actual": None,
         "planned": [],
+        "account_generation": None,
     }
     assert proposal.provider_state == {
         "target": fake_backend.approval_target,
         "actual": None,
         "planned": [],
+        "account_generation": None,
     }
     assert fake_backend.created_drafts == []
     assert fake_backend.update_calls == []

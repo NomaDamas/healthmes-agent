@@ -11,14 +11,11 @@ Covers, over one seeded week (frozen at 2026-07-10, UTC settings):
 - viewer auth: bearer plus the derived read-only ``?token=`` credential
   (the same construction as decision links);
 - pure helpers: :func:`weekly_report_url`, :func:`build_energy_sparkline`,
-  :func:`confidence_level`;
-- the bootstrap Sunday briefing prompt mentions the report link.
+  :func:`confidence_level`.
 """
 
-import importlib.util
-import sys
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -36,7 +33,6 @@ from healthmes.api.reports import (
 )
 from healthmes.app import create_app
 from healthmes.store import (
-    Base,
     CognitiveEnergyEstimate,
     DecisionKind,
     DecisionRecord,
@@ -46,7 +42,6 @@ from healthmes.store import (
     Task,
     TriggerEvent,
 )
-from healthmes.store.session import get_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -307,6 +302,72 @@ def test_weekly_report_json_computes_numbers(client, session):
     assert items[0]["url"] == f"http://healthmes.test:8100/decisions/{alert_id}"
 
 
+def test_weekly_report_excludes_decision_at_exact_expiry(
+    client,
+    session,
+):
+    current = datetime(2026, 7, 10, 12, tzinfo=UTC)
+    expired = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree=TREE,
+        summary="exact-cutoff report decision",
+        created_at=_utc(2026, 7, 10, 10),
+        expires_at=current,
+    )
+    available = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree=TREE,
+        summary="available report decision",
+        created_at=_utc(2026, 7, 10, 9),
+        expires_at=current + timedelta(microseconds=1),
+    )
+    session.add_all((expired, available))
+    session.commit()
+
+    with freeze_time(FROZEN_NOW):
+        body = client.get("/reports/weekly.json").json()
+
+    assert body["decisions"]["count"] == 1
+    assert [item["summary"] for item in body["decisions"]["items"]] == [
+        "available report decision"
+    ]
+
+
+def test_weekly_report_does_not_count_failed_transport_as_delivered(
+    client,
+    session,
+) -> None:
+    session.add(
+        TriggerEvent(
+            fired_at=_utc(2026, 7, 10, 8),
+            rule_id="native_transport_failed",
+            alert_sent=True,
+            payload={
+                "message": "Visible in the app, but transport failed.",
+                "push": {
+                    "sent": True,
+                    "channel": "native",
+                    "upstream_ok": False,
+                },
+            },
+        )
+    )
+    session.commit()
+
+    with freeze_time(FROZEN_NOW):
+        body = client.get("/reports/weekly.json").json()
+
+    assert body["alerts"]["fired"] == 1
+    assert body["alerts"]["delivered"] == 0
+    assert body["alerts"]["by_rule"] == [
+        {
+            "rule_id": "native_transport_failed",
+            "fired": 1,
+            "delivered": 0,
+        }
+    ]
+
+
 # --- HTML: same numbers, rendered --------------------------------------------
 
 
@@ -434,7 +495,6 @@ def _secured_client(settings):
     secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
     application = create_app(secured)
     with TestClient(application) as test_client:
-        Base.metadata.create_all(get_engine())
         yield test_client
 
 
@@ -526,33 +586,3 @@ def test_confidence_level_ladder():
     assert confidence_level(0.74) == "medium"
     assert confidence_level(0.75) == "high"
     assert confidence_level(1.0) == "high"
-
-
-# --- bootstrap: the Sunday briefing links the report ---------------------------
-
-
-def test_bootstrap_weekly_prompt_mentions_the_report_link():
-    """Only the Sunday weekly-planning prompt carries the report link — and it
-    instructs verbatim use of the snapshot's server-built ``weekly_report.url``
-    (token embedded by :func:`weekly_report_url` server-side). The agent must
-    never hand-construct viewer links: a bare public-base-URL + /reports/weekly
-    401s on every token-gated (i.e. phone-tappable) deployment.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "healthmes_bootstrap_reports_test", REPO_ROOT / "scripts" / "bootstrap.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    # Register before exec: the @dataclass decorator resolves the module via
-    # sys.modules (same recipe as tests/glue/conftest.py).
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-
-    jobs = {job["name"]: job for job in module.BRIEFING_JOBS}
-    weekly = jobs["healthmes-weekly-plan"]["prompt"]
-    assert "weekly_report.url" in weekly  # the snapshot field, used verbatim
-    assert "verbatim" in weekly
-    assert "Never construct" in weekly  # hand-built URLs are forbidden
-    for other in ("healthmes-morning-plan", "healthmes-evening-review"):
-        assert "/reports/weekly" not in jobs[other]["prompt"]
-        assert "weekly_report.url" not in jobs[other]["prompt"]

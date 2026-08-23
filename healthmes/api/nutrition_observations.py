@@ -492,7 +492,10 @@ def review_nutrition_observation(
     except NutritionRepositoryError as exc:
         if str(exc) == "nutrition observation not found":
             raise not_found("nutrition observation", observation_id) from exc
-        if "operation_id was already used" in str(exc):
+        if (
+            "operation_id was already used" in str(exc)
+            or str(exc) == "expired nutrition review cannot be retried"
+        ):
             raise APIError(
                 status.HTTP_409_CONFLICT,
                 "nutrition_review_operation_conflict",

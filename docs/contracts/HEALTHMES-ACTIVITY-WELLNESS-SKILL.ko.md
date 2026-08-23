@@ -7,12 +7,12 @@
 >
 > **목표 아키텍처:** 자연어 질문, LLM tool selection, Context Access Layer와
 > Hermes adapter는
-> [`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](../HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+> [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](../HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 > 를 따른다.
 >
 > **소유권:** 계산, 저장, privacy, retention과 데이터 접근 검사는 HealthMes가
-> 소유한다. 의미 기반 context selection과 최종 종합은 HealthMes Decision Agent의
-> LLM이 담당한다.
+> 소유한다. 의미 기반 context selection과 최종 종합은 HealthMes ingress가 호출한
+> Hermes의 단일 LLM turn이 담당한다.
 
 ## TLDR
 
@@ -47,7 +47,7 @@ Context Access Layer가 허용 범위와 source reference를 검사한다.
 | HealthMes activity engine | canonical 저장, 보존, 시간 경계, hourly/daily 집계, focus와 overwork context를 결정론적으로 계산한다. |
 | HealthMes compatibility resolver | 현재 `question_kind` preset에 대응하는 activity, wearable, calendar, nutrition과 time context를 조립한다. |
 | 이 skill 계약 | 현재 도구와 응답 shape를 보존한다. 목표 제품의 질문 taxonomy나 핵심 판단 엔진은 아니다. |
-| HealthMes Decision Agent | 자연어 질문을 해석하고 필요한 도구를 선택하며 여러 영역을 종합한다. |
+| Hermes decision runtime | 자연어 질문을 해석하고 필요한 HealthMes MCP 도구를 선택하며 여러 영역을 종합한다. |
 | Agent/runtime adapter | MCP 호출, 모델 실행, 대화 채널과 UI 표현을 연결한다. HealthMes 정책을 대체하지 않는다. |
 
 다음은 이 계약의 범위가 아니다.
@@ -179,8 +179,8 @@ policy 결과를 보존해서 설명하고, activity context는 휴식이나 과
 wearable, activity, calendar 또는 time context가 충분해도 위 조건을
 대체하지 않는다. 이 resolver는 context-only 계약이므로 반환하는
 `decision_ready`는 항상 `false`다. 최종 `decision_ready`와 DecisionRecord는
-후속 HealthMes Decision Agent가 LLM 종합, source reference 검증과 기록을
-완료한 뒤에만 만들 수 있다.
+후속 Hermes turn이 LLM 종합을 마치고 HealthMes가 source reference 검증과 필요한
+compact 기록을 완료한 뒤에만 만들 수 있다.
 
 ## 6. Privacy contract
 

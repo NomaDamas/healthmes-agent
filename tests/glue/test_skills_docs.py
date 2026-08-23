@@ -14,12 +14,19 @@ from pathlib import Path
 
 import pytest
 
+from healthmes.mcp_server.wellness_skills import (
+    REVIEWED_WELLNESS_SKILLS,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MCP_TOOL_PY = REPO_ROOT / "vendor" / "hermes-agent" / "tools" / "mcp_tool.py"
 SKILL_MDS = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
+WHOOP_SKILL_MD = REPO_ROOT / "skills" / "healthmes-whoop-recovery" / "SKILL.md"
+EXTENDING_DOC = REPO_ROOT / "docs" / "EXTENDING.md"
+EXPERT_ONBOARDING_DOC = REPO_ROOT / "docs" / "EXPERT-ONBOARDING.ko.md"
 
-# The two MCP servers registered by config/hermes-config.yaml.tmpl.
-SERVERS = ("healthmes", "open_wearables")
+# The product decision runtime exposes one HealthMes MCP boundary.
+SERVERS = ("healthmes",)
 
 
 def _vendor_constant(name: str) -> str:
@@ -55,8 +62,8 @@ def test_skill_docs_use_registry_tool_names(skill_md: Path) -> None:
         f"(vendor mcp_prefixed_tool_name)"
     )
 
-    # And each skill documents at least one correctly-formed name for a
-    # server registered by config/hermes-config.yaml.tmpl.
+    # And each skill documents at least one correctly-formed name for the
+    # HealthMes product MCP boundary.
     valid_starts = tuple(f"`{prefix}{server}{delim}" for server in (*SERVERS, "<server>"))
     assert any(start in text for start in valid_starts), (
         f"{skill_md} documents no {prefix}<server>{delim}<tool> names "
@@ -70,24 +77,74 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-caffeine",
         "healthmes-capture",
         "healthmes-nutrition",
+        "healthmes-nutrition-decision",
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",
+        "healthmes-wellness-decision",
         "healthmes-whoop-recovery",
     ]
-def test_whoop_recovery_skill_keeps_its_data_and_recording_boundaries() -> None:
-    text = (REPO_ROOT / "skills" / "healthmes-whoop-recovery" / "SKILL.md").read_text(
-        encoding="utf-8"
+
+
+def test_product_skills_never_call_open_wearables_directly() -> None:
+    for skill_md in SKILL_MDS:
+        text = skill_md.read_text(encoding="utf-8")
+        assert "mcp__open_wearables__" not in text, (
+            f"{skill_md} bypasses the HealthMes MCP boundary"
+        )
+
+
+def test_whoop_skill_uses_reviewed_common_wearable_contract() -> None:
+    text = WHOOP_SKILL_MD.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    assert "healthmes-whoop-recovery" in REVIEWED_WELLNESS_SKILLS
+    assert "mcp__healthmes__search_wearable" in text
+    assert "wearable.whoop-recovery-package" in text
+    assert "get_whoop_recovery_context" not in text
+    assert "record_decision" not in text
+    assert "Recovery label | Day-strain label | Level" not in text
+    assert "0 <= value <= 33" not in text
+    assert "34 <= value <= 66" not in text
+    assert "67 <= value <= 100" not in text
+    assert "Never reconstruct provider thresholds" in text
+    assert 'state: "selected"' in text
+    assert "does not mean the walk happened or was completed" in normalized
+    assert "without creating a completion record" in normalized
+    assert "one personal water bottle" in normalized
+    assert "sleep preparation 30 minutes earlier" in normalized
+
+
+def test_authoring_docs_keep_decision_and_command_audits_separate() -> None:
+    extending = EXTENDING_DOC.read_text(encoding="utf-8")
+    onboarding = EXPERT_ONBOARDING_DOC.read_text(encoding="utf-8")
+
+    assert "actual mutation is audited by its separate command workflow" in extending
+    assert "mutations keep their audit in the separate command workflow" in extending
+    assert "실제 mutation은 별도 command workflow가 자체 audit를 소유" in onboarding
+    assert "실제 mutation은 별도\n  command workflow의 audit" in onboarding
+    assert "material risk warnings, actual mutations" not in extending
+    assert "recommendations, mutations, material risk warnings" not in extending
+    assert "행동 변경 제안, 실제 mutation" not in onboarding
+    assert "행동 변경 제안, mutation, 중요 위험 경고" not in onboarding
+
+
+def test_authoring_docs_use_reviewed_wellness_skills_as_templates() -> None:
+    extending = EXTENDING_DOC.read_text(encoding="utf-8")
+    onboarding = EXPERT_ONBOARDING_DOC.read_text(encoding="utf-8")
+    reviewed = (
+        "healthmes-wellness-decision",
+        "healthmes-nutrition-decision",
+        "healthmes-caffeine",
+        "healthmes-sleep",
+        "healthmes-stress",
     )
 
-    assert "mcp__healthmes__get_whoop_recovery_context" in text
-    assert "Never recreate numeric WHOOP\n   thresholds" in text
-    assert "workout-specific" in text
-    assert "Never offer 20 or 30 minutes" in text
-    assert "separate immutable" in text
-    assert "do **not** create a\ncompletion record" in text
-    assert "v0 leaves completion unrecorded" in text
-    assert "Never put raw scores, timestamps" in text
-    assert '"source_refs": context["source_refs"]' in text
-    assert '"cycle_ids": context["cycle_ids"]' in text
-    assert "same `evidence_refs` object from the immediately preceding" in text
+    for skill_name in reviewed:
+        assert skill_name in extending
+        assert skill_name in onboarding
+    assert (
+        "`healthmes-planner` is a separate bounded command-workflow example"
+        in extending
+    )
+    assert "`healthmes-planner`는 별도 bounded command workflow의 예시" in onboarding

@@ -6,14 +6,19 @@ write backend advances accepted proposals to ``pushed`` by writing tagged
 agent blocks — the contract promised by healthmes/api/schedule.py.
 """
 
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
+from healthmes.calendars import creds
 from healthmes.calendars.base import (
+    CalendarAuthError,
     CalendarConflictError,
     CalendarEventIdentity,
     EventDraft,
@@ -30,16 +35,25 @@ from healthmes.calendars.jobs import (
     push_accepted_proposals,
     write_source,
 )
-from healthmes.calendars.state import InMemoryPendingDiffStore, InMemorySyncStateStore
+from healthmes.calendars.state import (
+    InMemoryPendingDiffStore,
+    InMemorySyncHealthStore,
+    InMemorySyncStateStore,
+    SyncCoverageKind,
+    SyncHealthStatus,
+)
 from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
+    Base,
     CalendarEventMirror,
     CalendarSource,
     ProposalStatus,
     ScheduleProposal,
     Task,
     TaskSource,
+    create_db_engine,
 )
+from tests.calendars.conftest import FakeCalendarBackend
 
 
 def utc(*args: int) -> datetime:
@@ -83,6 +97,559 @@ class TestEnablement:
 
 
 class TestJobRun:
+    def test_disconnect_waits_for_sync_and_reconnect_rebuilds_backend(
+        self,
+        settings,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite+pysqlite:///{tmp_path / 'calendar-fence.db'}"
+        )
+        engine = create_db_engine(database_url)
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        generation = {"value": "generation-1"}
+        sync_started = threading.Event()
+        release_sync = threading.Event()
+        disconnect_attempted = threading.Event()
+        disconnect_completed = threading.Event()
+        failures: list[BaseException] = []
+
+        class BlockingBackend(FakeCalendarBackend):
+            def list_changes(self, sync_state):
+                sync_started.set()
+                assert release_sync.wait(timeout=5)
+                return super().list_changes(sync_state)
+
+        backends = [
+            BlockingBackend(CalendarSource.GOOGLE),
+            FakeCalendarBackend(CalendarSource.GOOGLE),
+        ]
+        factory_calls = 0
+
+        def build_backend():
+            nonlocal factory_calls
+            backend = backends[factory_calls]
+            factory_calls += 1
+            return backend
+
+        job = build_calendar_job(
+            settings.model_copy(update={"database_url": database_url}),
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=build_backend,
+            session_factory=factory,
+            state_store=InMemorySyncStateStore(),
+            pending_store=InMemoryPendingDiffStore(),
+            health_store=InMemorySyncHealthStore(),
+            connection_generation_resolver=lambda: generation["value"],
+        )
+
+        def run_sync() -> None:
+            try:
+                job()
+            except BaseException as exc:
+                failures.append(exc)
+
+        def disconnect() -> None:
+            try:
+                disconnect_attempted.set()
+                with factory() as session:
+                    with creds.calendar_connection_write(
+                        session,
+                        CalendarSource.GOOGLE,
+                    ):
+                        generation["value"] = None
+                disconnect_completed.set()
+            except BaseException as exc:
+                failures.append(exc)
+
+        sync_thread = threading.Thread(target=run_sync)
+        disconnect_thread = threading.Thread(target=disconnect)
+        try:
+            sync_thread.start()
+            assert sync_started.wait(timeout=5)
+            disconnect_thread.start()
+            assert disconnect_attempted.wait(timeout=5)
+            time.sleep(0.1)
+            assert not disconnect_completed.is_set()
+
+            release_sync.set()
+            sync_thread.join(timeout=10)
+            disconnect_thread.join(timeout=10)
+
+            assert not sync_thread.is_alive()
+            assert not disconnect_thread.is_alive()
+            assert disconnect_completed.is_set()
+            assert failures == []
+            assert factory_calls == 1
+            assert len(backends[0].received_sync_states) == 1
+
+            assert job() is None
+            assert factory_calls == 1
+            assert len(backends[0].received_sync_states) == 1
+
+            with factory() as session:
+                with creds.calendar_connection_write(
+                    session,
+                    CalendarSource.GOOGLE,
+                ):
+                    generation["value"] = "generation-2"
+
+            assert job() is not None
+            assert factory_calls == 2
+            assert len(backends[0].received_sync_states) == 1
+            assert len(backends[1].received_sync_states) == 1
+        finally:
+            release_sync.set()
+            sync_thread.join(timeout=5)
+            disconnect_thread.join(timeout=5)
+            engine.dispose()
+
+    def test_health_attempt_precedes_backend_construction_and_empty_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        timeline: list[str] = []
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 2),
+            ]
+        )
+
+        class OrderedHealthStore(InMemorySyncHealthStore):
+            def record_attempt(self, source, at) -> None:
+                timeline.append("attempt")
+                super().record_attempt(source, at)
+
+            def record_success(
+                self,
+                source,
+                at,
+                *,
+                event_count,
+                coverage_kind=SyncCoverageKind.UNKNOWN,
+                coverage_start=None,
+                coverage_end=None,
+                account_generation=None,
+            ) -> None:
+                timeline.append("success")
+                super().record_success(
+                    source,
+                    at,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                    account_generation=account_generation,
+                )
+
+        health_store = OrderedHealthStore()
+
+        def build_backend():
+            timeline.append("backend")
+            return fake_backend
+
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=build_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        assert timeline == ["attempt", "backend", "success"]
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert health.last_attempt_at == utc(2026, 8, 12, 9)
+        assert health.last_success_at == utc(2026, 8, 12, 9, 0, 2)
+        assert health.last_success_event_count == 0
+
+    def test_health_success_is_recorded_after_calendar_commit(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        make_event,
+    ) -> None:
+        fake_backend.queue_changes(
+            [make_event("health-commit", summary="Private planning title")],
+            {"sync_token": "tok-1"},
+        )
+
+        class CommitObservingHealthStore(InMemorySyncHealthStore):
+            def record_success(
+                self,
+                source,
+                at,
+                *,
+                event_count,
+                coverage_kind=SyncCoverageKind.UNKNOWN,
+                coverage_start=None,
+                coverage_end=None,
+                account_generation=None,
+            ) -> None:
+                with session_factory() as observer:
+                    rows = observer.scalars(
+                        select(CalendarEventMirror).where(
+                            CalendarEventMirror.calendar_source == source
+                        )
+                    ).all()
+                assert [row.external_id for row in rows] == ["health-commit"]
+                assert event_count == 1
+                super().record_success(
+                    source,
+                    at,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                    account_generation=account_generation,
+                )
+
+        health_store = CommitObservingHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 2),
+            ]
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.SUCCESS
+        assert health.last_success_event_count == 1
+
+    def test_backend_failure_records_sanitized_code_without_message(
+        self,
+        settings,
+        session_factory,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        credential = "user@example.test:super-secret-app-password"
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+            ]
+        )
+
+        def exploding_factory():
+            raise CalendarAuthError(credential)
+
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=exploding_factory,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is None
+        health = health_store.load(CalendarSource.GOOGLE)
+        assert health is not None
+        assert health.status is SyncHealthStatus.RECENT_FAILURE
+        assert health.last_error_code == "calendar_auth_error"
+        assert credential not in repr(health)
+
+    def test_success_then_failure_and_recovery_preserve_history(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+                utc(2026, 8, 12, 9, 5),
+                utc(2026, 8, 12, 9, 5, 1),
+                utc(2026, 8, 12, 9, 10),
+                utc(2026, 8, 12, 9, 10, 1),
+            ]
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        original_list_changes = fake_backend.list_changes
+
+        def fail_sync(_state):
+            raise TimeoutError("private provider response")
+
+        fake_backend.list_changes = fail_sync
+        assert job() is None
+        failed = health_store.load(fake_backend.source)
+        assert failed is not None
+        assert failed.status is SyncHealthStatus.RECENT_FAILURE
+        assert failed.last_success_at == utc(2026, 8, 12, 9, 0, 1)
+        assert failed.last_error_code == "calendar_timeout"
+
+        fake_backend.list_changes = original_list_changes
+        assert job() is not None
+        recovered = health_store.load(fake_backend.source)
+        assert recovered is not None
+        assert recovered.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert recovered.last_failure_at == utc(2026, 8, 12, 9, 5, 1)
+        assert recovered.last_error_code == "calendar_timeout"
+        assert recovered.last_success_at == utc(2026, 8, 12, 9, 10, 1)
+
+    @pytest.mark.parametrize(
+        "failing_method",
+        ["record_attempt", "record_success"],
+    )
+    def test_health_write_failure_does_not_mask_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        failing_method,
+    ) -> None:
+        class FailingHealthStore(InMemorySyncHealthStore):
+            def record_attempt(self, source, at) -> None:
+                if failing_method == "record_attempt":
+                    raise OSError("health store unavailable")
+                super().record_attempt(source, at)
+
+            def record_success(
+                self,
+                source,
+                at,
+                *,
+                event_count,
+                coverage_kind=SyncCoverageKind.UNKNOWN,
+                coverage_start=None,
+                coverage_end=None,
+                account_generation=None,
+            ) -> None:
+                if failing_method == "record_success":
+                    raise OSError("health store unavailable")
+                super().record_success(
+                    source,
+                    at,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                    account_generation=account_generation,
+                )
+
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=FailingHealthStore(),
+            clock=lambda: utc(2026, 8, 12, 9),
+        )
+
+        result = job()
+
+        assert result is not None
+        with session_factory() as persisted:
+            assert persisted.scalars(select(CalendarEventMirror)).all() == []
+
+    def test_failure_health_write_does_not_escape_scheduler(
+        self,
+        settings,
+        session_factory,
+    ) -> None:
+        class FailingHealthStore(InMemorySyncHealthStore):
+            def record_failure(self, source, at, *, error_code) -> None:
+                raise OSError("health store unavailable")
+
+        def exploding_factory():
+            raise RuntimeError("private backend failure")
+
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=exploding_factory,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=FailingHealthStore(),
+            clock=lambda: utc(2026, 8, 12, 9),
+        )
+
+        assert job() is None
+
+    def test_writeback_exception_does_not_replace_inbound_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        monkeypatch,
+    ) -> None:
+        with session_factory() as setup:
+            task = Task(title="Retry calendar writeback")
+            setup.add(task)
+            setup.flush()
+            proposal = ScheduleProposal(
+                task_id=task.id,
+                proposed_start=utc(2026, 8, 12, 10),
+                proposed_end=utc(2026, 8, 12, 11),
+                status=ProposalStatus.ACCEPTED,
+            )
+            setup.add(proposal)
+            setup.commit()
+            proposal_id = proposal.id
+
+        health_store = InMemorySyncHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+                utc(2026, 8, 12, 9, 0, 2),
+                utc(2026, 8, 12, 9, 0, 3),
+            ]
+        )
+
+        def fail_writeback(*_args, **_kwargs):
+            raise TimeoutError("private provider response")
+
+        monkeypatch.setattr(
+            "healthmes.calendars.jobs.push_accepted_proposals",
+            fail_writeback,
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert health.last_success_at == utc(2026, 8, 12, 9, 0, 1)
+        assert health.last_failure_at is None
+        assert health.writeback_last_attempt_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            2,
+        )
+        assert health.writeback_last_failure_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            3,
+        )
+        assert health.writeback_last_error_code == "calendar_timeout"
+        assert health.writeback_attempted_count == 1
+        assert health.writeback_succeeded_count == 0
+        assert health.writeback_failed_count == 1
+        with session_factory() as persisted:
+            assert persisted.get(ScheduleProposal, proposal_id).status is (
+                ProposalStatus.ACCEPTED
+            )
+
+    def test_writeback_preparation_failure_does_not_replace_inbound_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        monkeypatch,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+                utc(2026, 8, 12, 9, 0, 2),
+                utc(2026, 8, 12, 9, 0, 3),
+            ]
+        )
+
+        def fail_preparation(_session):
+            raise RuntimeError("private writeback preparation failure")
+
+        monkeypatch.setattr(
+            "healthmes.calendars.jobs._accepted_proposal_ids",
+            fail_preparation,
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert health.last_success_at == utc(2026, 8, 12, 9, 0, 1)
+        assert health.last_failure_at is None
+        assert health.writeback_last_attempt_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            2,
+        )
+        assert health.writeback_last_failure_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            3,
+        )
+        assert health.writeback_last_error_code == "calendar_sync_error"
+        assert health.writeback_attempted_count == 0
+        assert health.writeback_succeeded_count == 0
+        assert health.writeback_failed_count == 0
+
     def test_intake_opt_out_is_sticky_until_hm_is_readded(self, session) -> None:
         mirror = CalendarEventMirror(
             external_id="hm-opt-out",
@@ -166,6 +733,7 @@ class TestJobRun:
             proposed_end=mirror.end_at,
             status=ProposalStatus.ACCEPTED,
             intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=mirror.connection_generation,
             intake_external_id=mirror.external_id,
             intake_revision=intake_revision(mirror),
         )
@@ -216,6 +784,7 @@ class TestJobRun:
             proposed_end=mirror.end_at,
             status=ProposalStatus.ACCEPTED,
             intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=mirror.connection_generation,
             intake_external_id=mirror.external_id,
             intake_revision=intake_revision(mirror),
         )
@@ -239,6 +808,144 @@ class TestJobRun:
         assert fake_backend.created_drafts == []
         assert session.get(ScheduleProposal, proposal.id).status is (
             ProposalStatus.INVALIDATED
+        )
+        assert session.get(
+            ScheduleProposal,
+            proposal.id,
+        ).invalidation_reason == "calendar_intake_event_changed"
+
+    def test_cross_provider_timed_intake_uses_original_account_generation(
+        self,
+        session,
+        fake_backend_factory,
+        monkeypatch,
+    ) -> None:
+        google_generation = "google-account-a"
+        caldav_generation = "caldav-account-b"
+        task = Task(title="Use existing Google block", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        mirror = CalendarEventMirror(
+            external_id="google-timed-intake",
+            calendar_source=CalendarSource.GOOGLE,
+            connection_generation=google_generation,
+            summary="[HM] Use existing Google block",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+            intake_task_id=task.id,
+        )
+        session.add(mirror)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=mirror.start_at,
+            proposed_end=mirror.end_at,
+            status=ProposalStatus.ACCEPTED,
+            intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=google_generation,
+            intake_external_id=mirror.external_id,
+            intake_revision=intake_revision(mirror),
+        )
+        session.add(proposal)
+        session.commit()
+        caldav_backend = fake_backend_factory(CalendarSource.CALDAV)
+        service = CalendarMirrorService(
+            session,
+            [caldav_backend],
+            InMemorySyncStateStore(),
+            account_generation=caldav_generation,
+        )
+        lock_entries: list[tuple[CalendarSource, ...]] = []
+
+        @contextmanager
+        def capture_lock_plan(waiting_session, sources):
+            assert not waiting_session.in_transaction()
+            lock_entries.append(tuple(sources))
+            yield
+
+        monkeypatch.setattr(
+            "healthmes.calendars.jobs.calendar_write_locks",
+            capture_lock_plan,
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            CalendarSource.CALDAV,
+            current_account_generations={
+                CalendarSource.GOOGLE: google_generation,
+                CalendarSource.CALDAV: caldav_generation,
+            },
+        ) == 1
+
+        assert caldav_backend.created_drafts == []
+        assert lock_entries == [
+            (CalendarSource.GOOGLE, CalendarSource.CALDAV)
+        ]
+        stored = session.get(ScheduleProposal, proposal.id)
+        assert stored.status is ProposalStatus.PUSHED
+        assert stored.invalidation_reason is None
+
+    def test_timed_intake_from_reconnected_account_is_explicitly_stale(
+        self,
+        session,
+        fake_backend,
+    ) -> None:
+        original_generation = "google-account-a"
+        task = Task(title="Stale account block", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        mirror = CalendarEventMirror(
+            external_id="stale-google-intake",
+            calendar_source=CalendarSource.GOOGLE,
+            connection_generation=original_generation,
+            summary="[HM] Stale account block",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+            intake_task_id=task.id,
+        )
+        session.add(mirror)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=mirror.start_at,
+            proposed_end=mirror.end_at,
+            status=ProposalStatus.ACCEPTED,
+            intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=original_generation,
+            intake_external_id=mirror.external_id,
+            intake_revision=intake_revision(mirror),
+        )
+        session.add(proposal)
+        session.commit()
+        service = CalendarMirrorService(
+            session,
+            [fake_backend],
+            InMemorySyncStateStore(),
+            account_generation="google-account-b",
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            CalendarSource.GOOGLE,
+            current_account_generations={
+                CalendarSource.GOOGLE: "google-account-b"
+            },
+        ) == 0
+
+        assert fake_backend.created_drafts == []
+        stored = session.get(ScheduleProposal, proposal.id)
+        assert stored.status is ProposalStatus.INVALIDATED
+        assert (
+            stored.invalidation_reason
+            == "calendar_intake_account_changed"
         )
 
     def test_all_day_intake_still_creates_provider_agnostic_output_block(
@@ -704,12 +1411,13 @@ class TestJobRun:
         lock_entries: list[bool] = []
 
         @contextmanager
-        def assert_connection_free(waiting_session, _source):
+        def assert_connection_free(waiting_session, sources):
             lock_entries.append(waiting_session.in_transaction())
+            assert tuple(sources) == (CalendarSource.GOOGLE,)
             yield
 
         monkeypatch.setattr(
-            "healthmes.calendars.jobs.calendar_write_lock",
+            "healthmes.calendars.jobs.calendar_write_locks",
             assert_connection_free,
         )
         service = CalendarMirrorService(

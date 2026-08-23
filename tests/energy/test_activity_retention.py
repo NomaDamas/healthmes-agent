@@ -20,6 +20,7 @@ def _usage(device_id: str, bucket_start: datetime) -> AppUsageSample:
 
 def test_cognitive_energy_hides_expired_legacy_usage_before_maintenance(
     session,
+    settings,
 ) -> None:
     update_retention_policy(session, "activity_raw", "1d")
     now = datetime.now(UTC)
@@ -41,8 +42,16 @@ def test_cognitive_energy_hides_expired_legacy_usage_before_maintenance(
     )
     session.flush()
 
-    expired_context = load_store_day_context(session, expired.date())
-    retained_context = load_store_day_context(session, retained.date())
+    expired_context = load_store_day_context(
+        session,
+        settings,
+        expired.date(),
+    )
+    retained_context = load_store_day_context(
+        session,
+        settings,
+        retained.date(),
+    )
 
     assert expired_context.usage == ()
     assert [row.app_package for row in retained_context.usage] == [

@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import select
 
 from healthmes.activity.android import ANDROID_BUCKET_SNAPSHOT_EVENT
@@ -15,8 +16,6 @@ from healthmes.activity.repository import (
 )
 from healthmes.storage import update_retention_policy
 from healthmes.store import AppUsageSample, WellnessEvent
-
-pytestmark = pytest.mark.usefixtures("fixture_clock")
 
 
 def _batch(samples):
@@ -91,12 +90,17 @@ def _set_generation(
 
 @pytest.fixture(autouse=True)
 def register_default_generation(client):
-    response = _set_generation(
-        client,
-        generation=0,
-        observed_at="2026-08-01T09:00:00Z",
-    )
-    assert response.status_code == 200
+    # Build FastAPI outside freezegun, then keep the dated payloads inside the
+    # default 14-day activity retention window for the entire test.
+    assert client.get("/v1/activity/devices/clock-prime/collection").status_code == 200
+    with freeze_time("2026-08-14 12:00:00", tick=True, real_asyncio=True):
+        response = _set_generation(
+            client,
+            generation=0,
+            observed_at="2026-08-01T09:00:00Z",
+        )
+        assert response.status_code == 200
+        yield
 
 
 SAMPLE_SLACK = {
@@ -615,9 +619,8 @@ def test_incomplete_empty_source_set_preserves_completed_hour_and_new_upload(
 def test_expired_incomplete_heartbeat_does_not_block_current_snapshot(
     client,
     session,
-    fixture_clock,
 ):
-    now = fixture_clock()
+    now = datetime.now(UTC)
     update_retention_policy(
         session,
         "activity_raw",
@@ -683,9 +686,8 @@ def test_expired_incomplete_heartbeat_does_not_block_current_snapshot(
 def test_empty_authoritative_snapshot_outside_retention_is_rejected(
     client,
     session,
-    fixture_clock,
 ):
-    now = fixture_clock()
+    now = datetime.now(UTC)
     update_retention_policy(
         session,
         "activity_raw",
@@ -758,9 +760,8 @@ def test_future_empty_authoritative_snapshot_is_rejected_without_fence(
 def test_activity_maintenance_expires_android_snapshot_state(
     client,
     session,
-    fixture_clock,
 ):
-    bucket_start = (fixture_clock() - timedelta(hours=2)).replace(
+    bucket_start = (datetime.now(UTC) - timedelta(hours=2)).replace(
         minute=0,
         second=0,
         microsecond=0,

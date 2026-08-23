@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# noqa: SIZE_OK — one SQL repository owns the complete atomic transition contract.
+# One SQL repository owns the complete atomic transition contract.
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -8,7 +8,9 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.calendars.adjustments_types import (
     APPLYING_RECONCILE_DELAY,
     MORNING_NUDGE_RULE_ID,
@@ -146,6 +148,7 @@ class SqlAlchemyAdjustmentRepository:
         proposal = CalendarMutationProposal(
             id=proposal_id,
             calendar_source=snapshot.calendar_source,
+            account_generation=snapshot.account_generation,
             mirror_event_id=snapshot.mirror_event_id,
             external_event_id=snapshot.external_event_id,
             operation=AdjustmentOperation.SHORTEN,
@@ -226,13 +229,47 @@ class SqlAlchemyAdjustmentRepository:
 
     def update_mirror_after_apply(
         self, proposal: StoredAdjustmentProposal, event: ExternalEvent
-    ) -> None:
-        mirror = self._session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
-        if mirror is None:
-            return
-        mirror.end_at = event.end_at
-        mirror.etag = event.etag
+    ) -> bool:
+        snapshot = proposal.snapshot
+        if snapshot.mirror_event_id is None:
+            return False
+        result = self._session.execute(
+            sa.update(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.id == snapshot.mirror_event_id,
+                CalendarEventMirror.calendar_source
+                == snapshot.calendar_source,
+                (
+                    CalendarEventMirror.connection_generation.is_(None)
+                    if snapshot.account_generation is None
+                    else CalendarEventMirror.connection_generation
+                    == snapshot.account_generation
+                ),
+                CalendarEventMirror.external_id
+                == snapshot.external_event_id,
+                CalendarEventMirror.start_at
+                == snapshot.original_start_at,
+                CalendarEventMirror.end_at == snapshot.original_end_at,
+                CalendarEventMirror.etag == snapshot.expected_etag,
+            )
+            .values(
+                end_at=event.end_at,
+                etag=event.etag,
+                updated_at=sa.func.now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
         self._session.flush()
+        if result.rowcount != 1:
+            return False
+        identity = self._session.get(
+            CalendarEventMirror,
+            snapshot.mirror_event_id,
+        )
+        if identity is not None:
+            set_committed_value(identity, "end_at", event.end_at)
+            set_committed_value(identity, "etag", event.etag)
+        return True
 
     def compare_and_mark_terminal(
         self,
@@ -300,6 +337,7 @@ class SqlAlchemyAdjustmentRepository:
     def _from_model(row: CalendarMutationProposal) -> StoredAdjustmentProposal:
         snapshot = ProposalSnapshot(
             calendar_source=row.calendar_source,
+            account_generation=row.account_generation,
             mirror_event_id=row.mirror_event_id,
             external_event_id=row.external_event_id,
             operation=row.operation,
@@ -329,8 +367,13 @@ class SqlAlchemyAdjustmentRepository:
         )
 
     def _begin_immediate_if_possible(self) -> None:
+        # The daily claim writes TriggerEvent and DecisionRecord rows. Acquire
+        # the global write plane before SQLite's immediate transaction or the
+        # PostgreSQL dedup advisory lock to preserve one canonical lock order.
+        transaction_was_active = self._session.in_transaction()
+        lock_activity_write_plane(self._session)
         bind = self._session.get_bind()
-        if bind.dialect.name != "sqlite" or self._session.in_transaction():
+        if bind.dialect.name != "sqlite" or transaction_was_active:
             return
         self._session.execute(sa.text("BEGIN IMMEDIATE"))
         self.begin_immediate_attempted = True

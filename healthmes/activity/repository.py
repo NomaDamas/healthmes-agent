@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from healthmes import clock
 from healthmes.activity.contracts import (
     ActivityBatchIn,
+    ActivityBatchOut,
     ActivityCapability,
     ActivityCollectionStatusUpdate,
     ActivityCollectionUpdate,
@@ -26,6 +27,8 @@ from healthmes.activity.contracts import (
     ActivityState,
     AppHourRecord,
     AppIntervalRecord,
+    ios_app_token_key_id,
+    is_ios_app_token,
 )
 from healthmes.activity.locking import (
     activity_write_lock,
@@ -64,6 +67,7 @@ ACTIVITY_RETENTION_DEFAULTS: dict[str, int | None] = {
 
 CONTROL_PROVIDER = "healthmes-activity-control"
 DELETION_PROVIDER = "healthmes-activity-deletion"
+IOS_PROVIDER = "ios-device-activity"
 SUMMARY_PROVIDER = "healthmes-activity-aggregator"
 RAW_EVENT_TYPES = (APP_HOUR_EVENT, APP_INTERVAL_EVENT)
 SUMMARY_EVENT_TYPES = (HOUR_SUMMARY_EVENT, DAY_SUMMARY_EVENT)
@@ -80,6 +84,31 @@ CONTROL_LOCK_PREFIX = "healthmes:activity:control:"
 
 class ActivityConflictError(ValueError):
     """A source identity was reused for different immutable input."""
+
+
+class InvalidIOSAppTokenError(ValueError):
+    """An iOS exclusion was not keyed by the device pseudonym secret."""
+
+
+def ios_exclusion_namespace(
+    excluded_apps: Sequence[object],
+) -> tuple[bool, str | None]:
+    """Return whether exclusions form one valid iOS pseudonym namespace."""
+
+    if any(
+        not isinstance(value, str) or not is_ios_app_token(value)
+        for value in excluded_apps
+    ):
+        return False, None
+    key_ids = {
+        key_id
+        for value in excluded_apps
+        for key_id in (ios_app_token_key_id(value),)
+        if key_id is not None
+    }
+    if len(key_ids) > 1:
+        return False, None
+    return True, next(iter(key_ids), None)
 
 
 class ActivityWriteConflictError(RuntimeError):
@@ -120,6 +149,7 @@ class IOSSnapshotFence:
     manifest_sha256: str
     snapshot_start: datetime
     snapshot_end: datetime
+    accepted_response: ActivityBatchOut | None
 
 
 def as_utc(value: datetime) -> datetime:
@@ -487,6 +517,36 @@ def _record_payload(
             "coverage_seconds": record.coverage_seconds,
             "bucket_complete": record.bucket_complete,
         }
+        if record.coverage_only:
+            payload["coverage_only"] = True
+        if record.coverage_status is not None:
+            payload["coverage_status"] = record.coverage_status.value
+        for key, value in (
+            (
+                "observed_activity_seconds",
+                record.observed_activity_seconds,
+            ),
+            (
+                "represented_app_seconds",
+                record.represented_app_seconds,
+            ),
+            (
+                "privacy_filtered_seconds",
+                record.privacy_filtered_seconds,
+            ),
+            (
+                "website_activity_seconds",
+                record.website_activity_seconds,
+            ),
+            (
+                "unknown_activity_seconds",
+                record.unknown_activity_seconds,
+            ),
+        ):
+            if value is not None:
+                payload[key] = value
+        if not record.launches_observed:
+            payload["launches_observed"] = False
         if record.snapshot_sequence is not None:
             payload["snapshot_sequence"] = record.snapshot_sequence
         return payload
@@ -544,7 +604,11 @@ def _provisional_hour_replacement_allowed(
         previous.get("foreground_seconds") or 0
     ):
         return False
-    if record.launches < int(previous.get("launches") or 0):
+    if (
+        record.launches_observed
+        and previous.get("launches_observed", True) is not False
+        and record.launches < int(previous.get("launches") or 0)
+    ):
         return False
     return as_utc(batch.collected_at) > as_utc(existing.recorded_at)
 
@@ -556,8 +620,16 @@ def _hour_snapshot_content(payload: dict[str, Any]) -> tuple[Any, ...]:
         payload.get("app_id"),
         payload.get("foreground_seconds"),
         payload.get("launches"),
+        payload.get("launches_observed", True),
         payload.get("category"),
         payload.get("coverage_seconds"),
+        payload.get("coverage_only", False),
+        payload.get("coverage_status"),
+        payload.get("observed_activity_seconds"),
+        payload.get("represented_app_seconds"),
+        payload.get("privacy_filtered_seconds"),
+        payload.get("website_activity_seconds"),
+        payload.get("unknown_activity_seconds"),
         payload.get("bucket_complete"),
     )
 
@@ -769,6 +841,7 @@ CONFIG_KEYS = {
     "excluded_apps",
     "paused_until",
     "config_revision",
+    "ios_pseudonym_key_id",
 }
 STATUS_KEYS = {
     "device_id",
@@ -894,6 +967,19 @@ def _cursor_source_id(device_id: str, cursor_key: str) -> str:
     return f"cursor:{digest}"
 
 
+def _default_collection_enabled(
+    device_id: str,
+    platform: ActivityPlatform,
+) -> bool:
+    # Versioned iPhone collector identities are introduced by the Keychain
+    # migration in PR #138. They must be registered through the input control
+    # plane before upload; arbitrary legacy IDs retain compatibility.
+    return not (
+        platform is ActivityPlatform.IOS
+        and device_id.startswith("ios-collector-v1-")
+    )
+
+
 def default_control_payload(
     device_id: str,
     *,
@@ -902,7 +988,7 @@ def default_control_payload(
     return {
         "device_id": device_id,
         "platform": platform.value,
-        "enabled": True,
+        "enabled": _default_collection_enabled(device_id, platform),
         "excluded_apps": [],
         "paused_until": None,
         "permission_status": ActivityPermissionStatus.UNKNOWN.value,
@@ -925,6 +1011,10 @@ def lock_activity_control_device(session: Session, device_id: str) -> None:
     """Serialize one device's control boundary across PostgreSQL processes."""
     if session.get_bind().dialect.name != "postgresql":
         return
+    # Retention and backup take the shared write plane first. Keep every
+    # per-device transaction lock behind that same boundary so no caller can
+    # accidentally establish the reverse lock order.
+    lock_activity_write_plane(session)
     session.execute(
         text(
             "SELECT pg_advisory_xact_lock("
@@ -1004,13 +1094,96 @@ def _legacy_control_payload(
     return dict(event.payload) if event is not None and isinstance(event.payload, dict) else {}
 
 
+def _fresh_control_payload(
+    session: Session,
+    device_id: str,
+    *,
+    platform: ActivityPlatform,
+) -> dict[str, Any]:
+    def one_payload(statement) -> dict[str, Any]:
+        value = session.scalar(
+            statement.with_only_columns(
+                WellnessEvent.payload,
+                maintain_column_froms=True,
+            )
+        )
+        return dict(value) if isinstance(value, dict) else {}
+
+    payload = {
+        **default_control_payload(device_id, platform=platform),
+        **one_payload(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == COLLECTION_CONTROL_EVENT,
+                WellnessEvent.source_provider == CONTROL_PROVIDER,
+                WellnessEvent.source_record_id.in_(
+                    (
+                        _control_source_id(device_id),
+                        "device:"
+                        + hashlib.sha256(
+                            device_id.encode("utf-8")
+                        ).hexdigest()[:32],
+                    )
+                ),
+            )
+        ),
+    }
+    payload.update(
+        one_payload(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == COLLECTION_STATUS_EVENT,
+                WellnessEvent.source_provider == CONTROL_PROVIDER,
+                WellnessEvent.source_record_id
+                == _control_source_id(device_id, "status"),
+            )
+        )
+    )
+    payload.update(
+        one_payload(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == COLLECTION_CONFIG_EVENT,
+                WellnessEvent.source_provider == CONTROL_PROVIDER,
+                WellnessEvent.source_record_id
+                == _control_source_id(device_id, "config"),
+            )
+        )
+    )
+    cursor_payloads = session.scalars(
+        select(WellnessEvent.payload).where(
+            WellnessEvent.event_type == COLLECTION_CURSOR_EVENT,
+            WellnessEvent.source_provider == CONTROL_PROVIDER,
+            WellnessEvent.source_device == device_id,
+        )
+    )
+    cursors = dict(payload.get("cursors") or {})
+    for value in cursor_payloads:
+        if not isinstance(value, dict):
+            continue
+        cursor_key = value.get("cursor_key")
+        cursor_value = value.get("cursor_value")
+        if isinstance(cursor_key, str) and isinstance(
+            cursor_value,
+            str,
+        ):
+            cursors[cursor_key] = cursor_value
+    payload["cursors"] = cursors
+    payload["device_id"] = device_id
+    return payload
+
+
 def get_control_payload(
     session: Session,
     device_id: str,
     *,
     platform: ActivityPlatform = ActivityPlatform.UNKNOWN,
     lock: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
+    if refresh and not lock:
+        return _fresh_control_payload(
+            session,
+            device_id,
+            platform=platform,
+        )
     if lock:
         lock_activity_control_device(session, device_id)
     payload = {
@@ -1169,6 +1342,7 @@ def get_ios_snapshot_fence(
     digest = event.payload.get("manifest_sha256")
     start = parse_optional_datetime(event.payload.get("snapshot_start"))
     end = parse_optional_datetime(event.payload.get("snapshot_end"))
+    response_payload = event.payload.get("accepted_response")
     if (
         not isinstance(sequence, int)
         or isinstance(sequence, bool)
@@ -1180,12 +1354,23 @@ def get_ios_snapshot_fence(
         or start >= end
     ):
         raise ActivityWriteConflictError("iOS snapshot fence is malformed")
+    accepted_response: ActivityBatchOut | None = None
+    if response_payload is not None:
+        try:
+            accepted_response = ActivityBatchOut.model_validate(
+                response_payload
+            )
+        except ValueError as exc:
+            raise ActivityWriteConflictError(
+                "iOS snapshot fence response is malformed"
+            ) from exc
     return IOSSnapshotFence(
         collection_generation=collection_generation,
         sequence=sequence,
         manifest_sha256=digest,
         snapshot_start=start,
         snapshot_end=end,
+        accepted_response=accepted_response,
     )
 
 
@@ -1198,6 +1383,7 @@ def persist_ios_snapshot_fence(
     manifest_sha256: str,
     snapshot_start: datetime,
     snapshot_end: datetime,
+    accepted_response: ActivityBatchOut,
     now: datetime | None = None,
 ) -> IOSSnapshotFence:
     if sequence < 1 or len(manifest_sha256) != 64:
@@ -1218,6 +1404,7 @@ def persist_ios_snapshot_fence(
             "manifest_sha256": manifest_sha256,
             "snapshot_start": start.isoformat(),
             "snapshot_end": end.isoformat(),
+            "accepted_response": accepted_response.model_dump(mode="json"),
         },
         event_type=IOS_SNAPSHOT_FENCE_EVENT,
         source_record_id=_control_source_id(
@@ -1232,6 +1419,7 @@ def persist_ios_snapshot_fence(
         manifest_sha256=manifest_sha256,
         snapshot_start=start,
         snapshot_end=end,
+        accepted_response=accepted_response,
     )
 
 
@@ -1343,20 +1531,86 @@ def update_collection_config(
         lock_activity_write_plane(session)
         lock_activity_control_device(session, device_id)
         for attempt in range(2):
+            stored = _control_payload_for_update(
+                session,
+                device_id,
+                event_type=COLLECTION_CONFIG_EVENT,
+                kind="config",
+                allowed_keys=CONFIG_KEYS,
+            )
+            initial_platform = (
+                update.platform.value
+                if update.platform is not None
+                else str(
+                    stored.get("platform")
+                    or ActivityPlatform.UNKNOWN.value
+                )
+            )
+            try:
+                initial_platform_value = ActivityPlatform(initial_platform)
+            except ValueError:
+                initial_platform_value = ActivityPlatform.UNKNOWN
             payload = {
                 "device_id": device_id,
-                "enabled": True,
+                "enabled": _default_collection_enabled(
+                    device_id,
+                    initial_platform_value,
+                ),
                 "excluded_apps": [],
                 "paused_until": None,
                 "config_revision": 0,
-                **_control_payload_for_update(
-                    session,
-                    device_id,
-                    event_type=COLLECTION_CONFIG_EVENT,
-                    kind="config",
-                    allowed_keys=CONFIG_KEYS,
-                ),
+                **stored,
             }
+            effective_platform = (
+                update.platform.value
+                if update.platform is not None
+                else str(
+                    payload.get("platform")
+                    or ActivityPlatform.UNKNOWN.value
+                )
+            )
+            effective_excluded_apps = (
+                update.excluded_apps
+                if update.excluded_apps is not None
+                else list(payload.get("excluded_apps") or [])
+            )
+            if effective_platform == ActivityPlatform.IOS.value:
+                exclusions_valid, exclusion_key_id = (
+                    ios_exclusion_namespace(effective_excluded_apps)
+                )
+                invalid_exclusions_supplied = (
+                    update.excluded_apps is not None
+                    and not exclusions_valid
+                )
+                resume_requested = (
+                    "paused_until" in update.model_fields_set
+                    and update.paused_until is None
+                )
+                enable_requested = update.enabled is True
+                containment_requested = (
+                    update.enabled is False
+                    or (
+                        "paused_until" in update.model_fields_set
+                        and update.paused_until is not None
+                    )
+                )
+                if not exclusions_valid and (
+                    invalid_exclusions_supplied
+                    or enable_requested
+                    or resume_requested
+                    or not containment_requested
+                ):
+                    raise InvalidIOSAppTokenError(
+                        "iOS excluded apps must be v2 tokens from one "
+                        "device pseudonym key namespace"
+                    )
+                effective_key_id = (
+                    exclusion_key_id
+                    if exclusions_valid
+                    else payload.get("ios_pseudonym_key_id")
+                )
+            else:
+                effective_key_id = None
             changed = False
             if update.platform is not None and payload.get("platform") != update.platform.value:
                 payload["platform"] = update.platform.value
@@ -1368,6 +1622,12 @@ def update_collection_config(
                 if payload["excluded_apps"] != update.excluded_apps:
                     payload["excluded_apps"] = update.excluded_apps
                     changed = True
+            if payload.get("ios_pseudonym_key_id") != effective_key_id:
+                if effective_key_id is None:
+                    payload.pop("ios_pseudonym_key_id", None)
+                else:
+                    payload["ios_pseudonym_key_id"] = effective_key_id
+                changed = True
             if "paused_until" in update.model_fields_set:
                 value = iso_or_none(update.paused_until)
                 if payload["paused_until"] != value:
@@ -1929,6 +2189,9 @@ def serialize_collection_state(
         "coverage": payload.get("coverage"),
         "config_revision": int(payload.get("config_revision", 0)),
         "cursors": dict(payload.get("cursors") or {}),
+        "ios_pseudonym_key_id": payload.get(
+            "ios_pseudonym_key_id"
+        ),
     }
 
 

@@ -5,7 +5,7 @@
 > **지위:** HealthMes의 잠재적 해자에 대한 소유자 결정 기록.
 >
 > **관련 문서:** `ACTIVITY-WELLNESS-MVP.ko.md`,
-> `HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`,
+> `HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`,
 > `contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`,
 > `WELLNESS-DATA-PLATFORM.ko.md`, `COMPETITIVE-LANDSCAPE.ko.md`
 
@@ -34,10 +34,10 @@ HealthMes가 만들려는 것은 이 기능들의 단순한 모음이 아니다.
 사용자의 질문
     |
     v
-HealthMes Decision Agent
+HealthMes wellness decision ingress
     |
-    +-- LLM이 필요한 context tool 선택
-    +-- Context Access Layer가 권한과 privacy 검사
+    +-- Hermes LLM이 필요한 HealthMes MCP tool 선택
+    +-- Context Access Layer가 retention과 privacy 검사
     +-- domain provider가 정확한 context 반환
     +-- subjective state
     |
@@ -140,7 +140,7 @@ HealthMes
 - 데이터별 freshness, confidence와 coverage
 - 전문 activity/nutrition/wearable/calendar policy
 - context tool catalog와 접근·privacy 계약
-- HealthMes Decision Agent 요청·결과 계약
+- HealthMes wellness 요청·결과와 단일 runtime 계약
 - decision과 outcome graph
 - privacy, consent와 retention
 
@@ -160,28 +160,26 @@ HealthMes
 - 전문 정책의 숫자 재계산
 - 근거 없이 원인을 하나로 확정하는 판단
 
-### Agent와 skill의 위치
+### Agent runtime과 Skill의 위치
 
 ```text
-HealthMes Decision Agent contract
+HealthMes wellness product API
         |
         v
-Context Access Layer + domain tools
+Hermes autonomous LLM + tool loop
         |
         v
-runtime adapter
-        |
-        v
-Hermes or another agent runtime
+HealthMes MCP + domain tools
 ```
 
 Skill은 핵심 판단 엔진이 아니라 runtime별 도구 사용법과 표현 방식을 설명하는 얇은
-adapter다. 필수 권한, 전문 정책과 DecisionRecord 저장은 Skill에만 맡기지 않는다.
+adapter다. 데이터 계산, retention과 source provenance는 Skill에 맡기지 않는다.
 
-Hermes는 제품 전체나 동등한 판단 엔진이 아니라 HealthMes Decision Agent 계약을
-실행하는 첫 번째 교체 가능한 runtime adapter다. 상세 경계와 마이그레이션은
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
-를 따른다. Hermes 변경은 별도 저장소와 별도 작업으로 진행한다.
+Hermes는 HealthMes 제품 전체가 아니라 자연어 질문과 자율 tool loop를 실행하는
+교체 가능한 runtime이다. 제품의 공식 진입점, 데이터와 저장 계약은 HealthMes가
+소유한다. 상세 경계는
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
+를 따른다. Hermes 변경이 필요하면 별도 저장소와 별도 작업으로 진행한다.
 
 ## 5. MVP 경계
 
@@ -228,7 +226,7 @@ nutrition engine -> nutrition/caffeine policy -┼-> Context Access Layer
 calendar -> calendar/time context -------------┘
                                                     |
                                                     v
-                                          HealthMes Decision Agent
+                                        Hermes wellness decision turn
 ```
 
 Context Access Layer는 날짜, freshness, coverage와 source reference가 맞지 않는 영역을

@@ -28,20 +28,25 @@ def capture_provider_state(
     backend = calendar.backend
     children = calendar_observations(observation)
     child_keys = {child.source_key for child in children}
-    actual_rows = session.scalars(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == backend.source,
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
-            CalendarEventMirror.sleep_local_date == observation.local_date,
-            sa.or_(
-                CalendarEventMirror.healthmes_source_key.in_(child_keys),
-                CalendarEventMirror.healthmes_source_key.like(
-                    f"{observation.source_key}:segment:%"
-                ),
+    actual_statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == backend.source,
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind
+        == HealthmesEventKind.ACTUAL_SLEEP.value,
+        CalendarEventMirror.sleep_local_date == observation.local_date,
+        sa.or_(
+            CalendarEventMirror.healthmes_source_key.in_(child_keys),
+            CalendarEventMirror.healthmes_source_key.like(
+                f"{observation.source_key}:segment:%"
             ),
+        ),
+    )
+    if calendar.account_generation is not None:
+        actual_statement = actual_statement.where(
+            CalendarEventMirror.connection_generation
+            == calendar.account_generation
         )
-    ).all()
+    actual_rows = session.scalars(actual_statement).all()
     actual_states: list[dict[str, Any]] = []
     for actual in actual_rows:
         remote = backend.read_event(actual.external_id)
@@ -59,16 +64,20 @@ def capture_provider_state(
     else:
         actual_state = actual_states[0] if actual_states else None
 
-    planned_rows = session.scalars(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == backend.source,
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind
-            == HealthmesEventKind.PLANNED_SLEEP.value,
-            CalendarEventMirror.start_at < ensure_utc(observation.end_at),
-            CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+    planned_statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == backend.source,
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind
+        == HealthmesEventKind.PLANNED_SLEEP.value,
+        CalendarEventMirror.start_at < ensure_utc(observation.end_at),
+        CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+    )
+    if calendar.account_generation is not None:
+        planned_statement = planned_statement.where(
+            CalendarEventMirror.connection_generation
+            == calendar.account_generation
         )
-    ).all()
+    planned_rows = session.scalars(planned_statement).all()
     planned: list[dict[str, Any]] = []
     for row in planned_rows:
         remote = backend.read_event(row.external_id)
@@ -82,6 +91,7 @@ def capture_provider_state(
     planned.sort(key=lambda item: str(item["external_id"]))
     return {
         "target": calendar.target,
+        "account_generation": calendar.account_generation,
         "actual": actual_state,
         "planned": planned,
     }
@@ -101,6 +111,7 @@ def redacted_provider_guard(provider_state: dict[str, Any]) -> dict[str, Any]:
     ]
     return {
         "target": redacted_digest(target),
+        "account_generation": provider_state.get("account_generation"),
         "actual": actual_digest,
         "planned": planned_digests,
     }

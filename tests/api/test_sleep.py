@@ -11,8 +11,9 @@ from healthmes.api.auth import viewer_token, viewer_url
 from healthmes.api.sleep import SleepReviewRuntime
 from healthmes.app import create_app
 from healthmes.calendars.approval import ApprovalCalendar
+from healthmes.calendars.connection import CalendarBackendFence
 from healthmes.calendars.sleep_proposal_state import redacted_digest
-from healthmes.store import SleepReconciliationProposal
+from healthmes.store import CalendarSource, SleepReconciliationProposal
 from healthmes.store.session import get_session
 from tests.calendars.conftest import FakeCalendarBackend
 
@@ -301,3 +302,55 @@ def test_malformed_persisted_sleep_segment_renders_safe_error(app, session) -> N
         assert rendered.status_code == 200
         assert "저장된 수면 preview를 표시할 수 없습니다." in rendered.text
         assert "이 preview를 Calendar에 반영" not in rendered.text
+
+
+def test_sleep_web_runtime_rejects_disconnect_and_rebuilds_on_reconnect(
+    app,
+) -> None:
+    generation = {"value": "generation-1"}
+    backends = [
+        FakeCalendarBackend(CalendarSource.GOOGLE),
+        FakeCalendarBackend(CalendarSource.GOOGLE),
+    ]
+    factory_calls = 0
+
+    def build_backend():
+        nonlocal factory_calls
+        backend = backends[factory_calls]
+        factory_calls += 1
+        return backend
+
+    app.state.sleep_review_runtime = SleepReviewRuntime(
+        SleepReader(),
+        "redacted-user",
+        None,
+        backend_fence=CalendarBackendFence(
+            source=CalendarSource.GOOGLE,
+            backend_factory=build_backend,
+            generation_resolver=lambda: generation["value"],
+        ),
+        calendar_target="google:test-calendar",
+    )
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        connected = client.get("/sleep?date=2026-07-26")
+        assert connected.status_code == 200
+        assert "would_create" in connected.text
+        assert factory_calls == 1
+
+        generation["value"] = None
+        disconnected = client.get("/sleep?date=2026-07-26")
+        assert disconnected.status_code == 200
+        assert "CalendarAuthError" in disconnected.text
+        assert "이 preview를 Calendar에 반영" not in disconnected.text
+        assert factory_calls == 1
+
+        generation["value"] = "generation-2"
+        reconnected = client.get("/sleep?date=2026-07-26")
+        assert reconnected.status_code == 200
+        assert "would_create" in reconnected.text
+        assert factory_calls == 2

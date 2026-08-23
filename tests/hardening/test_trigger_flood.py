@@ -19,9 +19,9 @@ from freezegun import freeze_time
 from sqlalchemy import select
 
 from healthmes.config import Settings
+from healthmes.engine.decision_dispatch import DecisionDispatchResult
 from healthmes.engine.rules import TriggerContext, TriggerFire
 from healthmes.engine.triggers import HealthSignals, TriggerEvaluator
-from healthmes.engine.webhook import WebhookResult
 from healthmes.store import TriggerEvent
 
 
@@ -37,9 +37,13 @@ class RecordingSender:
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult:
+    ) -> DecisionDispatchResult:
         self.sent.append(fire)
-        return WebhookResult(ok=True, status_code=202)
+        return DecisionDispatchResult(
+            ok=True,
+            status_code=202,
+            channel="test",
+        )
 
 
 class EmptyReader:

@@ -3,19 +3,21 @@
 #   data plane   : postgres (+ dedicated healthmes DB), redis,
 #                  open-wearables backend + celery worker/beat + its MCP server
 #   healthmes    : glue service (FastAPI + fastmcp) built from Dockerfile.healthmes
-#   agent plane  : hermes gateway (Telegram + webhook + MCP client)
+#   reasoning    : one attested Hermes Responses runtime behind HealthMes
 #
 # Service definitions for the vendored upstreams are grounded in
 # vendor/open-wearables/docker-compose.yml and vendor/hermes-agent/docker-compose.yml
 # (images, build contexts, commands, and env names reused verbatim where possible).
 # vendor/ is never modified: open-wearables config lives in ./config/open-wearables.env
 # (compose-injected env vars take precedence over the image's config/.env lookup),
-# and the Hermes home directory is a bind mount at ./data/hermes.
+# and the dedicated Hermes home is ./data/hermes/decision.
 #
 # Quick start:
 #   cp .env.example .env                                  # fill in tokens/keys
 #   cp config/open-wearables.env.example config/open-wearables.env
-#   docker compose up -d
+#   docker compose up -d                                  # core stack
+#   uv run python scripts/bootstrap.py --mode docker      # optional decision
+#   docker compose --profile decision up -d
 
 name: healthmes-agent
 
@@ -117,42 +119,6 @@ services:
       - ow-backend
     restart: on-failure
 
-  ow-mcp:
-    # vendor/open-wearables/mcp has no Dockerfile and its entrypoint
-    # (app/main.py -> mcp.run()) defaults to stdio, so we mount the vendor dir
-    # read-only into the official uv image and use the fastmcp CLI to serve the
-    # same server object over Streamable HTTP — zero vendor modification.
-    # Dependencies resolve from the mounted uv.lock into a container-local venv
-    # on each start (UV_PROJECT_ENVIRONMENT keeps the mount read-only).
-    #
-    # NOTE: the primary integration path in docs/PLAN.md registers this MCP
-    # server as a *stdio* subprocess inside the hermes container (see the
-    # vendor mount on the `hermes` service + config/hermes-config.yaml.tmpl).
-    # This service is the HTTP alternative and a compose-level smoke surface.
-    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
-    working_dir: /srv/ow-mcp
-    command:
-      [
-        "uv", "run", "--frozen",
-        "fastmcp", "run", "app/main.py:mcp",
-        "--transport", "http",
-        "--host", "0.0.0.0",
-        "--port", "8200",
-      ]
-    environment:
-      - UV_PROJECT_ENVIRONMENT=/opt/venv
-      - UV_CACHE_DIR=/opt/uv-cache
-      # Env names verbatim from vendor/open-wearables/mcp/app/config.py.
-      - OPEN_WEARABLES_API_URL=http://ow-backend:8000
-      - OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY:-}
-    volumes:
-      - ./vendor/open-wearables/mcp:/srv/ow-mcp:ro
-    ports:
-      - "${OW_MCP_PORT:-8200}:8200"
-    depends_on:
-      - ow-backend
-    restart: on-failure
-
   healthmes:
     build:
       context: .
@@ -160,9 +126,8 @@ services:
     image: healthmes:latest
     pull_policy: never
     env_file:
-      # Optional root .env for secrets (HEALTHMES_OW_API_KEY,
-      # HEALTHMES_HERMES_WEBHOOK_SECRET, ...). In-cluster endpoints below
-      # take precedence over any host-oriented values in .env.
+      # Optional root .env for secrets. In-cluster endpoints below take
+      # precedence over any host-oriented values in .env.
       - path: ./.env
         required: false
     # The image CMD is just `python -m healthmes`; migrations run here so the
@@ -171,7 +136,16 @@ services:
     environment:
       - HEALTHMES_DATABASE_URL=postgresql+psycopg://healthmes:healthmes@postgres:5432/healthmes
       - HEALTHMES_OW_BASE_URL=http://ow-backend:8000
-      - HEALTHMES_HERMES_WEBHOOK_URL=http://hermes:8644/webhooks/healthmes-alerts
+      - HEALTHMES_NATIVE_ALERT_DELIVERY=true
+      - HEALTHMES_DECISION_HERMES_BASE_URL=${HEALTHMES_DECISION_HERMES_BASE_URL:-}
+      - HEALTHMES_DECISION_HERMES_MODEL=${HEALTHMES_DECISION_HERMES_MODEL:-}
+      - HEALTHMES_DECISION_HERMES_PROVIDER=${HEALTHMES_DECISION_HERMES_PROVIDER:-}
+      - HEALTHMES_DECISION_HERMES_API_KEY=${HEALTHMES_DECISION_HERMES_API_KEY:-}
+      - HEALTHMES_DECISION_CORRELATION_SECRET=${HEALTHMES_DECISION_CORRELATION_SECRET:-}
+      - HEALTHMES_DECISION_HERMES_PROFILE_PATH=/run/healthmes-decision/config.yaml
+      - HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH=/run/healthmes-decision/runtime-manifest.json
+      - HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH=/run/healthmes-decision/runtime-attestation.key
+      - HEALTHMES_DECISION_HERMES_ALLOW_ATTESTED_PRIVATE_HTTP=true
       - HEALTHMES_DATA_DIR=/data
       - HEALTHMES_PORT=8100
       # Inside the container the service must bind all interfaces for the
@@ -189,46 +163,95 @@ services:
       - HEALTHMES_TIMEZONE=${HEALTHMES_TIMEZONE:-}
     volumes:
       - healthmes_data:/data
+      - ./data/hermes/decision:/run/healthmes-decision:ro
     ports:
       - "${HEALTHMES_PORT:-8100}:8100"
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     restart: on-failure
 
-  hermes:
-    # Grounded in vendor/hermes-agent/docker-compose.yml (`gateway` service):
-    # same build context/Dockerfile, image name, command, and HERMES_UID/GID
-    # envs. Deviation: the vendor file uses `network_mode: host` +
-    # `~/.hermes:/opt/data`; here the service joins the stack's bridge network
-    # (host networking breaks service DNS and does not work on macOS), and
-    # HERMES_HOME is the repo-local bind mount ./data/hermes so
-    # scripts/bootstrap.py can render config.yaml into it from the host.
+  hermes-decision:
+    # HealthMes owns this process and its public surface. The supervisor starts
+    # one child with the manifest-bound /opt/data HERMES_HOME, scrubs messaging
+    # and plugin environment variables, proxies only Responses/session probes,
+    # and signs a nonce-bound attestation before every model turn.
     build:
       context: ./vendor/hermes-agent
     image: hermes-agent
+    profiles: ["decision"]
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    # Keep the managed Python supervisor away from container PID 1. The
+    # runtime identity contract deliberately reserves PID 1 as unmanaged.
+    init: true
     restart: unless-stopped
+    # The supported decision timeout is at most 300 seconds. Child shutdown
+    # then has at most 10 seconds for TERM and 5 seconds after KILL. Keep
+    # Docker's grace period above that 315-second bound so leases drain first.
+    stop_grace_period: 6m
+    entrypoint:
+      - /opt/hermes/.venv/bin/python
+      - -m
+      - healthmes.hermes_runtime_supervisor
     volumes:
-      - ./data/hermes:/opt/data
-      # Read-only vendor MCP server for the stdio `mcp_servers` entry rendered
-      # from config/hermes-config.yaml.tmpl (uv is on PATH in this image; the
-      # venv is redirected to $HERMES_HOME via UV_PROJECT_ENVIRONMENT).
-      - ./vendor/open-wearables/mcp:/opt/vendor/open-wearables-mcp:ro
+      - ./data/hermes/decision:/opt/data
+      - ./healthmes:/opt/healthmes/healthmes:ro
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
-      # Gateway env overrides (vendor gateway/config.py) — set in root .env.
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - HERMES_HOME=/opt/data
+      - PYTHONPATH=/opt/healthmes
+      - HEALTHMES_DECISION_RUNTIME_HOST=0.0.0.0
+      - HEALTHMES_DECISION_RUNTIME_PORT=8645
+      - HEALTHMES_DECISION_RUNTIME_MAX_CONCURRENT_RESPONSES=${HEALTHMES_DECISION_MAX_PENDING_REQUESTS:-8}
+      - HEALTHMES_DECISION_TIMEOUT_SECONDS=${HEALTHMES_DECISION_TIMEOUT_SECONDS:-60}
+      - HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS=${HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS:-10}
+      - HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS=${HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS:-5}
+      - HEALTHMES_DECISION_RUNTIME_SHUTDOWN_BUDGET_PATH=/opt/data/runtime-stop-budget
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - HEALTHMES_CALENDAR_ADJUSTMENT_SECRET=${HEALTHMES_CALENDAR_ADJUSTMENT_SECRET:-}
-    ports:
-      # Webhook platform (gateway/platforms/webhook.py, default port 8644):
-      # healthmes reaches it in-cluster at hermes:8644; published for local
-      # smoke tests.
-      - "${HERMES_WEBHOOK_PORT:-8644}:8644"
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - XAI_API_KEY=${XAI_API_KEY:-}
+    expose:
+      - "8645"
     depends_on:
-      - healthmes
-    command: ["gateway", "run"]
+      healthmes:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:8645/healthmes/runtime-health >/dev/null",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    command:
+      [
+        "--hermes-home",
+        "/opt/data",
+        "--vendor-root",
+        "/opt/hermes",
+      ]
 
 volumes:
   postgres_data:

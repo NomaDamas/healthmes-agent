@@ -147,17 +147,23 @@ def delete_replaced_planned_sleep(
     session: Session,
     backend: CalendarBackend,
     observation: ActualSleepObservation,
+    *,
+    account_generation: str | None = None,
 ) -> PlannedSleepReplacement:
-    planned = session.scalars(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == backend.source,
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind
-            == HealthmesEventKind.PLANNED_SLEEP.value,
-            CalendarEventMirror.start_at < ensure_utc(observation.end_at),
-            CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+    statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == backend.source,
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind
+        == HealthmesEventKind.PLANNED_SLEEP.value,
+        CalendarEventMirror.start_at < ensure_utc(observation.end_at),
+        CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+    )
+    if account_generation is not None:
+        statement = statement.where(
+            CalendarEventMirror.connection_generation
+            == account_generation
         )
-    ).all()
+    planned = session.scalars(statement).all()
     deleted: list[str] = []
     cleanup_pending = 0
     for row in planned:

@@ -44,23 +44,36 @@ Security rules (medical photos live here — docs/PLAN.md §9):
 """
 
 import hashlib
+import logging
 import re
 import uuid
 from datetime import UTC
 from pathlib import Path
 
+import anyio.to_thread
 from fastapi import APIRouter, Request, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 # Starlette's type, not fastapi's subclass: ``request.form()`` (parsed by the
 # handler itself — see upload_media) yields starlette UploadFile instances.
 from starlette.datastructures import UploadFile
 
+from healthmes.activity.locking import global_write_plane_guard
 from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError, not_found
 from healthmes.config import Settings
+from healthmes.durable_files import (
+    DurableFileIdentity,
+    DurablePublishError,
+    durable_exclusive_writer,
+    durable_publish_no_clobber,
+    durable_unlink,
+    verify_regular_file,
+    write_all,
+)
 from healthmes.storage import register_storage_object
 from healthmes.store import StorageObject
 from healthmes.store.session import SessionDep
@@ -122,6 +135,7 @@ _MULTIPART_ENVELOPE_SLACK = 64 * 1024
 # Stored files are immutable (uuid names, never rewritten), so embedded
 # surfaces may cache — but only privately (medical photos, docs/PLAN.md §9).
 MEDIA_CACHE_CONTROL = "private, max-age=86400, immutable"
+logger = logging.getLogger(__name__)
 
 
 class MediaUploadOut(BaseModel):
@@ -161,6 +175,263 @@ def _payload_too_large(cap: int) -> APIError:
         f"media upload exceeds the {cap}-byte cap",
         detail={"max_bytes": cap},
     )
+
+
+def _verify_media_commit(
+    bind,
+    *,
+    storage_object_id,
+    media_path: str,
+    destination: Path,
+    publication_identity: DurableFileIdentity,
+    content_type: str,
+    size_bytes: int,
+    sha256: str,
+) -> bool | None:
+    """Confirm an ambiguous commit in a fresh session.
+
+    ``False`` is returned only when neither the expected id nor path exists.
+    Conflicting/partial state is unknown and therefore keeps the bytes for
+    maintenance or an operator to reconcile.
+    """
+    try:
+        with Session(bind=bind) as verification:
+            by_id = verification.get(StorageObject, storage_object_id)
+            by_path = verification.scalar(
+                select(StorageObject).where(StorageObject.relative_path == media_path)
+            )
+    except Exception:
+        logger.exception(
+            "could not verify ambiguous media commit for %s; retaining bytes",
+            media_path,
+        )
+        return None
+    if by_id is None and by_path is None:
+        return False
+    if (
+        by_id is not None
+        and by_path is not None
+        and by_id.id == storage_object_id
+        and by_path.id == storage_object_id
+        and by_id.relative_path == media_path
+        and by_path.relative_path == media_path
+        and by_id.data_class == "media"
+        and by_path.data_class == "media"
+        and by_id.content_type == content_type
+        and by_path.content_type == content_type
+        and by_id.size_bytes == size_bytes
+        and by_path.size_bytes == size_bytes
+        and by_id.sha256 == sha256
+        and by_path.sha256 == sha256
+        and by_id.purged_at is None
+        and by_path.purged_at is None
+    ):
+        try:
+            verify_regular_file(
+                destination,
+                publication_identity,
+                expected_size=size_bytes,
+                expected_sha256=sha256,
+            )
+        except OSError:
+            logger.exception(
+                "ambiguous media commit references a changed file generation "
+                "for %s; retaining staging bytes",
+                media_path,
+            )
+            return None
+        return True
+    logger.error(
+        "ambiguous media commit produced conflicting storage state for %s; retaining bytes",
+        media_path,
+    )
+    return None
+
+
+def _durably_cleanup_media(
+    path: Path,
+    *,
+    operation: str,
+    expected: DurableFileIdentity | None = None,
+) -> bool:
+    try:
+        durable_unlink(path, missing_ok=True, expected=expected)
+    except OSError:
+        logger.exception(
+            "failed to durably clean up media file after %s; "
+            "retaining any surviving copy: %s",
+            operation,
+            path,
+        )
+        return False
+    return True
+
+
+def _publish_media(
+    bind,
+    settings: Settings,
+    *,
+    staged: Path,
+    destination: Path,
+    media_path: str,
+    content_type: str,
+    written: int,
+    digest_hex: str,
+    observed_at,
+) -> MediaUploadOut:
+    """Publish bytes and their index while holding one snapshot generation."""
+    publication_attempted = False
+    destination_durable = False
+    publication_identity: DurableFileIdentity | None = None
+    commit_attempted = False
+    storage_object_id = None
+    result = MediaUploadOut(
+        media_path=media_path,
+        content_type=content_type,
+        bytes=written,
+    )
+    try:
+        with global_write_plane_guard(bind) as guard_connection:
+            writer_bind = guard_connection if guard_connection is not None else bind
+            publication_attempted = True
+            try:
+                publication_identity = durable_publish_no_clobber(
+                    staged,
+                    destination,
+                )
+                destination_durable = True
+            except FileExistsError:
+                _durably_cleanup_media(staged, operation="path collision")
+                raise APIError(
+                    status.HTTP_409_CONFLICT,
+                    "media_path_collision",
+                    "generated media path already exists",
+                ) from None
+            except DurablePublishError as exc:
+                if not exc.destination_created:
+                    _durably_cleanup_media(
+                        staged,
+                        operation="failed publication before destination creation",
+                    )
+                    raise
+                if exc.identity is None:
+                    raise
+                publication_identity = exc.identity
+                verify_regular_file(
+                    staged,
+                    publication_identity,
+                    expected_size=written,
+                    expected_sha256=digest_hex,
+                )
+                logger.warning(
+                    "media destination durability could not be confirmed; "
+                    "continuing from the crash-durable staging generation"
+                )
+            verify_regular_file(
+                destination,
+                publication_identity,
+                expected_size=written,
+                expected_sha256=digest_hex,
+            )
+            try:
+                with Session(bind=writer_bind) as writer:
+                    try:
+                        storage_object = register_storage_object(
+                            writer,
+                            settings,
+                            relative_path=media_path,
+                            data_class="media",
+                            content_type=content_type,
+                            size_bytes=written,
+                            sha256=digest_hex,
+                            observed_at=observed_at,
+                        )
+                        storage_object_id = storage_object.id
+                        verify_regular_file(
+                            destination,
+                            publication_identity,
+                            expected_size=written,
+                            expected_sha256=digest_hex,
+                        )
+                        commit_attempted = True
+                        writer.commit()
+                    except BaseException:
+                        try:
+                            writer.rollback()
+                        except Exception:
+                            logger.exception(
+                                "failed to reset media session after %s failure",
+                                "ambiguous commit"
+                                if commit_attempted
+                                else "pre-commit",
+                            )
+                        raise
+            except BaseException:
+                if commit_attempted and storage_object_id is not None:
+                    outcome = _verify_media_commit(
+                        writer_bind,
+                        storage_object_id=storage_object_id,
+                        media_path=media_path,
+                        destination=destination,
+                        publication_identity=publication_identity,
+                        content_type=content_type,
+                        size_bytes=written,
+                        sha256=digest_hex,
+                    )
+                    if outcome is True:
+                        if destination_durable:
+                            _durably_cleanup_media(
+                                staged,
+                                operation="confirmed commit",
+                                expected=publication_identity,
+                            )
+                        return result
+                    if outcome is None:
+                        logger.warning(
+                            "media commit outcome is unknown for %s; retaining bytes",
+                            media_path,
+                        )
+                    else:
+                        logger.warning(
+                            "media commit is not yet visible for %s; retaining bytes",
+                            media_path,
+                        )
+                else:
+                    destination_removed = _durably_cleanup_media(
+                        destination,
+                        operation="pre-commit failure",
+                        expected=publication_identity,
+                    )
+                    if destination_removed:
+                        _durably_cleanup_media(
+                            staged,
+                            operation="pre-commit failure",
+                            expected=publication_identity,
+                        )
+                raise
+            verify_regular_file(
+                destination,
+                publication_identity,
+                expected_size=written,
+                expected_sha256=digest_hex,
+            )
+            if destination_durable:
+                _durably_cleanup_media(
+                    staged,
+                    operation="successful commit",
+                    expected=publication_identity,
+                )
+    except BaseException:
+        if not publication_attempted:
+            _durably_cleanup_media(staged, operation="write-plane lock failure")
+        raise
+    if not destination_durable:
+        logger.warning(
+            "retaining media staging generation for startup reconciliation "
+            "after an unconfirmed destination fsync: %s",
+            media_path,
+        )
+    return result
 
 
 # No ``UploadFile`` route parameter on purpose: FastAPI parses the multipart
@@ -224,29 +495,38 @@ async def upload_media(request: Request, session: SessionDep) -> MediaUploadOut:
     if declared > budget:
         raise _payload_too_large(cap)
 
-    async with request.form() as form:
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile):
-            raise APIError(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "missing_file",
-                "multipart field 'file' with the captured bytes is required",
+    staged: Path | None = None
+    destination: Path | None = None
+    publisher_owns_staging = False
+    try:
+        async with request.form() as form:
+            upload = form.get("file")
+            if not isinstance(upload, UploadFile):
+                raise APIError(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "missing_file",
+                    "multipart field 'file' with the captured bytes is required",
+                )
+            content_type = _canonical_content_type(upload.content_type)
+
+            now = utc_now()
+            directory = _media_root(settings) / f"{now:%Y}" / f"{now:%m}"
+            filename = f"{uuid.uuid4().hex}{CANONICAL_CONTENT_TYPES[content_type]}"
+            destination = directory / filename
+            staging_dir = (
+                settings.data_dir
+                / ".staging"
+                / "media"
+                / f"{now:%Y}"
+                / f"{now:%m}"
             )
-        content_type = _canonical_content_type(upload.content_type)
+            staged = staging_dir / f"{filename}.part"
 
-        now = utc_now()
-        directory = _media_root(settings) / f"{now:%Y}" / f"{now:%m}"
-        directory.mkdir(parents=True, exist_ok=True)
-        filename = f"{uuid.uuid4().hex}{CANONICAL_CONTENT_TYPES[content_type]}"
-        destination = directory / filename
-
-        # Exclusive create before the cleanup guard: if the fresh uuid name
-        # somehow exists, fail loudly WITHOUT unlinking the stranger's file.
-        out = destination.open("xb")
-        written = 0
-        digest = hashlib.sha256()
-        try:
-            with out:
+            # Upload outside the live media tree so a backup can never capture
+            # a partially received object.
+            written = 0
+            digest = hashlib.sha256()
+            with durable_exclusive_writer(staged) as out:
                 # Exact per-file cap (the header gate above allows the small
                 # multipart envelope on top of it): stream in chunks and 413
                 # after at most one extra chunk.
@@ -254,32 +534,45 @@ async def upload_media(request: Request, session: SessionDep) -> MediaUploadOut:
                     written += len(chunk)
                     if written > cap:
                         raise _payload_too_large(cap)
-                    out.write(chunk)
+                    write_all(out, chunk)
                     digest.update(chunk)
-        except BaseException:
-            destination.unlink(missing_ok=True)  # never leave partial files behind
-            raise
-        if written == 0:
-            destination.unlink(missing_ok=True)
-            raise APIError(
-                status.HTTP_422_UNPROCESSABLE_CONTENT, "empty_file", "uploaded media file is empty"
-            )
+            if written == 0:
+                raise APIError(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "empty_file",
+                    "uploaded media file is empty",
+                )
 
-    # POSIX separators by construction — the token is a URL/DB value, not an
-    # OS path (healthmes/store/models.py media_path convention).
-    media_path = f"media/{now:%Y}/{now:%m}/{filename}"
-    register_storage_object(
-        session,
-        settings,
-        relative_path=media_path,
-        data_class="media",
-        content_type=content_type,
-        size_bytes=written,
-        sha256=digest.hexdigest(),
-        observed_at=now,
-    )
-    session.commit()
-    return MediaUploadOut(media_path=media_path, content_type=content_type, bytes=written)
+        # POSIX separators by construction — the token is a URL/DB value, not
+        # an OS path (healthmes/store/models.py media_path convention).
+        media_path = f"media/{now:%Y}/{now:%m}/{filename}"
+        digest_hex = digest.hexdigest()
+        assert staged is not None
+        assert destination is not None
+        publisher_owns_staging = True
+        return await anyio.to_thread.run_sync(
+            lambda: _publish_media(
+                session.get_bind(),
+                settings,
+                staged=staged,
+                destination=destination,
+                media_path=media_path,
+                content_type=content_type,
+                written=written,
+                digest_hex=digest_hex,
+                observed_at=now,
+            )
+        )
+    finally:
+        # Starts before multipart parsing, so FormData.close() failures cannot
+        # strand plaintext ``.part`` files.
+        if staged is not None and not publisher_owns_staging:
+            await anyio.to_thread.run_sync(
+                lambda: _durably_cleanup_media(
+                    staged,
+                    operation="upload staging failure",
+                )
+            )
 
 
 def resolve_media_file(settings: Settings, media_path: str) -> Path | None:
@@ -315,30 +608,19 @@ def get_media(
     file_path = resolve_media_file(_settings(request), media_path)
     if file_path is None:
         raise not_found("media", media_path)
-    relative_path = (
-        media_path
-        if media_path.startswith("media/")
-        else f"media/{media_path}"
-    )
-    obj = session.scalar(
-        select(StorageObject).where(
-            StorageObject.relative_path == relative_path
-        )
-    )
+    relative_path = media_path if media_path.startswith("media/") else f"media/{media_path}"
+    obj = session.scalar(select(StorageObject).where(StorageObject.relative_path == relative_path))
     if obj is None:
         raise not_found("media", media_path)
     now = utc_now()
-    if (
-        obj.purged_at is not None
-        or (
-            obj.expires_at is not None
-            and (
-                obj.expires_at.replace(tzinfo=UTC)
-                if obj.expires_at.tzinfo is None
-                else obj.expires_at.astimezone(UTC)
-            )
-            <= now
+    if obj.purged_at is not None or (
+        obj.expires_at is not None
+        and (
+            obj.expires_at.replace(tzinfo=UTC)
+            if obj.expires_at.tzinfo is None
+            else obj.expires_at.astimezone(UTC)
         )
+        <= now
     ):
         raise not_found("media", media_path)
     return FileResponse(

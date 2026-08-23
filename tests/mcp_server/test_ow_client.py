@@ -7,12 +7,24 @@ import pytest
 
 from healthmes.config import Settings
 from healthmes.mcp_server.ow_client import (
+    MAX_RESPONSE_BYTES,
     OWAuthError,
     OWClient,
     OWClientError,
     OWConfigurationError,
     OWNotFoundError,
 )
+
+
+class TrackingByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.iterations = 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.iterations += 1
+            yield chunk
 
 
 class TestRequestShape:
@@ -124,6 +136,56 @@ class TestRequestShape:
 
 
 class TestErrorMapping:
+    async def test_declared_oversize_response_is_rejected_before_read(
+        self,
+        ow_api_key,
+    ):
+        stream = TrackingByteStream([b'{"data": []}'])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Length": str(MAX_RESPONSE_BYTES + 1)
+                },
+                stream=stream,
+            )
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWClientError, match="byte limit"):
+            await client.list_users()
+        assert stream.iterations == 0
+
+    async def test_chunked_oversize_response_stops_before_json_parse(
+        self,
+        ow_api_key,
+    ):
+        stream = TrackingByteStream(
+            [
+                b"x" * (MAX_RESPONSE_BYTES // 2),
+                b"x" * (MAX_RESPONSE_BYTES // 2 + 1),
+                b'{"unreachable": true}',
+            ]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=stream)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWClientError, match="byte limit"):
+            await client.list_users()
+        assert stream.iterations == 2
+
     async def test_401_maps_to_auth_error(self, fake_ow):
         client = OWClient(
             base_url="http://open-wearables.test",

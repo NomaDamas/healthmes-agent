@@ -72,6 +72,12 @@ jobs:
           -destination "generic/platform=iOS Simulator"
           build CODE_SIGNING_ALLOWED=NO
 
+      - name: Build Screen Time opt-in capability path
+        # The probe compiles the real collector only when this runner's SDK
+        # exposes Apple's App & Website Usage export API. Older SDKs must
+        # still compile the explicit fail-closed adapter.
+        run: bash Scripts/build-screen-time-opt-in.sh build
+
       - name: Build watchOS app + complication extension
         run: >
           xcodebuild -project HealthMesCompanion.xcodeproj
@@ -111,6 +117,10 @@ jobs:
             -scheme HealthMesCompanion \
             -destination "platform=iOS Simulator,id=${UDID}" \
             CODE_SIGNING_ALLOWED=NO
+          HEALTHMES_SCREENTIME_DESTINATION="platform=iOS Simulator,id=${UDID}" \
+            bash Scripts/build-screen-time-opt-in.sh test \
+            -only-testing:HealthMesCompanionTests/ScreenTimeActivityContractTests \
+            -only-testing:HealthMesCompanionTests/ScreenTimeActivityLifecycleTests
 
   macos:
     name: xcodebuild macOS menu bar + widgets + saver (unsigned)

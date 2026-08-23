@@ -8,7 +8,13 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from healthmes.config import Settings
+from healthmes.engine.briefings import (
+    EVENING_BRIEFING_JOB_ID,
+    MORNING_BRIEFING_JOB_ID,
+    WEEKLY_BRIEFING_JOB_ID,
+)
 from healthmes.engine.scheduler import (
+    ACTIVITYWATCH_JOB_ID,
     BACKUP_JOB_ID,
     CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
@@ -16,9 +22,11 @@ from healthmes.engine.scheduler import (
     STORAGE_MAINTENANCE_JOB_ID,
     TRIGGER_JOB_ID,
     create_scheduler,
+    register_activitywatch_job,
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_energy_job,
+    register_scheduled_briefing_jobs,
     register_sleep_reconciliation_job,
     register_storage_maintenance_job,
     shutdown_scheduler,
@@ -99,6 +107,69 @@ def test_sleep_reconciliation_hook_registers_interval_job(scheduler) -> None:
     assert isinstance(job.trigger, IntervalTrigger)
     assert job.trigger.interval == timedelta(minutes=15)
     assert job.func is noop
+
+
+def test_activitywatch_hook_registers_non_overlapping_interval_job(scheduler) -> None:
+    job = register_activitywatch_job(scheduler, noop, minutes=7)
+    assert scheduler.get_job(ACTIVITYWATCH_JOB_ID) is job
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval == timedelta(minutes=7)
+    assert job.func is noop
+    assert job.max_instances == 1
+    assert job.coalesce is True
+
+
+def test_activitywatch_hook_replaces_pending_duplicate(scheduler) -> None:
+    register_activitywatch_job(scheduler, noop, minutes=5)
+
+    def replacement() -> None:
+        return None
+
+    job = register_activitywatch_job(scheduler, replacement, minutes=11)
+    matches = [item for item in scheduler.get_jobs() if item.id == ACTIVITYWATCH_JOB_ID]
+    assert matches == [job]
+    assert job.func is replacement
+    assert job.trigger.interval == timedelta(minutes=11)
+
+
+def test_scheduled_briefing_hooks_use_user_timezone(
+    scheduler,
+    settings,
+) -> None:
+    class NeverCalledSender:
+        requires_reasoning = True
+
+        def send(self, fire, *, fired_at, trigger_event_id):
+            raise AssertionError("registration must not execute the job")
+
+    jobs = register_scheduled_briefing_jobs(
+        scheduler,
+        settings,
+        alert_sender=NeverCalledSender(),
+    )
+
+    assert {job.id for job in jobs} == {
+        MORNING_BRIEFING_JOB_ID,
+        EVENING_BRIEFING_JOB_ID,
+        WEEKLY_BRIEFING_JOB_ID,
+    }
+    by_id = {job.id: job for job in jobs}
+    morning_fields = {
+        field.name: str(field)
+        for field in by_id[MORNING_BRIEFING_JOB_ID].trigger.fields
+    }
+    evening_fields = {
+        field.name: str(field)
+        for field in by_id[EVENING_BRIEFING_JOB_ID].trigger.fields
+    }
+    weekly_fields = {
+        field.name: str(field)
+        for field in by_id[WEEKLY_BRIEFING_JOB_ID].trigger.fields
+    }
+    assert (morning_fields["hour"], morning_fields["minute"]) == ("7", "0")
+    assert (evening_fields["hour"], evening_fields["minute"]) == ("21", "30")
+    assert weekly_fields["day_of_week"] == "sun"
+    assert str(by_id[MORNING_BRIEFING_JOB_ID].trigger.timezone) == "UTC"
 
 
 def test_hooks_are_replaceable(scheduler) -> None:

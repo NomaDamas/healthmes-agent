@@ -45,7 +45,7 @@ diagnose, never rank likely causes, never suggest treatments.
   `mcp__healthmes__<tool>` with double underscores —
   vendor/hermes-agent/tools/mcp_tool.py). NEVER call the HealthMes or
   open-wearables REST APIs directly (no `curl`, no HTTP from scripts) —
-  bypassing MCP breaks the decision-record chain.
+  bypassing MCP breaks the product data, retention, and provenance boundary.
 - The briefing file is written with your file tools (`write_file`), under
   the data directory reported by `list_medical_records` (`data_dir` in its
   response). If that path is unusable from this process, fall back to the
@@ -61,7 +61,6 @@ diagnose, never rank likely causes, never suggest treatments.
 | `get_health_scores` | Aggregated score context over the window (sleep, stress, readiness, recovery) with confidence/coverage |
 | `get_personal_baselines` | Current deviation vs 14/90-day personal baselines for headline metrics |
 | `get_daily_readiness_context` | Today's state (useful for a same-day appointment) |
-| `record_decision` | One record (kind: `capture`) noting the briefing was generated — generic labels only |
 
 ## When to use
 
@@ -114,11 +113,9 @@ diagnose, never rank likely causes, never suggest treatments.
    your file tools to `{data_dir}/exports/doctor-visit-YYYY-MM-DD.md`
    (today's date; create the `exports/` directory if needed; add `-2`,
    `-3`… if the file exists).
-6. **Record and confirm.** `record_decision` (kind: `capture`, generic
-   labels — e.g. inputs "medication records: 4, symptom records: 7,
-   window 90d", action "wrote doctor-visit briefing file"; NO medical
-   content). Then reply in chat with only: the file path, the window, and
-   the section counts.
+6. **Confirm without a decision record.** A routine local briefing is a file
+   operation, not a wellness decision. Do not create a DecisionRecord. Reply
+   in chat with only: the file path, the window, and the section counts.
 
 ## Briefing template
 

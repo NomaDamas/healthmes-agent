@@ -14,6 +14,7 @@ class ApprovalCalendar:
     target: str
     review_base_url: str | None = None
     review_url_builder: Callable[[dt.date], str] | None = None
+    account_generation: str | None = None
 
 
 def calendar_approval_target(settings: Settings, source: CalendarSource) -> str:

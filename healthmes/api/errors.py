@@ -35,8 +35,10 @@ _STATUS_CODE_NAMES: dict[int, str] = {
     status.HTTP_404_NOT_FOUND: "not_found",
     status.HTTP_405_METHOD_NOT_ALLOWED: "method_not_allowed",
     status.HTTP_409_CONFLICT: "conflict",
+    status.HTTP_429_TOO_MANY_REQUESTS: "too_many_requests",
     status.HTTP_422_UNPROCESSABLE_CONTENT: "validation_error",
     status.HTTP_502_BAD_GATEWAY: "upstream_error",
+    status.HTTP_503_SERVICE_UNAVAILABLE: "service_unavailable",
 }
 
 

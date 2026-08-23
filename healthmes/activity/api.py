@@ -58,16 +58,20 @@ from healthmes.activity.maintenance import (
 from healthmes.activity.privacy import collection_gate
 from healthmes.activity.repository import (
     APP_HOUR_EVENT,
+    IOS_PROVIDER,
     ActivityChangeWindow,
     ActivityConflictError,
     ActivityLocalScope,
     ActivityWriteConflictError,
+    InvalidIOSAppTokenError,
     activity_write_lock,
     event_bounds,
     event_scopes,
     fixed_offset_summary_scopes_by_change,
     get_control_payload,
     get_ios_snapshot_fence,
+    ios_exclusion_namespace,
+    legacy_app_usage_cutoff,
     lock_activity_write_plane,
     parse_optional_datetime,
     persist_ios_snapshot_fence,
@@ -100,7 +104,6 @@ from healthmes.timezones import parse_timezone
 
 router = APIRouter(tags=["activity"])
 CollectionDeviceId = Annotated[str, Path(min_length=1, max_length=255)]
-IOS_PROVIDER = "ios-device-activity"
 
 
 def _timezone(request: Request, explicit: str | None = None) -> str:
@@ -129,8 +132,10 @@ def _commit_collection(
     session: Session,
     payload: dict[str, Any],
 ) -> ActivityCollectionOut:
+    serialized = serialize_collection_state(payload)
+    serialized["raw_retention_cutoff"] = legacy_app_usage_cutoff(session)
     session.commit()
-    return ActivityCollectionOut.model_validate(serialize_collection_state(payload))
+    return ActivityCollectionOut.model_validate(serialized)
 
 
 def _scope_public_batch_source_ids(
@@ -201,8 +206,13 @@ def _ios_snapshot_manifest_digest(body: IOSCapabilityReport) -> str:
         "timezone": body.timezone,
         "capability": body.capability.value,
         "permission_status": body.permission_status.value,
+        "pseudonym_key_id": body.pseudonym_key_id,
         "collection_revision": body.collection_revision,
         "collection_generation": body.collection_generation,
+        "authoritative_bucket_starts": [
+            value.isoformat()
+            for value in body.authoritative_bucket_starts
+        ],
         "samples": [
             sample.model_dump(mode="json")
             for sample in sorted(
@@ -230,15 +240,17 @@ def _ios_batch(body: IOSCapabilityReport) -> ActivityBatchIn:
             f"record:{source_record_id}"
         )
 
-    return ActivityBatchIn(
-        source_provider=IOS_PROVIDER,
-        source_device=body.device_id,
-        platform=ActivityPlatform.IOS,
-        capability=body.capability,
-        timezone=body.timezone,
-        collected_at=body.collected_at,
-        collection_revision=body.collection_revision,
-        records=[
+    records: list[AppHourRecord] = []
+    for sample in body.samples:
+        if sample.coverage_only:
+            app_id = "__healthmes_coverage__"
+        else:
+            if sample.opaque_app_token is None:
+                raise AssertionError(
+                    "validated iOS activity sample is missing its app token"
+                )
+            app_id = sample.opaque_app_token
+        records.append(
             AppHourRecord(
                 source_record_id=scoped_source_record_id(
                     prefix="ios-hour",
@@ -248,17 +260,35 @@ def _ios_batch(body: IOSCapabilityReport) -> ActivityBatchIn:
                     ),
                 ),
                 bucket_start=sample.bucket_start,
-                app_id=sample.opaque_app_token
-                or f"category:{sample.category}",
+                app_id=app_id,
                 foreground_seconds=sample.foreground_seconds,
-                launches=sample.launches,
-                category=sample.category,
+                launches=0,
+                launches_observed=False,
+                category=(
+                    None if sample.coverage_only else sample.category
+                ),
                 coverage_seconds=sample.coverage_seconds,
+                coverage_only=sample.coverage_only,
+                coverage_status=sample.coverage_status,
+                observed_activity_seconds=sample.observed_activity_seconds,
+                represented_app_seconds=sample.represented_app_seconds,
+                privacy_filtered_seconds=sample.privacy_filtered_seconds,
+                website_activity_seconds=sample.website_activity_seconds,
+                unknown_activity_seconds=sample.unknown_activity_seconds,
                 bucket_complete=True,
                 snapshot_sequence=body.snapshot_sequence,
             )
-            for sample in body.samples
-        ],
+        )
+
+    return ActivityBatchIn(
+        source_provider=IOS_PROVIDER,
+        source_device=body.device_id,
+        platform=ActivityPlatform.IOS,
+        capability=body.capability,
+        timezone=body.timezone,
+        collected_at=body.collected_at,
+        collection_revision=body.collection_revision,
+        records=records,
     )
 
 
@@ -291,11 +321,15 @@ def _ios_authoritative_scopes(
 ) -> set[ActivityLocalScope]:
     assert body.snapshot_start is not None
     assert body.snapshot_end is not None
-    scopes = range_scopes(
-        start=body.snapshot_start,
-        end=body.snapshot_end,
-        timezone=body.timezone,
-    )
+    scopes = {
+        scope
+        for bucket_start in body.authoritative_bucket_starts
+        for scope in range_scopes(
+            start=bucket_start,
+            end=bucket_start + timedelta(hours=1),
+            timezone=body.timezone,
+        )
+    }
     scopes.update(
         scope
         for record in records
@@ -312,11 +346,12 @@ def _ios_authoritative_scopes(
     )
     changes = [
         ActivityChangeWindow(
-            key="authoritative-range",
-            start=body.snapshot_start,
-            end=body.snapshot_end,
+            key=f"authoritative-bucket:{bucket_start.isoformat()}",
+            start=bucket_start,
+            end=bucket_start + timedelta(hours=1),
             timezone=body.timezone,
         )
+        for bucket_start in body.authoritative_bucket_starts
     ]
     changes.extend(
         ActivityChangeWindow(
@@ -368,9 +403,16 @@ def _ios_authoritative_scopes(
 def get_collection(
     device_id: CollectionDeviceId,
     session: SessionDep,
+    platform: ActivityPlatform | None = None,
 ) -> ActivityCollectionOut:
-    payload = get_control_payload(session, device_id)
-    return ActivityCollectionOut.model_validate(serialize_collection_state(payload))
+    payload = get_control_payload(
+        session,
+        device_id,
+        platform=platform or ActivityPlatform.UNKNOWN,
+    )
+    serialized = serialize_collection_state(payload)
+    serialized["raw_retention_cutoff"] = legacy_app_usage_cutoff(session)
+    return ActivityCollectionOut.model_validate(serialized)
 
 
 @router.put("/v1/activity/devices/{device_id}/collection")
@@ -380,7 +422,14 @@ def put_collection(
     session: SessionDep,
 ) -> ActivityCollectionOut:
     with activity_write_lock():
-        payload = update_collection_config(session, device_id, body)
+        try:
+            payload = update_collection_config(session, device_id, body)
+        except InvalidIOSAppTokenError as exc:
+            raise APIError(
+                422,
+                "invalid_ios_app_token",
+                str(exc),
+            ) from exc
         return _commit_collection(session, payload)
 
 
@@ -393,11 +442,18 @@ def pause_collection(
     if body.until <= clock.utc_now():
         raise APIError(422, "invalid_pause", "pause deadline must be in the future")
     with activity_write_lock():
-        payload = update_collection_config(
-            session,
-            device_id,
-            ActivityCollectionUpdate(paused_until=body.until),
-        )
+        try:
+            payload = update_collection_config(
+                session,
+                device_id,
+                ActivityCollectionUpdate(paused_until=body.until),
+            )
+        except InvalidIOSAppTokenError as exc:
+            raise APIError(
+                422,
+                "invalid_ios_app_token",
+                str(exc),
+            ) from exc
         return _commit_collection(session, payload)
 
 
@@ -407,11 +463,18 @@ def resume_collection(
     session: SessionDep,
 ) -> ActivityCollectionOut:
     with activity_write_lock():
-        payload = update_collection_config(
-            session,
-            device_id,
-            ActivityCollectionUpdate(paused_until=None),
-        )
+        try:
+            payload = update_collection_config(
+                session,
+                device_id,
+                ActivityCollectionUpdate(paused_until=None),
+            )
+        except InvalidIOSAppTokenError as exc:
+            raise APIError(
+                422,
+                "invalid_ios_app_token",
+                str(exc),
+            ) from exc
         return _commit_collection(session, payload)
 
 
@@ -598,19 +661,86 @@ def post_ios_report(
         try:
             with session.begin_nested():
                 lock_activity_write_plane(session)
+                snapshot_fence = get_ios_snapshot_fence(
+                    session,
+                    body.device_id,
+                    lock=True,
+                )
+                manifest_sha256: str | None = None
+                if available and authoritative:
+                    assert body.snapshot_sequence is not None
+                    assert body.snapshot_start is not None
+                    assert body.snapshot_end is not None
+                    manifest_sha256 = _ios_snapshot_manifest_digest(body)
+                    if (
+                        snapshot_fence is not None
+                        and body.collection_generation
+                        == snapshot_fence.collection_generation
+                        and body.snapshot_sequence
+                        == snapshot_fence.sequence
+                    ):
+                        if (
+                            manifest_sha256
+                            != snapshot_fence.manifest_sha256
+                        ):
+                            raise ActivityConflictError(
+                                "iOS snapshot sequence was reused with "
+                                "different content"
+                            )
+                        if snapshot_fence.accepted_response is not None:
+                            return snapshot_fence.accepted_response
+                        raise APIError(
+                            409,
+                            "snapshot_retry_response_unavailable",
+                            "This legacy iOS snapshot was accepted, but its "
+                            "exact response is unavailable; advance the "
+                            "snapshot sequence before retrying",
+                        )
                 previous_state = get_control_payload(
                     session,
                     body.device_id,
                     platform=ActivityPlatform.IOS,
                     lock=True,
                 )
+                configured_exclusions = list(
+                    previous_state.get("excluded_apps") or []
+                )
+                configured_pseudonym_key_id = previous_state.get(
+                    "ios_pseudonym_key_id"
+                )
+                exclusions_valid, exclusion_key_id = (
+                    ios_exclusion_namespace(configured_exclusions)
+                )
+                if (
+                    available
+                    and configured_exclusions
+                    and (
+                        not exclusions_valid
+                        or exclusion_key_id is None
+                        or configured_pseudonym_key_id
+                        != exclusion_key_id
+                    )
+                ):
+                    raise APIError(
+                        409,
+                        "ios_exclusion_reapproval_required",
+                        "Stored iOS exclusions must be cleared or "
+                        "re-approved with the current device pseudonym key",
+                    )
+                if (
+                    available
+                    and configured_pseudonym_key_id is not None
+                    and body.pseudonym_key_id
+                    != configured_pseudonym_key_id
+                ):
+                    raise APIError(
+                        409,
+                        "ios_exclusion_reapproval_required",
+                        "iOS report pseudonym key does not match the "
+                        "configured exclusion namespace",
+                    )
                 previous_collected_at = parse_optional_datetime(
                     previous_state.get("last_collected_at")
-                )
-                snapshot_fence = get_ios_snapshot_fence(
-                    session,
-                    body.device_id,
-                    lock=True,
                 )
                 if (
                     not authoritative
@@ -633,13 +763,12 @@ def post_ios_report(
                         "iOS aggregate report is older than the latest "
                         "accepted device snapshot"
                     )
-                manifest_sha256: str | None = None
                 apply_snapshot = True
                 if available and authoritative:
                     assert body.snapshot_sequence is not None
                     assert body.snapshot_start is not None
                     assert body.snapshot_end is not None
-                    manifest_sha256 = _ios_snapshot_manifest_digest(body)
+                    assert manifest_sha256 is not None
                     if snapshot_fence is not None:
                         generation_changed = (
                             body.collection_generation
@@ -647,9 +776,11 @@ def post_ios_report(
                         )
                         if generation_changed:
                             if not body.reset_snapshot_fence:
-                                raise ActivityConflictError(
+                                raise APIError(
+                                    409,
+                                    "activity_snapshot_fence_reset_required",
                                     "iOS snapshot collection generation changed "
-                                    "without an authenticated fence reset"
+                                    "without an authenticated fence reset",
                                 )
                             if (
                                 snapshot_fence.collection_generation is not None
@@ -777,24 +908,34 @@ def post_ios_report(
                             record.source_record_id
                             for record in allowed_records
                         }
-                        existing_rows = list(
-                            session.scalars(
-                                select(WellnessEvent)
-                                .where(
-                                    WellnessEvent.event_type
-                                    == APP_HOUR_EVENT,
-                                    WellnessEvent.source_provider
-                                    == IOS_PROVIDER,
-                                    WellnessEvent.source_device
-                                    == body.device_id,
-                                    WellnessEvent.observed_at
-                                    >= body.snapshot_start,
-                                    WellnessEvent.observed_at
-                                    < body.snapshot_end,
+                        # Authoritative means complete after the device's
+                        # privacy filter, not complete raw Screen Time
+                        # coverage. Query the whole replacement scope so an
+                        # app newly made private is deleted even when allowed
+                        # samples remain in the same hour.
+                        existing_rows = (
+                            list(
+                                session.scalars(
+                                    select(WellnessEvent)
+                                    .where(
+                                        WellnessEvent.event_type
+                                        == APP_HOUR_EVENT,
+                                        WellnessEvent.source_provider
+                                        == IOS_PROVIDER,
+                                        WellnessEvent.source_device
+                                        == body.device_id,
+                                        WellnessEvent.observed_at.in_(
+                                            body.authoritative_bucket_starts
+                                        ),
+                                    )
+                                    .with_for_update()
+                                    .execution_options(
+                                        populate_existing=True
+                                    )
                                 )
-                                .with_for_update()
-                                .execution_options(populate_existing=True)
                             )
+                            if body.authoritative_bucket_starts
+                            else []
                         )
                         scopes = _ios_authoritative_scopes(
                             session,
@@ -875,6 +1016,7 @@ def post_ios_report(
                             manifest_sha256=manifest_sha256,
                             snapshot_start=body.snapshot_start,
                             snapshot_end=body.snapshot_end,
+                            accepted_response=response,
                             now=uploaded_at,
                         )
                 elif available and body.samples:
@@ -981,6 +1123,7 @@ async def post_wellness_context(
             body,
             default_timezone=zone,
             wearable_reader=wearable_reader,
+            calendar_settings=request.app.state.settings,
         )
     except WellnessContextRangeError as exc:
         raise APIError(422, "invalid_context_range", str(exc)) from exc

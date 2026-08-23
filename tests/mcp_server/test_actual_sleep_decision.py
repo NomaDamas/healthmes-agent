@@ -1,9 +1,11 @@
 import datetime as dt
+import json
 
 import pytest
 from fastmcp.exceptions import ToolError
 from sqlalchemy import select
 
+from healthmes.mcp_server import server as server_module
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
@@ -12,9 +14,30 @@ from healthmes.store import (
 )
 
 LOCAL_DATE = dt.date(2026, 7, 8)
+GOOGLE_ACCOUNT_GENERATION = "b" * 32
 
 
 def _seed_actual_sleep(store_factory, pinned_tz) -> None:
+    token_path = (
+        server_module._active_settings().data_dir
+        / "google"
+        / "calendar_token.json"
+    )
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fake-refresh",
+                "client_id": "test.apps.googleusercontent.com",
+                "client_secret": "fake-secret",
+                "_healthmes_account_generation": (
+                    GOOGLE_ACCOUNT_GENERATION
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
     start = dt.datetime(2026, 7, 7, 23, 30, tzinfo=pinned_tz)
     wake = dt.datetime(2026, 7, 8, 7, 0, tzinfo=pinned_tz)
     with store_factory() as session:
@@ -33,6 +56,7 @@ def _seed_actual_sleep(store_factory, pinned_tz) -> None:
                 sleep_local_date=LOCAL_DATE,
                 sleep_duration_minutes=420,
                 sleep_time_in_bed_minutes=450,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
             )
         )
         session.commit()
@@ -81,6 +105,8 @@ async def test_readiness_exposes_actual_sleep_without_changing_confidence(
         "upstream_provider": "oura",
         "resource_type": "actual_sleep",
         "observed_at": "2026-07-07T22:00:00+00:00",
+        "calendar_source": "google",
+        "account_generation": GOOGLE_ACCOUNT_GENERATION,
         "schema_version": 1,
         "derived_by": "healthmes.actual-sleep-mirror.v1",
     }

@@ -30,12 +30,20 @@ from sqlalchemy.pool import StaticPool
 from healthmes.config import Settings, get_settings
 
 _SQLITE_MEMORY_DATABASES = (None, "", ":memory:")
+_RUNTIME_WRITE_FENCE_ENABLED_MARKER = (
+    "_healthmes_runtime_write_fence_enabled"
+)
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
 
-def create_db_engine(database_url: str, **engine_kwargs: Any) -> Engine:
+def create_db_engine(
+    database_url: str,
+    *,
+    enforce_runtime_write_fence: bool = True,
+    **engine_kwargs: Any,
+) -> Engine:
     """Create an Engine for ``database_url`` with per-backend safety settings.
 
     Extra ``engine_kwargs`` are passed through to ``sqlalchemy.create_engine``
@@ -52,6 +60,11 @@ def create_db_engine(database_url: str, **engine_kwargs: Any) -> Engine:
         else:
             Path(url.database).parent.mkdir(parents=True, exist_ok=True)
         engine = create_engine(url, **engine_kwargs)
+        setattr(
+            engine,
+            _RUNTIME_WRITE_FENCE_ENABLED_MARKER,
+            enforce_runtime_write_fence,
+        )
 
         @event.listens_for(engine, "connect")
         def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
@@ -63,10 +76,26 @@ def create_db_engine(database_url: str, **engine_kwargs: Any) -> Engine:
                 cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
+        if enforce_runtime_write_fence:
+            from healthmes.activity.locking import (
+                install_engine_write_fence,
+            )
+
+            install_engine_write_fence(engine)
         return engine
 
     engine_kwargs.setdefault("pool_pre_ping", True)
-    return create_engine(url, **engine_kwargs)
+    engine = create_engine(url, **engine_kwargs)
+    setattr(
+        engine,
+        _RUNTIME_WRITE_FENCE_ENABLED_MARKER,
+        enforce_runtime_write_fence,
+    )
+    if enforce_runtime_write_fence:
+        from healthmes.activity.locking import install_engine_write_fence
+
+        install_engine_write_fence(engine)
+    return engine
 
 
 def init_engine(settings: Settings | None = None) -> Engine:

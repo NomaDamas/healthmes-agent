@@ -17,6 +17,7 @@ from healthmes.calendars import creds
 from healthmes.calendars.base import CalendarError
 
 PASSWORD = "abcd-efgh-ijkl-mnop"
+ACCOUNT_GENERATION = "a" * 32
 
 
 def file_mode(path) -> int:
@@ -38,6 +39,7 @@ class TestCalDavCredsFile:
             username="me@icloud.com",
             app_password=PASSWORD,
             url="https://caldav.icloud.com",
+            account_generation=ACCOUNT_GENERATION,
         )
         assert path == creds.caldav_credentials_path(tmp_path)
         assert file_mode(path) == 0o600
@@ -46,6 +48,7 @@ class TestCalDavCredsFile:
             "username": "me@icloud.com",
             "app_password": PASSWORD,
             "url": "https://caldav.icloud.com",
+            "account_generation": ACCOUNT_GENERATION,
         }
 
     def test_roundtrip(self, tmp_path) -> None:

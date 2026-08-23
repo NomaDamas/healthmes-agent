@@ -1,6 +1,6 @@
 """Alert history for the companion apps (issues #10/#11).
 
-``GET /v1/alerts`` lists recent *pushed* trigger events with the same
+``GET /v1/alerts`` lists recent delivered or app-available trigger events with the same
 "unresolved == recent" placeholder semantics as the glance ``alerts`` block
 (healthmes/api/briefing.py — the store has no resolution tracking yet; the
 domain expert owns refining that policy). Each item carries the §8.5
@@ -10,10 +10,10 @@ decision-viewer deep link, resolved through the same persisted trigger
 correlation the glance top alert uses — so an app listing alerts never
 disagrees with its own widget.
 
-The window (``hours``, default = glance's ALERT_RECENT_HOURS) and the SQL
+The window (``hours``, default = glance's ALERT_RECENT_HOURS) and the
 filter mirror ``briefing._alerts_block``, including the Python-side re-check
 of ``fired_at`` (sqlite reads are naive). Pagination happens in Python over
-the verified rows: pushed alerts are budget-capped per day
+the verified rows: visible alerts are budget-capped per day
 (Settings.alert_daily_budget), so a full week's window stays tiny.
 """
 
@@ -30,7 +30,15 @@ from healthmes.api.briefing import ALERT_RECENT_HOURS, decision_viewer_url
 from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.pagination import Page, PageMeta, PageParamsDep
 from healthmes.config import Settings
+from healthmes.engine.alert_visibility import (
+    AlertDeliveryState,
+    alert_delivery_state,
+    is_user_visible_alert,
+)
 from healthmes.store import DecisionRecord, ProposalStatus, ScheduleProposal, Task, TriggerEvent
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
 from healthmes.store.session import SessionDep
 
 __all__ = ["router", "MAX_WINDOW_HOURS"]
@@ -60,11 +68,12 @@ class DecisionCardOut(BaseModel):
 
 
 class AlertOut(BaseModel):
-    """One pushed alert, shaped after the §8.5 notification grammar."""
+    """One visible alert, shaped after the §8.5 notification grammar."""
 
     id: uuid.UUID
     rule_id: str
     fired_at: datetime
+    delivery_state: AlertDeliveryState = "delivered"
     summary: str  # observation line (falls back to rule_id for legacy rows)
     proposal: str | None  # proposal line
     evidence: dict[str, Any] | None  # evidence facts (client renders the line)
@@ -74,7 +83,10 @@ class AlertOut(BaseModel):
 
 
 def _decision_ids(
-    session: Session, events: list[TriggerEvent]
+    session: Session,
+    events: list[TriggerEvent],
+    *,
+    now: datetime,
 ) -> dict[uuid.UUID, uuid.UUID]:
     """Return the exact persisted decision correlation for each alert."""
     if not events:
@@ -84,7 +96,8 @@ def _decision_ids(
         trigger_event_id: decision_id
         for trigger_event_id, decision_id in session.execute(
             select(DecisionRecord.trigger_event_id, DecisionRecord.id).where(
-                DecisionRecord.trigger_event_id.in_(event_ids)
+                DecisionRecord.trigger_event_id.in_(event_ids),
+                decision_record_is_available_at(now),
             )
         )
         if trigger_event_id is not None
@@ -182,21 +195,23 @@ def list_alerts(
     page: PageParamsDep,
     hours: Annotated[int, Query(ge=1, le=MAX_WINDOW_HOURS)] = ALERT_RECENT_HOURS,
 ) -> Page[AlertOut]:
-    """Recent pushed alerts, newest first (glance ``alerts`` block semantics)."""
+    """Recent visible alerts, newest first (glance ``alerts`` semantics)."""
     settings: Settings = request.app.state.settings
-    cutoff = utc_now() - timedelta(hours=hours)
+    now = utc_now()
+    cutoff = now - timedelta(hours=hours)
     events = [
         event
         for event in session.scalars(
             select(TriggerEvent)
-            .where(TriggerEvent.alert_sent.is_(True), TriggerEvent.fired_at >= cutoff)
+            .where(TriggerEvent.fired_at >= cutoff)
             .order_by(TriggerEvent.fired_at.desc(), TriggerEvent.created_at.desc())
         ).all()
-        if ensure_utc(event.fired_at) >= cutoff  # sqlite reads are naive; re-verify
+        if ensure_utc(event.fired_at) >= cutoff
+        and is_user_visible_alert(session, event, now=now)
     ]
 
     window = events[page.offset : page.offset + page.limit]
-    decision_ids = _decision_ids(session, window)
+    decision_ids = _decision_ids(session, window, now=now)
     links = {
         event_id: decision_viewer_url(settings, decision_id)
         for event_id, decision_id in decision_ids.items()
@@ -211,8 +226,10 @@ def list_alerts(
     )
     data = []
     for event in window:
+        delivery_state = alert_delivery_state(event)
+        assert delivery_state is not None
         payload: dict[str, Any] = event.payload or {}
-        summary = payload.get("summary")
+        summary = payload.get("message") or payload.get("summary")
         evidence = payload.get("evidence")
         proposal = payload.get("proposal")
         data.append(
@@ -220,6 +237,7 @@ def list_alerts(
                 id=event.id,
                 rule_id=event.rule_id,
                 fired_at=ensure_utc(event.fired_at),
+                delivery_state=delivery_state,
                 # Same honest fallback as the glance top alert: the rule id
                 # when a legacy row carries no payload.
                 summary=str(summary) if summary else event.rule_id,

@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from healthmes import clock
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
@@ -78,10 +79,51 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _event_is_expired(event: WellnessEvent) -> bool:
+    return (
+        event.expires_at is not None
+        and _as_utc(event.expires_at) <= clock.utc_now()
+    )
+
+
+def _validate_observation_retry(
+    event: WellnessEvent,
+    *,
+    media_object_id: uuid.UUID | None,
+    request_fingerprint: str,
+) -> None:
+    if _event_is_expired(event):
+        raise NutritionRepositoryError(
+            "expired nutrition observation cannot be retried"
+        )
+    derived_from = event.derived_from
+    if (
+        not isinstance(derived_from, dict)
+        or derived_from.get("request_fingerprint")
+        != request_fingerprint
+    ):
+        raise NutritionRepositoryError(
+            "nutrition observation_id was already used with different request input"
+        )
+    stored_media_id = derived_from.get("storage_object_id")
+    if (
+        media_object_id is None
+        or event.raw_object_id != media_object_id
+        or (
+            stored_media_id is not None
+            and stored_media_id != str(media_object_id)
+        )
+    ):
+        raise NutritionRepositoryError(
+            "nutrition observation_id was already used with different media"
+        )
+
+
 def _policy(session: Session, data_class: str) -> RetentionPolicy:
-    ensure_default_policies(session)
     policy = session.scalar(
-        select(RetentionPolicy).where(RetentionPolicy.data_class == data_class)
+        select(RetentionPolicy)
+        .where(RetentionPolicy.data_class == data_class)
+        .execution_options(populate_existing=True)
     )
     if policy is None:  # pragma: no cover - ensure_default_policies owns this invariant
         raise NutritionRepositoryError(f"missing retention policy: {data_class}")
@@ -186,14 +228,30 @@ def persist_observation(
     *,
     request_fingerprint: str,
 ) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     source_record_id = str(observation.observation_id)
     existing = session.scalar(
-        select(WellnessEvent).where(
+        select(WellnessEvent)
+        .where(
+            WellnessEvent.event_type == OBSERVATION_EVENT,
             WellnessEvent.source_provider == SOURCE_PROVIDER,
             WellnessEvent.source_record_id == source_record_id,
         )
+        .execution_options(populate_existing=True)
     )
     if existing is not None:
+        media_object_id = session.scalar(
+            select(StorageObject.id).where(
+                StorageObject.relative_path
+                == observation.capture.media_path
+            )
+        )
+        _validate_observation_retry(
+            existing,
+            media_object_id=media_object_id,
+            request_fingerprint=request_fingerprint,
+        )
         return existing
 
     obj = storage_object_for_media(session, observation.capture.media_path)
@@ -280,23 +338,22 @@ def persist_observation(
             )
     except IntegrityError:
         existing = session.scalar(
-            select(WellnessEvent).where(
+            select(WellnessEvent)
+            .where(
                 WellnessEvent.event_type == OBSERVATION_EVENT,
                 WellnessEvent.raw_object_id == obj.id,
             )
+            .execution_options(populate_existing=True)
         )
         if existing is None:
             raise NutritionRepositoryError(
                 "media already belongs to another nutrition observation"
             )
-        if (
-            not isinstance(existing.derived_from, dict)
-            or existing.derived_from.get("request_fingerprint")
-            != request_fingerprint
-        ):
-            raise NutritionRepositoryError(
-                "media was already analyzed with different capture metadata"
-            )
+        _validate_observation_retry(
+            existing,
+            media_object_id=obj.id,
+            request_fingerprint=request_fingerprint,
+        )
         return existing
     return event
 
@@ -371,6 +428,8 @@ def list_observations(
 def persist_caffeine_confirmation(
     session: Session, confirmation: CaffeineConfirmation
 ) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     observation = get_observation(session, confirmation.observation_id)
     if observation is None:
         raise NutritionRepositoryError("nutrition observation not found")
@@ -478,17 +537,25 @@ def _validate_review_estimate(estimate: Estimate) -> None:
 def persist_nutrition_review(
     session: Session, review: NutritionReview
 ) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     existing = session.scalar(
-        select(WellnessEvent).where(
+        select(WellnessEvent)
+        .where(
             WellnessEvent.source_provider == "user-nutrition-review",
             WellnessEvent.source_record_id == str(review.review_id),
         )
+        .execution_options(populate_existing=True)
     )
     if existing is not None:
         stored = nutrition_review_from_payload(existing.payload)
         if not _same_nutrition_review(stored, review):
             raise NutritionRepositoryError(
                 "nutrition review operation_id was already used with different input"
+            )
+        if _event_is_expired(existing):
+            raise NutritionRepositoryError(
+                "expired nutrition review cannot be retried"
             )
         return existing
     observation = get_observation(session, review.observation_id)
@@ -596,10 +663,12 @@ def persist_nutrition_review(
             session.flush()
     except IntegrityError:
         existing = session.scalar(
-            select(WellnessEvent).where(
+            select(WellnessEvent)
+            .where(
                 WellnessEvent.source_provider == "user-nutrition-review",
                 WellnessEvent.source_record_id == str(review.review_id),
             )
+            .execution_options(populate_existing=True)
         )
         if existing is None:
             raise
@@ -608,6 +677,10 @@ def persist_nutrition_review(
             raise NutritionRepositoryError(
                 "nutrition review operation_id was already used with different input"
             )
+        if _event_is_expired(existing):
+            raise NutritionRepositoryError(
+                "expired nutrition review cannot be retried"
+            )
         return existing
     return event
 
@@ -615,6 +688,8 @@ def persist_nutrition_review(
 def persist_daily_confirmation(
     session: Session, confirmation: DailyIntakeConfirmation
 ) -> WellnessEvent:
+    lock_activity_write_plane(session)
+    ensure_default_policies(session)
     start, end = local_day_bounds(confirmation.local_date, confirmation.timezone)
     day_ids = {
         uuid.UUID(value)

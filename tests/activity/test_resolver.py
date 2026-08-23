@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
+from healthmes import clock
 from healthmes.activity import resolver as resolver_module
 from healthmes.activity.contracts import (
     ActivityBatchIn,
@@ -24,6 +25,7 @@ from healthmes.activity.resolver import (
 )
 from healthmes.activity.service import ingest_activity_batch
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.visibility import CalendarVisibility
 from healthmes.nutrition.contracts import (
     Confidence,
     DailyIntakeConfirmation,
@@ -504,7 +506,11 @@ async def test_one_domain_failure_does_not_erase_other_focus_context(session) ->
     assert result["domain_statuses"]["activity"] == "ok"
     assert result["contexts"]["wearable"]["status"] == "unavailable"
     assert result["contexts"]["wearable"]["reason"] == "RuntimeError"
-    assert result["contexts"]["calendar"]["status"] == "insufficient_data"
+    assert result["contexts"]["calendar"]["status"] == "unavailable"
+    assert (
+        result["contexts"]["calendar"]["reason"]
+        == "calendar_visibility_not_configured"
+    )
     assert result["evidence"]
     assert result["freshness"]["activity"]["status"] == "retained_raw_window"
     assert "open_wearables_context_unavailable" in result["limitations"]
@@ -630,7 +636,7 @@ async def test_resolver_uses_injected_now_for_overwork_expiry(
             now=start + timedelta(hours=13),
         )
 
-    wall_clock_expired_at = datetime.now(UTC) - timedelta(minutes=1)
+    wall_clock_expired_at = clock.utc_now() - timedelta(minutes=1)
     assert wall_clock_expired_at > datetime(2026, 8, 1, 12, tzinfo=UTC)
     daily_rows = list(
         session.scalars(
@@ -1095,11 +1101,13 @@ def test_previous_night_sleep_summary_source_ref_remains_valid() -> None:
 
 
 def test_calendar_context_excludes_all_day_and_actual_sleep_rows(session) -> None:
+    generation = "resolver-visible-generation"
     session.add_all(
         [
             CalendarEventMirror(
                 external_id="work",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generation,
                 summary="Work",
                 start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
                 end_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
@@ -1107,6 +1115,7 @@ def test_calendar_context_excludes_all_day_and_actual_sleep_rows(session) -> Non
             CalendarEventMirror(
                 external_id="all-day",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generation,
                 summary="Holiday",
                 start_at=datetime(2026, 8, 1, tzinfo=UTC),
                 end_at=datetime(2026, 8, 2, tzinfo=UTC),
@@ -1115,6 +1124,7 @@ def test_calendar_context_excludes_all_day_and_actual_sleep_rows(session) -> Non
             CalendarEventMirror(
                 external_id="actual-sleep",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generation,
                 summary="Sleep",
                 start_at=datetime(2026, 8, 1, 1, tzinfo=UTC),
                 end_at=datetime(2026, 8, 1, 8, tzinfo=UTC),
@@ -1128,6 +1138,9 @@ def test_calendar_context_excludes_all_day_and_actual_sleep_rows(session) -> Non
         session,
         day=date(2026, 8, 1),
         timezone="UTC",
+        visibility=CalendarVisibility(
+            {CalendarSource.GOOGLE: generation}
+        ),
     )
 
     assert context["event_count"] == 1
