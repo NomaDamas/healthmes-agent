@@ -21,6 +21,7 @@ struct WellnessControlView: View {
     @State private var preview: CommandPreview?
     @State private var commandMessage: String?
     @State private var generatedScene: WellnessScene?
+    @State private var generatedDecisionOutput: WellnessDecisionOutput?
     @State private var generatedSceneOperation: PairingOperationToken?
     @State private var isGeneratingScene = false
     @State private var sceneOperationGate = PairingOperationGate()
@@ -362,14 +363,14 @@ struct WellnessControlView: View {
                     .font(.footnote.weight(.medium))
                 HStack(spacing: 10) {
                     Button {
-                        performSceneDecision(.declineProposal, decision: decision)
+                        performSceneDecision(.decline, decision: decision)
                     } label: {
                         Label("유지", systemImage: "xmark").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
 
                     Button {
-                        performSceneDecision(.acceptProposal, decision: decision)
+                        performSceneDecision(.accept, decision: decision)
                     } label: {
                         Label("변경 승인", systemImage: "checkmark").frame(maxWidth: .infinity)
                     }
@@ -397,46 +398,54 @@ struct WellnessControlView: View {
     }
 
     private var activeDecision: PendingDecision? {
-        let pending = briefing.pendingDecisions
-        guard
-            let generatedScene,
-            WellnessDecisionSafety.canResolve(
-                hasHealthSnapshot: briefing.snapshot != nil,
-                isBriefingStale: briefing.isStale,
-                sceneAllowsActions: generatedScene.allowsProposalActions
-            ),
-            let sceneOperation = generatedSceneOperation,
-            sceneOperationGate.isCurrent(
-                sceneOperation,
-                pairing: PairingStore.shared.load()
-            )
-        else { return nil }
-        let proposalID =
-            generatedScene.exactMutationPreview?.proposalID
-            ?? generatedSceneOperation?.proposalID
-        guard
-            let proposalID,
-            generatedScene.allowsProposalActions(for: proposalID),
-            sceneOperation.proposalID == proposalID
-        else {
-            return nil
-        }
-        return pending.first { $0.id == proposalID }
+        WellnessDecisionSafety.activeDecision(
+            in: briefing.pendingDecisions,
+            hasHealthSnapshot: briefing.snapshot != nil,
+            isBriefingStale: briefing.isStale,
+            operation: generatedSceneOperation,
+            operationGate: sceneOperationGate,
+            currentPairing: PairingStore.shared.load()
+        )
     }
 
     private func performSceneDecision(
-        _ kind: WellnessActionKind,
+        _ action: ProposalAction,
         decision: PendingDecision
     ) {
         guard
-            let action = generatedScene?.actions.first(where: {
-                $0.kind == kind && $0.proposalID == decision.id
-            })
+            resolvingSceneProposalID == nil,
+            let pairing = PairingStore.shared.load(),
+            WellnessDecisionSafety.activeDecision(
+                in: briefing.pendingDecisions,
+                hasHealthSnapshot: briefing.snapshot != nil,
+                isBriefingStale: briefing.isStale,
+                operation: generatedSceneOperation,
+                operationGate: sceneOperationGate,
+                currentPairing: pairing
+            )?.id == decision.id
         else {
             commandMessage = "이 제안은 더 이상 승인할 수 없습니다. 새로고침해 주세요."
             return
         }
-        handleSceneAction(action)
+        resolvingSceneProposalID = decision.id
+        let resolutionOperation = resolutionOperationGate.begin(
+            pairing: pairing,
+            proposalID: decision.id
+        )
+        Task {
+            await briefing.resolve(
+                decision.proposal,
+                action: action,
+                pairing: pairing
+            )
+            guard resolutionOperationGate.isCurrent(
+                resolutionOperation,
+                pairing: PairingStore.shared.load(),
+                proposalID: decision.id
+            ) else { return }
+            resolvingSceneProposalID = nil
+            await refreshAll()
+        }
     }
 
     private func proposalResultBanner(_ message: String) -> some View {
@@ -645,17 +654,31 @@ struct WellnessControlView: View {
         commandMessage = nil
         switch intent {
         case .show(let target):
+            let relatedRecordIDs =
+                generatedDecisionOutput?.relatedRecordIDs ?? [:]
             selectDetail(target)
             let query = command.transcript
             command.transcript = ""
-            Task { await loadScene(query: query) }
+            Task {
+                await loadScene(
+                    query: query,
+                    relatedRecordIDs: relatedRecordIDs
+                )
+            }
         case .createTask(let title):
             preview = CommandPreview(kind: .task, title: title)
         case .createGoal(let title):
             preview = CommandPreview(kind: .goal, title: title)
         case .clarify(let query):
+            let relatedRecordIDs =
+                generatedDecisionOutput?.relatedRecordIDs ?? [:]
             command.transcript = ""
-            Task { await loadScene(query: query) }
+            Task {
+                await loadScene(
+                    query: query,
+                    relatedRecordIDs: relatedRecordIDs
+                )
+            }
         }
     }
 
@@ -709,14 +732,10 @@ struct WellnessControlView: View {
             refreshOperation,
             pairing: PairingStore.shared.load()
         ) else { return }
-        if let proposal = ProactiveProposalSelection.firstEligible(
-            in: briefing.pendingProposals
-        ) {
+        if let decision = briefing.pendingDecisions.first {
             await loadScene(
-                query: "\(proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
-                source: .proactive,
-                proposalID: proposal.id,
-                decisionRecordID: proposal.decisionRecordId
+                query: decision.prompt,
+                proposalID: decision.id
             )
         } else {
             await loadScene(query: sceneQuery(for: lens))
@@ -725,11 +744,11 @@ struct WellnessControlView: View {
 
     private func loadScene(
         query: String,
-        source: WellnessSceneRequest.Source = .user,
-        proposalID: UUID? = nil,
-        decisionRecordID: UUID? = nil
+        relatedRecordIDs: [String: String] = [:],
+        proposalID: UUID? = nil
     ) async {
         generatedScene = nil
+        generatedDecisionOutput = nil
         generatedSceneOperation = nil
         isGeneratingScene = true
         commandMessage = nil
@@ -751,11 +770,15 @@ struct WellnessControlView: View {
             }
         }
         do {
-            let scene = try await HealthMesAPI().createWellnessScene(
-                query: query,
-                source: source,
-                proposalID: proposalID,
-                decisionRecordID: decisionRecordID,
+            let presentation = try await HealthMesAPI().createWellnessDecision(
+                question: query,
+                hints: WellnessDecisionHints(
+                    relatedRecordIDs: relatedRecordIDs
+                ),
+                lens: lens,
+                timezone:
+                    briefing.snapshot?.payload.timezone
+                    ?? TimeZone.autoupdatingCurrent.identifier,
                 pairing: pairingSnapshot
             )
             guard
@@ -764,8 +787,10 @@ struct WellnessControlView: View {
                     pairing: PairingStore.shared.load()
                 )
             else { return }
+            let scene = presentation.scene
             lens = scene.lens
             generatedScene = scene
+            generatedDecisionOutput = presentation.output
             generatedSceneOperation = sceneOperation
         } catch {
             guard
@@ -775,6 +800,7 @@ struct WellnessControlView: View {
                 )
             else { return }
             generatedScene = nil
+            generatedDecisionOutput = nil
             generatedSceneOperation = nil
             commandMessage = "Wellness insight를 불러오지 못했습니다. 연결 상태를 확인한 뒤 다시 시도하세요."
         }
@@ -783,57 +809,7 @@ struct WellnessControlView: View {
     private func handleSceneAction(_ action: WellnessSceneAction) {
         switch action.kind {
         case .acceptProposal, .declineProposal:
-            guard
-                WellnessDecisionSafety.canResolve(
-                    hasHealthSnapshot: briefing.snapshot != nil,
-                    isBriefingStale: briefing.isStale,
-                    sceneAllowsActions: generatedScene?.allowsProposalActions == true
-                ),
-                let sceneOperation = generatedSceneOperation,
-                sceneOperationGate.isCurrent(
-                    sceneOperation,
-                    pairing: PairingStore.shared.load()
-                ),
-                generatedScene?.allowsProposalActions == true,
-                let proposalID = action.proposalID,
-                sceneOperation.proposalID == proposalID,
-                resolvingSceneProposalID == nil,
-                let proposal = briefing.pendingProposals.first(where: {
-                    $0.id == proposalID && $0.isActionable
-                })
-            else {
-                commandMessage = "이 제안은 더 이상 승인할 수 없습니다. 새로고침해 주세요."
-                return
-            }
-            resolvingSceneProposalID = proposalID
-            let proposalAction: ProposalAction =
-                action.kind == .acceptProposal ? .accept : .decline
-            let resolutionOperation = resolutionOperationGate.begin(
-                pairing: sceneOperation.pairing,
-                proposalID: proposalID
-            )
-            Task {
-                await briefing.resolve(
-                    proposal,
-                    action: proposalAction,
-                    pairing: sceneOperation.pairing
-                )
-                guard resolutionOperationGate.isCurrent(
-                    resolutionOperation,
-                    pairing: PairingStore.shared.load(),
-                    proposalID: proposalID
-                ) else { return }
-                resolvingSceneProposalID = nil
-                guard
-                    generatedSceneOperation == sceneOperation,
-                    sceneOperationGate.isCurrent(
-                        sceneOperation,
-                        pairing: PairingStore.shared.load(),
-                        proposalID: sceneOperation.proposalID
-                    )
-                else { return }
-                await refreshAll()
-            }
+            commandMessage = "일정 승인과 거절은 위의 검증된 제안 카드에서만 실행됩니다."
         case .openWebDetail:
             if let url = action.url {
                 router.openDecision(url)
@@ -855,6 +831,7 @@ struct WellnessControlView: View {
     private func invalidateGeneratedScene() {
         sceneOperationGate.invalidate()
         generatedScene = nil
+        generatedDecisionOutput = nil
         generatedSceneOperation = nil
         isGeneratingScene = false
     }

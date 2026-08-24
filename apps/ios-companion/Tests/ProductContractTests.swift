@@ -109,29 +109,51 @@ final class ProductContractTests: XCTestCase {
                 + "?start=2026-08-06T00:00:00Z&end=2026-08-13T00:00:00Z&limit=100"
         )
 
-        let proposalID = UUID(uuidString: "91000000-0000-0000-0000-000000000091")!
-        let decisionID = UUID(uuidString: "92000000-0000-0000-0000-000000000092")!
-        let scene = try HealthMesAPI.wellnessSceneRequest(
+        let idempotencyKey = "product-contract-20260824"
+        let decision = try HealthMesAPI.wellnessDecisionRequest(
             pairing: pairing,
-            query: "언제 집중 업무를 해야 해?",
-            source: .proactive,
-            proposalID: proposalID,
-            decisionRecordID: decisionID
+            question: "언제 집중 업무를 해야 해?",
+            idempotencyKey: idempotencyKey
         )
         XCTAssertEqual(
-            scene.url?.absoluteString,
-            "https://healthmes.example/v1/wellness/scenes"
+            decision.url?.absoluteString,
+            "https://healthmes.example/v1/wellness-decisions"
         )
-        XCTAssertEqual(scene.httpMethod, "POST")
-        let sceneBody = try XCTUnwrap(
+        XCTAssertEqual(decision.httpMethod, "POST")
+        XCTAssertEqual(
+            decision.value(forHTTPHeaderField: "Authorization"),
+            "Bearer token"
+        )
+        XCTAssertEqual(
+            decision.value(forHTTPHeaderField: "Content-Type"),
+            "application/json"
+        )
+        XCTAssertEqual(
+            decision.value(forHTTPHeaderField: "Idempotency-Key"),
+            idempotencyKey
+        )
+        let decisionBody = try XCTUnwrap(
             JSONSerialization.jsonObject(
-                with: try XCTUnwrap(scene.httpBody)
-            ) as? [String: String]
+                with: try XCTUnwrap(decision.httpBody)
+            ) as? [String: Any]
         )
-        XCTAssertEqual(sceneBody["query"], "언제 집중 업무를 해야 해?")
-        XCTAssertEqual(sceneBody["source"], "proactive")
-        XCTAssertEqual(sceneBody["proposal_id"], proposalID.uuidString.uppercased())
-        XCTAssertEqual(sceneBody["decision_record_id"], decisionID.uuidString.uppercased())
+        XCTAssertEqual(
+            Set(decisionBody.keys),
+            Set(["question", "persistence_requested", "hints"])
+        )
+        XCTAssertEqual(decisionBody["question"] as? String, "언제 집중 업무를 해야 해?")
+        XCTAssertEqual(decisionBody["persistence_requested"] as? Bool, false)
+        XCTAssertNil(decisionBody["proposal_id"])
+        XCTAssertNil(decisionBody["decision_record_id"])
+
+        let hints = try XCTUnwrap(decisionBody["hints"] as? [String: Any])
+        XCTAssertEqual(
+            Set(hints.keys),
+            Set(["local_date", "start", "end", "lookback_days", "related_record_ids"])
+        )
+        XCTAssertTrue((hints["related_record_ids"] as? [String: Any])?.isEmpty == true)
+        XCTAssertNil(hints["proposal_id"])
+        XCTAssertNil(hints["decision_record_id"])
     }
 
     func testSetupReadinessDecodesIndependentComponents() throws {
@@ -1847,6 +1869,132 @@ final class ProductContractTests: XCTestCase {
                 sceneAllowsActions: false
             )
         )
+    }
+
+    func testActiveDecisionRequiresCurrentProposalScopedOperation() throws {
+        let pairing = Pairing(
+            baseURL: try XCTUnwrap(URL(string: "https://healthmes.example")),
+            token: "token"
+        )
+        let changedPairing = Pairing(
+            baseURL: pairing.baseURL,
+            token: "changed-token"
+        )
+        let start = try XCTUnwrap(
+            GlanceJSON.parseISO8601("2026-08-24T09:00:00Z")
+        )
+        let proposalID = UUID()
+        let decisionID = UUID()
+        let proposal = ProposalItem(
+            id: proposalID,
+            taskId: UUID(),
+            proposedStart: start,
+            proposedEnd: start.addingTimeInterval(3_600),
+            status: .proposed,
+            decisionRecordId: decisionID,
+            acceptResolutionToken: "accept",
+            declineResolutionToken: "decline"
+        )
+        let alert = AlertItem(
+            id: UUID(),
+            ruleId: "schedule",
+            firedAt: start,
+            summary: "Recovery changed",
+            proposal: "Move Deep Work?",
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID,
+            decisionCard: DecisionCard(
+                decisionId: decisionID,
+                proposalId: proposalID,
+                kind: "schedule_change",
+                severity: "coaching",
+                title: "Deep Work",
+                observationShort: "Recovery changed",
+                evidenceShort: nil,
+                proposedAction: "Move Deep Work?",
+                before: nil,
+                after: start,
+                endsAt: start.addingTimeInterval(3_600),
+                expiresAt: start.addingTimeInterval(600),
+                decisionUrl: nil
+            )
+        )
+        let decisions = PendingDecision.correlate(
+            alerts: [alert],
+            proposals: [proposal]
+        )
+        let decision = try XCTUnwrap(decisions.first)
+        var gate = PairingOperationGate()
+        let generalOperation = gate.begin(pairing: pairing)
+
+        XCTAssertNil(
+            WellnessDecisionSafety.activeDecision(
+                in: decisions,
+                hasHealthSnapshot: true,
+                isBriefingStale: false,
+                operation: generalOperation,
+                operationGate: gate,
+                currentPairing: pairing
+            )
+        )
+
+        let proposalOperation = gate.begin(
+            pairing: pairing,
+            proposalID: proposalID
+        )
+        XCTAssertEqual(
+            WellnessDecisionSafety.activeDecision(
+                in: decisions,
+                hasHealthSnapshot: true,
+                isBriefingStale: false,
+                operation: proposalOperation,
+                operationGate: gate,
+                currentPairing: pairing
+            ),
+            decision
+        )
+        XCTAssertNil(
+            WellnessDecisionSafety.activeDecision(
+                in: decisions,
+                hasHealthSnapshot: true,
+                isBriefingStale: false,
+                operation: proposalOperation,
+                operationGate: gate,
+                currentPairing: changedPairing
+            )
+        )
+        XCTAssertNil(
+            WellnessDecisionSafety.activeDecision(
+                in: decisions,
+                hasHealthSnapshot: true,
+                isBriefingStale: true,
+                operation: proposalOperation,
+                operationGate: gate,
+                currentPairing: pairing
+            )
+        )
+    }
+
+    func testWellnessDecisionProjectorUsesReceiptTimestamp() {
+        let output = WellnessDecisionOutput(
+            requestID: UUID(),
+            turnID: UUID(),
+            status: .completed,
+            answer: "Protect the next recovery block.",
+            runtime: WellnessDecisionRuntime(runtime: "hermes")
+        )
+        let generatedAt = Date(timeIntervalSince1970: 1_787_549_400)
+
+        let scene = WellnessDecisionProjector.project(
+            output,
+            timezone: "Asia/Seoul",
+            generatedAt: generatedAt
+        )
+
+        XCTAssertEqual(scene.generatedAt, generatedAt)
+        XCTAssertEqual(scene.timezone, "Asia/Seoul")
+        XCTAssertNotEqual(scene.generatedAt, Date(timeIntervalSince1970: 0))
     }
 
     func testTimelineLaneCountsResetAfterOverlapCluster() throws {

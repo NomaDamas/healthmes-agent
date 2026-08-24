@@ -314,6 +314,35 @@ public enum WellnessDecisionSafety {
     ) -> Bool {
         hasHealthSnapshot && !isBriefingStale && sceneAllowsActions
     }
+
+    public static func activeDecision(
+        in pendingDecisions: [PendingDecision],
+        hasHealthSnapshot: Bool,
+        isBriefingStale: Bool,
+        operation: PairingOperationToken?,
+        operationGate: PairingOperationGate,
+        currentPairing: Pairing?
+    ) -> PendingDecision? {
+        guard
+            hasHealthSnapshot,
+            !isBriefingStale,
+            let operation,
+            let proposalID = operation.proposalID,
+            operationGate.isCurrent(
+                operation,
+                pairing: currentPairing,
+                proposalID: proposalID
+            ),
+            let decision = pendingDecisions.first(where: {
+                $0.id == proposalID
+            }),
+            decision.proposal.isActionable,
+            decision.hasExactDecisionCorrelation
+        else {
+            return nil
+        }
+        return decision
+    }
 }
 
 public struct TimelineLaneAssignment: Equatable {
