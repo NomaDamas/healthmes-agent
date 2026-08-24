@@ -328,10 +328,11 @@ _SOURCES = (
         actions=(
             InputActionDescriptor(
                 action="connect",
-                execution="external",
+                execution="device",
                 description=(
-                    "Configure a HealthKit auto-export app to send data to "
-                    "the HealthMes receiver."
+                    "Authorize Apple Health in the paired HealthMes iPhone "
+                    "app. No separate exporter app or provider API key is "
+                    "required."
                 ),
             ),
             InputActionDescriptor(
@@ -358,8 +359,10 @@ _SOURCES = (
             ),
         ),
         limitations=(
-            "healthkit_exporter_configuration_is_external",
+            "healthkit_collection_requires_healthmes_ios_companion",
             "healthkit_delivery_freshness_is_not_observed",
+            "wearable_provider_device_inventory_not_available",
+            "wearable_provider_device_crud_not_available",
         ),
     ),
     _SourceSpec(
@@ -398,6 +401,11 @@ _SOURCES = (
                 "HealthMes stores normalized provenance snapshots, not provider "
                 "credentials.",
             ),
+        ),
+        limitations=(
+            "open_wearables_configuration_is_server_managed",
+            "wearable_provider_device_inventory_not_available",
+            "wearable_provider_device_crud_not_available",
         ),
     ),
     _SourceSpec(

@@ -46,6 +46,7 @@ from healthmes.api.local_session import (
     is_loopback_scope,
 )
 from healthmes.config import Settings
+from healthmes.pairing import PAIRING_EXCHANGE_PATH
 
 __all__ = [
     "BearerTokenMiddleware",
@@ -172,6 +173,11 @@ class BearerTokenMiddleware:
     def _is_authorized(self, scope: Scope) -> bool:
         path = scope.get("path", "")
         if path in OPEN_PATHS:
+            return True
+        if (
+            scope.get("method") == "POST"
+            and path == PAIRING_EXCHANGE_PATH
+        ):
             return True
         if (
             scope.get("method") == "POST"

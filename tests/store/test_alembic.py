@@ -74,7 +74,11 @@ EXPECTED_TABLES = {
     "wellness_event",
     "storage_usage_daily",
     "purge_job",
+    "healthkit_ingest_receipt",
+    "healthkit_deletion_tombstone",
 }
+
+ALEMBIC_HEAD = "c8d9e0f1a2b3"
 
 
 def _config(database_url: str, buffer: io.StringIO | None = None) -> Config:
@@ -323,7 +327,7 @@ def _render_offline_decision_receipt_basis_upgrade(
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert script.get_heads() == ["b7c8d9e0f1a2"]
+    assert script.get_heads() == [ALEMBIC_HEAD]
 
 
 def test_migration_keeps_existing_application_loggers_enabled():
@@ -506,7 +510,7 @@ class TestOfflineRender:
             "file_cleanup_completed_at",
         } <= columns
         assert "storage_object_file_cleanup_consistent" in table_sql
-        assert "b7c8d9e0f1a2" in revisions
+        assert ALEMBIC_HEAD in revisions
 
     def test_decision_policy_constraint_normalization_renders_for_sqlite(
         self,
@@ -992,6 +996,171 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    @pytest.mark.parametrize(
+        "omission",
+        ("column", "unique", "check", "foreign_key"),
+    )
+    def test_healthkit_receipt_migration_rejects_partial_existing_table(
+        self,
+        tmp_path,
+        omission,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / f'partial-healthkit-{omission}.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "b7c8d9e0f1a2")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData(
+            naming_convention=Base.metadata.naming_convention
+        )
+        sa.Table(
+            "raw_ingest_event",
+            metadata,
+            autoload_with=engine,
+        )
+        columns = [
+            sa.Column("id", sa.Uuid(), nullable=False),
+            sa.Column(
+                "idempotency_key_digest",
+                sa.String(length=64),
+                nullable=False,
+            ),
+            sa.Column("body_sha256", sa.String(length=64), nullable=False),
+            sa.Column("state", sa.String(length=32), nullable=False),
+            sa.Column("owner_token", sa.Uuid(), nullable=True),
+            sa.Column("lease_generation", sa.Integer(), nullable=False),
+            sa.Column(
+                "lease_expires_at",
+                sa.DateTime(timezone=True),
+                nullable=True,
+            ),
+            sa.Column("raw_id", sa.Uuid(), nullable=True),
+            sa.Column("ack_payload", sa.JSON(), nullable=True),
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                nullable=False,
+            ),
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                nullable=False,
+            ),
+        ]
+        if omission == "column":
+            columns = [
+                column
+                for column in columns
+                if column.name != "body_sha256"
+            ]
+        constraints: list[sa.SchemaItem] = [
+            sa.PrimaryKeyConstraint(
+                "id",
+                name="pk_healthkit_ingest_receipt",
+            ),
+        ]
+        if omission != "unique":
+            constraints.append(
+                sa.UniqueConstraint(
+                    "idempotency_key_digest",
+                    name=(
+                        "uq_healthkit_ingest_receipt_"
+                        "idempotency_key_digest"
+                    ),
+                )
+            )
+        if omission != "check":
+            constraints.extend(
+                [
+                    sa.CheckConstraint(
+                        "lease_generation >= 1",
+                        name="lease_generation_positive",
+                    ),
+                    sa.CheckConstraint(
+                        "("
+                        "state = 'pending' "
+                        "AND owner_token IS NOT NULL "
+                        "AND lease_expires_at IS NOT NULL "
+                        "AND ack_payload IS NULL"
+                        ") OR ("
+                        "state = 'completed' "
+                        "AND owner_token IS NULL "
+                        "AND lease_expires_at IS NULL "
+                        "AND ack_payload IS NOT NULL"
+                        ")",
+                        name="state_consistent",
+                    ),
+                ]
+            )
+        if omission != "foreign_key":
+            constraints.append(
+                sa.ForeignKeyConstraint(
+                    ["raw_id"],
+                    ["raw_ingest_event.id"],
+                    name=(
+                        "fk_healthkit_ingest_receipt_raw_id_"
+                        "raw_ingest_event"
+                    ),
+                    ondelete="SET NULL",
+                )
+            )
+        sa.Table(
+            "healthkit_ingest_receipt",
+            metadata,
+            *columns,
+            *constraints,
+        )
+        metadata.create_all(engine)
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "existing healthkit_ingest_receipt table is "
+                "incomplete or incompatible"
+            ),
+        ):
+            command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert not inspector.has_table(
+                "healthkit_deletion_tombstone"
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b7c8d9e0f1a2"
+        finally:
+            engine.dispose()
+
+    def test_healthkit_receipt_migration_round_trip_is_lossless_when_empty(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite:///{tmp_path / 'healthkit-receipt-round-trip.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        command.downgrade(config, "b7c8d9e0f1a2")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert not inspector.has_table("healthkit_ingest_receipt")
+            assert not inspector.has_table(
+                "healthkit_deletion_tombstone"
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b7c8d9e0f1a2"
+        finally:
+            engine.dispose()
+
     def test_wellness_provider_migration_normalizes_and_enforces_check(
         self,
         tmp_path,
@@ -1107,7 +1276,7 @@ class TestSqliteUpgrade:
                 ) == str(uuid.UUID(raw_id))
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
             with engine.begin() as connection:
                 with pytest.raises(sa.exc.IntegrityError):
                     connection.execute(
@@ -1683,7 +1852,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             engine.dispose()
 
@@ -1753,7 +1922,7 @@ class TestSqliteUpgrade:
             with engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
                 assert (
                     connection.scalar(
                         sa.select(
@@ -1872,7 +2041,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
                 row = connection.execute(
                     sa.select(current_storage_object).where(
                         current_storage_object.c.id == object_id
@@ -2427,7 +2596,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             engine.dispose()
 
@@ -4211,7 +4380,7 @@ class TestSqliteUpgrade:
                 assert row.revision == 7
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             engine.dispose()
 
@@ -4361,7 +4530,7 @@ class TestSqliteUpgrade:
                 ) == 3
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             engine.dispose()
 
@@ -5130,7 +5299,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             engine.dispose()
 
@@ -5356,7 +5525,7 @@ def test_postgres_wellness_provider_migration_is_atomic() -> None:
                 assert row.source_record_id == str(raw_id)
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             scoped_engine.dispose()
 
@@ -5744,7 +5913,7 @@ def test_postgres_decision_policy_constraint_normalization_round_trip() -> None:
                 assert row.revision == 9
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             scoped_engine.dispose()
 
@@ -5866,7 +6035,7 @@ def test_postgres_multi_revision_failure_rolls_back_earlier_downgrade() -> None:
             with scoped_engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             scoped_engine.dispose()
     finally:
@@ -7073,7 +7242,7 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             scoped_engine.dispose()
     finally:
@@ -7167,7 +7336,7 @@ def test_postgres_receipt_hardening_repairs_nullable_requested_at() -> None:
                 assert row.lease_generation == 1
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             scoped_engine.dispose()
     finally:
@@ -7306,7 +7475,7 @@ def test_postgres_receipt_basis_repairs_future_requested_at() -> None:
                 assert row.expires_at == identity_expires_at
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b7c8d9e0f1a2"
+                ) == ALEMBIC_HEAD
         finally:
             scoped_engine.dispose()
     finally:

@@ -11,6 +11,7 @@ import os
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -23,14 +24,17 @@ from healthmes.activity.locking import (
     global_write_plane_guard as real_global_write_plane_guard,
 )
 from healthmes.api import ingest as ingest_api_mod
+from healthmes.api.errors import APIError
 from healthmes.backup import snapshot as snapshot_mod
 from healthmes.backup.snapshot import (
     DataLocations,
     create_snapshot,
     restore_snapshot,
 )
-from healthmes.ingest import transform_hae
+from healthmes.ingest import transform_hae, transform_healthkit_v1
 from healthmes.store import (
+    HealthKitDeletionTombstone,
+    HealthKitIngestReceipt,
     RawIngestEvent,
     StorageObject,
     WellnessEvent,
@@ -64,6 +68,49 @@ HAE_PAYLOAD = {
     }
 }
 
+NATIVE_HEALTHKIT_PAYLOAD = {
+    "schema": "healthmes.healthkit.v1",
+    "sdkVersion": "healthmes-ios/1",
+    "syncTimestamp": "2026-08-24T03:00:00Z",
+    "data": {
+        "records": [
+            {
+                "id": "metric-1",
+                "type": "HKQuantityTypeIdentifierHeartRate",
+                "startDate": "2026-08-24T02:59:00Z",
+                "endDate": "2026-08-24T03:00:00Z",
+                "value": 62.0,
+                "unit": "count/min",
+                "source": {
+                    "bundleIdentifier": "com.apple.health",
+                    "deviceType": "watch",
+                    "productType": "Watch7,5",
+                },
+            }
+        ],
+        "sleep": [
+            {
+                "id": "sleep-1",
+                "stage": "deep",
+                "startDate": "2026-08-23T15:00:00Z",
+                "endDate": "2026-08-23T16:00:00Z",
+            }
+        ],
+        "workouts": [
+            {
+                "id": "workout-1",
+                "type": "running",
+                "startDate": "2026-08-23T22:00:00Z",
+                "endDate": "2026-08-23T22:30:00Z",
+                "values": [
+                    {"type": "duration", "unit": "s", "value": 1800.0}
+                ],
+            }
+        ],
+        "deletions": [],
+    },
+}
+
 
 def _stored_file(settings, event: RawIngestEvent):
     return settings.data_dir / event.path
@@ -95,6 +142,18 @@ def test_transform_maps_known_metrics_and_skips_unknown():
 @pytest.mark.parametrize("junk", [None, [], "str", {"data": {"metrics": "nope"}}, {}])
 def test_transform_tolerates_garbage(junk):
     assert transform_hae(junk) == []
+
+
+def test_transform_native_healthkit_preserves_all_sdk_arrays():
+    batch = transform_healthkit_v1(NATIVE_HEALTHKIT_PAYLOAD)
+
+    assert batch is not None
+    assert batch.sdk_version == "healthmes-ios/1"
+    assert batch.sync_timestamp == "2026-08-24T03:00:00Z"
+    assert [row["id"] for row in batch.records] == ["metric-1"]
+    assert [row["id"] for row in batch.sleep] == ["sleep-1"]
+    assert [row["id"] for row in batch.workouts] == ["workout-1"]
+    assert batch.deletions == ()
 
 
 # --- POST /v1/ingest/healthkit ----------------------------------------------
@@ -178,6 +237,390 @@ def test_healthkit_ingest_non_json_is_kept_unparsed(client, session, settings):
     event = session.scalars(select(RawIngestEvent)).one()
     assert _stored_file(settings, event).read_bytes() == b"\x00\x01 not json"
     assert event.path.endswith(".bin")
+
+
+def test_healthkit_ingest_deep_json_with_idempotency_header_is_stored_raw_first(
+    client,
+    session,
+    settings,
+):
+    depth = 1_024
+    while True:
+        body = b'{"nested":' * depth + b"0" + b"}" * depth
+        try:
+            json.loads(body)
+        except RecursionError:
+            break
+        depth *= 2
+        if len(body) >= settings.ingest_max_bytes:
+            pytest.fail("JSON parser accepted nesting up to the ingest byte cap")
+
+    response = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": "deep-legacy-payload-1",
+        },
+    )
+
+    assert response.status_code == 202
+    ack = response.json()
+    assert ack["parse_status"] == "stored_unparsed"
+    assert ack["forward_status"] == "nothing_mapped"
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert _stored_file(settings, event).read_bytes() == body
+    assert session.scalar(
+        select(func.count()).select_from(HealthKitIngestReceipt)
+    ) == 0
+
+
+def test_native_healthkit_forwards_all_arrays_and_stores_exact_body(
+    client,
+    session,
+    settings,
+):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read())
+        return httpx.Response(202, json={"status": "queued"})
+
+    client.app.state.ingest_transport = httpx.MockTransport(handler)
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
+    body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    response = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": "native-all-arrays-1",
+        },
+    )
+
+    assert response.status_code == 202
+    ack = response.json()
+    assert ack["durable"] is True
+    assert ack["records_forwarded"] == 1
+    assert ack["sleep_forwarded"] == 1
+    assert ack["workouts_forwarded"] == 1
+    assert ack["deletions_received"] == 0
+    assert captured["body"]["sdkVersion"] == "healthmes-ios/1"
+    assert captured["body"]["syncTimestamp"] == "2026-08-24T03:00:00Z"
+    assert [row["id"] for row in captured["body"]["data"]["records"]] == [
+        "metric-1"
+    ]
+    assert [row["id"] for row in captured["body"]["data"]["sleep"]] == [
+        "sleep-1"
+    ]
+    assert [row["id"] for row in captured["body"]["data"]["workouts"]] == [
+        "workout-1"
+    ]
+
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert _stored_file(client.app.state.settings, event).read_bytes() == body
+    receipt = session.scalars(select(HealthKitIngestReceipt)).one()
+    assert receipt.state == "completed"
+    assert receipt.raw_id == event.id
+
+
+def test_native_healthkit_exact_replay_returns_stored_ack_once(
+    client,
+    session,
+    settings,
+):
+    forward_count = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal forward_count
+        forward_count += 1
+        return httpx.Response(202, json={"status": "queued"})
+
+    client.app.state.ingest_transport = httpx.MockTransport(handler)
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
+    body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "native-exact-replay-1",
+    }
+
+    first = client.post("/v1/ingest/healthkit", content=body, headers=headers)
+    second = client.post("/v1/ingest/healthkit", content=body, headers=headers)
+
+    assert first.status_code == second.status_code == 202
+    assert second.json() == first.json()
+    assert forward_count == 1
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+    assert (
+        session.scalar(select(func.count()).select_from(HealthKitIngestReceipt))
+        == 1
+    )
+
+
+def test_native_forward_failure_reuses_raw_and_completes_after_retry(
+    client,
+    session,
+    settings,
+):
+    forward_count = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal forward_count
+        forward_count += 1
+        if forward_count == 1:
+            return httpx.Response(500, text="worker down")
+        return httpx.Response(202, json={"status": "queued"})
+
+    client.app.state.ingest_transport = httpx.MockTransport(handler)
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
+    body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "native-forward-retry-1",
+    }
+
+    first = client.post("/v1/ingest/healthkit", content=body, headers=headers)
+    replay = client.post("/v1/ingest/healthkit", content=body, headers=headers)
+
+    assert first.status_code == replay.status_code == 202
+    assert first.json()["forward_status"] == "forward_failed"
+    assert replay.json()["forward_status"] == "queued"
+    assert replay.json()["raw_id"] == first.json()["raw_id"]
+    assert forward_count == 2
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+    receipt = session.scalars(select(HealthKitIngestReceipt)).one()
+    assert receipt.state == "completed"
+    assert receipt.ack_payload == replay.json()
+
+
+def test_native_missing_user_reuses_raw_until_forwarding_is_configured(
+    client,
+    session,
+    settings,
+):
+    forward_count = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal forward_count
+        forward_count += 1
+        return httpx.Response(202, json={"status": "queued"})
+
+    client.app.state.ingest_transport = httpx.MockTransport(handler)
+    body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "native-user-retry-1",
+    }
+
+    first = client.post("/v1/ingest/healthkit", content=body, headers=headers)
+    assert first.status_code == 202
+    assert first.json()["forward_status"] == "skipped_no_user"
+    receipt = session.scalars(select(HealthKitIngestReceipt)).one()
+    assert receipt.state == "pending"
+    assert receipt.ack_payload is None
+
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
+    replay = client.post("/v1/ingest/healthkit", content=body, headers=headers)
+
+    assert replay.status_code == 202
+    assert replay.json()["forward_status"] == "queued"
+    assert replay.json()["raw_id"] == first.json()["raw_id"]
+    assert forward_count == 1
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+    session.refresh(receipt)
+    assert receipt.state == "completed"
+
+
+def test_native_healthkit_reused_key_with_different_bytes_conflicts(
+    client,
+    session,
+):
+    first_body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    changed = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "syncTimestamp": "2026-08-24T03:00:01Z",
+    }
+    second_body = json.dumps(
+        changed,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "native-byte-conflict-1",
+    }
+
+    first = client.post(
+        "/v1/ingest/healthkit",
+        content=first_body,
+        headers=headers,
+    )
+    second = client.post(
+        "/v1/ingest/healthkit",
+        content=second_body,
+        headers=headers,
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "idempotency_conflict"
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+
+
+def test_headerless_native_payload_is_stored_before_missing_key_rejection(
+    client,
+    session,
+    settings,
+):
+    body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    response = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_idempotency_key"
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert _stored_file(settings, event).read_bytes() == body
+    assert event.parse_status == "parsed"
+    assert event.forward_status == "rejected_missing_idempotency"
+
+
+def test_native_invalid_idempotency_key_preserves_exact_raw_before_rejection(
+    client,
+    session,
+    settings,
+):
+    body = json.dumps(
+        NATIVE_HEALTHKIT_PAYLOAD,
+        separators=(", ", ": "),
+        sort_keys=False,
+    ).encode()
+
+    response = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": "x" * 256,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_idempotency_key"
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert _stored_file(settings, event).read_bytes() == body
+    assert event.parse_status == "parsed"
+    assert event.forward_status == "rejected_invalid_idempotency"
+    assert session.scalar(
+        select(func.count()).select_from(HealthKitIngestReceipt)
+    ) == 0
+
+
+def test_native_healthkit_tombstone_suppresses_stale_replay(
+    client,
+    session,
+    settings,
+):
+    forward_count = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal forward_count
+        forward_count += 1
+        return httpx.Response(202, json={"status": "queued"})
+
+    client.app.state.ingest_transport = httpx.MockTransport(handler)
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
+    deleted = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "data": {
+            "records": [],
+            "sleep": [],
+            "workouts": [],
+            "deletions": [
+                {
+                    "id": "metric-1",
+                    "type": "HKQuantityTypeIdentifierHeartRate",
+                }
+            ],
+        },
+    }
+    stale = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "data": {
+            "records": NATIVE_HEALTHKIT_PAYLOAD["data"]["records"],
+            "sleep": [],
+            "workouts": [],
+            "deletions": [],
+        },
+    }
+
+    deletion_response = client.post(
+        "/v1/ingest/healthkit",
+        json=deleted,
+        headers={"Idempotency-Key": "native-delete-1"},
+    )
+    stale_response = client.post(
+        "/v1/ingest/healthkit",
+        json=stale,
+        headers={"Idempotency-Key": "native-stale-replay-1"},
+    )
+
+    assert deletion_response.status_code == 202
+    assert deletion_response.json()["deletions_received"] == 1
+    assert deletion_response.json()["forward_status"] == "deletions_recorded"
+    assert stale_response.status_code == 202
+    assert stale_response.json()["records_forwarded"] == 0
+    assert stale_response.json()["forward_status"] == "nothing_mapped"
+    assert forward_count == 0
+    tombstone = session.scalars(select(HealthKitDeletionTombstone)).one()
+    assert tombstone.sample_id == "metric-1"
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        " native-key",
+        "native-key ",
+        "native\nkey",
+        "native\x7fkey",
+    ),
+)
+def test_native_healthkit_idempotency_key_rejects_unsafe_characters(key):
+    request = SimpleNamespace(headers={"idempotency-key": key})
+
+    with pytest.raises(APIError) as exc_info:
+        ingest_api_mod._native_idempotency_key(request)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.code == "invalid_idempotency_key"
 
 
 def test_ingest_rejects_oversize_payload(client, settings):

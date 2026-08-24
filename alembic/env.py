@@ -18,7 +18,10 @@ from sqlalchemy import event, pool
 
 from alembic import context
 from healthmes.config import get_settings
-from healthmes.store import models  # noqa: F401  (register all tables on Base.metadata)
+from healthmes.store import (  # noqa: F401  (register all tables on Base.metadata)
+    healthkit_models,
+    models,
+)
 from healthmes.store.base import Base
 from healthmes.store.session import create_db_engine
 

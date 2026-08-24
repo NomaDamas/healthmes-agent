@@ -23,6 +23,8 @@ Failures in 2–3 are recorded on the index row and never surface as request
 errors: the raw payload is already durable.
 """
 
+from __future__ import annotations
+
 import hashlib
 import logging
 import math
@@ -74,6 +76,46 @@ _HAE_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M %z")
 
 class IngestForwardError(Exception):
     """open-wearables rejected or never received the forwarded batch."""
+
+
+@dataclass(frozen=True, slots=True)
+class HealthKitNativeBatch:
+    """Open Wearables-compatible arrays from ``healthmes.healthkit.v1``."""
+
+    sdk_version: str
+    sync_timestamp: str
+    records: tuple[dict[str, Any], ...]
+    sleep: tuple[dict[str, Any], ...]
+    workouts: tuple[dict[str, Any], ...]
+    deletions: tuple[tuple[str, str], ...]
+
+    @property
+    def candidate_ids(self) -> set[str]:
+        return {
+            sample_id
+            for row in (*self.records, *self.sleep, *self.workouts)
+            if (sample_id := _native_id(row)) is not None
+        }
+
+    def suppress(self, tombstoned_ids: set[str]) -> HealthKitNativeBatch:
+        def retained(
+            rows: tuple[dict[str, Any], ...],
+        ) -> tuple[dict[str, Any], ...]:
+            return tuple(
+                row
+                for row in rows
+                if (sample_id := _native_id(row)) is None
+                or sample_id not in tombstoned_ids
+            )
+
+        return HealthKitNativeBatch(
+            sdk_version=self.sdk_version,
+            sync_timestamp=self.sync_timestamp,
+            records=retained(self.records),
+            sleep=retained(self.sleep),
+            workouts=retained(self.workouts),
+            deletions=self.deletions,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,11 +319,65 @@ def transform_hae(payload: Any) -> list[dict[str, Any]]:
     return records
 
 
+def _native_rows(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(dict(row) for row in value if isinstance(row, dict))
+
+
+def _native_id(row: dict[str, Any]) -> str | None:
+    value = row.get("id")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized if normalized else None
+
+
+def transform_healthkit_v1(payload: Any) -> HealthKitNativeBatch | None:
+    """Recognize the first-party schema without changing legacy HAE parsing."""
+
+    if not isinstance(payload, dict) or payload.get("schema") != "healthmes.healthkit.v1":
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+
+    deletions: list[tuple[str, str]] = []
+    for deletion in _native_rows(data.get("deletions")):
+        sample_id = _native_id(deletion)
+        sample_type = deletion.get("type")
+        if sample_id is None or not isinstance(sample_type, str):
+            continue
+        normalized_type = sample_type.strip()
+        if normalized_type:
+            deletions.append((sample_id, normalized_type))
+
+    sdk_version = payload.get("sdkVersion")
+    if not isinstance(sdk_version, str) or not sdk_version.strip():
+        sdk_version = "healthmes-ios/1"
+    sync_timestamp = payload.get("syncTimestamp")
+    if not isinstance(sync_timestamp, str) or not sync_timestamp.strip():
+        sync_timestamp = datetime.now(UTC).isoformat()
+
+    return HealthKitNativeBatch(
+        sdk_version=sdk_version,
+        sync_timestamp=sync_timestamp,
+        records=_native_rows(data.get("records")),
+        sleep=_native_rows(data.get("sleep")),
+        workouts=_native_rows(data.get("workouts")),
+        deletions=tuple(deletions),
+    )
+
+
 def forward_sdk_sync(
     settings: Settings,
     records: list[dict[str, Any]],
     *,
     user_id: str,
+    sleep: list[dict[str, Any]] | None = None,
+    workouts: list[dict[str, Any]] | None = None,
+    sdk_version: str = "healthmes-bridge/1",
+    sync_timestamp: str | None = None,
     timeout: float = 60.0,
     transport: httpx.BaseTransport | None = None,
 ) -> None:
@@ -300,9 +396,13 @@ def forward_sdk_sync(
 
     body = {
         "provider": "apple",
-        "sdkVersion": "healthmes-bridge/1",
-        "syncTimestamp": datetime.now(UTC).isoformat(),
-        "data": {"records": records, "sleep": [], "workouts": []},
+        "sdkVersion": sdk_version,
+        "syncTimestamp": sync_timestamp or datetime.now(UTC).isoformat(),
+        "data": {
+            "records": records,
+            "sleep": sleep or [],
+            "workouts": workouts or [],
+        },
     }
     url = f"{settings.ow_base_url.rstrip('/')}/api/v1/sdk/users/{user_id}/sync"
     try:

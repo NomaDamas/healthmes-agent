@@ -220,6 +220,31 @@ def test_unified_inputs_lists_stable_ui_contract(client) -> None:
         if action["action"] == "sync"
     )
     assert sync["endpoint"] == "/v1/ingest/healthkit"
+    connect = next(
+        action
+        for action in healthkit["actions"]
+        if action["action"] == "connect"
+    )
+    assert connect["execution"] == "device"
+    assert "No separate exporter app" in connect["description"]
+    assert healthkit["instances"] == []
+    assert healthkit["limitations"] == [
+        "healthkit_collection_requires_healthmes_ios_companion",
+        "healthkit_delivery_freshness_is_not_observed",
+        "wearable_provider_device_inventory_not_available",
+        "wearable_provider_device_crud_not_available",
+    ]
+
+    open_wearables = _source(payload, "wearable.open-wearables")
+    assert open_wearables["connection_state"] == "configured"
+    assert open_wearables["collection_state"] == "not_applicable"
+    assert open_wearables["instances"] == []
+    assert open_wearables["limitations"] == [
+        "open_wearables_configuration_is_server_managed",
+        "wearable_provider_device_inventory_not_available",
+        "wearable_provider_device_crud_not_available",
+    ]
+    assert "test-ow-api-key" not in response.text
 
 
 def test_unified_inputs_returns_one_source_and_404s_unknown(client) -> None:

@@ -74,7 +74,7 @@ _MCP_INITIALIZE = {
 }
 _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_EXPECTED_ALEMBIC_HEAD = "b7c8d9e0f1a2"
+_EXPECTED_ALEMBIC_HEAD = "c8d9e0f1a2b3"
 
 
 def _migration_config(database_url: str) -> Config:

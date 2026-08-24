@@ -1,22 +1,27 @@
 """Raw-first ingest receiver (docs/PLAN.md §13).
 
-``POST /v1/ingest/healthkit`` is the continuous-collection bridge: point any
-HealthKit auto-export app (Health Auto Export et al.) at it and the phone
-pushes health data on a schedule — no HealthMes app code involved. The body
-is stored verbatim first (that alone makes the request a success), then
-best-effort mapped and forwarded into open-wearables so the energy loop sees
-it. ``POST /v1/ingest/raw`` accepts anything from any future source.
+``POST /v1/ingest/healthkit`` is the continuous-collection bridge for the
+first-party iPhone collector and legacy HealthKit exporters. Legacy bodies are
+stored verbatim before JSON parsing. First-party ``healthmes.healthkit.v1``
+batches add exact-byte idempotency and deletion tombstones, then best-effort
+forward into open-wearables so the energy loop sees them.
+``POST /v1/ingest/raw`` accepts anything from any future source.
 
 Bearer auth comes from the global /v1 middleware (healthmes/api/auth.py).
 Responses are 202 whenever the raw payload is durable — parse and forward
 outcomes are reported in the body, never as request failures.
 """
 
+import hashlib
 import json
 import logging
+import time
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
+import anyio
 import anyio.to_thread
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -31,14 +36,22 @@ from healthmes.durable_files import (
     verify_regular_file,
 )
 from healthmes.ingest import (
+    HealthKitNativeBatch,
     IngestForwardError,
     forward_sdk_sync,
     store_raw,
     transform_hae,
+    transform_healthkit_v1,
 )
 from healthmes.source_providers import canonical_source_provider
 from healthmes.storage import index_raw_ingest
 from healthmes.store import RawIngestEvent, StorageObject, WellnessEvent
+from healthmes.store.healthkit_ingest import (
+    HealthKitIdempotencyConflictError,
+    HealthKitIngestStore,
+    HealthKitReceiptClaim,
+    HealthKitReceiptClaimState,
+)
 from healthmes.store.session import SessionDep
 
 logger = logging.getLogger(__name__)
@@ -50,11 +63,15 @@ class IngestAck(BaseModel):
     """What happened to one accepted payload (raw storage is the contract)."""
 
     raw_id: str
+    durable: bool = True
     sha256: str
     size_bytes: int
     parse_status: Literal["parsed", "stored_unparsed"]
     forward_status: str
     records_forwarded: int
+    sleep_forwarded: int = 0
+    workouts_forwarded: int = 0
+    deletions_received: int = 0
     status_persistence_uncertain: bool = False
 
 
@@ -104,6 +121,10 @@ def _load_raw_state(bind, raw_id) -> _RawIngestState | None:
 def _ack(
     state: _RawIngestState,
     *,
+    records_forwarded: int | None = None,
+    sleep_forwarded: int = 0,
+    workouts_forwarded: int = 0,
+    deletions_received: int = 0,
     status_persistence_uncertain: bool = False,
 ) -> IngestAck:
     parse_status = (
@@ -113,11 +134,19 @@ def _ack(
     )
     return IngestAck(
         raw_id=str(state.raw_id),
+        durable=True,
         sha256=state.sha256,
         size_bytes=state.size_bytes,
         parse_status=parse_status,  # type: ignore[arg-type]
         forward_status=state.forward_status,
-        records_forwarded=state.records_forwarded,
+        records_forwarded=(
+            state.records_forwarded
+            if records_forwarded is None
+            else records_forwarded
+        ),
+        sleep_forwarded=sleep_forwarded,
+        workouts_forwarded=workouts_forwarded,
+        deletions_received=deletions_received,
         status_persistence_uncertain=status_persistence_uncertain,
     )
 
@@ -332,6 +361,8 @@ def _persist_raw_ingest(
     source: str,
     content_type: str | None,
     body: bytes,
+    healthkit_claim: HealthKitReceiptClaim | None = None,
+    healthkit_owner_token: uuid.UUID | None = None,
 ) -> _RawIngestPersistence:
     """Persist raw bytes and references without using the async event loop."""
     source = canonical_source_provider(source)
@@ -368,6 +399,18 @@ def _persist_raw_ingest(
             with Session(bind=writer_bind) as writer:
                 writer.add(event)
                 wellness = index_raw_ingest(writer, settings, event)
+                if healthkit_claim is not None:
+                    if healthkit_owner_token is None:
+                        raise ValueError(
+                            "healthkit_owner_token is required with a receipt"
+                        )
+                    HealthKitIngestStore.attach_raw_in_session(
+                        writer,
+                        claim=healthkit_claim,
+                        owner_token=healthkit_owner_token,
+                        raw_id=event.id,
+                        now=event.received_at,
+                    )
                 raw_id = event.id
                 storage_object_id = wellness.raw_object_id
                 wellness_event_id = wellness.id
@@ -554,13 +597,287 @@ async def _read_capped_body(request: Request) -> bytes:
     return bytes(chunks)
 
 
+def _native_idempotency_key(request: Request) -> str:
+    key = request.headers.get("idempotency-key")
+    if (
+        key is None
+        or not 1 <= len(key) <= 255
+        or key != key.strip()
+        or not key.isprintable()
+    ):
+        raise APIError(
+            422,
+            "invalid_idempotency_key",
+            (
+                "First-party HealthKit sync requires an Idempotency-Key "
+                "with 1 to 255 printable characters and no surrounding "
+                "whitespace."
+            ),
+        )
+    return key
+
+
+async def _reject_native_healthkit_idempotency_key(
+    request: Request,
+    *,
+    bind,
+    body: bytes,
+    reason: str,
+) -> None:
+    settings = request.app.state.settings
+    persisted = await anyio.to_thread.run_sync(
+        lambda: _persist_raw_ingest(
+            bind,
+            settings,
+            source="healthkit-bridge",
+            content_type=request.headers.get("content-type"),
+            body=body,
+        )
+    )
+    await anyio.to_thread.run_sync(
+        lambda: _update_healthkit_state(
+            bind,
+            persisted.state,
+            parse_status="parsed",
+            forward_status="rejected_invalid_idempotency",
+            forward_detail=reason,
+            records_forwarded=0,
+        )
+    )
+
+
+async def _claim_native_healthkit_receipt(
+    store: HealthKitIngestStore,
+    *,
+    idempotency_key: str,
+    body_sha256: str,
+    owner_token: uuid.UUID,
+) -> HealthKitReceiptClaim:
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            claim = await anyio.to_thread.run_sync(
+                lambda: store.claim(
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                    owner_token=owner_token,
+                    now=datetime.now(UTC),
+                )
+            )
+        except HealthKitIdempotencyConflictError as exc:
+            raise APIError(
+                409,
+                "idempotency_conflict",
+                "Idempotency-Key was already used for different request bytes.",
+            ) from exc
+        if claim.state is not HealthKitReceiptClaimState.WAIT:
+            return claim
+        if time.monotonic() >= deadline:
+            raise APIError(
+                409,
+                "healthkit_ingest_in_progress",
+                "The same HealthKit upload is still being processed.",
+            )
+        await anyio.sleep(claim.retry_after_seconds)
+
+
+def _native_forward_status(
+    batch: HealthKitNativeBatch,
+    *,
+    user_id: str,
+) -> str:
+    has_forwardable_rows = bool(
+        batch.records or batch.sleep or batch.workouts
+    )
+    if has_forwardable_rows:
+        return "pending" if user_id else "skipped_no_user"
+    if batch.deletions:
+        return "deletions_recorded"
+    return "nothing_mapped"
+
+
+async def _ingest_native_healthkit(
+    request: Request,
+    *,
+    bind,
+    body: bytes,
+    batch: HealthKitNativeBatch,
+) -> IngestAck:
+    settings = request.app.state.settings
+    idempotency_key = _native_idempotency_key(request)
+    body_sha256 = hashlib.sha256(body).hexdigest()
+    owner_token = uuid.uuid4()
+    receipt_store = HealthKitIngestStore(bind)
+    claim = await _claim_native_healthkit_receipt(
+        receipt_store,
+        idempotency_key=idempotency_key,
+        body_sha256=body_sha256,
+        owner_token=owner_token,
+    )
+    if claim.state is HealthKitReceiptClaimState.COMPLETED:
+        assert claim.ack_payload is not None
+        return IngestAck.model_validate(claim.ack_payload)
+
+    try:
+        if claim.raw_id is None:
+            persisted = await anyio.to_thread.run_sync(
+                lambda: _persist_raw_ingest(
+                    bind,
+                    settings,
+                    source="healthkit-bridge",
+                    content_type=request.headers.get("content-type"),
+                    body=body,
+                    healthkit_claim=claim,
+                    healthkit_owner_token=owner_token,
+                )
+            )
+            initial = persisted.state
+            persistence_uncertain = persisted.persistence_uncertain
+        else:
+            initial = await anyio.to_thread.run_sync(
+                lambda: _load_raw_state(bind, claim.raw_id)
+            )
+            if initial is None:
+                raise RuntimeError(
+                    "HealthKit receipt references a missing raw ingest row"
+                )
+            persistence_uncertain = False
+
+        suppressed_ids = await anyio.to_thread.run_sync(
+            lambda: receipt_store.apply_deletions(
+                raw_id=initial.raw_id,
+                deletions=batch.deletions,
+                candidate_ids=batch.candidate_ids,
+                now=datetime.now(UTC),
+                claim=claim,
+                owner_token=owner_token,
+            )
+        )
+        retained = batch.suppress(suppressed_ids)
+        user_id = (settings.ow_user_id or "").strip()
+        forward_status = _native_forward_status(retained, user_id=user_id)
+        forward_detail: str | None = None
+        records_forwarded = 0
+        sleep_forwarded = 0
+        workouts_forwarded = 0
+
+        if forward_status == "pending":
+            transport = getattr(request.app.state, "ingest_transport", None)
+            try:
+                await anyio.to_thread.run_sync(
+                    lambda: forward_sdk_sync(
+                        settings,
+                        list(retained.records),
+                        user_id=user_id,
+                        sleep=list(retained.sleep),
+                        workouts=list(retained.workouts),
+                        sdk_version=retained.sdk_version,
+                        sync_timestamp=retained.sync_timestamp,
+                        transport=transport,
+                    )
+                )
+                forward_status = "queued"
+                records_forwarded = len(retained.records)
+                sleep_forwarded = len(retained.sleep)
+                workouts_forwarded = len(retained.workouts)
+            except IngestForwardError as exc:
+                forward_status = "forward_failed"
+                forward_detail = str(exc)[:255]
+                logger.warning(
+                    "native HealthKit forward failed (raw kept at %s): %s",
+                    initial.path,
+                    exc,
+                )
+
+        status_update = await anyio.to_thread.run_sync(
+            lambda: _update_healthkit_state(
+                bind,
+                initial,
+                parse_status="parsed",
+                forward_status=forward_status,
+                forward_detail=forward_detail,
+                records_forwarded=records_forwarded,
+            )
+        )
+        ack = _ack(
+            status_update.ack_state,
+            records_forwarded=records_forwarded,
+            sleep_forwarded=sleep_forwarded,
+            workouts_forwarded=workouts_forwarded,
+            deletions_received=len(batch.deletions),
+            status_persistence_uncertain=(
+                persistence_uncertain
+                or status_update.persistence_uncertain
+            ),
+        )
+        if forward_status in {
+            "queued",
+            "deletions_recorded",
+            "nothing_mapped",
+        }:
+            stored_ack = await anyio.to_thread.run_sync(
+                lambda: receipt_store.complete(
+                    claim=claim,
+                    owner_token=owner_token,
+                    ack_payload=ack.model_dump(mode="json"),
+                    now=datetime.now(UTC),
+                )
+            )
+            return IngestAck.model_validate(stored_ack)
+        await anyio.to_thread.run_sync(
+            lambda: receipt_store.release(
+                claim=claim,
+                owner_token=owner_token,
+                now=datetime.now(UTC),
+            )
+        )
+        return ack
+    except BaseException:
+        await anyio.to_thread.run_sync(
+            lambda: receipt_store.release(
+                claim=claim,
+                owner_token=owner_token,
+                now=datetime.now(UTC),
+            )
+        )
+        raise
+
+
 @router.post("/healthkit", status_code=202)
 async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
-    """Store a HealthKit bridge push verbatim, then map+forward best-effort."""
+    """Accept legacy exporters and the first-party iPhone HealthKit collector."""
     settings = request.app.state.settings
     body = await _read_capped_body(request)
-
     bind = session.get_bind()
+
+    # The idempotency header is the first-party protocol discriminator. Legacy
+    # exporters normally omit it, preserving the raw-first guarantee that no
+    # parser sees their body before durable storage.
+    payload = None
+    if request.headers.get("idempotency-key") is not None:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            pass
+        native_batch = transform_healthkit_v1(payload)
+        if native_batch is not None:
+            try:
+                _native_idempotency_key(request)
+            except APIError as exc:
+                await _reject_native_healthkit_idempotency_key(
+                    request,
+                    bind=bind,
+                    body=body,
+                    reason=exc.message,
+                )
+                raise
+            return await _ingest_native_healthkit(
+                request,
+                bind=bind,
+                body=body,
+                batch=native_batch,
+            )
+
     persisted = await anyio.to_thread.run_sync(
         lambda: _persist_raw_ingest(
             bind,
@@ -572,12 +889,31 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
     )
     initial = persisted.state
 
-    payload = None
     try:
-        payload = json.loads(body)
+        if payload is None:
+            payload = json.loads(body)
         parse_status = "parsed"
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         parse_status = "stored_unparsed"
+
+    if transform_healthkit_v1(payload) is not None:
+        await anyio.to_thread.run_sync(
+            lambda: _update_healthkit_state(
+                bind,
+                initial,
+                parse_status="parsed",
+                forward_status="rejected_missing_idempotency",
+                forward_detail=(
+                    "healthmes.healthkit.v1 requires an Idempotency-Key"
+                ),
+                records_forwarded=0,
+            )
+        )
+        raise APIError(
+            422,
+            "invalid_idempotency_key",
+            "First-party HealthKit sync requires an Idempotency-Key.",
+        )
 
     records: list[dict] = transform_hae(payload) if payload is not None else []
     user_id = (settings.ow_user_id or "").strip()

@@ -21,6 +21,10 @@ from healthmes.store.enums import (
     SleepProposalStatus,
     TaskSource,
 )
+from healthmes.store.healthkit_models import (
+    HealthKitDeletionTombstone,
+    HealthKitIngestReceipt,
+)
 from healthmes.store.models import (
     AppUsageSample,
     CalendarEventMirror,
@@ -89,6 +93,8 @@ __all__ = [
     "DecisionRecord",
     "DecisionRequestReceipt",
     "FoodLog",
+    "HealthKitDeletionTombstone",
+    "HealthKitIngestReceipt",
     "Insight",
     "MedicalRecord",
     "ScheduleProposal",
