@@ -265,7 +265,7 @@ final class CompanionUITests: XCTestCase {
         notificationTitle.press(forDuration: 2)
 
         XCTAssertTrue(
-            springboard.staticTexts["HEALTHMES · DECISION"].waitForExistence(timeout: 5),
+            springboard.staticTexts["HEALTHMES · WELLNESS"].waitForExistence(timeout: 5),
             "The HealthMes content extension must render instead of a blank card."
         )
         XCTAssertTrue(

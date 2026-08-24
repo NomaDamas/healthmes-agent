@@ -6,10 +6,12 @@ struct SettingsView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
     @State private var showAdvanced = false
+    @State private var showHealthKitQueueDeletion = false
     @State private var serverReadiness: SetupReadiness?
     @State private var readinessError: String?
     @StateObject private var calendarPermission = DeviceCalendarPermissionModel()
     @StateObject private var healthKit = HealthKitSyncManager.shared
+    @StateObject private var inputControl = InputControlPlaneModel()
 
     var body: some View {
         Form {
@@ -101,23 +103,135 @@ struct SettingsView: View {
                     } label: {
                         Label("Connect Apple Health", systemImage: "heart.badge.plus")
                     }
+                } else if healthKit.isPaused {
+                    Button {
+                        Task { await healthKit.resumeSync() }
+                    } label: {
+                        Label(
+                            "Resume Apple Health sync",
+                            systemImage: "play.circle"
+                        )
+                    }
                 } else {
                     Button {
                         Task { await healthKit.sync() }
                     } label: {
                         Label("Sync Apple Health now", systemImage: "arrow.triangle.2.circlepath")
                     }
+                    .disabled(
+                        healthKit.state == .syncing
+                            || healthKit.isPaused
+                    )
+                }
+
+                if healthKit.pendingUploadCount > 0 {
+                    LabeledContent("Pending uploads") {
+                        Text(
+                            verbatim:
+                                "\(healthKit.pendingUploadCount)"
+                        )
+                    }
+                    if let nextRetryAt = healthKit.nextRetryAt {
+                        LabeledContent("Next automatic retry") {
+                            Text(
+                                nextRetryAt,
+                                style: .relative
+                            )
+                        }
+                    }
+                    Button {
+                        Task { await healthKit.retryPendingUploads() }
+                    } label: {
+                        Label(
+                            "Retry queued uploads now",
+                            systemImage: "arrow.clockwise.circle"
+                        )
+                    }
+                    .disabled(
+                        healthKit.state == .syncing
+                            || healthKit.isPaused
+                    )
+                }
+
+                if healthKit.state != .notRequested,
+                    healthKit.state != .unavailable,
+                    !healthKit.isPaused
+                {
+                    Button {
+                        Task { await healthKit.pauseSync() }
+                    } label: {
+                        Label(
+                            "Pause Apple Health sync",
+                            systemImage: "pause.circle"
+                        )
+                    }
                     .disabled(healthKit.state == .syncing)
                 }
+
+                if healthKit.pendingUploadCount > 0 {
+                    Button(role: .destructive) {
+                        showHealthKitQueueDeletion = true
+                    } label: {
+                        Label(
+                            "Delete queued health data",
+                            systemImage: "trash"
+                        )
+                    }
+                    .disabled(healthKit.state == .syncing)
+                }
+
                 if case .failed(let message) = healthKit.state {
                     Text(verbatim: message)
                         .font(.footnote)
                         .foregroundStyle(.orange)
                 }
+                Text(
+                    "To revoke HealthKit access, use Settings > Health > Data Access & Devices > HealthMes."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             } header: {
                 Text("Apple Health")
             } footer: {
-                Text("Apple Watch data is collected once through iPhone HealthKit and uploaded only to your paired HealthMes instance.")
+                Text(
+                    "Apple Watch data is collected once through iPhone HealthKit. Pending batches are encrypted on this iPhone and sent only to the currently paired HealthMes instance."
+                )
+            }
+
+            Section {
+                if inputControl.isLoading, inputControl.sources.isEmpty {
+                    ProgressView("Loading server data sources…")
+                } else if inputControl.sources.isEmpty {
+                    Text("No server data sources are available.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(inputControl.sources) { source in
+                        inputSourceDisclosure(source)
+                    }
+                }
+
+                if let error = inputControl.errorMessage {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+
+                Button {
+                    Task { await inputControl.load() }
+                } label: {
+                    if inputControl.isLoading {
+                        Label("Refreshing server settings…", systemImage: "arrow.triangle.2.circlepath")
+                    } else {
+                        Label("Refresh server settings", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(inputControl.isLoading)
+            } header: {
+                Text("HealthMes data sources")
+            } footer: {
+                Text(
+                    "These controls are stored on the paired HealthMes server. Mac and iPhone stay in sync by reading this same server source of truth; secrets such as the Open Wearables API key never enter either app."
+                )
             }
 
             Section {
@@ -215,13 +329,48 @@ struct SettingsView: View {
             notificationStatus = await NotificationManager.shared.authorizationStatus()
             calendarPermission.refresh()
             await loadReadiness()
+            await inputControl.load()
+            await healthKit.refreshStatus()
         }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             calendarPermission.refresh()
             Task {
                 notificationStatus = await NotificationManager.shared.authorizationStatus()
+                await inputControl.load()
+                await healthKit.refreshStatus()
             }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .healthmesPairingChanged
+            )
+        ) { _ in
+            inputControl.reset()
+            Task {
+                await healthKit.pairingDidChange()
+                await loadReadiness()
+                await inputControl.load()
+            }
+        }
+        .refreshable {
+            await loadReadiness()
+            await inputControl.load()
+            await healthKit.refreshStatus()
+        }
+        .confirmationDialog(
+            "Delete queued health data?",
+            isPresented: $showHealthKitQueueDeletion,
+            titleVisibility: .visible
+        ) {
+            Button("Delete queue and pause sync", role: .destructive) {
+                Task { await healthKit.deletePendingUploads() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Only encrypted batches waiting on this iPhone for the current HealthMes pairing are deleted. Server data is unchanged."
+            )
         }
     }
 
@@ -267,6 +416,248 @@ struct SettingsView: View {
         case .blocked:
             return String(localized: "Blocked · \(check.detail)")
         }
+    }
+
+    private func inputSourceDisclosure(
+        _ source: InputSourceDescriptor
+    ) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 14) {
+                LabeledContent("Server status") {
+                    Text(verbatim: InputControlPlanePresentation.sourceSummary(source))
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Platforms") {
+                    Text(verbatim: source.platforms.map(platformTitle).joined(separator: ", "))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+                LabeledContent("Capabilities") {
+                    Text(
+                        verbatim: source.capabilities
+                            .map(InputControlPlanePresentation.humanize)
+                            .joined(separator: ", ")
+                    )
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+                }
+
+                if source.isWearable {
+                    LabeledContent("Provider/device inventory") {
+                        Text(verbatim: InputControlPlanePresentation.instanceSummary(source))
+                            .foregroundStyle(.secondary)
+                    }
+                    if source.sourceID == "wearable.open-wearables" {
+                        LabeledContent("Server credential") {
+                            Text(
+                                source.connectionState == .notConfigured
+                                    ? "Not configured on server"
+                                    : "Configured on server"
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if source.supports(
+                    setting: "decision_access_enabled",
+                    scope: "domain"
+                ) {
+                    Toggle(
+                        "Allow Decision Agent access",
+                        isOn: decisionAccessBinding(source)
+                    )
+                    .disabled(inputControl.isBusy(source.sourceID))
+                }
+
+                if source.supports(setting: "retention", scope: "data_class") {
+                    ForEach(source.retention) { policy in
+                        Picker(
+                            retentionTitle(policy.dataClass),
+                            selection: retentionBinding(
+                                source: source,
+                                policy: policy
+                            )
+                        ) {
+                            ForEach(source.retentionAllowedValues, id: \.self) { preset in
+                                Text(retentionPresetTitle(preset))
+                                    .tag(preset)
+                            }
+                        }
+                        .disabled(inputControl.isBusy(source.sourceID))
+                    }
+                }
+
+                if !source.instances.isEmpty {
+                    Divider()
+                    ForEach(source.instances) { instance in
+                        instanceControl(instance, source: source)
+                    }
+                } else if source.isWearable {
+                    Text(
+                        "This is an aggregate server status. Individual provider and device details are unavailable until Main exposes an inventory/CRUD API."
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+
+                if !source.limitations.isEmpty {
+                    Divider()
+                    ForEach(source.limitations, id: \.self) { limitation in
+                        Label(
+                            InputControlPlanePresentation.limitation(limitation),
+                            systemImage: "info.circle"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let message = inputControl.sourceMessages[source.sourceID] {
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+
+                if inputControl.isBusy(source.sourceID) {
+                    ProgressView("Saving to HealthMes…")
+                        .font(.footnote)
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: sourceIcon(source))
+                    .foregroundStyle(HealthMesVisualStyle.brand)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: source.displayName)
+                        .font(.body.weight(.semibold))
+                    Text(verbatim: InputControlPlanePresentation.sourceSummary(source))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func instanceControl(
+        _ instance: InputInstance,
+        source: InputSourceDescriptor
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Toggle(
+                isOn: instanceEnabledBinding(
+                    source: source,
+                    instance: instance
+                )
+            ) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: platformTitle(instance.platform))
+                        .font(.subheadline.weight(.semibold))
+                    Text(verbatim: instance.instanceID)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(
+                !source.supports(setting: "enabled", scope: "instance")
+                    || inputControl.isBusy(source.sourceID)
+            )
+            Text(verbatim: InputControlPlanePresentation.instanceStatus(instance))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func decisionAccessBinding(
+        _ source: InputSourceDescriptor
+    ) -> Binding<Bool> {
+        Binding(
+            get: { source.decisionAccessEnabled },
+            set: { enabled in
+                Task {
+                    await inputControl.setDecisionAccess(
+                        enabled,
+                        for: source.sourceID
+                    )
+                }
+            }
+        )
+    }
+
+    private func retentionBinding(
+        source: InputSourceDescriptor,
+        policy: InputRetentionPolicy
+    ) -> Binding<String> {
+        Binding(
+            get: { policy.preset },
+            set: { preset in
+                Task {
+                    await inputControl.setRetention(
+                        preset,
+                        dataClass: policy.dataClass,
+                        for: source.sourceID
+                    )
+                }
+            }
+        )
+    }
+
+    private func instanceEnabledBinding(
+        source: InputSourceDescriptor,
+        instance: InputInstance
+    ) -> Binding<Bool> {
+        Binding(
+            get: { instance.enabled },
+            set: { enabled in
+                Task {
+                    await inputControl.setInstanceEnabled(
+                        enabled,
+                        instanceID: instance.instanceID,
+                        for: source.sourceID
+                    )
+                }
+            }
+        )
+    }
+
+    private func sourceIcon(_ source: InputSourceDescriptor) -> String {
+        switch source.domain {
+        case "activity":
+            return "figure.walk.motion"
+        case "nutrition":
+            return "fork.knife"
+        case "wearable":
+            return source.sourceID == "wearable.healthkit-bridge"
+                ? "heart.text.square"
+                : "watch.analog"
+        case "calendar":
+            return "calendar"
+        default:
+            return "square.stack.3d.up"
+        }
+    }
+
+    private func platformTitle(_ platform: String) -> String {
+        switch platform {
+        case "ios":
+            return "iPhone"
+        case "watchos":
+            return "Apple Watch"
+        case "macos":
+            return "Mac"
+        default:
+            return InputControlPlanePresentation.humanize(platform)
+        }
+    }
+
+    private func retentionTitle(_ dataClass: String) -> String {
+        "\(InputControlPlanePresentation.humanize(dataClass)) retention"
+    }
+
+    private func retentionPresetTitle(_ preset: String) -> String {
+        preset == "forever" ? "Keep forever" : preset
     }
 
     private func loadReadiness() async {

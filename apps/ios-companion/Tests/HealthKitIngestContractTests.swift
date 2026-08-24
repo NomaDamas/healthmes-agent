@@ -83,5 +83,136 @@ final class HealthKitIngestContractTests: XCTestCase {
             request.value(forHTTPHeaderField: "Authorization"),
             "Bearer secret"
         )
+        let body = try XCTUnwrap(request.httpBody)
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Idempotency-Key"),
+            HealthKitSyncOutboxIdentity.idempotencyKey(for: body)
+        )
+    }
+
+    func testExactBodyUploadRequestPreservesBytesAndStableKey() throws {
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "secret"
+        )
+        let body = Data(
+            #"{"schema":"healthmes.healthkit.v1","data":{"records":[]}}"#.utf8
+        )
+        let idempotencyKey =
+            HealthKitSyncOutboxIdentity.idempotencyKey(for: body)
+
+        let request = try HealthMesAPI.healthKitUploadRequest(
+            pairing: pairing,
+            body: body,
+            idempotencyKey: idempotencyKey
+        )
+
+        XCTAssertEqual(request.httpBody, body)
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Idempotency-Key"),
+            idempotencyKey
+        )
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Content-Type"),
+            "application/json"
+        )
+    }
+
+    func testExactBodyUploadRequestRejectsUnsafeIdempotencyKeys() {
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "secret"
+        )
+        let body = Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8)
+
+        for key in ["", " leading", "trailing ", "line\nbreak", "한글"] {
+            XCTAssertThrowsError(
+                try HealthMesAPI.healthKitUploadRequest(
+                    pairing: pairing,
+                    body: body,
+                    idempotencyKey: key
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? HealthKitUploadRequestError,
+                    .invalidIdempotencyKey
+                )
+            }
+        }
+    }
+
+    func testAckValidationRequiresDurableExactHashAndSize() throws {
+        let body = Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8)
+        let matching = try makeAck(
+            durable: true,
+            sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+            sizeBytes: body.count
+        )
+        XCTAssertNoThrow(try matching.validate(exactBody: body))
+
+        let notDurable = try makeAck(
+            durable: false,
+            sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+            sizeBytes: body.count
+        )
+        XCTAssertThrowsError(try notDurable.validate(exactBody: body)) {
+            XCTAssertEqual(
+                $0 as? HealthKitIngestAckValidationError,
+                .notDurable
+            )
+        }
+
+        let wrongSize = try makeAck(
+            durable: true,
+            sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+            sizeBytes: body.count + 1
+        )
+        XCTAssertThrowsError(try wrongSize.validate(exactBody: body)) {
+            XCTAssertEqual(
+                $0 as? HealthKitIngestAckValidationError,
+                .sizeMismatch(
+                    expected: body.count,
+                    received: body.count + 1
+                )
+            )
+        }
+
+        let wrongHash = try makeAck(
+            durable: true,
+            sha256: String(repeating: "0", count: 64),
+            sizeBytes: body.count
+        )
+        XCTAssertThrowsError(try wrongHash.validate(exactBody: body)) {
+            XCTAssertEqual(
+                $0 as? HealthKitIngestAckValidationError,
+                .hashMismatch
+            )
+        }
+    }
+
+    private func makeAck(
+        durable: Bool,
+        sha256: String,
+        sizeBytes: Int
+    ) throws -> HealthKitIngestAck {
+        let data = try JSONSerialization.data(
+            withJSONObject: [
+                "raw_id": "00000000-0000-0000-0000-000000000001",
+                "durable": durable,
+                "sha256": sha256,
+                "size_bytes": sizeBytes,
+                "parse_status": "parsed",
+                "forward_status": "queued",
+                "records_forwarded": 0,
+                "sleep_forwarded": 0,
+                "workouts_forwarded": 0,
+                "deletions_received": 0,
+            ],
+            options: [.sortedKeys]
+        )
+        return try JSONDecoder().decode(
+            HealthKitIngestAck.self,
+            from: data
+        )
     }
 }

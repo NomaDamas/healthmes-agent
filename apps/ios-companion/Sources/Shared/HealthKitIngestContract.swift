@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct HealthKitIngestPayload: Codable, Equatable {
@@ -212,5 +213,44 @@ public struct HealthKitIngestAck: Codable, Equatable {
         case sleepForwarded = "sleep_forwarded"
         case workoutsForwarded = "workouts_forwarded"
         case deletionsReceived = "deletions_received"
+    }
+
+    public func validate(exactBody: Data) throws {
+        guard durable else {
+            throw HealthKitIngestAckValidationError.notDurable
+        }
+        guard sizeBytes == exactBody.count else {
+            throw HealthKitIngestAckValidationError.sizeMismatch(
+                expected: exactBody.count,
+                received: sizeBytes
+            )
+        }
+        let expectedHash = SHA256.hash(data: exactBody)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        guard sha256.lowercased() == expectedHash else {
+            throw HealthKitIngestAckValidationError.hashMismatch
+        }
+    }
+}
+
+public enum HealthKitIngestAckValidationError:
+    Error,
+    Equatable,
+    LocalizedError
+{
+    case notDurable
+    case sizeMismatch(expected: Int, received: Int)
+    case hashMismatch
+
+    public var errorDescription: String? {
+        switch self {
+        case .notDurable:
+            return "The personal server did not confirm durable HealthKit storage."
+        case .sizeMismatch:
+            return "The HealthKit acknowledgement size did not match the uploaded bytes."
+        case .hashMismatch:
+            return "The HealthKit acknowledgement hash did not match the uploaded bytes."
+        }
     }
 }

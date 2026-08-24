@@ -16,6 +16,55 @@ Linux machine. A physical iPhone cannot reach that machine through
 `localhost`; production pairing requires a trusted HTTPS
 `HEALTHMES_PUBLIC_BASE_URL`.
 
+## Main 통합 책임 경계
+
+Apple 앱은 Main runtime을 복제하지 않는 client layer다. 세 경로를 분리한다.
+
+```text
+일반 데이터/설정
+iPhone · macOS · Watch -> Main REST API + /v1/inputs
+
+자연어 wellness 판단
+iPhone · macOS voice/text -> POST /v1/wellness-decisions
+                            -> Decision Service -> Hermes -> HealthMes MCP
+
+Apple Health 수집
+Apple Watch -> iPhone HealthKit -> pairing별 encrypted outbox
+            -> POST /v1/ingest/healthkit -> durable ACK -> anchor 확정
+```
+
+Dashboard, alert, task, schedule와 settings는 Main REST 응답이 정본이다. 앱은
+Hermes, HealthMes MCP 또는 Open Wearables를 직접 호출하지 않는다. 자유 형식
+질문만 `/v1/wellness-decisions`를 사용한다.
+
+iPhone과 macOS는 각각 하나의 Settings 화면에서
+`GET /v1/setup/readiness`와 `GET /v1/inputs`를 함께 렌더링한다. source 변경은
+상세 GET의 strong `ETag`를 `If-Match`로 보내며, 두 앱은 같은 서버 정본을 다시
+읽어 동기화한다. Mac 설정 blob을 iPhone에 복사하지 않고 Open Wearables,
+Hermes와 calendar credential도 서버 밖으로 내보내지 않는다.
+
+HealthKit 통합의 완료 조건은 collector가 exact request bytes와 stable
+`Idempotency-Key`, candidate anchors를 encrypted outbox에 먼저 저장하는 것이다.
+outbox와 anchor는 `Pairing.cacheFingerprint`별로 격리한다. HTTP `202`,
+`durable=true`, 일치하는 `sha256`와 `size_bytes`를 받은 뒤에만 anchor를
+확정하고 queue item을 삭제한다. 응답이 유실되면 같은 key와 같은 bytes로
+재시도한다.
+
+외부 Health Auto Export 계열 앱은 optional legacy adapter다. 별도 exporter를
+설치하지 않아도 first-party iPhone collector가 동기화하는 것이 기본이며, 서버는
+기존 headerless payload 자동화를 깨뜨리지 않기 위해 같은 ingest endpoint의
+legacy parsing을 유지한다.
+
+현재 `HealthKitSyncManager`는 exact bytes와 candidate anchors를 AES-GCM
+outbox에 먼저 저장하고, stable `Idempotency-Key`로 재전송하며, 서버의 durable
+hash/size ACK를 검증한 뒤 anchor를 확정한다. queue, pause와 last-upload 상태는
+pairing fingerprint별로 격리되고 Settings에서 retry, pause/resume와 현재
+pairing의 queue 삭제를 제어한다. simulator contract/outbox test와 unsigned build는
+저장소 검증 범위이며, 실제 권한 prompt, Watch-origin sample과 background cadence는
+signed hardware QA가 필요하다. 상세 계약은
+[`APPLE-MAIN-INTEGRATION.ko.md`](../../docs/APPLE-MAIN-INTEGRATION.ko.md)를
+따른다.
+
 ## What the app does
 
 - **Issue #108 core IA** — one current wellness conclusion, at most one
@@ -75,11 +124,12 @@ Linux machine. A physical iPhone cannot reach that machine through
   end` so iOS dims it when no budget arrives. Polling only — no push token.
 - **Apple Health sync** — the iPhone requests read access for supported
   heart, HRV, respiratory, oxygen, activity, distance, wrist-temperature,
-  sleep-stage, and workout samples. Incremental anchored queries upload the
-  native `healthmes.healthkit.v1` contract; anchors advance only after a
-  successful server response. Observer queries, hourly background delivery,
-  app activation, and first pairing all request a sync. Apple Watch samples
-  are read once through the phone's HealthKit store.
+  sleep-stage, and workout samples. Incremental anchored queries produce the
+  native `healthmes.healthkit.v1` contract. The integration contract queues
+  exact bytes in a pairing-scoped encrypted outbox and advances anchors only
+  after a durable, hash-matched server ACK. Observer queries, hourly
+  background delivery, app activation, and first pairing all request a sync.
+  Apple Watch samples are read once through the phone's HealthKit store.
 - **Localization & accessibility** — all app strings ko+en via
   `Resources/Localizable.xcstrings` (server-provided text renders
   verbatim); Dynamic Type throughout (verified at accessibility-large);
@@ -107,6 +157,8 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 
 | Endpoint | Used by |
 |---|---|
+| `GET /v1/setup/readiness` | one-page iPhone/macOS setup readiness |
+| `GET /v1/inputs`, `GET /v1/inputs/{source_id}`, `PUT …/settings` | server-owned input settings shared by iPhone and Mac |
 | `GET /v1/briefing/glance` (ETag/304, max-age 300) | home, widgets, watch, Live Activity |
 | `GET /v1/alerts?hours=24` (§8.5 grammar items) | home alert list, notifications |
 | `GET /v1/schedule/proposals?status=proposed` + `POST …/{id}/accept\|decline` | proposal cards, notification actions |
@@ -119,14 +171,16 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 | `POST /v1/intake-interactions/analyze`, `POST /v1/intake-interactions` | text/voice analysis and reviewed photo capture |
 | `POST /v1/intake-interactions/{id}/outcomes` | explicit consumed/not-consumed/cancelled result |
 | `POST /v1/medical-records` | medication/symptom capture |
+| `POST /v1/wellness-decisions` | natural-language wellness reasoning only |
 | `POST /v1/ingest/healthkit` (`healthmes.healthkit.v1`) | native HealthKit upload |
 
-HealthKit anchors advance only after the paired personal server confirms that
-the verbatim batch is durably stored. Open Wearables normalization remains
+HealthKit retries must reuse one outbox item's exact bytes and
+`Idempotency-Key`. The server's durable ACK must match those bytes before the
+pairing-scoped anchors advance. Open Wearables normalization remains
 asynchronous and replayable from that raw source. HealthKit deletion
-tombstones are retained in the native payload and raw store; the current
-Open Wearables SDK contract has no deletion endpoint, so normalized
-derivatives may remain until that upstream contract adds deletion support.
+tombstones are retained in the native payload and raw store; the current Open
+Wearables SDK contract has no deletion endpoint, so normalized derivatives
+may remain until that upstream contract adds deletion support.
 
 Contracts are pinned twice: Swift decoding tests against
 `Tests/Fixtures/{glance,alerts,weekly_report}.json`, and those same three
@@ -213,7 +267,12 @@ xcodebuild test … -only-testing:HealthMesCompanionUITests
    (`group.com.healthmes.companion`); the token lives in the Keychain (App
    Group access group, unsigned-simulator fallback documented in
    `Pairing.swift`). The watch gets it over WatchConnectivity.
-5. **Unpair** clears pairing, snapshot cache, seen-alerts store and the watch.
+5. Input settings are not copied through WatchConnectivity. iPhone and Mac
+   read the same server-owned `/v1/inputs` descriptors.
+6. **Unpair** clears pairing, snapshot cache, seen-alerts store and the watch.
+   It also deletes the old pairing's encrypted HealthKit queue, anchors,
+   pause state and last-upload timestamp from this iPhone. Data already
+   stored on the server is unchanged.
 
 Transport policy: production pairing requires **HTTPS**. Plain HTTP is
 accepted only for same-device loopback hosts (`localhost`, `127.0.0.0/8`,

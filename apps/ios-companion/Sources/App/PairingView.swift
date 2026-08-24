@@ -12,6 +12,7 @@ struct PairingView: View {
     @State private var token: String = ""
     @State private var status: String = ""
     @State private var busy = false
+    @State private var showUnpairConfirmation = false
 
     var body: some View {
         Form {
@@ -49,7 +50,7 @@ struct PairingView: View {
                 }
                 .disabled(busy)
                 Button(role: .destructive) {
-                    unpair()
+                    showUnpairConfirmation = true
                 } label: {
                     Text("Unpair")
                 }
@@ -73,6 +74,20 @@ struct PairingView: View {
             }
         }
         .onAppear(perform: loadExisting)
+        .confirmationDialog(
+            "Disconnect HealthMes?",
+            isPresented: $showUnpairConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Unpair and delete queued uploads", role: .destructive) {
+                unpair()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Unsent Apple Health batches and sync cursors for this pairing are deleted from this iPhone. Data already stored on the server is unchanged."
+            )
+        }
     }
 
     private var statusPlaceholder: String {
@@ -145,6 +160,26 @@ struct PairingView: View {
     }
 
     private func unpair() {
+        guard let pairing = PairingStore.shared.load() else {
+            finishUnpair()
+            return
+        }
+        busy = true
+        Task { @MainActor in
+            do {
+                try await HealthKitSyncManager.shared.prepareForUnpair(pairing)
+                finishUnpair()
+            } catch {
+                busy = false
+                status = String(
+                    localized:
+                        "Could not safely unpair because the encrypted Apple Health queue could not be removed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func finishUnpair() {
         PairingStore.shared.clear()
         GlanceSnapshotCache.shared.clear()
         SeenAlertsStore.shared.clear()
@@ -153,6 +188,7 @@ struct PairingView: View {
         token = ""
         baseURL = ""
         status = String(localized: "Not paired")
+        busy = false
         NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
     }
 }

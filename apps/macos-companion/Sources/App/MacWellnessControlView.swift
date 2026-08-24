@@ -136,20 +136,19 @@ struct MacWellnessControlView: View {
                 await refreshAllAndScene()
             }
         }
-        .onChange(of: glanceStore.pendingProposals) { _, proposals in
-            guard let proposal = ProactiveProposalSelection.firstEligible(in: proposals) else {
+        .onChange(of: pendingDecisions) { _, decisions in
+            guard let decision = decisions.first else {
                 if generatedSceneOperation?.proposalID != nil {
                     invalidateGeneratedScene()
                 }
                 return
             }
-            guard generatedSceneOperation?.proposalID != proposal.id else { return }
+            guard generatedSceneOperation?.proposalID != decision.id else { return }
             Task {
                 await loadScene(
-                    "\(proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
-                    source: .proactive,
-                    proposalID: proposal.id,
-                    decisionRecordID: proposal.decisionRecordId
+                    decision.prompt,
+                    lens: .coordinate,
+                    proposalID: decision.id
                 )
             }
         }
@@ -349,6 +348,9 @@ struct MacWellnessControlView: View {
                     resolvingProposalID: resolvingProposalID,
                     onAction: handleSceneAction
                 )
+                if let decision = activeGeneratedDecision {
+                    generatedDecisionControls(decision)
+                }
             } else {
                 let scene = projectedScene
                 ForEach(scene.modules) { module in
@@ -924,14 +926,15 @@ struct MacWellnessControlView: View {
             selectDetail(lens)
             let query = commandText
             commandText = ""
-            Task { await loadScene(query) }
+            Task { await loadScene(query, lens: lens) }
         case .createTask(let title):
             presentPreview(kind: .task, title: title)
         case .createGoal(let title):
             presentPreview(kind: .goal, title: title)
         case .clarify(let query):
+            let lens = router.lens
             commandText = ""
-            Task { await loadScene(query) }
+            Task { await loadScene(query, lens: lens) }
         }
     }
 
@@ -1090,10 +1093,9 @@ struct MacWellnessControlView: View {
     }
 
     private func loadScene(
-        _ query: String,
-        source: WellnessSceneRequest.Source = .user,
+        _ question: String,
+        lens: WellnessLens,
         proposalID: UUID? = nil,
-        decisionRecordID: UUID? = nil,
         clearMessage: Bool = true
     ) async {
         generatedScene = nil
@@ -1123,13 +1125,13 @@ struct MacWellnessControlView: View {
             }
         }
         do {
-            let scene = try await HealthMesAPI().createWellnessScene(
-                query: query,
-                source: source,
-                proposalID: proposalID,
-                decisionRecordID: decisionRecordID,
+            let presentation = try await HealthMesAPI().createWellnessDecision(
+                question: question,
+                lens: lens,
+                timezone: decisionTimeZone.identifier,
                 pairing: pairingSnapshot
             )
+            let scene = presentation.scene
             guard
                 sceneOperationGate.isCurrent(
                     sceneOperation,
@@ -1153,6 +1155,141 @@ struct MacWellnessControlView: View {
                 tone: .caution
             )
         }
+    }
+
+    private var pendingDecisions: [PendingDecision] {
+        PendingDecision.correlate(
+            alerts: glanceStore.alerts,
+            proposals: glanceStore.pendingProposals
+        )
+    }
+
+    private var activeGeneratedDecision: PendingDecision? {
+        guard
+            let operation = generatedSceneOperation,
+            let proposalID = operation.proposalID,
+            sceneOperationGate.isCurrent(
+                operation,
+                pairing: dashboardStore.pairing,
+                proposalID: proposalID
+            )
+        else { return nil }
+        return pendingDecisions.first(where: { $0.id == proposalID })
+    }
+
+    private var decisionTimeZone: TimeZone {
+        guard let identifier = glanceStore.payload?.timezone else {
+            return .autoupdatingCurrent
+        }
+        return TimeZone(identifier: identifier) ?? .autoupdatingCurrent
+    }
+
+    private func generatedDecisionControls(
+        _ decision: PendingDecision
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Pending schedule decision", systemImage: "calendar.badge.clock")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(MacHealthMesStyle.amber)
+            Text(verbatim: decision.prompt)
+                .font(.title3.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            if let reason = decision.reason {
+                Text(verbatim: reason)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Text(
+                verbatim: ProposalFormat.windowLine(
+                    decision.proposal,
+                    timeZone: decisionTimeZone
+                )
+            )
+            .font(.callout.weight(.semibold).monospacedDigit())
+
+            if let decisionOutcome, decisionOutcome.proposalID == decision.id {
+                proposalOutcome(decisionOutcome.outcome)
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            await resolveGeneratedDecision(
+                                decision,
+                                action: .decline
+                            )
+                        }
+                    } label: {
+                        Label("Keep", systemImage: "xmark")
+                            .frame(minWidth: 84)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        Task {
+                            await resolveGeneratedDecision(
+                                decision,
+                                action: .accept
+                            )
+                        }
+                    } label: {
+                        Label("Approve change", systemImage: "checkmark")
+                            .frame(minWidth: 84)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(MacHealthMesStyle.moss)
+
+                    if let alert = decision.alert {
+                        Button("Why?") {
+                            onSelect(.proposal(decision.proposal, alert: alert))
+                        }
+                        .buttonStyle(.link)
+                    }
+                    Spacer()
+                }
+                .controlSize(.large)
+                .disabled(resolvingProposalID != nil)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(MacHealthMesStyle.line)
+        }
+    }
+
+    private func resolveGeneratedDecision(
+        _ decision: PendingDecision,
+        action: ProposalAction
+    ) async {
+        guard
+            activeGeneratedDecision == decision,
+            let operation = generatedSceneOperation
+        else {
+            message = MacControlMessage(
+                text: "This proposal is no longer actionable. Refresh the scene.",
+                tone: .caution
+            )
+            return
+        }
+        let completed = await resolve(
+            decision.proposal,
+            action: action,
+            pairing: operation.pairing
+        )
+        guard
+            completed,
+            generatedSceneOperation == operation,
+            sceneOperationGate.isCurrent(
+                operation,
+                pairing: dashboardStore.pairing,
+                proposalID: decision.id
+            )
+        else { return }
+        generatedScene = nil
+        generatedSceneOperation = nil
+        selectDetail(.change, clearMessage: false)
     }
 
     private func handleSceneAction(_ action: WellnessSceneAction) {
@@ -1223,17 +1360,15 @@ struct MacWellnessControlView: View {
             refreshOperation,
             pairing: dashboardStore.pairing
         ) else { return }
-        if let proposal = ProactiveProposalSelection.firstEligible(
-            in: glanceStore.pendingProposals
-        ) {
+        if let decision = pendingDecisions.first {
             await loadScene(
-                "\(proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
-                source: .proactive,
-                proposalID: proposal.id,
-                decisionRecordID: proposal.decisionRecordId
+                decision.prompt,
+                lens: .coordinate,
+                proposalID: decision.id
             )
         } else {
-            await loadScene(sceneQuery(for: router.lens))
+            let lens = router.lens
+            await loadScene(sceneQuery(for: lens), lens: lens)
         }
     }
 

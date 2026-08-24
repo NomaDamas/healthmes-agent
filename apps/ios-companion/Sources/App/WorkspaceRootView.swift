@@ -1109,15 +1109,16 @@ private struct WorkspaceInsightCanvas: View {
             }
         }
         do {
-            let generated = try await HealthMesAPI().createWellnessScene(
-                query: "최근 건강·활동·식사·일정 데이터에서 검증 가능한 wellness 추이와 영향 요인을 보여줘",
+            let presentation = try await HealthMesAPI().createWellnessDecision(
+                question: "최근 건강·활동·식사·일정 데이터에서 검증 가능한 wellness 추이와 영향 요인을 보여줘",
+                lens: .now,
                 pairing: pairing
             )
             guard operationGate.isCurrent(
                 operation,
                 pairing: PairingStore.shared.load()
             ) else { return }
-            scene = generated
+            scene = presentation.scene
             message = nil
         } catch {
             guard operationGate.isCurrent(
@@ -1175,6 +1176,9 @@ private struct WorkspaceAgentCanvas: View {
                             showsActions: true,
                             onAction: handleAction
                         )
+                        if let decision = activeDecision {
+                            proposalDecisionControls(decision)
+                        }
                     } else {
                         readyState
                     }
@@ -1537,9 +1541,7 @@ private struct WorkspaceAgentCanvas: View {
 
     private var executionSummary: String {
         guard let scene else { return "승인할 변경 없음" }
-        if scene.actions.contains(where: {
-            $0.kind == .acceptProposal || $0.kind == .declineProposal
-        }) {
+        if activeDecision != nil {
             return busyProposalID == nil ? "사용자 승인 대기" : "Calendar 반영 요청 중"
         }
         return "읽기 전용 인사이트 · Calendar 변경 없음"
@@ -1548,9 +1550,7 @@ private struct WorkspaceAgentCanvas: View {
     private var executionStageState: StageState {
         guard scene != nil else { return .waiting }
         if busyProposalID != nil { return .active }
-        if scene?.actions.contains(where: {
-            $0.kind == .acceptProposal || $0.kind == .declineProposal
-        }) == true {
+        if activeDecision != nil {
             return .attention
         }
         return .complete
@@ -1560,6 +1560,7 @@ private struct WorkspaceAgentCanvas: View {
         command.stopListening()
         let query = command.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, !isRunning else { return }
+        let fallbackLens = scene?.lens ?? .now
         resolutionGate.invalidate()
         busyProposalID = nil
         submittedCommand = query
@@ -1572,14 +1573,16 @@ private struct WorkspaceAgentCanvas: View {
             writePreview = AgentWritePreview(kind: .task, title: title)
         case .createGoal(let title):
             writePreview = AgentWritePreview(kind: .goal, title: title)
-        case .show, .clarify:
-            Task { await run(query) }
+        case .show(let lens):
+            Task { await run(query, lens: lens) }
+        case .clarify:
+            Task { await run(query, lens: fallbackLens) }
         case nil:
             break
         }
     }
 
-    private func run(_ query: String) async {
+    private func run(_ query: String, lens: WellnessLens) async {
         guard !isRunning else { return }
         guard let pairing = PairingStore.shared.load() else {
             statusMessage = "HealthMes 연결을 먼저 설정해 주세요."
@@ -1592,15 +1595,17 @@ private struct WorkspaceAgentCanvas: View {
 
         let operation = sceneGate.begin(pairing: pairing)
         do {
-            let generated = try await HealthMesAPI().createWellnessScene(
-                query: query,
+            let presentation = try await HealthMesAPI().createWellnessDecision(
+                question: query,
+                lens: lens,
+                timezone: decisionTimeZone.identifier,
                 pairing: pairing
             )
             guard sceneGate.isCurrent(
                 operation,
                 pairing: PairingStore.shared.load()
             ) else { return }
-            scene = generated
+            scene = presentation.scene
             sceneOperation = operation
         } catch {
             guard sceneGate.isCurrent(
@@ -1638,11 +1643,10 @@ private struct WorkspaceAgentCanvas: View {
             proposalID: decision.proposal.id
         )
         do {
-            let generated = try await HealthMesAPI().createWellnessScene(
-                query: "\(decision.proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
-                source: .proactive,
-                proposalID: decision.proposal.id,
-                decisionRecordID: decision.proposal.decisionRecordId,
+            let presentation = try await HealthMesAPI().createWellnessDecision(
+                question: decision.prompt,
+                lens: .coordinate,
+                timezone: decisionTimeZone.identifier,
                 pairing: pairing
             )
             guard sceneGate.isCurrent(
@@ -1650,7 +1654,7 @@ private struct WorkspaceAgentCanvas: View {
                 pairing: PairingStore.shared.load(),
                 proposalID: decision.proposal.id
             ) else { return }
-            scene = generated
+            scene = presentation.scene
             sceneOperation = operation
         } catch {
             guard sceneGate.isCurrent(
@@ -1682,62 +1686,148 @@ private struct WorkspaceAgentCanvas: View {
         _ = await (briefingRefresh, planRefresh)
     }
 
+    private var decisionTimeZone: TimeZone {
+        guard let identifier = briefing.snapshot?.payload.timezone else {
+            return .autoupdatingCurrent
+        }
+        return TimeZone(identifier: identifier) ?? .autoupdatingCurrent
+    }
+
+    private var activeDecision: PendingDecision? {
+        guard
+            !briefing.isStale,
+            briefing.snapshot != nil,
+            let operation = sceneOperation,
+            let proposalID = operation.proposalID,
+            sceneGate.isCurrent(
+                operation,
+                pairing: PairingStore.shared.load(),
+                proposalID: proposalID
+            )
+        else { return nil }
+        return briefing.pendingDecisions.first {
+            $0.id == proposalID
+                && $0.hasExactDecisionCorrelation
+                && $0.proposal.isActionable
+        }
+    }
+
+    private func proposalDecisionControls(_ decision: PendingDecision) -> some View {
+        ProductCard(kicker: "Pending decision", systemImage: "calendar.badge.clock") {
+            Text(verbatim: decision.prompt)
+                .font(.headline)
+                .fixedSize(horizontal: false, vertical: true)
+            if let reason = decision.reason {
+                Text(verbatim: reason)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Text(
+                verbatim: ProposalFormat.windowLine(
+                    decision.proposal,
+                    timeZone: decisionTimeZone
+                )
+            )
+            .font(.footnote.weight(.semibold).monospacedDigit())
+            HStack(spacing: 10) {
+                Button {
+                    resolve(decision, action: .decline)
+                } label: {
+                    Label("유지", systemImage: "xmark")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    resolve(decision, action: .accept)
+                } label: {
+                    Label("변경 승인", systemImage: "checkmark")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(moss)
+            }
+            .disabled(busyProposalID != nil)
+        }
+    }
+
+    private func resolve(
+        _ decision: PendingDecision,
+        action: ProposalAction
+    ) {
+        guard
+            busyProposalID == nil,
+            let operation = sceneOperation,
+            sceneGate.isCurrent(
+                operation,
+                pairing: PairingStore.shared.load(),
+                proposalID: decision.id
+            ),
+            operation.proposalID == decision.id,
+            let current = briefing.pendingDecisions.first(where: {
+                $0.id == decision.id
+                    && $0.hasExactDecisionCorrelation
+                    && $0.proposal.isActionable
+            }),
+            current == decision
+        else {
+            statusMessage = "이 제안은 현재 상태와 정확히 연결되지 않아 실행하지 않았습니다."
+            return
+        }
+        busyProposalID = decision.id
+        let resolutionOperation = resolutionGate.begin(
+            pairing: operation.pairing,
+            proposalID: decision.id
+        )
+        let resolvedSceneOperation = operation
+        Task {
+            await briefing.resolve(
+                decision.proposal,
+                action: action,
+                pairing: operation.pairing
+            )
+            guard resolutionGate.isCurrent(
+                resolutionOperation,
+                pairing: PairingStore.shared.load(),
+                proposalID: decision.id
+            ) else { return }
+            busyProposalID = nil
+            statusMessage = briefing.proposalBanner
+            guard sceneOperation == resolvedSceneOperation else { return }
+            scene = nil
+            sceneOperation = nil
+        }
+    }
+
     private func handleAction(_ action: WellnessSceneAction) {
         switch action.kind {
         case .acceptProposal, .declineProposal:
             guard
-                let scene,
-                scene.allowsProposalActions,
-                !briefing.isStale,
-                briefing.snapshot != nil,
                 let proposalID = action.proposalID,
-                scene.allowsProposalActions(for: proposalID),
-                let operation = sceneOperation,
-                sceneGate.isCurrent(
-                    operation,
-                    pairing: PairingStore.shared.load()
-                ),
-                let proposal = briefing.pendingProposals.first(where: {
-                    $0.id == proposalID && $0.isActionable
-                }),
                 let decision = briefing.pendingDecisions.first(where: {
                     $0.id == proposalID && $0.hasExactDecisionCorrelation
-                }),
-                decision.proposal == proposal
+                        && $0.proposal.isActionable
+                })
             else {
                 statusMessage = "이 제안은 현재 상태와 정확히 연결되지 않아 실행하지 않았습니다."
                 return
             }
-            busyProposalID = proposalID
-            let resolutionOperation = resolutionGate.begin(
-                pairing: operation.pairing,
-                proposalID: proposalID
+            resolve(
+                decision,
+                action: action.kind == .acceptProposal ? .accept : .decline
             )
-            let resolvedSceneOperation = operation
-            Task {
-                await briefing.resolve(
-                    proposal,
-                    action: action.kind == .acceptProposal ? .accept : .decline,
-                    pairing: operation.pairing
-                )
-                guard resolutionGate.isCurrent(
-                    resolutionOperation,
-                    pairing: PairingStore.shared.load(),
-                    proposalID: proposalID
-                ) else { return }
-                busyProposalID = nil
-                statusMessage = briefing.proposalBanner
-                guard sceneOperation == resolvedSceneOperation else { return }
-                self.scene = nil
-                sceneOperation = nil
-            }
         case .openWebDetail:
             if let url = action.url {
                 router.openDecision(url)
             }
         case .refresh:
             if let submittedCommand {
-                Task { await run(submittedCommand) }
+                Task {
+                    await run(
+                        submittedCommand,
+                        lens: scene?.lens ?? .now
+                    )
+                }
             }
         case .createTask, .createGoal, .modifyProposal, .switchLens:
             statusMessage = "이 동작은 기존 확인 절차가 있는 화면에서만 실행됩니다."

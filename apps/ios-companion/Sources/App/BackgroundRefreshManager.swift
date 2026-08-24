@@ -59,7 +59,13 @@ final class BackgroundRefreshManager {
         schedule()
 
         let work = Task {
-            let success = await RefreshCoordinator.shared.sync(isForeground: false)
+            async let productRefresh =
+                RefreshCoordinator.shared.sync(isForeground: false)
+            async let healthKitRefresh =
+                HealthKitSyncManager.shared.backgroundSync()
+            let productSuccess = await productRefresh
+            let healthKitSuccess = await healthKitRefresh
+            let success = productSuccess || healthKitSuccess
             task.setTaskCompleted(success: success)
         }
         task.expirationHandler = {

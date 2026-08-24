@@ -109,18 +109,22 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
         proposalID: UUID?
     ) async {
         do {
-            let scene = try await HealthMesAPI().createWellnessScene(
-                query: command,
-                source: .user,
-                proposalID: proposalID
+            let presentation = try await HealthMesAPI().createWellnessDecision(
+                question: WellnessDecisionWatchRelay.question(
+                    from: command,
+                    proposalID: proposalID
+                ),
+                idempotencyKey: requestID,
+                lens: proposalID == nil ? .now : .coordinate
             )
+            let scene = presentation.scene
             let detail = AlertNotificationContent.compactLine(
                 scene.summary,
                 limit: 120
             )
             sendSpeakResult(
                 requestID: requestID,
-                status: "completed",
+                status: presentation.output.status.rawValue,
                 title: scene.title,
                 detail: detail
             )

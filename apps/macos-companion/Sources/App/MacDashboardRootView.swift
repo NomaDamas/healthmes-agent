@@ -3,8 +3,8 @@ import SwiftUI
 struct MacDashboardRootView: View {
     @ObservedObject var glanceStore: GlanceStore
     @ObservedObject var notifications: MacNotificationManager
+    @ObservedObject var dashboardStore: MacDashboardStore
     @EnvironmentObject private var router: MacAppRouter
-    @StateObject private var dashboardStore = MacDashboardStore()
     @StateObject private var workspaceStore = MacWorkspaceViewModel()
 
     var body: some View {

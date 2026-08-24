@@ -11,6 +11,7 @@ struct MacSettingsView: View {
     @State private var serverReadiness: SetupReadiness?
     @State private var readinessError: String?
     @StateObject private var setup = MacSetupCoordinator()
+    @StateObject private var inputControl = InputControlPlaneModel()
 
     var body: some View {
         ScrollView {
@@ -35,6 +36,8 @@ struct MacSettingsView: View {
                     privacyCard
                 }
 
+                inputSourcesPanel
+
                 DisclosureGroup(isExpanded: $showAdvanced) {
                     PairingSettingsView(
                         store: glanceStore,
@@ -56,7 +59,17 @@ struct MacSettingsView: View {
             }
             .padding(32)
         }
-        .task { await loadReadiness() }
+        .task {
+            await loadReadiness()
+            await inputControl.load()
+        }
+        .onChange(of: glanceStore.pairingRevision) { _, _ in
+            inputControl.reset()
+            Task {
+                await loadReadiness()
+                await inputControl.load()
+            }
+        }
     }
 
     private var calendarCard: some View {
@@ -176,6 +189,315 @@ struct MacSettingsView: View {
             }
             .foregroundStyle(MacHealthMesStyle.graphite)
         }
+    }
+
+    private var inputSourcesPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("HealthMes data sources", systemImage: "square.stack.3d.up.fill")
+                        .font(.headline)
+                    Text("Server-owned settings shared by this Mac and every paired iPhone.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await inputControl.load() }
+                } label: {
+                    if inputControl.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(inputControl.isLoading)
+            }
+
+            if inputControl.isLoading, inputControl.sources.isEmpty {
+                ProgressView("Loading server data sources…")
+                    .frame(maxWidth: .infinity, minHeight: 120)
+            } else if inputControl.sources.isEmpty {
+                Text("No server data sources are available.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 90)
+            } else {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 330), spacing: 14)],
+                    alignment: .leading,
+                    spacing: 14
+                ) {
+                    ForEach(inputControl.sources) { source in
+                        macInputSourceCard(source)
+                    }
+                }
+            }
+
+            if let error = inputControl.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+
+            Text(
+                "Open Wearables credentials stay on the HealthMes server. These apps receive only configured/not configured state, never the API key."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20)
+                .stroke(MacHealthMesStyle.line)
+        }
+    }
+
+    private func macInputSourceCard(
+        _ source: InputSourceDescriptor
+    ) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 12) {
+                MacMetadataRow(
+                    label: "Server status",
+                    value: InputControlPlanePresentation.sourceSummary(source)
+                )
+                MacMetadataRow(
+                    label: "Platforms",
+                    value: source.platforms.map(platformTitle).joined(separator: ", ")
+                )
+                MacMetadataRow(
+                    label: "Capabilities",
+                    value: source.capabilities
+                        .map(InputControlPlanePresentation.humanize)
+                        .joined(separator: ", ")
+                )
+
+                if source.isWearable {
+                    MacMetadataRow(
+                        label: "Provider/device inventory",
+                        value: InputControlPlanePresentation.instanceSummary(source)
+                    )
+                    if source.sourceID == "wearable.open-wearables" {
+                        MacMetadataRow(
+                            label: "Server credential",
+                            value: source.connectionState == .notConfigured
+                                ? "Not configured on server"
+                                : "Configured on server"
+                        )
+                    }
+                }
+
+                if source.supports(
+                    setting: "decision_access_enabled",
+                    scope: "domain"
+                ) {
+                    Toggle(
+                        "Allow Decision Agent access",
+                        isOn: decisionAccessBinding(source)
+                    )
+                    .toggleStyle(.switch)
+                    .disabled(inputControl.isBusy(source.sourceID))
+                }
+
+                if source.supports(setting: "retention", scope: "data_class") {
+                    ForEach(source.retention) { policy in
+                        Picker(
+                            retentionTitle(policy.dataClass),
+                            selection: retentionBinding(
+                                source: source,
+                                policy: policy
+                            )
+                        ) {
+                            ForEach(source.retentionAllowedValues, id: \.self) { preset in
+                                Text(retentionPresetTitle(preset))
+                                    .tag(preset)
+                            }
+                        }
+                        .disabled(inputControl.isBusy(source.sourceID))
+                    }
+                }
+
+                if !source.instances.isEmpty {
+                    Divider()
+                    ForEach(source.instances) { instance in
+                        macInstanceControl(instance, source: source)
+                    }
+                } else if source.isWearable {
+                    Text(
+                        "Aggregate status only. Main does not yet expose individual provider/device inventory or CRUD."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                if !source.limitations.isEmpty {
+                    Divider()
+                    ForEach(source.limitations, id: \.self) { limitation in
+                        Label(
+                            InputControlPlanePresentation.limitation(limitation),
+                            systemImage: "info.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let message = inputControl.sourceMessages[source.sourceID] {
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                if inputControl.isBusy(source.sourceID) {
+                    ProgressView("Saving to HealthMes…")
+                        .controlSize(.small)
+                }
+            }
+            .padding(.top, 10)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: sourceIcon(source))
+                    .foregroundStyle(MacHealthMesStyle.brand)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: source.displayName)
+                        .font(.headline)
+                        .foregroundStyle(MacHealthMesStyle.graphite)
+                    Text(verbatim: InputControlPlanePresentation.sourceSummary(source))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(16)
+        .background(Color.white.opacity(0.5), in: RoundedRectangle(cornerRadius: 16))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(MacHealthMesStyle.line)
+        }
+    }
+
+    private func macInstanceControl(
+        _ instance: InputInstance,
+        source: InputSourceDescriptor
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(
+                isOn: instanceEnabledBinding(
+                    source: source,
+                    instance: instance
+                )
+            ) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: platformTitle(instance.platform))
+                        .font(.subheadline.weight(.semibold))
+                    Text(verbatim: instance.instanceID)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+            .disabled(
+                !source.supports(setting: "enabled", scope: "instance")
+                    || inputControl.isBusy(source.sourceID)
+            )
+            Text(verbatim: InputControlPlanePresentation.instanceStatus(instance))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func decisionAccessBinding(
+        _ source: InputSourceDescriptor
+    ) -> Binding<Bool> {
+        Binding(
+            get: { source.decisionAccessEnabled },
+            set: { enabled in
+                Task {
+                    await inputControl.setDecisionAccess(
+                        enabled,
+                        for: source.sourceID
+                    )
+                }
+            }
+        )
+    }
+
+    private func retentionBinding(
+        source: InputSourceDescriptor,
+        policy: InputRetentionPolicy
+    ) -> Binding<String> {
+        Binding(
+            get: { policy.preset },
+            set: { preset in
+                Task {
+                    await inputControl.setRetention(
+                        preset,
+                        dataClass: policy.dataClass,
+                        for: source.sourceID
+                    )
+                }
+            }
+        )
+    }
+
+    private func instanceEnabledBinding(
+        source: InputSourceDescriptor,
+        instance: InputInstance
+    ) -> Binding<Bool> {
+        Binding(
+            get: { instance.enabled },
+            set: { enabled in
+                Task {
+                    await inputControl.setInstanceEnabled(
+                        enabled,
+                        instanceID: instance.instanceID,
+                        for: source.sourceID
+                    )
+                }
+            }
+        )
+    }
+
+    private func sourceIcon(_ source: InputSourceDescriptor) -> String {
+        switch source.domain {
+        case "activity":
+            return "figure.walk.motion"
+        case "nutrition":
+            return "fork.knife"
+        case "wearable":
+            return source.sourceID == "wearable.healthkit-bridge"
+                ? "heart.text.square"
+                : "watch.analog"
+        case "calendar":
+            return "calendar"
+        default:
+            return "square.stack.3d.up"
+        }
+    }
+
+    private func platformTitle(_ platform: String) -> String {
+        switch platform {
+        case "ios":
+            return "iPhone"
+        case "watchos":
+            return "Apple Watch"
+        case "macos":
+            return "Mac"
+        default:
+            return InputControlPlanePresentation.humanize(platform)
+        }
+    }
+
+    private func retentionTitle(_ dataClass: String) -> String {
+        "\(InputControlPlanePresentation.humanize(dataClass)) retention"
+    }
+
+    private func retentionPresetTitle(_ preset: String) -> String {
+        preset == "forever" ? "Keep forever" : preset
     }
 
     private func openNotificationSettings() {
