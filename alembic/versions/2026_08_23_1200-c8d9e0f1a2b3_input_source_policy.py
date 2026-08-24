@@ -22,6 +22,7 @@ depends_on: str | Sequence[str] | None = None
 _TABLE = "input_source_policy"
 _OWNER_INDEX = "ix_input_source_policy_owner_principal_id"
 _SOURCE_INDEX = "ix_input_source_policy_source_id"
+_PRIMARY_KEY = "pk_input_source_policy"
 _CHECK = "ck_input_source_policy_revision_positive"
 _UNIQUE = "uq_input_source_policy_owner_source"
 _EXPECTED_COLUMNS = {
@@ -32,6 +33,19 @@ _EXPECTED_COLUMNS = {
     "revision",
     "created_at",
     "updated_at",
+}
+_EXPECTED_COLUMN_TYPES = {
+    "id": sa.Uuid(),
+    "owner_principal_id": sa.String(length=255),
+    "source_id": sa.String(length=255),
+    "enabled": sa.Boolean(),
+    "revision": sa.Integer(),
+    "created_at": sa.DateTime(timezone=True),
+    "updated_at": sa.DateTime(timezone=True),
+}
+_EXPECTED_INDEXES = {
+    _OWNER_INDEX: (("owner_principal_id",), False),
+    _SOURCE_INDEX: (("source_id",), False),
 }
 
 
@@ -128,6 +142,38 @@ def _create_table() -> None:
     )
 
 
+def _type_signature(
+    column_type: sa.types.TypeEngine[object],
+    *,
+    dialect: sa.engine.Dialect,
+) -> str:
+    return " ".join(
+        str(column_type.compile(dialect=dialect)).upper().split()
+    )
+
+
+def _default_signature(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = "".join(str(value).strip().casefold().split())
+    while (
+        len(normalized) >= 2
+        and normalized.startswith("(")
+        and normalized.endswith(")")
+    ):
+        normalized = normalized[1:-1]
+    normalized = normalized.split("::", maxsplit=1)[0]
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        normalized = normalized[1:-1]
+    if normalized in {"current_timestamp", "current_timestamp()", "now()"}:
+        return "now"
+    return normalized
+
+
 def _validate_existing_table(bind: sa.Connection) -> set[str]:
     """Accept a table created from current ORM metadata, but no other shape."""
 
@@ -147,9 +193,44 @@ def _validate_existing_table(bind: sa.Connection) -> set[str]:
         raise RuntimeError(
             "existing input_source_policy has nullable required columns"
         )
+    incompatible_types = {
+        name
+        for name, expected_type in _EXPECTED_COLUMN_TYPES.items()
+        if _type_signature(
+            columns[name]["type"],
+            dialect=bind.dialect,
+        )
+        != _type_signature(expected_type, dialect=bind.dialect)
+    }
+    if incompatible_types:
+        raise RuntimeError(
+            "existing input_source_policy has incompatible column types"
+        )
+    expected_defaults = {
+        "id": None,
+        "owner_principal_id": None,
+        "source_id": None,
+        "enabled": "1"
+        if bind.dialect.name == "sqlite"
+        else "true",
+        "revision": "1",
+        "created_at": "now",
+        "updated_at": "now",
+    }
+    if any(
+        _default_signature(columns[name].get("default"))
+        != expected_default
+        for name, expected_default in expected_defaults.items()
+    ):
+        raise RuntimeError(
+            "existing input_source_policy has incompatible server defaults"
+        )
 
     primary_key = inspector.get_pk_constraint(_TABLE)
-    if tuple(primary_key.get("constrained_columns") or ()) != ("id",):
+    if (
+        primary_key.get("name") != _PRIMARY_KEY
+        or tuple(primary_key.get("constrained_columns") or ()) != ("id",)
+    ):
         raise RuntimeError(
             "existing input_source_policy has an incompatible primary key"
         )
@@ -161,12 +242,11 @@ def _validate_existing_table(bind: sa.Connection) -> set[str]:
         )
         for item in inspector.get_unique_constraints(_TABLE)
     }
-    if (
-        _UNIQUE,
-        ("owner_principal_id", "source_id"),
-    ) not in unique_constraints:
+    if unique_constraints != {
+        (_UNIQUE, ("owner_principal_id", "source_id"))
+    }:
         raise RuntimeError(
-            "existing input_source_policy lacks its owner/source uniqueness"
+            "existing input_source_policy has incompatible uniqueness"
         )
 
     checks = {
@@ -175,16 +255,31 @@ def _validate_existing_table(bind: sa.Connection) -> set[str]:
         )
         for item in inspector.get_check_constraints(_TABLE)
     }
-    if checks.get(_CHECK) != "revision >= 1":
+    if checks != {_CHECK: "revision >= 1"}:
         raise RuntimeError(
-            "existing input_source_policy lacks its revision constraint"
+            "existing input_source_policy has incompatible checks"
         )
 
-    return {
-        str(item["name"])
+    indexes = {
+        str(item["name"]): (
+            tuple(item.get("column_names") or ()),
+            bool(item.get("unique", False)),
+        )
         for item in inspector.get_indexes(_TABLE)
         if item.get("name") is not None
+        and item.get("duplicates_constraint") != _UNIQUE
     }
+    if (
+        set(indexes) - set(_EXPECTED_INDEXES)
+        or any(
+            definition != _EXPECTED_INDEXES[name]
+            for name, definition in indexes.items()
+        )
+    ):
+        raise RuntimeError(
+            "existing input_source_policy has incompatible index definitions"
+        )
+    return set(indexes)
 
 
 def upgrade() -> None:

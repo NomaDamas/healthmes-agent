@@ -100,6 +100,8 @@ class OpenWearablesAvailabilitySnapshot(BaseModel):
     def blocking_reason_code(self) -> str | None:
         if OPEN_WEARABLES_SOURCE_SETTING_UNAVAILABLE in self.reason_codes:
             return OPEN_WEARABLES_SOURCE_SETTING_UNAVAILABLE
+        if OPEN_WEARABLES_SOURCE_POLICY_CHANGED in self.reason_codes:
+            return OPEN_WEARABLES_SOURCE_POLICY_CHANGED
         if OPEN_WEARABLES_METADATA_UNAVAILABLE in self.reason_codes:
             return OPEN_WEARABLES_METADATA_UNAVAILABLE
         if self.state is OpenWearablesAvailabilityState.DISABLED:
@@ -176,25 +178,43 @@ class OpenWearablesAvailabilityResolver:
                     self._settings,
                 )
         except LookupError:
-            return OpenWearablesAvailabilitySnapshot(
-                state=OpenWearablesAvailabilityState.UNCONFIGURED,
-                observed_at=observed_at,
-                source_policy_revision=source_policy.revision,
-                reason_codes=(OPEN_WEARABLES_UNCONFIGURED,),
+            return await self._finalize_snapshot(
+                source_policy,
+                OpenWearablesAvailabilitySnapshot(
+                    state=OpenWearablesAvailabilityState.UNCONFIGURED,
+                    observed_at=observed_at,
+                    source_policy_revision=source_policy.revision,
+                    reason_codes=(OPEN_WEARABLES_UNCONFIGURED,),
+                ),
             )
         except (TimeoutError, OWClientError):
-            return await self._metadata_failure(
+            snapshot = await self._metadata_failure(
                 observed_at,
                 source_policy_revision=source_policy.revision,
             )
+            return await self._finalize_snapshot(
+                source_policy,
+                snapshot,
+            )
+
+        policy_failure = await self._source_policy_failure(
+            source_policy,
+            observed_at=observed_at,
+        )
+        if policy_failure is not None:
+            return policy_failure
 
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 connections, data_sources = await self._read_metadata(user_id)
         except (TimeoutError, OWClientError):
-            return await self._metadata_failure(
+            snapshot = await self._metadata_failure(
                 observed_at,
                 source_policy_revision=source_policy.revision,
+            )
+            return await self._finalize_snapshot(
+                source_policy,
+                snapshot,
             )
 
         active_connection_ids = _active_connection_ids(connections)
@@ -202,17 +222,63 @@ class OpenWearablesAvailabilityResolver:
             data_sources,
             active_connection_ids=active_connection_ids,
         ):
-            return OpenWearablesAvailabilitySnapshot(
+            snapshot = OpenWearablesAvailabilitySnapshot(
                 state=OpenWearablesAvailabilityState.AVAILABLE,
                 observed_at=observed_at,
                 source_policy_revision=source_policy.revision,
             )
-        return OpenWearablesAvailabilitySnapshot(
-            state=OpenWearablesAvailabilityState.DISCONNECTED,
-            observed_at=observed_at,
-            source_policy_revision=source_policy.revision,
-            reason_codes=(OPEN_WEARABLES_DISCONNECTED,),
+        else:
+            snapshot = OpenWearablesAvailabilitySnapshot(
+                state=OpenWearablesAvailabilityState.DISCONNECTED,
+                observed_at=observed_at,
+                source_policy_revision=source_policy.revision,
+                reason_codes=(OPEN_WEARABLES_DISCONNECTED,),
+            )
+        return await self._finalize_snapshot(
+            source_policy,
+            snapshot,
         )
+
+    async def _source_policy_failure(
+        self,
+        expected: InputSourcePolicyBinding,
+        *,
+        observed_at: datetime,
+    ) -> OpenWearablesAvailabilitySnapshot | None:
+        """Fence policy changes that occur during awaited metadata reads."""
+
+        try:
+            current = await asyncio.to_thread(
+                self._source_policy_binding
+            )
+        except Exception:
+            return OpenWearablesAvailabilitySnapshot(
+                state=OpenWearablesAvailabilityState.DISABLED,
+                observed_at=observed_at,
+                source_policy_revision=expected.revision,
+                reason_codes=(
+                    OPEN_WEARABLES_SOURCE_SETTING_UNAVAILABLE,
+                ),
+            )
+        if current == expected and current.enabled:
+            return None
+        return OpenWearablesAvailabilitySnapshot(
+            state=OpenWearablesAvailabilityState.DISABLED,
+            observed_at=observed_at,
+            source_policy_revision=current.revision,
+            reason_codes=(OPEN_WEARABLES_SOURCE_POLICY_CHANGED,),
+        )
+
+    async def _finalize_snapshot(
+        self,
+        expected: InputSourcePolicyBinding,
+        snapshot: OpenWearablesAvailabilitySnapshot,
+    ) -> OpenWearablesAvailabilitySnapshot:
+        policy_failure = await self._source_policy_failure(
+            expected,
+            observed_at=snapshot.observed_at,
+        )
+        return policy_failure or snapshot
 
     async def _read_metadata(
         self,

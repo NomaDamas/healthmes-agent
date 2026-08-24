@@ -13,6 +13,7 @@ from healthmes.wearables import (
     OPEN_WEARABLES_DISCONNECTED,
     OPEN_WEARABLES_METADATA_DEGRADED,
     OPEN_WEARABLES_METADATA_UNAVAILABLE,
+    OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
     OPEN_WEARABLES_SOURCE_SETTING_UNAVAILABLE,
     OPEN_WEARABLES_UNCONFIGURED,
     WEARABLE_INPUT_DISABLED,
@@ -191,6 +192,72 @@ async def test_active_connection_or_data_source_is_available(
     assert snapshot.state is OpenWearablesAvailabilityState.AVAILABLE
     assert snapshot.reason_codes == ()
     assert snapshot.exposes_capabilities is True
+
+
+@pytest.mark.asyncio
+async def test_metadata_read_off_on_revision_race_is_fail_closed(
+    session_factory: sessionmaker[Session],
+) -> None:
+    with session_factory() as session:
+        session.add(
+            InputSourcePolicy(
+                owner_principal_id="owner",
+                source_id="wearable.open-wearables",
+                enabled=True,
+                revision=1,
+            )
+        )
+        session.commit()
+
+    class BlockingMetadataClient(FakeOpenWearablesClient):
+        def __init__(self) -> None:
+            super().__init__(
+                connections=[
+                    {"id": "connection-1", "status": "active"}
+                ]
+            )
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def get_connections(self, user_id: str) -> list[dict]:
+            assert user_id == "user-1"
+            self.started.set()
+            await self.release.wait()
+            return self.connections
+
+        async def get_user_data_sources(self, user_id: str) -> dict:
+            assert user_id == "user-1"
+            await self.release.wait()
+            return self.data_sources
+
+    client = BlockingMetadataClient()
+    pending = asyncio.create_task(_resolver(session_factory, client)())
+    await client.started.wait()
+
+    with session_factory() as session:
+        policy = session.query(InputSourcePolicy).one()
+        policy.enabled = False
+        policy.revision = 2
+        session.commit()
+    with session_factory() as session:
+        policy = session.query(InputSourcePolicy).one()
+        policy.enabled = True
+        policy.revision = 3
+        session.commit()
+
+    client.release.set()
+    snapshot = await pending
+
+    assert snapshot.state is OpenWearablesAvailabilityState.DISABLED
+    assert snapshot.source_policy_revision == 3
+    assert snapshot.reason_codes == (
+        OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+    )
+    assert (
+        snapshot.blocking_reason_code
+        == OPEN_WEARABLES_SOURCE_POLICY_CHANGED
+    )
+    assert snapshot.exposes_capabilities is False
 
 
 @pytest.mark.asyncio

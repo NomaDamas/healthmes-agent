@@ -167,6 +167,7 @@ disconnected 또는 다른 revision으로 바뀌면 catalog에 capability가 남
   -> availability + source_policy_revision 동결
 
 각 tool 호출 직전
+  -> availability metadata 조회 전·후 exact source binding 재검사
   -> 현재 availability와 동결 revision 재검사
   -> 불일치하면 provider를 호출하지 않음
 
