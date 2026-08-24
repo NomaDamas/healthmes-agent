@@ -85,7 +85,7 @@ struct PairingView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Unsent Apple Health batches and sync cursors for this pairing are deleted from this iPhone. Data already stored on the server is unchanged."
+                "Unsent Apple Health batches and sync cursors for this pairing are deleted from this iPhone. If the encrypted queue is unreadable, HealthMes may delete the entire local Apple Health upload queue, including queued batches for other pairings, so corrupted encrypted data cannot remain. Data already stored on the server is unchanged."
             )
         }
     }
@@ -102,32 +102,48 @@ struct PairingView: View {
     }
 
     private func save() {
-        do {
-            let pairing = try PairingStore.shared.save(baseURLString: baseURL, token: token)
-            PhoneWatchSync.shared.pushPairing(
-                baseURL: pairing.baseURL.absoluteString,
-                token: pairing.token ?? ""
-            )
-            WidgetCenter.shared.reloadAllTimelines()
-            status = String(
-                localized: "Paired with \(pairing.baseURL.absoluteString). Widgets will refresh."
-            )
-            NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
-            Task {
+        busy = true
+        Task { @MainActor in
+            do {
+                let candidate = try PairingStore.validatedPairing(
+                    baseURLString: baseURL,
+                    token: token
+                )
+                let pairing = try await HealthKitSyncManager.shared.replacePairing(
+                    with: candidate
+                )
+                PhoneWatchSync.shared.pushPairing(
+                    baseURL: pairing.baseURL.absoluteString,
+                    token: pairing.token ?? ""
+                )
+                WidgetCenter.shared.reloadAllTimelines()
+                status = String(
+                    localized: "Paired with \(pairing.baseURL.absoluteString). Widgets will refresh."
+                )
+                NotificationCenter.default.post(
+                    name: .healthmesPairingChanged,
+                    object: nil
+                )
                 // Ask for notification permission now that alerts can exist,
                 // and mark the current history as seen so enabling
                 // notifications never replays old alerts as new ones.
                 _ = await NotificationManager.shared.requestAuthorization()
-                if let page = try? await HealthMesAPI().listAlerts(hours: 24) {
-                    SeenAlertsStore.shared.primeWithoutNotifying(page.data)
-                } else {
-                    SeenAlertsStore.shared.deferPrimingUntilNextFeed()
-                }
+                let page = try? await HealthMesAPI().listAlerts(
+                    pairing: pairing,
+                    hours: 24
+                )
+                SeenAlertsStore.shared.applyPairingScopedBaseline(
+                    page?.data,
+                    for: pairing
+                )
                 BackgroundRefreshManager.shared.schedule()
                 await HealthKitSyncManager.shared.requestAuthorizationAndSync()
+                busy = false
+            } catch {
+                await HealthKitSyncManager.shared.pairingDidChange()
+                busy = false
+                status = error.localizedDescription
             }
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -160,14 +176,10 @@ struct PairingView: View {
     }
 
     private func unpair() {
-        guard let pairing = PairingStore.shared.load() else {
-            finishUnpair()
-            return
-        }
         busy = true
         Task { @MainActor in
             do {
-                try await HealthKitSyncManager.shared.prepareForUnpair(pairing)
+                try await HealthKitSyncManager.shared.unpair()
                 finishUnpair()
             } catch {
                 busy = false
@@ -180,7 +192,6 @@ struct PairingView: View {
     }
 
     private func finishUnpair() {
-        PairingStore.shared.clear()
         GlanceSnapshotCache.shared.clear()
         SeenAlertsStore.shared.clear()
         PhoneWatchSync.shared.pushUnpair()

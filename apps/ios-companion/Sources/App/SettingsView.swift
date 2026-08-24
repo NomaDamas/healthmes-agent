@@ -131,6 +131,15 @@ struct SettingsView: View {
                                 "\(healthKit.pendingUploadCount)"
                         )
                     }
+                    if healthKit.terminalFailureCount > 0 {
+                        Label(
+                            healthKit.latestTerminalFailure
+                                ?? "Some uploads need attention.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                    }
                     if let nextRetryAt = healthKit.nextRetryAt {
                         LabeledContent("Next automatic retry") {
                             Text(
@@ -168,7 +177,9 @@ struct SettingsView: View {
                     .disabled(healthKit.state == .syncing)
                 }
 
-                if healthKit.pendingUploadCount > 0 {
+                if healthKit.pendingUploadCount > 0
+                    || healthKit.queueStatusError != nil
+                {
                     Button(role: .destructive) {
                         showHealthKitQueueDeletion = true
                     } label: {
@@ -369,7 +380,7 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Only encrypted batches waiting on this iPhone for the current HealthMes pairing are deleted. Server data is unchanged."
+                "Encrypted batches waiting on this iPhone for the current HealthMes pairing are deleted. If the encrypted queue is unreadable, HealthMes may erase the entire local Apple Health queue so corrupted data cannot remain. Server data is unchanged."
             )
         }
     }

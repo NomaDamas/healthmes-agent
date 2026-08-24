@@ -2,6 +2,8 @@ import Foundation
 
 @MainActor
 final class MacSetupCoordinator: ObservableObject {
+    typealias ReadinessLoader = (Pairing) async throws -> SetupReadiness
+
     @Published private(set) var events: [MacSetupEvent] = []
     @Published private(set) var isRunning = false
     @Published private(set) var failure: String?
@@ -9,6 +11,47 @@ final class MacSetupCoordinator: ObservableObject {
     @Published private(set) var phonePairingExpiresAt: Date?
     @Published private(set) var requiresDeveloperTools = false
     @Published private(set) var requiresHomebrew = false
+
+    private let pairingStore: PairingStore
+    private let readinessLoader: ReadinessLoader
+    private var operationGeneration: UInt = 0
+    private var activeAction: Action?
+    private var expectedInstallPairing: Pairing?
+
+    init(
+        pairingStore: PairingStore = .shared,
+        readinessLoader: ReadinessLoader? = nil
+    ) {
+        self.pairingStore = pairingStore
+        if let readinessLoader {
+            self.readinessLoader = readinessLoader
+        } else {
+            let api = HealthMesAPI(pairingStore: pairingStore)
+            self.readinessLoader = { pairing in
+                try await api.setupReadiness(pairing: pairing)
+            }
+        }
+    }
+
+    func resetForPairingChange() {
+        if activeAction == .install,
+            let expectedInstallPairing,
+            pairingStore.load() == expectedInstallPairing
+        {
+            self.expectedInstallPairing = nil
+            return
+        }
+        operationGeneration &+= 1
+        activeAction = nil
+        expectedInstallPairing = nil
+        events = []
+        failure = nil
+        phonePairingURL = nil
+        phonePairingExpiresAt = nil
+        requiresDeveloperTools = false
+        requiresHomebrew = false
+        isRunning = false
+    }
 
     func install(glanceStore: GlanceStore) async {
         await run(.install, glanceStore: glanceStore)
@@ -24,27 +67,59 @@ final class MacSetupCoordinator: ObservableObject {
 
     func verifyPairing() async {
         guard !isRunning else { return }
+        operationGeneration &+= 1
+        let operation = operationGeneration
+        activeAction = nil
+        expectedInstallPairing = nil
         isRunning = true
         failure = nil
-        defer { isRunning = false }
+        defer {
+            if operationGeneration == operation {
+                isRunning = false
+            }
+        }
+        guard
+            let pairing = pairingStore.load(),
+            let identity = pairingStore.cacheIdentity(for: pairing)
+        else {
+            events = []
+            failure = "HealthMes is not paired."
+            return
+        }
         do {
-            events = try await readinessEvents()
+            let readiness = try await readinessEvents(for: pairing)
+            guard isCurrent(operation, pairing: pairing, identity: identity) else {
+                return
+            }
+            events = readiness
         } catch {
+            guard isCurrent(operation, pairing: pairing, identity: identity) else {
+                return
+            }
             failure = error.localizedDescription
         }
     }
 
     func requestDeveloperToolsInstallation() async {
         guard !isRunning else { return }
+        operationGeneration &+= 1
+        let operation = operationGeneration
+        activeAction = nil
+        expectedInstallPairing = nil
         isRunning = true
         failure = nil
-        defer { isRunning = false }
+        defer {
+            if operationGeneration == operation {
+                isRunning = false
+            }
+        }
         do {
             let result = try await Self.execute(
                 executable: URL(fileURLWithPath: "/usr/bin/xcode-select"),
                 arguments: ["--install"],
                 currentDirectory: URL(fileURLWithPath: "/")
             )
+            guard operationGeneration == operation else { return }
             if result.status == 0 {
                 failure = "Complete Apple's installation, then select Set up this Mac again."
             } else {
@@ -56,6 +131,7 @@ final class MacSetupCoordinator: ObservableObject {
                     ?? "Apple Developer Tools could not be requested automatically."
             }
         } catch {
+            guard operationGeneration == operation else { return }
             failure = error.localizedDescription
         }
     }
@@ -71,6 +147,10 @@ final class MacSetupCoordinator: ObservableObject {
 
     private func run(_ action: Action, glanceStore: GlanceStore?) async {
         guard !isRunning else { return }
+        operationGeneration &+= 1
+        let operation = operationGeneration
+        activeAction = action
+        expectedInstallPairing = nil
         isRunning = true
         failure = nil
         requiresDeveloperTools = false
@@ -80,7 +160,13 @@ final class MacSetupCoordinator: ObservableObject {
             phonePairingURL = nil
             phonePairingExpiresAt = nil
         }
-        defer { isRunning = false }
+        defer {
+            if operationGeneration == operation {
+                activeAction = nil
+                expectedInstallPairing = nil
+                isRunning = false
+            }
+        }
 
         do {
             let python = try Self.pythonExecutable()
@@ -96,6 +182,7 @@ final class MacSetupCoordinator: ObservableObject {
                 currentDirectory: root,
                 environment: Self.managedRuntimeEnvironment()
             )
+            guard operationGeneration == operation else { return }
             events = MacSetupSupport.decodeEvents(result.output)
             requiresDeveloperTools = events.contains {
                 $0.step == "tool_python3" && $0.isFailure
@@ -111,7 +198,18 @@ final class MacSetupCoordinator: ObservableObject {
             }
             if action == .install {
                 try await completePairing(glanceStore: glanceStore)
-                events.append(contentsOf: try await readinessEvents())
+                guard operationGeneration == operation else { return }
+                guard
+                    let pairing = pairingStore.load(),
+                    let identity = pairingStore.cacheIdentity(for: pairing)
+                else {
+                    throw SetupError.missingPairing
+                }
+                let readiness = try await readinessEvents(for: pairing)
+                guard isCurrent(operation, pairing: pairing, identity: identity) else {
+                    return
+                }
+                events.append(contentsOf: readiness)
             } else if action == .pair {
                 updatePhonePairing()
             }
@@ -231,15 +329,25 @@ final class MacSetupCoordinator: ObservableObject {
         }
         let pairing = try await PairingExchangeClient().exchange(macURL)
         if let glanceStore {
+            expectedInstallPairing = pairing
             try await glanceStore.pair(
                 baseURLString: pairing.baseURL.absoluteString,
                 token: pairing.token ?? ""
             )
         } else {
-            _ = try PairingStore.shared.save(
+            let previous = pairingStore.load()
+            let saved = try await MacPairingTransitionCoordinator.replace(
                 baseURLString: pairing.baseURL.absoluteString,
-                token: pairing.token ?? ""
+                token: pairing.token ?? "",
+                store: pairingStore,
+                cleanup: {
+                    await MacNotificationManager.shared.clearAccountSurfaces()
+                }
             )
+            if previous != saved {
+                GlanceSnapshotCache().clear()
+                SeenAlertsStore.shared.resetForPairingChange()
+            }
         }
         updatePhonePairing()
     }
@@ -252,9 +360,19 @@ final class MacSetupCoordinator: ObservableObject {
         }
     }
 
-    private func readinessEvents() async throws -> [MacSetupEvent] {
-        let readiness = try await HealthMesAPI().setupReadiness()
+    private func readinessEvents(for pairing: Pairing) async throws -> [MacSetupEvent] {
+        let readiness = try await readinessLoader(pairing)
         return MacSetupSupport.readinessEvents(readiness)
+    }
+
+    private func isCurrent(
+        _ operation: UInt,
+        pairing: Pairing,
+        identity: PairingCacheIdentity
+    ) -> Bool {
+        operationGeneration == operation
+            && pairingStore.load() == pairing
+            && pairingStore.cacheIdentity(for: pairing) == identity
     }
 
     private static func execute(
@@ -291,6 +409,7 @@ final class MacSetupCoordinator: ObservableObject {
 
 private enum SetupError: LocalizedError {
     case missingPairingGrant
+    case missingPairing
     case cloneFailed(String?)
     case revisionUnavailable(String)
     case invalidManagedCheckout(URL)
@@ -300,6 +419,8 @@ private enum SetupError: LocalizedError {
         switch self {
         case .missingPairingGrant:
             return "Setup completed, but the one-time pairing grant was missing."
+        case .missingPairing:
+            return "Setup completed, but the Mac pairing was not saved."
         case .cloneFailed(let detail):
             return detail.map { "Could not download HealthMes: \($0)" }
                 ?? "Could not download HealthMes."

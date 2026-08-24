@@ -46,9 +46,17 @@
         }
 
         public let proposalID: String
+        public let pairingFingerprint: String?
+        public let pairingGeneration: UInt64?
 
-        public init(proposalID: String) {
+        public init(
+            proposalID: String,
+            pairingFingerprint: String? = nil,
+            pairingGeneration: UInt64? = nil
+        ) {
             self.proposalID = proposalID
+            self.pairingFingerprint = pairingFingerprint
+            self.pairingGeneration = pairingGeneration
         }
     }
 #endif

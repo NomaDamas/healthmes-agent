@@ -84,6 +84,21 @@ case "${sdk}" in
     ;;
 esac
 
+case "${sdk}" in
+  iphonesimulator*)
+    if [[ "${destination}" != *"platform=iOS Simulator"* ]]; then
+      echo "HEALTHMES_SCREENTIME_SDK=iphonesimulator requires an iOS Simulator destination" >&2
+      exit 64
+    fi
+    ;;
+  iphoneos*)
+    if [[ "${destination}" == *"Simulator"* || "${destination}" != *"platform=iOS"* ]]; then
+      echo "HEALTHMES_SCREENTIME_SDK=iphoneos requires a physical iOS destination" >&2
+      exit 64
+    fi
+    ;;
+esac
+
 cat >"${probe_root}/ScreenTimeSDKProbe.swift" <<'SWIFT'
 import Combine
 import DeviceActivity
@@ -130,7 +145,6 @@ exec xcodebuild \
   -project HealthMesCompanion.xcodeproj \
   -scheme HealthMesCompanionScreenTimeOptIn \
   -configuration "${configuration}" \
-  -sdk "${sdk}" \
   -destination "${destination}" \
   "${action}" \
   CODE_SIGNING_ALLOWED=NO \

@@ -14,6 +14,8 @@ public enum SpeakCommandSyncKeys {
     public static let command = "healthmes_alternative_command"
     public static let requestID = "healthmes_speak_request_id"
     public static let proposalID = "healthmes_speak_proposal_id"
+    public static let pairingFingerprint = "healthmes_pairing_fingerprint"
+    public static let pairingGeneration = "healthmes_pairing_generation"
     public static let resultTitle = "healthmes_speak_result_title"
     public static let resultDetail = "healthmes_speak_result_detail"
     public static let resultStatus = "healthmes_speak_result_status"
@@ -76,6 +78,8 @@ public struct AlertNotificationContent: Equatable {
     public static let userInfoAlertID = "healthmes_alert_id"
     public static let userInfoDecisionURL = "healthmes_decision_url"
     public static let userInfoProposalID = "healthmes_proposal_id"
+    public static let userInfoPairingFingerprint = "healthmes_pairing_fingerprint"
+    public static let userInfoPairingGeneration = "healthmes_pairing_generation"
     public static let userInfoDecisionTitle = "healthmes_decision_title"
     public static let userInfoDecisionObservation = "healthmes_decision_observation"
     public static let userInfoDecisionEvidence = "healthmes_decision_evidence"
@@ -223,7 +227,9 @@ public struct AlertNotificationContent: Equatable {
     /// override.
     public static func from(
         alert: AlertItem,
-        pendingProposalID: UUID? = nil
+        pendingProposalID: UUID? = nil,
+        pairingFingerprint: String? = nil,
+        pairingGeneration: UInt64? = nil
     ) -> AlertNotificationContent {
         let identityIsSafe = alert.hasConsistentProposalIdentity
         let correlatedCard = identityIsSafe ? alert.correlatedDecisionCard : nil
@@ -239,6 +245,17 @@ public struct AlertNotificationContent: Equatable {
         var userInfo: [String: String] = [
             userInfoAlertID: alert.id.uuidString.lowercased()
         ]
+        if
+            let pairingFingerprint,
+            PairingScope.isValidFingerprint(pairingFingerprint)
+        {
+            userInfo[userInfoPairingFingerprint] = pairingFingerprint
+            if let pairingGeneration, pairingGeneration > 0 {
+                userInfo[userInfoPairingGeneration] = String(
+                    pairingGeneration
+                )
+            }
+        }
         if let decisionUrl = correlatedCard?.decisionUrl ?? alert.decisionUrl {
             userInfo[userInfoDecisionURL] = decisionUrl
         }

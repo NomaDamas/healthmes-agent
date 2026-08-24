@@ -30,7 +30,8 @@ iPhone · macOS voice/text -> POST /v1/wellness-decisions
 
 Apple Health 수집
 Apple Watch -> iPhone HealthKit -> pairing별 encrypted outbox
-            -> POST /v1/ingest/healthkit -> durable ACK -> anchor 확정
+            -> POST /v1/ingest/healthkit
+            -> durable ACK + accepted forward status -> anchor 확정
 ```
 
 Dashboard, alert, task, schedule와 settings는 Main REST 응답이 정본이다. 앱은
@@ -46,9 +47,10 @@ Hermes와 calendar credential도 서버 밖으로 내보내지 않는다.
 HealthKit 통합의 완료 조건은 collector가 exact request bytes와 stable
 `Idempotency-Key`, candidate anchors를 encrypted outbox에 먼저 저장하는 것이다.
 outbox와 anchor는 `Pairing.cacheFingerprint`별로 격리한다. HTTP `202`,
-`durable=true`, 일치하는 `sha256`와 `size_bytes`를 받은 뒤에만 anchor를
-확정하고 queue item을 삭제한다. 응답이 유실되면 같은 key와 같은 bytes로
-재시도한다.
+`durable=true`, 일치하는 `sha256`와 `size_bytes`, 그리고 accepted forward
+status를 받은 뒤에만 anchor를 확정하고 queue item을 삭제한다.
+`forward_failed` 또는 `skipped_no_user`이거나 응답이 유실되면 같은 key와 같은
+bytes로 재시도한다.
 
 외부 Health Auto Export 계열 앱은 optional legacy adapter다. 별도 exporter를
 설치하지 않아도 first-party iPhone collector가 동기화하는 것이 기본이며, 서버는
@@ -57,9 +59,9 @@ legacy parsing을 유지한다.
 
 현재 `HealthKitSyncManager`는 exact bytes와 candidate anchors를 AES-GCM
 outbox에 먼저 저장하고, stable `Idempotency-Key`로 재전송하며, 서버의 durable
-hash/size ACK를 검증한 뒤 anchor를 확정한다. queue, pause와 last-upload 상태는
-pairing fingerprint별로 격리되고 Settings에서 retry, pause/resume와 현재
-pairing의 queue 삭제를 제어한다. simulator contract/outbox test와 unsigned build는
+hash/size ACK와 accepted forward status를 검증한 뒤 anchor를 확정한다. queue,
+pause와 last-upload 상태는 pairing fingerprint별로 격리되고 Settings에서 retry,
+pause/resume와 현재 pairing의 queue 삭제를 제어한다. simulator contract/outbox test와 unsigned build는
 저장소 검증 범위이며, 실제 권한 prompt, Watch-origin sample과 background cadence는
 signed hardware QA가 필요하다. 상세 계약은
 [`APPLE-MAIN-INTEGRATION.ko.md`](../../docs/APPLE-MAIN-INTEGRATION.ko.md)를
@@ -175,12 +177,24 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 | `POST /v1/ingest/healthkit` (`healthmes.healthkit.v1`) | native HealthKit upload |
 
 HealthKit retries must reuse one outbox item's exact bytes and
-`Idempotency-Key`. The server's durable ACK must match those bytes before the
-pairing-scoped anchors advance. Open Wearables normalization remains
-asynchronous and replayable from that raw source. HealthKit deletion
-tombstones are retained in the native payload and raw store; the current Open
-Wearables SDK contract has no deletion endpoint, so normalized derivatives
-may remain until that upstream contract adds deletion support.
+`Idempotency-Key`. The server's durable ACK must match those bytes and report
+an accepted forwarding state before the pairing-scoped anchors advance.
+Forwarding failures keep both the server receipt and encrypted iPhone outbox
+retryable without advancing the stored HealthKit anchor. Ordinary transport,
+`5xx`, durable `forward_failed`, and `skipped_no_user` responses remain on
+exponential backoff. A permanent client-side rejection is retained as an
+observable terminal entry and blocks only the affected HealthKit lanes until
+the owner retries or removes it; independent lanes may continue. Legacy
+uncommitted terminal entries created by the retired cursor-commit policy are
+migrated back to retryable state on the next drain. HealthKit deletion
+tombstones are retained in the native payload and raw store. The current server
+returns `503 healthkit_deletion_pending` for such a batch because the Open
+Wearables SDK contract has no deletion endpoint; the iPhone keeps the encrypted
+outbox item and deletion anchor pending rather than claiming synchronization.
+For compatibility, a legacy `202` with
+`forward_status=deletions_recorded` is also treated as retryable and never as an
+accepted anchor state. Normalized derivatives may remain until that upstream
+contract adds deletion support.
 
 Contracts are pinned twice: Swift decoding tests against
 `Tests/Fixtures/{glance,alerts,weekly_report}.json`, and those same three

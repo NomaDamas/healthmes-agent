@@ -51,7 +51,14 @@
                         HStack(spacing: 8) {
                             Button(
                                 intent: DeclineDecisionIntent(
-                                    proposalID: context.attributes.proposalID
+                                    proposalID: context.attributes.proposalID,
+                                    pairingFingerprint:
+                                        context.attributes.pairingFingerprint
+                                        ?? "",
+                                    pairingGeneration: context.attributes
+                                        .pairingGeneration
+                                        .map(String.init)
+                                        ?? ""
                                 )
                             ) {
                                 Text("No")
@@ -62,7 +69,14 @@
 
                             Button(
                                 intent: AcceptDecisionIntent(
-                                    proposalID: context.attributes.proposalID
+                                    proposalID: context.attributes.proposalID,
+                                    pairingFingerprint:
+                                        context.attributes.pairingFingerprint
+                                        ?? "",
+                                    pairingGeneration: context.attributes
+                                        .pairingGeneration
+                                        .map(String.init)
+                                        ?? ""
                                 )
                             ) {
                                 Text("Yes")
@@ -127,14 +141,34 @@
                                 HStack {
                                     Button(
                                         intent: DeclineDecisionIntent(
-                                            proposalID: context.attributes.proposalID
+                                            proposalID:
+                                                context.attributes.proposalID,
+                                            pairingFingerprint:
+                                                context.attributes
+                                                .pairingFingerprint
+                                                ?? "",
+                                            pairingGeneration:
+                                                context.attributes
+                                                .pairingGeneration
+                                                .map(String.init)
+                                                ?? ""
                                         )
                                     ) {
                                         Label("No", systemImage: "xmark")
                                     }
                                     Button(
                                         intent: AcceptDecisionIntent(
-                                            proposalID: context.attributes.proposalID
+                                            proposalID:
+                                                context.attributes.proposalID,
+                                            pairingFingerprint:
+                                                context.attributes
+                                                .pairingFingerprint
+                                                ?? "",
+                                            pairingGeneration:
+                                                context.attributes
+                                                .pairingGeneration
+                                                .map(String.init)
+                                                ?? ""
                                         )
                                     ) {
                                         Label("Yes", systemImage: "checkmark")

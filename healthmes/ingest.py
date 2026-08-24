@@ -78,6 +78,15 @@ class IngestForwardError(Exception):
     """open-wearables rejected or never received the forwarded batch."""
 
 
+class InvalidHealthKitPayloadError(ValueError):
+    """A recognized first-party HealthKit payload violated its wire contract."""
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{path}: {reason}")
+
+
 @dataclass(frozen=True, slots=True)
 class HealthKitNativeBatch:
     """Open Wearables-compatible arrays from ``healthmes.healthkit.v1``."""
@@ -319,10 +328,24 @@ def transform_hae(payload: Any) -> list[dict[str, Any]]:
     return records
 
 
-def _native_rows(value: Any) -> tuple[dict[str, Any], ...]:
+def _native_rows(
+    value: Any,
+    path: str,
+) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, list):
-        return ()
-    return tuple(dict(row) for row in value if isinstance(row, dict))
+        raise InvalidHealthKitPayloadError(
+            path,
+            "must be an array",
+        )
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            raise InvalidHealthKitPayloadError(
+                f"{path}[{index}]",
+                "each array item must be an object",
+            )
+        rows.append(dict(row))
+    return tuple(rows)
 
 
 def _native_id(row: dict[str, Any]) -> str | None:
@@ -333,39 +356,171 @@ def _native_id(row: dict[str, Any]) -> str | None:
     return normalized if normalized else None
 
 
-def transform_healthkit_v1(payload: Any) -> HealthKitNativeBatch | None:
-    """Recognize the first-party schema without changing legacy HAE parsing."""
+def is_healthkit_v1_payload(payload: Any) -> bool:
+    """Return whether ``payload`` claims the first-party HealthKit schema."""
 
-    if not isinstance(payload, dict) or payload.get("schema") != "healthmes.healthkit.v1":
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema") == "healthmes.healthkit.v1"
+    )
+
+
+def _native_string(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidHealthKitPayloadError(path, "must be a non-empty string")
+    return value.strip()
+
+
+def _native_timestamp(value: Any, path: str) -> datetime:
+    raw = _native_string(value, path)
+    try:
+        parsed = datetime.fromisoformat(
+            raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        )
+    except ValueError as exc:
+        raise InvalidHealthKitPayloadError(
+            path,
+            "must be an ISO 8601 timestamp",
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidHealthKitPayloadError(
+            path,
+            "must include a UTC offset",
+        )
+    return parsed
+
+
+def _native_number(value: Any, path: str) -> int | float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise InvalidHealthKitPayloadError(
+            path,
+            "must be a finite number",
+        )
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise InvalidHealthKitPayloadError(path, "must be a finite number")
+    return value
+
+
+def _validate_native_interval(row: dict[str, Any], path: str) -> None:
+    start = _native_timestamp(row.get("startDate"), f"{path}.startDate")
+    end = _native_timestamp(row.get("endDate"), f"{path}.endDate")
+    if end < start:
+        raise InvalidHealthKitPayloadError(
+            f"{path}.endDate",
+            "must not be earlier than startDate",
+        )
+
+
+def _validate_native_optional_metadata(
+    row: dict[str, Any],
+    path: str,
+) -> None:
+    if "zoneOffset" in row and row["zoneOffset"] is not None:
+        _native_string(row["zoneOffset"], f"{path}.zoneOffset")
+    if "source" in row and row["source"] is not None:
+        if not isinstance(row["source"], dict):
+            raise InvalidHealthKitPayloadError(
+                f"{path}.source",
+                "must be an object when present",
+            )
+
+
+def _validate_native_metric(row: dict[str, Any], path: str) -> None:
+    _native_string(row.get("id"), f"{path}.id")
+    _native_string(row.get("type"), f"{path}.type")
+    _validate_native_interval(row, path)
+    _native_number(row.get("value"), f"{path}.value")
+    _native_string(row.get("unit"), f"{path}.unit")
+    _validate_native_optional_metadata(row, path)
+
+
+def _validate_native_sleep(row: dict[str, Any], path: str) -> None:
+    _native_string(row.get("id"), f"{path}.id")
+    _native_string(row.get("stage"), f"{path}.stage")
+    _validate_native_interval(row, path)
+    _validate_native_optional_metadata(row, path)
+
+
+def _validate_native_workout(row: dict[str, Any], path: str) -> None:
+    _native_string(row.get("id"), f"{path}.id")
+    _native_string(row.get("type"), f"{path}.type")
+    _validate_native_interval(row, path)
+    values = row.get("values")
+    if not isinstance(values, list):
+        raise InvalidHealthKitPayloadError(
+            f"{path}.values",
+            "must be an array",
+        )
+    for index, statistic in enumerate(values):
+        statistic_path = f"{path}.values[{index}]"
+        if not isinstance(statistic, dict):
+            raise InvalidHealthKitPayloadError(
+                statistic_path,
+                "must be an object",
+            )
+        _native_string(statistic.get("type"), f"{statistic_path}.type")
+        _native_string(statistic.get("unit"), f"{statistic_path}.unit")
+        _native_number(statistic.get("value"), f"{statistic_path}.value")
+    _validate_native_optional_metadata(row, path)
+
+
+def _validate_native_deletion(
+    row: dict[str, Any],
+    path: str,
+) -> tuple[str, str]:
+    return (
+        _native_string(row.get("id"), f"{path}.id"),
+        _native_string(row.get("type"), f"{path}.type"),
+    )
+
+
+def transform_healthkit_v1(payload: Any) -> HealthKitNativeBatch | None:
+    """Strictly validate and preserve the first-party HealthKit wire schema."""
+
+    if not is_healthkit_v1_payload(payload):
         return None
+    assert isinstance(payload, dict)
     data = payload.get("data")
     if not isinstance(data, dict):
-        data = {}
+        raise InvalidHealthKitPayloadError("data", "must be an object")
 
-    deletions: list[tuple[str, str]] = []
-    for deletion in _native_rows(data.get("deletions")):
-        sample_id = _native_id(deletion)
-        sample_type = deletion.get("type")
-        if sample_id is None or not isinstance(sample_type, str):
-            continue
-        normalized_type = sample_type.strip()
-        if normalized_type:
-            deletions.append((sample_id, normalized_type))
+    records = _native_rows(data.get("records"), "data.records")
+    sleep = _native_rows(data.get("sleep"), "data.sleep")
+    workouts = _native_rows(data.get("workouts"), "data.workouts")
+    deletion_rows = _native_rows(
+        data.get("deletions"),
+        "data.deletions",
+    )
 
-    sdk_version = payload.get("sdkVersion")
-    if not isinstance(sdk_version, str) or not sdk_version.strip():
-        sdk_version = "healthmes-ios/1"
-    sync_timestamp = payload.get("syncTimestamp")
-    if not isinstance(sync_timestamp, str) or not sync_timestamp.strip():
-        sync_timestamp = datetime.now(UTC).isoformat()
+    for index, row in enumerate(records):
+        _validate_native_metric(row, f"data.records[{index}]")
+    for index, row in enumerate(sleep):
+        _validate_native_sleep(row, f"data.sleep[{index}]")
+    for index, row in enumerate(workouts):
+        _validate_native_workout(row, f"data.workouts[{index}]")
+    deletions = tuple(
+        _validate_native_deletion(row, f"data.deletions[{index}]")
+        for index, row in enumerate(deletion_rows)
+    )
+
+    sdk_version = _native_string(payload.get("sdkVersion"), "sdkVersion")
+    sync_timestamp = _native_string(
+        payload.get("syncTimestamp"),
+        "syncTimestamp",
+    )
+    _native_timestamp(sync_timestamp, "syncTimestamp")
 
     return HealthKitNativeBatch(
         sdk_version=sdk_version,
         sync_timestamp=sync_timestamp,
-        records=_native_rows(data.get("records")),
-        sleep=_native_rows(data.get("sleep")),
-        workouts=_native_rows(data.get("workouts")),
-        deletions=tuple(deletions),
+        records=records,
+        sleep=sleep,
+        workouts=workouts,
+        deletions=deletions,
     )
 
 

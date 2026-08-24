@@ -28,11 +28,13 @@ public final class GlanceStore: ObservableObject {
 
     /// Hook for the notification manager: fires after every alerts refresh
     /// with the full history page + currently pending proposals.
-    public var onAlertsRefreshed: (([AlertItem], [ProposalItem]) -> Void)?
+    public var onAlertsRefreshed:
+        (([AlertItem], [ProposalItem], Pairing) -> Void)?
 
     private let client: GlanceClient
     private let api: HealthMesAPI
     private let pairingStore: PairingStore
+    private let notificationCleanup: () async -> Bool
     private var nextGlanceRefresh = Date.distantPast
     private var timer: Timer?
     private var refreshGate = LatestRefreshGate()
@@ -41,12 +43,18 @@ public final class GlanceStore: ObservableObject {
     public init(
         client: GlanceClient = GlanceClient(),
         api: HealthMesAPI = HealthMesAPI(),
-        pairingStore: PairingStore = .shared
+        pairingStore: PairingStore = .shared,
+        notificationCleanup: @escaping () async -> Bool = {
+            await MacNotificationManager.shared.clearAccountSurfaces()
+        }
     ) {
         self.client = client
         self.api = api
         self.pairingStore = pairingStore
-        self.isPaired = pairingStore.load() != nil
+        self.notificationCleanup = notificationCleanup
+        self.isPaired =
+            pairingStore.load() != nil
+            || pairingStore.hasPersistedPairingState
     }
 
     /// Start the 60 s ticker and do the initial fetch.
@@ -59,7 +67,10 @@ public final class GlanceStore: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
-        Task { await self.refresh(force: true) }
+        Task {
+            await self.recoverAccountTransitionIfNeeded()
+            await self.refresh(force: true)
+        }
     }
 
     private func refreshIfDue() async {
@@ -70,6 +81,11 @@ public final class GlanceStore: ObservableObject {
     /// One full refresh: glance (conditional GET) + alerts + proposals.
     public func refresh(force: Bool) async {
         let refreshID = refreshGate.begin()
+        guard !pairingStore.hasPendingTransition else {
+            hideAccountStateForTransition()
+            errorKey = "error.unreachable"
+            return
+        }
         guard let pairingSnapshot = pairingStore.load() else {
             resetAccountState(isPaired: false)
             return
@@ -144,7 +160,7 @@ public final class GlanceStore: ObservableObject {
             alerts = page.data
             hasLoadedAlerts = true
             pendingProposals = proposalPage.data
-            onAlertsRefreshed?(alerts, pendingProposals)
+            onAlertsRefreshed?(alerts, pendingProposals, pairing)
         } catch {
             // Keep the last known lists; the glance error banner already
             // covers reachability problems.
@@ -199,10 +215,27 @@ public final class GlanceStore: ObservableObject {
 
     /// Pairing flow used by Settings: save, then prove it with a live fetch.
     public func pair(baseURLString: String, token: String) async throws {
-        _ = try pairingStore.save(baseURLString: baseURLString, token: token)
+        let previous = pairingStore.load()
+        let saved: Pairing
+        do {
+            saved = try await MacPairingTransitionCoordinator.replace(
+                baseURLString: baseURLString,
+                token: token,
+                store: pairingStore,
+                cleanup: notificationCleanup
+            )
+        } catch {
+            if pairingStore.hasPendingTransition {
+                hideAccountStateForTransition()
+            }
+            throw error
+        }
         _ = refreshGate.begin()
         proposalRefreshGate.invalidate()
         client.cache.clear()
+        if previous != saved {
+            SeenAlertsStore.shared.resetForPairingChange()
+        }
         pairingRevision &+= 1
         resetAccountState(isPaired: true)
         nextGlanceRefresh = .distantPast
@@ -212,13 +245,56 @@ public final class GlanceStore: ObservableObject {
         }
     }
 
-    public func unpair() {
+    public func unpair() async throws {
+        do {
+            try await MacPairingTransitionCoordinator.unpair(
+                store: pairingStore,
+                cleanup: notificationCleanup
+            )
+        } catch {
+            if pairingStore.hasPendingTransition {
+                hideAccountStateForTransition()
+            }
+            throw error
+        }
         _ = refreshGate.begin()
         proposalRefreshGate.invalidate()
-        pairingStore.clear()
         client.cache.clear()
         SeenAlertsStore.shared.clear()
         pairingRevision &+= 1
+        resetAccountState(isPaired: false)
+    }
+
+    private func recoverAccountTransitionIfNeeded() async {
+        guard pairingStore.hasPendingTransition else { return }
+        do {
+            let recovered = try await MacPairingTransitionCoordinator.recover(
+                store: pairingStore,
+                cleanup: notificationCleanup
+            )
+            client.cache.clear()
+            SeenAlertsStore.shared.resetForPairingChange()
+            pairingRevision &+= 1
+            resetAccountState(isPaired: recovered != nil)
+        } catch {
+            hideAccountStateForTransition()
+            errorKey = "error.unreachable"
+        }
+    }
+
+    private func hideAccountStateForTransition() {
+        let hadVisibleAccountState =
+            isPaired
+            || payload != nil
+            || !alerts.isEmpty
+            || !pendingProposals.isEmpty
+            || lastFetched != nil
+        _ = refreshGate.begin()
+        proposalRefreshGate.invalidate()
+        client.cache.clear()
+        if hadVisibleAccountState {
+            pairingRevision &+= 1
+        }
         resetAccountState(isPaired: false)
     }
 

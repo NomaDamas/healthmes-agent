@@ -81,7 +81,28 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     // MARK: - Posting
 
     /// Post one local notification for an alert-history item.
-    func post(content: AlertNotificationContent) async {
+    @discardableResult
+    func post(content: AlertNotificationContent) async -> Bool {
+        guard
+            let pairing = PairingScope.matchingPairing(
+                fingerprint: content.userInfo[
+                    AlertNotificationContent.userInfoPairingFingerprint
+                ],
+                generation: PairingScope.generation(
+                    from: content.userInfo[
+                        AlertNotificationContent.userInfoPairingGeneration
+                    ]
+                )
+            ),
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing
+            )
+        else {
+            return false
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
         let notification = UNMutableNotificationContent()
         notification.title = content.systemTitle
         if !content.subtitle.isEmpty {
@@ -101,7 +122,17 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             content: notification,
             trigger: nil
         )
-        try? await UNUserNotificationCenter.current().add(request)
+        do {
+            let center = UNUserNotificationCenter.current()
+            try await PairingStore.shared.withPairingLease(
+                for: pairing
+            ) {
+                try await center.add(request)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     #if DEBUG
@@ -109,6 +140,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         /// the expanded notification card and its two decision actions.
         func postDecisionDemo() async {
             guard await requestAuthorization() else { return }
+            guard let pairing = PairingStore.shared.load() else { return }
 
             let center = UNUserNotificationCenter.current()
             center.removeAllPendingNotificationRequests()
@@ -156,46 +188,80 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             try? await Task.sleep(for: .seconds(6))
 
             let alertID = UUID().uuidString.lowercased()
+            var userInfo = [
+                AlertNotificationContent.userInfoAlertID: alertID,
+                AlertNotificationContent.userInfoPairingFingerprint:
+                    pairing.cacheFingerprint,
+                AlertNotificationContent.userInfoPairingGeneration:
+                    String(
+                        PairingStore.shared.cacheIdentity(for: pairing)?
+                            .generation ?? 0
+                    ),
+                AlertNotificationContent.userInfoProposalID:
+                    proposalID.uuidString.lowercased(),
+                AlertNotificationContent.userInfoDecisionObservation:
+                    reason,
+                AlertNotificationContent.userInfoDecisionTitle:
+                    String(localized: "Deep Work"),
+                AlertNotificationContent.userInfoDecisionEvidence:
+                    String(localized: "HRV is 18% below your baseline"),
+                AlertNotificationContent.userInfoDecisionAction:
+                    String(
+                        localized:
+                            "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
+                    ),
+                AlertNotificationContent.userInfoDecisionCompactPrompt:
+                    String(localized: "Move Deep Work?"),
+                AlertNotificationContent.userInfoDecisionBefore:
+                    formatter.string(from: currentStart),
+                AlertNotificationContent.userInfoDecisionAfter:
+                    formatter.string(from: proposedStart),
+                AlertNotificationContent.userInfoDecisionEndsAt:
+                    formatter.string(from: proposedEnd),
+                AlertNotificationContent.userInfoDecisionExpiresAt:
+                    formatter.string(from: expiresAt),
+            ]
+            #if targetEnvironment(simulator)
+                if
+                    pairing.token == nil,
+                    PairingStore.isLoopbackOrigin(pairing.baseURL)
+                {
+                    userInfo[
+                        PairingScope
+                            .debugSimulatorLoopbackBaseURLUserInfoKey
+                    ] = pairing.baseURL.absoluteString
+                }
+            #endif
             let content = AlertNotificationContent(
                 title: prompt,
                 subtitle: reason,
                 body: target,
                 categoryID: AlertNotificationContent.actionableCategoryID,
                 threadID: "healthmes-decision-demo",
-                userInfo: [
-                    AlertNotificationContent.userInfoAlertID: alertID,
-                    AlertNotificationContent.userInfoProposalID:
-                        proposalID.uuidString.lowercased(),
-                    AlertNotificationContent.userInfoDecisionObservation:
-                        reason,
-                    AlertNotificationContent.userInfoDecisionTitle:
-                        String(localized: "Deep Work"),
-                    AlertNotificationContent.userInfoDecisionEvidence:
-                        String(localized: "HRV is 18% below your baseline"),
-                    AlertNotificationContent.userInfoDecisionAction:
-                        String(
-                            localized:
-                                "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
-                        ),
-                    AlertNotificationContent.userInfoDecisionCompactPrompt:
-                        String(localized: "Move Deep Work?"),
-                    AlertNotificationContent.userInfoDecisionBefore:
-                        formatter.string(from: currentStart),
-                    AlertNotificationContent.userInfoDecisionAfter:
-                        formatter.string(from: proposedStart),
-                    AlertNotificationContent.userInfoDecisionEndsAt:
-                        formatter.string(from: proposedEnd),
-                    AlertNotificationContent.userInfoDecisionExpiresAt:
-                        formatter.string(from: expiresAt),
-                ]
+                userInfo: userInfo
             )
-            await post(content: content)
+            _ = await post(content: content)
         }
     #endif
 
     /// Outcome toast for actions taken from the lock screen (there is no
     /// visible UI to confirm in).
-    func postOutcome(title: String, body: String) async {
+    @discardableResult
+    func postOutcome(
+        title: String,
+        body: String,
+        pairing: Pairing
+    ) async -> Bool {
+        guard
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing
+            )
+        else {
+            return false
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -205,11 +271,37 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             content: content,
             trigger: nil
         )
-        try? await UNUserNotificationCenter.current().add(request)
+        do {
+            let center = UNUserNotificationCenter.current()
+            try await PairingStore.shared.withPairingLease(
+                for: pairing
+            ) {
+                try await center.add(request)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     func setBadge(_ count: Int) {
         UNUserNotificationCenter.current().setBadgeCount(count)
+    }
+
+    func clearAccountSurfaces() async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        let result = await NotificationDeletionBarrier().clear(
+            using: notificationSurface(center)
+        )
+        guard case .success = result else {
+            return false
+        }
+        do {
+            try await center.setBadgeCount(0)
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: - UNUserNotificationCenterDelegate
@@ -231,6 +323,22 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
+        guard
+            let pairing = PairingScope.matchingPairing(
+                fingerprint: userInfo[
+                    AlertNotificationContent.userInfoPairingFingerprint
+                ] as? String,
+                generation: PairingScope.generation(
+                    from: userInfo[
+                        AlertNotificationContent
+                            .userInfoPairingGeneration
+                    ]
+                )
+            )
+        else {
+            completionHandler()
+            return
+        }
         let decisionURL = (userInfo[AlertNotificationContent.userInfoDecisionURL] as? String)
             .flatMap(URL.init(string:))
         let proposalID = (userInfo[AlertNotificationContent.userInfoProposalID] as? String)
@@ -238,9 +346,19 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
         switch response.actionIdentifier {
         case AlertNotificationActionID.yes:
-            resolve(proposalID, action: .accept, completionHandler: completionHandler)
+            resolve(
+                proposalID,
+                action: .accept,
+                pairing: pairing,
+                completionHandler: completionHandler
+            )
         case AlertNotificationActionID.no:
-            resolve(proposalID, action: .decline, completionHandler: completionHandler)
+            resolve(
+                proposalID,
+                action: .decline,
+                pairing: pairing,
+                completionHandler: completionHandler
+            )
         case AlertNotificationActionID.speak,
             AlertNotificationActionID.legacyAlternative:
             let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
@@ -276,6 +394,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     private func resolve(
         _ proposalID: UUID?,
         action: ProposalAction,
+        pairing: Pairing,
         completionHandler: @escaping () -> Void
     ) {
         Task {
@@ -283,13 +402,25 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             guard let proposalID else {
                 await postOutcome(
                     title: String(localized: "Nothing to apply"),
-                    body: String(localized: "This alert has no pending proposal attached.")
+                    body: String(localized: "This alert has no pending proposal attached."),
+                    pairing: pairing
                 )
                 return
             }
             do {
+                guard
+                    let relayLease = PairingRelayGate.shared.begin(
+                        pairing: pairing
+                    )
+                else { return }
+                defer {
+                    PairingRelayGate.shared.end(relayLease)
+                }
                 let api = HealthMesAPI()
-                let pending = try await api.getProposal(proposalID)
+                let pending = try await api.getProposal(
+                    proposalID,
+                    pairing: pairing
+                )
                 guard pending.isActionable else {
                     let stillProposed = pending.status == .proposed
                     await postOutcome(
@@ -298,7 +429,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                             : String(localized: "Already resolved"),
                         body: stillProposed
                             ? String(localized: "The decision window closed without a change.")
-                            : String(localized: "This proposal is no longer pending.")
+                            : String(localized: "This proposal is no longer pending."),
+                        pairing: pairing
                     )
                     return
                 }
@@ -307,30 +439,59 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     action: action,
                     // A mirrored Watch action is delivered through the iPhone
                     // delegate, which cannot reliably distinguish the device.
-                    surface: "apple_notification"
+                    surface: "apple_notification",
+                    pairing: pairing
                 )
                 await postOutcome(
                     title: ProposalStatusPresentation.label(for: proposal.status),
-                    body: ProposalStatusPresentation.detail(for: proposal.status)
+                    body: ProposalStatusPresentation.detail(for: proposal.status),
+                    pairing: pairing
                 )
             } catch let error as HealthMesAPIError where error.isAlreadyResolved {
+                guard PairingStore.shared.load() == pairing else { return }
                 await postOutcome(
                     title: String(localized: "Already resolved"),
                     body: String(
                         localized: "This proposal was already decided (\(error.alreadyResolvedStatus ?? "resolved"))."
-                    )
+                    ),
+                    pairing: pairing
                 )
             } catch let error as HealthMesAPIError where error.isProposalExpired {
+                guard PairingStore.shared.load() == pairing else { return }
                 await postOutcome(
                     title: String(localized: "Proposal expired"),
-                    body: String(localized: "The decision window closed without a change.")
+                    body: String(localized: "The decision window closed without a change."),
+                    pairing: pairing
                 )
             } catch {
+                guard PairingStore.shared.load() == pairing else { return }
                 await postOutcome(
                     title: String(localized: "Could not reach your instance"),
-                    body: String(localized: "Open the app and retry from the Home tab.")
+                    body: String(localized: "Open the app and retry from the Home tab."),
+                    pairing: pairing
                 )
             }
         }
+    }
+
+    private func notificationSurface(
+        _ center: UNUserNotificationCenter
+    ) -> NotificationSurface {
+        NotificationSurface(
+            removeAll: {
+                center.removeAllPendingNotificationRequests()
+                center.removeAllDeliveredNotifications()
+            },
+            snapshot: {
+                async let pending =
+                    center.pendingNotificationRequests()
+                async let delivered =
+                    center.deliveredNotifications()
+                return await NotificationSurfaceSnapshot(
+                    pendingCount: pending.count,
+                    deliveredCount: delivered.count
+                )
+            }
+        )
     }
 }

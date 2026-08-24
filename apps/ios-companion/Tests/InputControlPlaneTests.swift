@@ -678,16 +678,18 @@ private struct InputControlPlaneTestContext {
 }
 
 private final class InputControlPlaneFakeTokenStore: PairingTokenStoring {
-    private var token: String?
+    private var tokens: [String: String] = [:]
 
-    func readToken() -> String? { token }
-
-    func writeToken(_ token: String) throws {
-        self.token = token
+    func readToken(identifier: String) -> String? {
+        tokens[identifier]
     }
 
-    func deleteToken() {
-        token = nil
+    func writeToken(_ token: String, identifier: String) throws {
+        tokens[identifier] = token
+    }
+
+    func deleteToken(identifier: String) {
+        tokens.removeValue(forKey: identifier)
     }
 }
 

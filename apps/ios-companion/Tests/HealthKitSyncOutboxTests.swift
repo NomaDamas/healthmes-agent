@@ -36,6 +36,33 @@ private final class RecordingHealthKitKeyProvider:
         }
         isAvailable = false
     }
+
+    func fixtureKey() -> SymmetricKey {
+        key
+    }
+}
+
+private struct LegacyHealthKitOutboxStoredFile: Encodable {
+    let version: Int
+    let sealedData: Data
+}
+
+private struct LegacyHealthKitOutboxEnvelope: Encodable {
+    let version: Int
+    let entries: [LegacyHealthKitOutboxEntry]
+}
+
+private struct LegacyHealthKitOutboxEntry: Encodable {
+    let idempotencyKey: String
+    let body: Data
+    let anchors: [String: Data]
+    let destinationFingerprint: String
+    let enqueuedAt: Date
+    let failedAttempts: Int
+    let nextAttemptAt: Date
+    let terminalFailure: String?
+    let terminalAnchorsCommitted: Bool?
+    let forwardingFailedAttempts: Int?
 }
 
 final class HealthKitSyncOutboxTests: XCTestCase {
@@ -230,6 +257,34 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         XCTAssertNil(deferred)
     }
 
+    func testForwardingFailureCounterExcludesTransportFailures() async throws {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        let entry = try await fixture.outbox.enqueue(
+            body: Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a"
+        )
+
+        for _ in 0..<7 {
+            _ = try await fixture.outbox.markFailed(
+                idempotencyKey: entry.idempotencyKey,
+                destinationFingerprint: "destination-a"
+            )
+        }
+        let forwardingFailure = try await fixture.outbox.markFailed(
+            idempotencyKey: entry.idempotencyKey,
+            destinationFingerprint: "destination-a",
+            countsTowardAutomaticQuarantine: true
+        )
+
+        XCTAssertEqual(forwardingFailure?.failedAttempts, 8)
+        XCTAssertEqual(
+            forwardingFailure?.forwardingFailedAttempts,
+            1
+        )
+    }
+
     func testTerminalFailurePersistsAndStopsAutomaticRetry() async throws {
         let fixture = makeFixture()
         defer { removeFixture(fixture) }
@@ -244,7 +299,8 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         let terminal = try await fixture.outbox.markTerminal(
             idempotencyKey: entry.idempotencyKey,
             destinationFingerprint: "destination-a",
-            reason: "HTTP 422 invalid payload"
+            reason: "HTTP 422 invalid payload",
+            anchorsCommitted: true
         )
         let reloaded = HealthKitSyncOutbox(
             fileURL: fixture.fileURL,
@@ -252,6 +308,7 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         )
 
         XCTAssertEqual(terminal?.terminalFailure, "HTTP 422 invalid payload")
+        XCTAssertEqual(terminal?.terminalAnchorsCommitted, true)
         let nextPending = try await reloaded.nextPending(
             destinationFingerprint: "destination-a",
             now: now.addingTimeInterval(86_400)
@@ -265,9 +322,14 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         let retried = try await reloaded.markFailed(
             idempotencyKey: entry.idempotencyKey,
             destinationFingerprint: "destination-a",
+            preserveTerminalFailure: true,
             now: now
         )
-        XCTAssertNil(retried?.terminalFailure)
+        XCTAssertEqual(
+            retried?.terminalFailure,
+            "HTTP 422 invalid payload"
+        )
+        XCTAssertEqual(retried?.terminalAnchorsCommitted, true)
     }
 
     func testNextPendingReturnsDueEntryOnly() async throws {
@@ -589,71 +651,590 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         XCTAssertEqual(fixture.keyProvider.deleteCalls, 1)
     }
 
-    @MainActor
-    func testPairingReplacementCleansOldPairingBeforeSavingCandidate() async throws {
-        let current = Pairing(
-            baseURL: URL(string: "https://old.healthmes.example")!,
-            token: "old"
+    func testUserRemovalPurgesAllWhenFingerprintCannotBeRecovered()
+        async throws
+    {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        _ = try await fixture.outbox.enqueue(
+            body: Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a"
         )
-        let candidate = Pairing(
-            baseURL: URL(string: "https://new.healthmes.example")!,
-            token: "new"
-        )
-        var events: [String] = []
+        fixture.keyProvider.deleteError =
+            .keychainDeleteFailed(-1)
 
-        let saved = try await PairingReplacementTransaction.apply(
-            current: current,
-            candidate: candidate,
-            save: { pairing in
-                events.append("save:\(pairing.baseURL.host ?? "")")
-                return pairing
-            },
-            cleanup: { pairing in
-                events.append("cleanup:\(pairing.baseURL.host ?? "")")
-            }
-        )
+        let removed = try await fixture.outbox
+            .purgeAllForUserRemoval()
 
-        XCTAssertEqual(saved, candidate)
+        XCTAssertEqual(removed, 1)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.fileURL.path
+            )
+        )
+        let pendingCount = try await fixture.outbox.pendingCount()
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(fixture.keyProvider.deleteCalls, 1)
+    }
+
+    func testUnknownFingerprintRemovalScopeIsPrivacySafe() {
         XCTAssertEqual(
-            events,
-            [
-                "cleanup:old.healthmes.example",
-                "save:new.healthmes.example",
-            ]
+            HealthKitSyncRemovalPolicy.scope(
+                fingerprint: nil,
+                userDirectedRemoval: true
+            ),
+            .all
+        )
+        XCTAssertEqual(
+            HealthKitSyncRemovalPolicy.scope(
+                fingerprint: nil,
+                userDirectedRemoval: false
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            HealthKitSyncRemovalPolicy.scope(
+                fingerprint: "destination-a",
+                userDirectedRemoval: true
+            ),
+            .destination("destination-a")
         )
     }
 
-    @MainActor
-    func testPairingReplacementDoesNotSaveCandidateWhenCleanupFails() async {
-        let current = Pairing(
-            baseURL: URL(string: "https://old.healthmes.example")!,
-            token: "old"
+    func testFullLocalStatePurgeKeepsUnrelatedDefaults() throws {
+        let suiteName =
+            "healthmes-healthkit-local-state-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: suiteName)
         )
-        let candidate = Pairing(
-            baseURL: URL(string: "https://new.healthmes.example")!,
-            token: "new"
-        )
-        var saveCalls = 0
-
-        do {
-            _ = try await PairingReplacementTransaction.apply(
-                current: current,
-                candidate: candidate,
-                save: { pairing in
-                    saveCalls += 1
-                    return pairing
-                },
-                cleanup: { _ in
-                    throw HealthKitSyncOutboxError.persistenceFailed
-                }
-            )
-            XCTFail("Expected cleanup failure")
-        } catch let error as HealthKitSyncOutboxError {
-            XCTAssertEqual(error, .persistenceFailed)
-        } catch {
-            XCTFail("Unexpected error \(error)")
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
         }
-        XCTAssertEqual(saveCalls, 0)
+        defaults.set(
+            Data([1]),
+            forKey: "healthmes.healthkit.anchor.first.heartRate"
+        )
+        defaults.set(
+            Data([2]),
+            forKey: "healthmes.healthkit.anchor.second.sleep"
+        )
+        defaults.set(
+            true,
+            forKey: "healthmes.healthkit.paused.first"
+        )
+        defaults.set(
+            Date(),
+            forKey: "healthmes.healthkit.lastUploadAt.second"
+        )
+        defaults.set("keep", forKey: "healthmes.unrelated")
+
+        HealthKitSyncLocalState.clearAll(defaults: defaults)
+
+        XCTAssertNil(
+            defaults.object(
+                forKey: "healthmes.healthkit.anchor.first.heartRate"
+            )
+        )
+        XCTAssertNil(
+            defaults.object(
+                forKey: "healthmes.healthkit.anchor.second.sleep"
+            )
+        )
+        XCTAssertNil(
+            defaults.object(
+                forKey: "healthmes.healthkit.paused.first"
+            )
+        )
+        XCTAssertNil(
+            defaults.object(
+                forKey: "healthmes.healthkit.lastUploadAt.second"
+            )
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: "healthmes.unrelated"),
+            "keep"
+        )
+    }
+
+    func testCommittedTerminalEntryDoesNotBlockLaterUpload() {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let terminal = HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(
+                    for: Data("terminal".utf8)
+                ),
+            body: Data("terminal".utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now,
+            failedAttempts: 0,
+            nextAttemptAt: now,
+            terminalFailure: "HTTP 422 invalid payload",
+            terminalAnchorsCommitted: true
+        )
+        let retryable = HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(
+                    for: Data("retryable".utf8)
+                ),
+            body: Data("retryable".utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now.addingTimeInterval(1),
+            failedAttempts: 1,
+            nextAttemptAt: now.addingTimeInterval(60),
+            terminalFailure: nil
+        )
+
+        let summary = HealthKitSyncQueueSummary(
+            entries: [terminal, retryable]
+        )
+
+        XCTAssertEqual(summary.pendingCount, 2)
+        XCTAssertEqual(summary.terminalFailureCount, 1)
+        XCTAssertEqual(
+            summary.latestTerminalFailure,
+            "HTTP 422 invalid payload"
+        )
+        XCTAssertEqual(
+            summary.nextRetryAt,
+            now.addingTimeInterval(60)
+        )
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: [terminal, retryable],
+                forceRetry: false,
+                includeTerminalFailures: false,
+                now: now.addingTimeInterval(60)
+            ),
+            .upload(retryable)
+        )
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: [terminal, retryable],
+                forceRetry: true,
+                includeTerminalFailures: true,
+                now: now
+            ),
+            .upload(terminal)
+        )
+    }
+
+    func testCommittedTerminalHistoryDoesNotConsumeActiveQueueCapacity()
+        async throws
+    {
+        let fixture = makeFixture(maximumEntries: 2)
+        defer { removeFixture(fixture) }
+
+        for index in 0..<2 {
+            let entry = try await fixture.outbox.enqueue(
+                body: Data("terminal-\(index)".utf8),
+                anchors: [:],
+                destinationFingerprint: "destination-a"
+            )
+            _ = try await fixture.outbox.markTerminal(
+                idempotencyKey: entry.idempotencyKey,
+                destinationFingerprint: "destination-a",
+                reason: "terminal",
+                anchorsCommitted: true
+            )
+        }
+
+        for index in 0..<2 {
+            _ = try await fixture.outbox.enqueue(
+                body: Data("active-\(index)".utf8),
+                anchors: [:],
+                destinationFingerprint: "destination-a"
+            )
+        }
+        let entries = try await fixture.outbox.pendingEntries(
+            destinationFingerprint: "destination-a"
+        )
+
+        XCTAssertEqual(entries.count, 4)
+        XCTAssertEqual(
+            entries.filter { $0.terminalFailure != nil }.count,
+            2
+        )
+        await assertOutboxError(.queueTooLarge(maxEntries: 2)) {
+            _ = try await fixture.outbox.enqueue(
+                body: Data("active-overflow".utf8),
+                anchors: [:],
+                destinationFingerprint: "destination-a"
+            )
+        }
+    }
+
+    func testUploadAcceptedJournalSurvivesReloadAndRequiresFinalization()
+        async throws
+    {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        let entry = try await fixture.outbox.enqueue(
+            body: Data("accepted".utf8),
+            anchors: ["heartRate": Data([1, 2, 3])],
+            destinationFingerprint: "destination-a"
+        )
+
+        let accepted = try await fixture.outbox.markUploadAccepted(
+            idempotencyKey: entry.idempotencyKey,
+            destinationFingerprint: "destination-a"
+        )
+        let reloaded = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+        let persisted = try await reloaded.pendingEntries(
+            destinationFingerprint: "destination-a"
+        )
+
+        XCTAssertEqual(accepted?.uploadAccepted, true)
+        XCTAssertEqual(persisted.first?.uploadAccepted, true)
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: persisted,
+                forceRetry: false,
+                includeTerminalFailures: false,
+                now: Date()
+            ),
+            .finalize(try XCTUnwrap(persisted.first))
+        )
+        let retryable = try await reloaded.nextPending(
+            destinationFingerprint: "destination-a",
+            now: Date.distantFuture
+        )
+        XCTAssertNil(retryable)
+    }
+
+    func testLegacyEncryptedTerminalEntryMigratesToRetryable()
+        async throws
+    {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        let body = Data("legacy-terminal-journal".utf8)
+        let anchors = ["sleep": Data([4, 5, 6])]
+        let enqueuedAt = Date(timeIntervalSince1970: 1_787_000_000)
+        let retryAt = enqueuedAt.addingTimeInterval(3_600)
+        let migrationTime = enqueuedAt.addingTimeInterval(7_200)
+        try writeLegacyTerminalFixture(
+            fixture,
+            body: body,
+            anchors: anchors,
+            destinationFingerprint: "destination-a",
+            enqueuedAt: enqueuedAt,
+            nextAttemptAt: retryAt
+        )
+
+        let reloaded = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+        let legacyEntries = try await reloaded.pendingEntries(
+            destinationFingerprint: "destination-a"
+        )
+        let legacy = try XCTUnwrap(legacyEntries.first)
+        XCTAssertEqual(legacy.terminalFailure, "forwarding failed")
+        XCTAssertEqual(legacy.terminalAnchorsCommitted, false)
+        XCTAssertNil(legacy.terminalFailureIsPermanent)
+
+        let migratedCount = try await reloaded.migrateLegacyTerminalEntries(
+            destinationFingerprint: "destination-a",
+            now: migrationTime
+        )
+        XCTAssertEqual(migratedCount, 1)
+
+        let migratedReload = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+        let migratedEntries = try await migratedReload.pendingEntries(
+            destinationFingerprint: "destination-a"
+        )
+        let migrated = try XCTUnwrap(migratedEntries.first)
+        XCTAssertEqual(migrated.body, body)
+        XCTAssertEqual(migrated.anchors, anchors)
+        XCTAssertNil(migrated.terminalFailure)
+        XCTAssertNil(migrated.terminalAnchorsCommitted)
+        XCTAssertNil(migrated.terminalAnchorCommitPending)
+        XCTAssertEqual(migrated.nextAttemptAt, migrationTime)
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: migratedEntries,
+                forceRetry: false,
+                includeTerminalFailures: false,
+                now: migrationTime
+            ),
+            .upload(migrated)
+        )
+    }
+
+    func testObserverAcknowledgesOnceAfterSyncFinishes() async {
+        var events: [String] = []
+        var completionCount = 0
+
+        await HealthKitObserverLifecycle.synchronizeAndAcknowledge(
+            completion: {
+                events.append("completed")
+                completionCount += 1
+            },
+            synchronize: {
+                events.append("sync-started")
+                await Task.yield()
+                events.append("sync-finished")
+            }
+        )
+
+        XCTAssertEqual(
+            events,
+            ["sync-started", "sync-finished", "completed"]
+        )
+        XCTAssertEqual(completionCount, 1)
+    }
+
+    func testBackgroundTaskExpirationCancelsAndCompletesOnce() async {
+        let started = expectation(description: "operation started")
+        let cancelled = expectation(description: "operation cancelled")
+        let completed = expectation(description: "task completed")
+        let completions = HealthKitTestLockedValues<Bool>()
+        let runner = HealthKitBackgroundTaskRunner(
+            operation: {
+                started.fulfill()
+                do {
+                    try await Task.sleep(
+                        nanoseconds: 5_000_000_000
+                    )
+                    return true
+                } catch is CancellationError {
+                    cancelled.fulfill()
+                    return true
+                } catch {
+                    return false
+                }
+            },
+            completion: { success in
+                completions.append(success)
+                completed.fulfill()
+            }
+        )
+        runner.start()
+        await fulfillment(of: [started], timeout: 2)
+
+        runner.expire()
+        runner.expire()
+
+        await fulfillment(
+            of: [cancelled, completed],
+            timeout: 2
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(completions.values, [false])
+    }
+
+    func testUncommittedTerminalEntryKeepsQueueFailClosed() {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let terminal = HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(
+                    for: Data("terminal".utf8)
+                ),
+            body: Data("terminal".utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now,
+            failedAttempts: 0,
+            nextAttemptAt: now,
+            terminalFailure: "HTTP 422 invalid payload",
+            terminalAnchorsCommitted: false
+        )
+
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: [terminal],
+                forceRetry: false,
+                includeTerminalFailures: false,
+                now: now
+            ),
+            .deferred
+        )
+    }
+
+    func testManualRetryAttemptsEachTerminalOnceBeforeHonoringHeadOfLine() {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let first = terminalEntry(
+            "first",
+            lane: "heartRate",
+            committed: false,
+            date: now
+        )
+        let second = terminalEntry(
+            "second",
+            lane: "sleep",
+            committed: true,
+            date: now.addingTimeInterval(1)
+        )
+        let active = HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(
+                    for: Data("active".utf8)
+            ),
+            body: Data("active".utf8),
+            anchors: ["workout": Data([3])],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now.addingTimeInterval(2),
+            failedAttempts: 0,
+            nextAttemptAt: now,
+            terminalFailure: nil
+        )
+        let entries = [first, second, active]
+
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: entries,
+                forceRetry: true,
+                includeTerminalFailures: true,
+                now: now
+            ),
+            .upload(first)
+        )
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: entries,
+                forceRetry: true,
+                includeTerminalFailures: true,
+                attemptedTerminalKeys: [first.idempotencyKey],
+                now: now
+            ),
+            .upload(second)
+        )
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: entries,
+                forceRetry: true,
+                includeTerminalFailures: true,
+                attemptedTerminalKeys: [
+                    first.idempotencyKey,
+                    second.idempotencyKey,
+                ],
+                now: now
+            ),
+            .upload(active)
+        )
+    }
+
+    func testCommittedRetriedTerminalsDoNotBlockTheActiveQueue() {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let first = terminalEntry(
+            "first",
+            lane: "heartRate",
+            committed: true,
+            date: now
+        )
+        let second = terminalEntry(
+            "second",
+            lane: "sleep",
+            committed: true,
+            date: now.addingTimeInterval(1)
+        )
+        let active = HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(
+                    for: Data("active".utf8)
+            ),
+            body: Data("active".utf8),
+            anchors: ["workout": Data([3])],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now.addingTimeInterval(2),
+            failedAttempts: 0,
+            nextAttemptAt: now,
+            terminalFailure: nil
+        )
+
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: [first, second, active],
+                forceRetry: true,
+                includeTerminalFailures: true,
+                attemptedTerminalKeys: [
+                    first.idempotencyKey,
+                    second.idempotencyKey,
+                ],
+                now: now
+            ),
+            .upload(active)
+        )
+    }
+
+    func testBlockedLaneDoesNotStopIndependentLaneUpload() {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let blocked = terminalEntry(
+            "blocked-heart-rate",
+            lane: "heartRate",
+            committed: false,
+            date: now
+        )
+        let sameLane = activeEntry(
+            "new-heart-rate",
+            lane: "heartRate",
+            date: now.addingTimeInterval(1)
+        )
+        let independent = activeEntry(
+            "new-sleep",
+            lane: "sleep",
+            date: now.addingTimeInterval(2)
+        )
+
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: [blocked, sameLane, independent],
+                forceRetry: false,
+                includeTerminalFailures: false,
+                now: now.addingTimeInterval(3)
+            ),
+            .upload(independent)
+        )
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.blockedLaneKeys(
+                in: [blocked, sameLane]
+            ),
+            ["heartRate"]
+        )
+    }
+
+    func testLegacyAnchorlessEntryBlocksEveryLane() {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let legacy = HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(
+                    for: Data("legacy".utf8)
+                ),
+            body: Data("legacy".utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now,
+            failedAttempts: 1,
+            nextAttemptAt: now.addingTimeInterval(60),
+            terminalFailure: nil
+        )
+        let independent = activeEntry(
+            "new-sleep",
+            lane: "sleep",
+            date: now.addingTimeInterval(1)
+        )
+
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.select(
+                from: [legacy, independent],
+                forceRetry: false,
+                includeTerminalFailures: false,
+                now: now
+            ),
+            .deferred
+        )
+        XCTAssertEqual(
+            HealthKitSyncQueuePolicy.blockedLaneKeys(in: [legacy]),
+            [HealthKitSyncQueuePolicy.legacyGlobalLane]
+        )
     }
 
     func testEntryTooLargeDoesNotWriteAFile() async throws {
@@ -677,7 +1258,49 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         let keyProvider: RecordingHealthKitKeyProvider
     }
 
+    private func terminalEntry(
+        _ body: String,
+        lane: String,
+        committed: Bool,
+        date: Date
+    ) -> HealthKitSyncOutboxEntry {
+        let data = Data(body.utf8)
+        return HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(for: data),
+            body: data,
+            anchors: [lane: Data([1])],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: date,
+            failedAttempts: 0,
+            nextAttemptAt: date,
+            terminalFailure: "terminal",
+            terminalAnchorsCommitted: committed
+        )
+    }
+
+    private func activeEntry(
+        _ body: String,
+        lane: String,
+        date: Date
+    ) -> HealthKitSyncOutboxEntry {
+        let data = Data(body.utf8)
+        return HealthKitSyncOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(for: data),
+            body: data,
+            anchors: [lane: Data([2])],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: date,
+            failedAttempts: 0,
+            nextAttemptAt: date,
+            terminalFailure: nil
+        )
+    }
+
     private func makeFixture(
+        maximumEntries: Int =
+            HealthKitSyncOutbox.defaultMaximumEntries,
         maximumBytes: Int = HealthKitSyncOutbox.defaultMaximumBytes,
         retryPolicy: HealthKitSyncRetryPolicy = .default
     ) -> Fixture {
@@ -692,12 +1315,64 @@ final class HealthKitSyncOutboxTests: XCTestCase {
             outbox: HealthKitSyncOutbox(
                 fileURL: fileURL,
                 keyProvider: keyProvider,
+                maximumEntries: maximumEntries,
                 maximumBytes: maximumBytes,
                 retryPolicy: retryPolicy
             ),
             fileURL: fileURL,
             keyProvider: keyProvider
         )
+    }
+
+    private func writeLegacyTerminalFixture(
+        _ fixture: Fixture,
+        body: Data,
+        anchors: [String: Data],
+        destinationFingerprint: String,
+        enqueuedAt: Date,
+        nextAttemptAt: Date
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let entry = LegacyHealthKitOutboxEntry(
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(for: body),
+            body: body,
+            anchors: anchors,
+            destinationFingerprint: destinationFingerprint,
+            enqueuedAt: enqueuedAt,
+            failedAttempts: 8,
+            nextAttemptAt: nextAttemptAt,
+            terminalFailure: "forwarding failed",
+            terminalAnchorsCommitted: false,
+            forwardingFailedAttempts: 8
+        )
+        let plaintext = try encoder.encode(
+            LegacyHealthKitOutboxEnvelope(
+                version: 1,
+                entries: [entry]
+            )
+        )
+        let sealedBox = try AES.GCM.seal(
+            plaintext,
+            using: fixture.keyProvider.fixtureKey(),
+            authenticating:
+                Data("HealthMes.HealthKitSyncOutbox.v1".utf8)
+        )
+        let sealedData = try XCTUnwrap(sealedBox.combined)
+        let storedData = try encoder.encode(
+            LegacyHealthKitOutboxStoredFile(
+                version: 1,
+                sealedData: sealedData
+            )
+        )
+        try FileManager.default.createDirectory(
+            at: fixture.fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try storedData.write(to: fixture.fileURL, options: .atomic)
+        XCTAssertNil(storedData.range(of: body))
     }
 
     private func removeFixture(_ fixture: Fixture) {
@@ -728,5 +1403,22 @@ final class HealthKitSyncOutboxTests: XCTestCase {
                 line: line
             )
         }
+    }
+}
+
+private final class HealthKitTestLockedValues<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Value] = []
+
+    var values: [Value] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ value: Value) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage.append(value)
     }
 }

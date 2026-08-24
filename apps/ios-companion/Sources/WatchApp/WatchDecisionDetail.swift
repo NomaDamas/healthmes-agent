@@ -22,6 +22,20 @@ final class WatchDecisionInbox: ObservableObject {
 
     func present(content: UNNotificationContent) {
         let info = content.userInfo
+        guard
+            PairingContextCoordinator.matchingSourcePairing(
+                fingerprint: info[
+                    AlertNotificationContent.userInfoPairingFingerprint
+                ] as? String,
+                generation: PairingScope.generation(
+                    from: info[
+                        AlertNotificationContent.userInfoPairingGeneration
+                    ]
+                )
+            ) != nil
+        else {
+            return
+        }
         let formatter = ISO8601DateFormatter()
         detail = WatchDecisionDetail(
             prompt: content.title,
@@ -38,6 +52,10 @@ final class WatchDecisionInbox: ObservableObject {
             expiresAt: (info[AlertNotificationContent.userInfoDecisionExpiresAt] as? String)
                 .flatMap(formatter.date(from:))
         )
+    }
+
+    func clear() {
+        detail = nil
     }
 }
 

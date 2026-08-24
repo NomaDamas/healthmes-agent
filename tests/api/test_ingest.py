@@ -31,7 +31,11 @@ from healthmes.backup.snapshot import (
     create_snapshot,
     restore_snapshot,
 )
-from healthmes.ingest import transform_hae, transform_healthkit_v1
+from healthmes.ingest import (
+    InvalidHealthKitPayloadError,
+    transform_hae,
+    transform_healthkit_v1,
+)
 from healthmes.store import (
     HealthKitDeletionTombstone,
     HealthKitIngestReceipt,
@@ -154,6 +158,96 @@ def test_transform_native_healthkit_preserves_all_sdk_arrays():
     assert [row["id"] for row in batch.sleep] == ["sleep-1"]
     assert [row["id"] for row in batch.workouts] == ["workout-1"]
     assert batch.deletions == ()
+
+
+@pytest.mark.parametrize(
+    ("payload", "path"),
+    [
+        (
+            {
+                "schema": "healthmes.healthkit.v1",
+                "sdkVersion": "healthmes-ios/1",
+                "syncTimestamp": "2026-08-24T03:00:00Z",
+            },
+            "data",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD,
+                "data": {
+                    **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                    "records": {},
+                },
+            },
+            "data.records",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD,
+                "data": {
+                    **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                    "records": [
+                        {
+                            **NATIVE_HEALTHKIT_PAYLOAD["data"]["records"][0],
+                            "id": "",
+                        }
+                    ],
+                },
+            },
+            "data.records[0].id",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD,
+                "data": {
+                    **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                    "records": [
+                        {
+                            **NATIVE_HEALTHKIT_PAYLOAD["data"]["records"][0],
+                            "value": True,
+                        }
+                    ],
+                },
+            },
+            "data.records[0].value",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD,
+                "data": {
+                    **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                    "sleep": [
+                        {
+                            **NATIVE_HEALTHKIT_PAYLOAD["data"]["sleep"][0],
+                            "endDate": "not-a-date",
+                        }
+                    ],
+                },
+            },
+            "data.sleep[0].endDate",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD,
+                "data": {
+                    **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                    "workouts": [
+                        {
+                            **NATIVE_HEALTHKIT_PAYLOAD["data"]["workouts"][0],
+                            "values": [{"type": "duration", "value": 1}],
+                        }
+                    ],
+                },
+            },
+            "data.workouts[0].values[0].unit",
+        ),
+    ],
+)
+def test_transform_native_healthkit_rejects_malformed_contract(payload, path):
+    with pytest.raises(InvalidHealthKitPayloadError) as exc_info:
+        transform_healthkit_v1(payload)
+
+    assert exc_info.value.path == path
 
 
 # --- POST /v1/ingest/healthkit ----------------------------------------------
@@ -366,6 +460,141 @@ def test_native_healthkit_exact_replay_returns_stored_ack_once(
     )
 
 
+@pytest.mark.parametrize(
+    ("changed_data", "path"),
+    [
+        (None, "data"),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                "records": "not-an-array",
+            },
+            "data.records",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                "records": [
+                    NATIVE_HEALTHKIT_PAYLOAD["data"]["records"][0],
+                    {"id": "broken-row"},
+                ],
+            },
+            "data.records[1].type",
+        ),
+        (
+            {
+                **NATIVE_HEALTHKIT_PAYLOAD["data"],
+                "deletions": [{"id": "metric-1", "type": ""}],
+            },
+            "data.deletions[0].type",
+        ),
+    ],
+)
+def test_native_malformed_payload_is_stored_exactly_then_rejected(
+    client,
+    session,
+    settings,
+    changed_data,
+    path,
+):
+    payload = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "data": changed_data,
+    }
+    body = json.dumps(
+        payload,
+        separators=(", ", ": "),
+        sort_keys=False,
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": f"native-invalid-{path}",
+    }
+
+    first = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers=headers,
+    )
+    replay = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers=headers,
+    )
+
+    assert first.status_code == replay.status_code == 422
+    assert first.json()["error"]["code"] == "invalid_healthkit_payload"
+    assert first.json()["error"]["detail"]["path"] == path
+    assert replay.json() == first.json()
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert _stored_file(settings, event).read_bytes() == body
+    assert event.parse_status == "parsed"
+    assert event.forward_status == "rejected_invalid_payload"
+    receipt = session.scalars(select(HealthKitIngestReceipt)).one()
+    assert receipt.state == "pending"
+    assert receipt.raw_id == event.id
+    assert receipt.ack_payload is None
+
+
+def test_native_malformed_payload_key_reuse_with_different_bytes_conflicts(
+    client,
+    session,
+):
+    first_payload = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "data": None,
+    }
+    second_payload = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "data": [],
+    }
+    headers = {"Idempotency-Key": "native-invalid-conflict-1"}
+
+    first = client.post(
+        "/v1/ingest/healthkit",
+        json=first_payload,
+        headers=headers,
+    )
+    second = client.post(
+        "/v1/ingest/healthkit",
+        json=second_payload,
+        headers=headers,
+    )
+
+    assert first.status_code == 422
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "idempotency_conflict"
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+
+
+def test_headerless_malformed_native_payload_is_raw_before_rejection(
+    client,
+    session,
+    settings,
+):
+    payload = {
+        **NATIVE_HEALTHKIT_PAYLOAD,
+        "data": {"records": []},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    response = client.post(
+        "/v1/ingest/healthkit",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_healthkit_payload"
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert _stored_file(settings, event).read_bytes() == body
+    assert event.forward_status == "rejected_invalid_payload"
+    assert session.scalar(
+        select(func.count()).select_from(HealthKitIngestReceipt)
+    ) == 0
+
+
 def test_native_forward_failure_reuses_raw_and_completes_after_retry(
     client,
     session,
@@ -544,7 +773,7 @@ def test_native_invalid_idempotency_key_preserves_exact_raw_before_rejection(
     ) == 0
 
 
-def test_native_healthkit_tombstone_suppresses_stale_replay(
+def test_native_healthkit_deletion_stays_pending_and_suppresses_stale_replay(
     client,
     session,
     settings,
@@ -561,7 +790,12 @@ def test_native_healthkit_tombstone_suppresses_stale_replay(
     deleted = {
         **NATIVE_HEALTHKIT_PAYLOAD,
         "data": {
-            "records": [],
+            "records": [
+                {
+                    **NATIVE_HEALTHKIT_PAYLOAD["data"]["records"][0],
+                    "id": "metric-2",
+                }
+            ],
             "sleep": [],
             "workouts": [],
             "deletions": [
@@ -587,15 +821,31 @@ def test_native_healthkit_tombstone_suppresses_stale_replay(
         json=deleted,
         headers={"Idempotency-Key": "native-delete-1"},
     )
+    deletion_replay = client.post(
+        "/v1/ingest/healthkit",
+        json=deleted,
+        headers={"Idempotency-Key": "native-delete-1"},
+    )
+
+    assert deletion_response.status_code == deletion_replay.status_code == 503
+    assert deletion_response.json()["error"]["code"] == (
+        "healthkit_deletion_pending"
+    )
+    assert deletion_replay.json() == deletion_response.json()
+    assert forward_count == 0
+    assert session.scalar(select(func.count()).select_from(RawIngestEvent)) == 1
+    receipt = session.scalars(select(HealthKitIngestReceipt)).one()
+    assert receipt.state == "pending"
+    assert receipt.ack_payload is None
+    event = session.scalars(select(RawIngestEvent)).one()
+    assert event.forward_status == "deletion_pending"
+
     stale_response = client.post(
         "/v1/ingest/healthkit",
         json=stale,
         headers={"Idempotency-Key": "native-stale-replay-1"},
     )
 
-    assert deletion_response.status_code == 202
-    assert deletion_response.json()["deletions_received"] == 1
-    assert deletion_response.json()["forward_status"] == "deletions_recorded"
     assert stale_response.status_code == 202
     assert stale_response.json()["records_forwarded"] == 0
     assert stale_response.json()["forward_status"] == "nothing_mapped"

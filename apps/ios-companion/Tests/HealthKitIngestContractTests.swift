@@ -190,24 +190,89 @@ final class HealthKitIngestContractTests: XCTestCase {
         }
     }
 
-    func testDurableRawAckConfirmsAnchorsAcrossTerminalProcessingStates() throws {
+    func testAckRequiresAcceptedForwardingBeforeAnchorsAdvance() throws {
         let body = Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8)
-        for (parseStatus, forwardStatus) in [
-            ("parsed", "queued"),
-            ("parsed", "forward_failed"),
-            ("parsed", "deletions_recorded"),
-            ("stored_unparsed", "nothing_mapped"),
+        for forwardStatus in [
+            "queued",
+            "nothing_mapped",
         ] {
             let ack = try makeAck(
                 durable: true,
                 sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
                 sizeBytes: body.count,
-                parseStatus: parseStatus,
                 forwardStatus: forwardStatus
             )
             XCTAssertNoThrow(
                 try ack.validate(exactBody: body),
-                "\(parseStatus)/\(forwardStatus)"
+                forwardStatus
+            )
+        }
+
+        let legacyDeletionAck = try makeAck(
+            durable: true,
+            sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+            sizeBytes: body.count,
+            forwardStatus: "deletions_recorded"
+        )
+        XCTAssertThrowsError(
+            try legacyDeletionAck.validate(exactBody: body)
+        ) {
+            XCTAssertEqual(
+                $0 as? HealthKitIngestAckValidationError,
+                .deletionForwardingPending
+            )
+            XCTAssertEqual(
+                HealthKitUploadFailureDisposition.classify($0),
+                .retryable
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition.permitsAnchorAdvance($0)
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .countsTowardAutomaticQuarantine($0)
+            )
+        }
+
+        for forwardStatus in ["forward_failed", "skipped_no_user"] {
+            let ack = try makeAck(
+                durable: true,
+                sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+                sizeBytes: body.count,
+                forwardStatus: forwardStatus
+            )
+            XCTAssertThrowsError(try ack.validate(exactBody: body)) {
+                XCTAssertEqual(
+                    $0 as? HealthKitIngestAckValidationError,
+                    .forwardingPending(status: forwardStatus)
+                )
+            }
+        }
+
+        let unknown = try makeAck(
+            durable: true,
+            sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+            sizeBytes: body.count,
+            forwardStatus: "future_status"
+        )
+        XCTAssertThrowsError(try unknown.validate(exactBody: body)) {
+            XCTAssertEqual(
+                $0 as? HealthKitIngestAckValidationError,
+                .unsupportedForwardStatus("future_status")
+            )
+        }
+
+        let unparsed = try makeAck(
+            durable: true,
+            sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+            sizeBytes: body.count,
+            parseStatus: "stored_unparsed",
+            forwardStatus: "nothing_mapped"
+        )
+        XCTAssertThrowsError(try unparsed.validate(exactBody: body)) {
+            XCTAssertEqual(
+                $0 as? HealthKitIngestAckValidationError,
+                .unsupportedParseStatus("stored_unparsed")
             )
         }
     }
@@ -239,7 +304,139 @@ final class HealthKitIngestContractTests: XCTestCase {
                 detail: nil
             )
         )
+        assertRetryable(
+            HealthKitIngestAckValidationError.forwardingPending(
+                status: "forward_failed"
+            )
+        )
+        assertRetryable(
+            HealthKitIngestAckValidationError.deletionForwardingPending
+        )
         assertTerminal(HealthKitIngestAckValidationError.hashMismatch)
+        assertTerminal(
+            HealthKitIngestAckValidationError.unsupportedForwardStatus(
+                "future_status"
+            )
+        )
+        assertTerminal(
+            HealthKitIngestAckValidationError.unsupportedParseStatus(
+                "stored_unparsed"
+            )
+        )
+    }
+
+    func testForwardingFailuresNeverAutoQuarantineOrAdvanceAnchors() {
+        let policy = HealthKitSyncRetryPolicy(
+            initialDelay: 1,
+            maximumDelay: 60,
+            maximumAutomaticAttempts: 8
+        )
+        for status in ["forward_failed", "skipped_no_user"] {
+            let error =
+                HealthKitIngestAckValidationError.forwardingPending(
+                    status: status
+                )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .countsTowardAutomaticQuarantine(error)
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .countsTowardAutomaticQuarantine(
+                        error,
+                        isManualRetry: true
+                    )
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .shouldQuarantineAfterAutomaticRetries(
+                        error,
+                        failedAttempts: 7,
+                        retryPolicy: policy
+                    ),
+                status
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .shouldQuarantineAfterAutomaticRetries(
+                        error,
+                        failedAttempts: 8,
+                        retryPolicy: policy
+                    ),
+                status
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .shouldQuarantineAfterAutomaticRetries(
+                        error,
+                        failedAttempts: 8,
+                        isManualRetry: true,
+                        retryPolicy: policy
+                    ),
+                status
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .permitsAnchorAdvance(error)
+            )
+            XCTAssertFalse(
+                HealthKitUploadFailureDisposition
+                    .permitsAnchorAdvance(
+                        error,
+                        isManualRetry: true
+                    )
+            )
+        }
+
+        XCTAssertFalse(
+            HealthKitUploadFailureDisposition
+                .shouldQuarantineAfterAutomaticRetries(
+                    HealthMesAPIError.transport(
+                        underlying: URLError(.notConnectedToInternet)
+                    ),
+                    failedAttempts: 8,
+                    retryPolicy: policy
+                )
+        )
+        XCTAssertFalse(
+            HealthKitUploadFailureDisposition
+                .countsTowardAutomaticQuarantine(
+                    HealthMesAPIError.transport(
+                        underlying: URLError(.notConnectedToInternet)
+                    )
+                )
+        )
+        XCTAssertFalse(
+            HealthKitUploadFailureDisposition
+                .shouldQuarantineAfterAutomaticRetries(
+                    HealthMesAPIError.httpStatus(503),
+                    failedAttempts: 8,
+                    retryPolicy: policy
+                )
+        )
+        let deletionPending = HealthMesAPIError.server(
+            statusCode: 503,
+            code: "healthkit_deletion_pending",
+            message: "canonical deletion is pending",
+            detail: nil
+        )
+        assertRetryable(deletionPending)
+        XCTAssertFalse(
+            HealthKitUploadFailureDisposition
+                .countsTowardAutomaticQuarantine(deletionPending)
+        )
+        XCTAssertFalse(
+            HealthKitUploadFailureDisposition
+                .shouldQuarantineAfterAutomaticRetries(
+                    deletionPending,
+                    failedAttempts: 8,
+                    retryPolicy: policy
+                )
+        )
+        XCTAssertFalse(
+            HealthKitUploadFailureDisposition
+                .permitsAnchorAdvance(deletionPending)
+        )
     }
 
     private func makeAck(

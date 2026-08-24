@@ -51,6 +51,44 @@ final class NotificationContentTests: XCTestCase {
         )
     }
 
+    func testNotificationCarriesPairingFingerprintAndGenerationTogether() {
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example.com")!,
+            token: "secret"
+        )
+        let content = AlertNotificationContent.from(
+            alert: fullAlert,
+            pendingProposalID: proposalID,
+            pairingFingerprint: pairing.cacheFingerprint,
+            pairingGeneration: 7
+        )
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoPairingFingerprint],
+            pairing.cacheFingerprint
+        )
+        XCTAssertEqual(
+            content.userInfo[
+                AlertNotificationContent.userInfoPairingGeneration
+            ],
+            "7"
+        )
+
+        let invalid = AlertNotificationContent.from(
+            alert: fullAlert,
+            pendingProposalID: proposalID,
+            pairingFingerprint: "wrong",
+            pairingGeneration: 7
+        )
+        XCTAssertNil(
+            invalid.userInfo[AlertNotificationContent.userInfoPairingFingerprint]
+        )
+        XCTAssertNil(
+            invalid.userInfo[
+                AlertNotificationContent.userInfoPairingGeneration
+            ]
+        )
+    }
+
     func testNoProposalMeansInfoCategoryAndDroppedLines() {
         let bare = AlertItem(
             id: alertID,

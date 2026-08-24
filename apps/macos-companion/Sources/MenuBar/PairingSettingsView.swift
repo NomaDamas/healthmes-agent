@@ -43,8 +43,15 @@ struct PairingSettingsView: View {
 
                     if store.isPaired {
                         Button(role: .destructive) {
-                            store.unpair()
-                            testResultKey = nil
+                            Task {
+                                do {
+                                    try await store.unpair()
+                                    testResultKey = nil
+                                } catch {
+                                    testSucceeded = false
+                                    testResultKey = "error.unreachable"
+                                }
+                            }
                         } label: {
                             Text("settings.unpair")
                         }

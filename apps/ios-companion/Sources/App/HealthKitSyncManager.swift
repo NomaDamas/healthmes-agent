@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import WidgetKit
 
 @MainActor
 final class HealthKitSyncManager: ObservableObject {
@@ -28,7 +29,10 @@ final class HealthKitSyncManager: ObservableObject {
     @Published private(set) var state: State
     @Published private(set) var lastUploadAt: Date?
     @Published private(set) var pendingUploadCount = 0
+    @Published private(set) var terminalFailureCount = 0
+    @Published private(set) var latestTerminalFailure: String?
     @Published private(set) var nextRetryAt: Date?
+    @Published private(set) var queueStatusError: String?
     @Published private(set) var isPaused = false
 
     private let store = HKHealthStore()
@@ -43,7 +47,15 @@ final class HealthKitSyncManager: ObservableObject {
     private var syncRequestedWhileActive = false
     private var forceRetryRequested = false
     private var syncWaiters: [CheckedContinuation<Void, Never>] = []
+    private var quiescenceWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pairingTransitionInProgress = false
     private var syncOperationGate = PairingOperationGate()
+    private var activeUpload: ActiveUpload?
+
+    private struct ActiveUpload {
+        let id: UUID
+        let task: Task<HealthKitIngestAck, Error>
+    }
 
     private struct QuantitySpec {
         let type: HKQuantityType
@@ -75,6 +87,12 @@ final class HealthKitSyncManager: ObservableObject {
         case .notRequested:
             return String(localized: "Permission required")
         case .ready:
+            if terminalFailureCount > 0 {
+                return String(
+                    localized:
+                        "\(terminalFailureCount) upload(s) need attention"
+                )
+            }
             if pendingUploadCount > 0 {
                 return String(
                     localized: "\(pendingUploadCount) upload(s) queued"
@@ -101,13 +119,17 @@ final class HealthKitSyncManager: ObservableObject {
     }
 
     func requestAuthorizationAndSync() async {
+        guard await recoverInterruptedPairingTransition() else { return }
+        guard !pairingTransitionInProgress else { return }
         guard HKHealthStore.isHealthDataAvailable() else {
             state = .unavailable
             return
         }
         do {
             try await store.requestAuthorization(toShare: [], read: readTypes)
+            guard !pairingTransitionInProgress else { return }
             try await enableBackgroundDelivery()
+            guard !pairingTransitionInProgress else { return }
             installObservers()
             setPaused(false, for: PairingStore.shared.load())
             await sync()
@@ -117,6 +139,7 @@ final class HealthKitSyncManager: ObservableObject {
     }
 
     func resume() async {
+        guard await recoverInterruptedPairingTransition() else { return }
         guard HKHealthStore.isHealthDataAvailable() else {
             state = .unavailable
             return
@@ -162,10 +185,121 @@ final class HealthKitSyncManager: ObservableObject {
 
     func pairingDidChange() async {
         syncOperationGate.invalidate()
+        guard await recoverInterruptedPairingTransition() else { return }
+        PairingRelayGate.shared.reopenIfStable()
         await refreshStatus()
     }
 
+    func replacePairing(with candidate: Pairing) async throws -> Pairing {
+        guard !pairingTransitionInProgress else {
+            throw PairingError.transitionInProgress
+        }
+        guard await recoverInterruptedPairingTransition() else {
+            throw PairingError.transitionInProgress
+        }
+        let current = PairingStore.shared.load()
+        guard current != candidate else {
+            let saved = try savePairing(candidate)
+            await pairingDidChange()
+            return saved
+        }
+
+        let wasPaused = current.map {
+            defaults.bool(forKey: pauseKey($0.cacheFingerprint))
+        } ?? false
+        await beginPairingTransition()
+        do {
+            let transition = try PairingStore.shared.beginReplacement(
+                with: candidate
+            )
+            try await clearAccountSurfaces()
+            try PairingStore.shared
+                .markPendingTransitionCleanupStarted()
+            try await removeLocalHealthData(
+                fingerprint: transition.previousFingerprint,
+                userDirectedRemoval: false
+            )
+            prepareClientState(for: transition.kind)
+            guard
+                let saved = try PairingStore.shared
+                    .commitPendingTransition()
+            else {
+                throw PairingError.credentialStorageFailed
+            }
+            endPairingTransition()
+            await refreshStatus()
+            return saved
+        } catch {
+            if PairingStore.shared.hasPendingTransition {
+                // Cleanup may already have changed the old queue. Keep every
+                // process fenced and let the next lifecycle pass resume the
+                // durable journal instead of exposing partial old state.
+                pairingTransitionInProgress = false
+                state = .failed(error.localizedDescription)
+                throw error
+            }
+            if let current {
+                setPaused(wasPaused, for: current)
+            }
+            endPairingTransition()
+            await refreshStatus()
+            throw error
+        }
+    }
+
+    func unpair() async throws {
+        guard !pairingTransitionInProgress else {
+            throw PairingError.transitionInProgress
+        }
+        guard await recoverInterruptedPairingTransition() else {
+            throw PairingError.transitionInProgress
+        }
+        let pairing = PairingStore.shared.load()
+        guard
+            pairing != nil
+                || PairingStore.shared.hasPersistedPairingState
+        else {
+            resetUnpairedState()
+            return
+        }
+
+        let wasPaused = pairing.map {
+            defaults.bool(forKey: pauseKey($0.cacheFingerprint))
+        } ?? false
+        await beginPairingTransition()
+        do {
+            let transition = try PairingStore.shared.beginUnpair()
+            try await clearAccountSurfaces()
+            try PairingStore.shared
+                .markPendingTransitionCleanupStarted()
+            try await removeLocalHealthData(
+                fingerprint: transition.previousFingerprint,
+                userDirectedRemoval: true
+            )
+            prepareClientState(for: transition.kind)
+            _ = try PairingStore.shared.commitPendingTransition()
+            endPairingTransition()
+            resetUnpairedState()
+        } catch {
+            if PairingStore.shared.hasPendingTransition {
+                pairingTransitionInProgress = false
+                state = .failed(error.localizedDescription)
+                throw error
+            }
+            if let pairing {
+                setPaused(wasPaused, for: pairing)
+            }
+            endPairingTransition()
+            await refreshStatus()
+            throw error
+        }
+    }
+
     func pauseSync() async {
+        guard
+            !pairingTransitionInProgress,
+            !PairingStore.shared.hasPendingTransition
+        else { return }
         guard let pairing = PairingStore.shared.load() else { return }
         setPaused(true, for: pairing)
         syncOperationGate.invalidate()
@@ -174,19 +308,25 @@ final class HealthKitSyncManager: ObservableObject {
     }
 
     func resumeSync() async {
+        guard !pairingTransitionInProgress else { return }
         guard let pairing = PairingStore.shared.load() else { return }
         setPaused(false, for: pairing)
         state = .ready
-        await retryPendingUploads()
+        await sync()
     }
 
     func retryPendingUploads() async {
+        guard !pairingTransitionInProgress else { return }
         forceRetryRequested = true
         await sync()
     }
 
     func backgroundSync() async -> Bool {
+        guard await recoverInterruptedPairingTransition() else {
+            return false
+        }
         await sync()
+        guard !Task.isCancelled else { return false }
         switch state {
         case .ready, .paused:
             return true
@@ -197,33 +337,176 @@ final class HealthKitSyncManager: ObservableObject {
 
     func deletePendingUploads() async {
         guard let pairing = PairingStore.shared.load() else { return }
+        guard !pairingTransitionInProgress else { return }
+        let wasPaused = defaults.bool(
+            forKey: pauseKey(pairing.cacheFingerprint)
+        )
+        setPaused(true, for: pairing)
+        await beginPairingTransition()
         do {
-            setPaused(true, for: pairing)
-            syncOperationGate.invalidate()
-            _ = try await outbox.purge(
+            _ = try await outbox.purgeForUserRemoval(
                 destinationFingerprint: pairing.cacheFingerprint
             )
-            guard await refreshQueueStatus(for: pairing) else { return }
+            let refreshed = await refreshQueueStatus(for: pairing)
+            endPairingTransition()
+            guard refreshed else { return }
             state = .paused
         } catch {
+            setPaused(wasPaused, for: pairing)
+            endPairingTransition()
             state = .failed(error.localizedDescription)
         }
     }
 
-    func prepareForUnpair(_ pairing: Pairing) async throws {
-        setPaused(true, for: pairing)
+    private func beginPairingTransition() async {
+        pairingTransitionInProgress = true
+        await PairingRelayGate.shared.fenceAndWait()
         syncOperationGate.invalidate()
-        await sync()
-        _ = try await outbox.purge(
-            destinationFingerprint: pairing.cacheFingerprint
+        syncRequestedWhileActive = false
+        forceRetryRequested = false
+        activeUpload?.task.cancel()
+        await waitForSyncToQuiesce()
+    }
+
+    private func endPairingTransition() {
+        pairingTransitionInProgress = false
+        syncOperationGate.invalidate()
+        PairingRelayGate.shared.reopenIfStable()
+    }
+
+    private func savePairing(_ pairing: Pairing) throws -> Pairing {
+        try PairingStore.shared.save(
+            baseURLString: pairing.baseURL.absoluteString,
+            token: pairing.token ?? ""
         )
-        clearPersistedState(for: pairing)
+    }
+
+    private func removeLocalHealthData(
+        fingerprint: String?,
+        userDirectedRemoval: Bool
+    ) async throws {
+        switch HealthKitSyncRemovalPolicy.scope(
+            fingerprint: fingerprint,
+            userDirectedRemoval: userDirectedRemoval
+        ) {
+        case .destination(let fingerprint):
+            if userDirectedRemoval {
+                _ = try await outbox.purgeForUserRemoval(
+                    destinationFingerprint: fingerprint
+                )
+            } else {
+                _ = try await outbox.purge(
+                    destinationFingerprint: fingerprint
+                )
+            }
+            HealthKitSyncLocalState.clear(
+                fingerprint: fingerprint,
+                defaults: defaults
+            )
+        case .all:
+            _ = try await outbox.purgeAllForUserRemoval()
+            HealthKitSyncLocalState.clearAll(defaults: defaults)
+        case .none:
+            return
+        }
         pendingUploadCount = 0
+        terminalFailureCount = 0
+        latestTerminalFailure = nil
         nextRetryAt = nil
+        queueStatusError = nil
         lastUploadAt = nil
     }
 
+    private func prepareClientState(
+        for transition: PairingTransitionKind
+    ) {
+        GlanceSnapshotCache.shared.clear()
+        if transition == .replacement {
+            SeenAlertsStore.shared.resetForPairingChange()
+        } else {
+            SeenAlertsStore.shared.clear()
+        }
+    }
+
+    private func clearAccountSurfaces() async throws {
+        guard await NotificationManager.shared.clearAccountSurfaces() else {
+            throw PairingError.transitionInProgress
+        }
+        await DecisionLiveActivityController.shared.endAll()
+        await LiveActivityController.shared.endAll()
+    }
+
+    private func recoverInterruptedPairingTransition() async -> Bool {
+        guard PairingStore.shared.hasPendingTransition else {
+            return true
+        }
+        guard !pairingTransitionInProgress else { return false }
+        await beginPairingTransition()
+        guard let transition = PairingStore.shared.pendingTransition() else {
+            if
+                let recovery =
+                    PairingStore.shared.abortStagingTransitionIfSafe()
+            {
+                endPairingTransition()
+                publishRecoveredPairing(recovery.pairing)
+                await refreshStatus()
+                return true
+            }
+            // A malformed journal cannot prove whether local cleanup began.
+            // Keep every process fail-closed until the user retries or
+            // reinstalls instead of exposing either destination.
+            state = .failed(
+                PairingError.transitionInProgress.localizedDescription
+            )
+            pairingTransitionInProgress = false
+            return false
+        }
+        do {
+            try await clearAccountSurfaces()
+            try PairingStore.shared
+                .markPendingTransitionCleanupStarted()
+            try await removeLocalHealthData(
+                fingerprint: transition.previousFingerprint,
+                userDirectedRemoval: transition.kind == .unpair
+            )
+            prepareClientState(for: transition.kind)
+            let pairing = try PairingStore.shared
+                .commitPendingTransition()
+            endPairingTransition()
+            publishRecoveredPairing(pairing)
+            await refreshStatus()
+            return true
+        } catch {
+            // Keep the persisted fence. A later foreground/background pass
+            // retries recovery without exposing either destination.
+            pairingTransitionInProgress = false
+            state = .failed(error.localizedDescription)
+            return false
+        }
+    }
+
+    private func publishRecoveredPairing(_ pairing: Pairing?) {
+        if let pairing {
+            PhoneWatchSync.shared.pushPairing(
+                baseURL: pairing.baseURL.absoluteString,
+                token: pairing.token ?? ""
+            )
+        } else {
+            PhoneWatchSync.shared.pushUnpair()
+        }
+        WidgetCenter.shared.reloadAllTimelines()
+        NotificationCenter.default.post(
+            name: .healthmesPairingChanged,
+            object: nil
+        )
+    }
+
     func sync() async {
+        guard
+            !Task.isCancelled,
+            !pairingTransitionInProgress,
+            !PairingStore.shared.hasPendingTransition
+        else { return }
         if syncInProgress {
             syncRequestedWhileActive = true
             await withCheckedContinuation { continuation in
@@ -233,22 +516,36 @@ final class HealthKitSyncManager: ObservableObject {
         }
         syncInProgress = true
         repeat {
+            guard !Task.isCancelled else { break }
             syncRequestedWhileActive = false
             let forcePending = forceRetryRequested
             forceRetryRequested = false
             await performSyncPass(forcePending: forcePending)
-        } while syncRequestedWhileActive
+        } while syncRequestedWhileActive && !pairingTransitionInProgress
         syncInProgress = false
         let completedWaiters = syncWaiters
         syncWaiters.removeAll(keepingCapacity: true)
         for waiter in completedWaiters {
             waiter.resume()
         }
-        await settleStateAfterSyncIfNeeded()
+        let completedQuiescenceWaiters = quiescenceWaiters
+        quiescenceWaiters.removeAll(keepingCapacity: true)
+        for waiter in completedQuiescenceWaiters {
+            waiter.resume()
+        }
+        if !pairingTransitionInProgress {
+            await settleStateAfterSyncIfNeeded()
+        }
     }
 
     private enum PendingDrainResult: Equatable {
         case drained
+        case deferred(blockedLaneKeys: Set<String>)
+    }
+
+    private enum PendingUploadResult {
+        case completed
+        case failed
         case deferred
     }
 
@@ -272,41 +569,55 @@ final class HealthKitSyncManager: ObservableObject {
         let syncOperation = syncOperationGate.begin(pairing: pairingSnapshot)
         state = .syncing
         do {
-            let drainResult = try await drainPendingUploads(
+            let initialDrain = try await drainPendingUploads(
                 pairing: pairingSnapshot,
                 operation: syncOperation,
-                forceRetry: forcePending
+                forceRetry: forcePending,
+                includeTerminalFailures: forcePending
             )
-            guard drainResult == .drained else {
-                state = .ready
-                return
+            var blockedLaneKeys: Set<String>
+            switch initialDrain {
+            case .drained:
+                blockedLaneKeys = []
+            case .deferred(let blocked):
+                blockedLaneKeys = blocked
             }
 
             while true {
                 guard isCurrent(syncOperation) else { return }
                 let batch = try await collectBatch(
-                    pairingFingerprint: pairingSnapshot.cacheFingerprint
+                    pairingFingerprint: pairingSnapshot.cacheFingerprint,
+                    excludingLaneKeys: blockedLaneKeys
                 )
                 guard isCurrent(syncOperation) else { return }
                 guard batch.hasChanges else { break }
-                let body = try HealthMesAPI.healthKitUploadBody(
-                    batch.payload
-                )
-                let anchors = try archiveAnchors(batch.anchors)
-                _ = try await outbox.enqueue(
-                    body: body,
-                    anchors: anchors,
-                    destinationFingerprint:
-                        pairingSnapshot.cacheFingerprint
-                )
+                for lane in batch.lanes where lane.hasChanges {
+                    let body = try HealthMesAPI.healthKitUploadBody(
+                        lane.payload
+                    )
+                    let anchors = try archiveAnchors(lane.anchors)
+                    _ = try await outbox.enqueue(
+                        body: body,
+                        anchors: anchors,
+                        destinationFingerprint:
+                            pairingSnapshot.cacheFingerprint
+                    )
+                }
                 guard await refreshQueueStatus(for: pairingSnapshot) else {
                     return
                 }
-                _ = try await drainPendingUploads(
+                let drainResult = try await drainPendingUploads(
                     pairing: pairingSnapshot,
                     operation: syncOperation,
-                    forceRetry: true
+                    forceRetry: false,
+                    includeTerminalFailures: false
                 )
+                switch drainResult {
+                case .drained:
+                    blockedLaneKeys = []
+                case .deferred(let blocked):
+                    blockedLaneKeys = blocked
+                }
                 guard isCurrent(syncOperation) else { return }
                 if !batch.hasMore {
                     break
@@ -327,55 +638,194 @@ final class HealthKitSyncManager: ObservableObject {
     private func drainPendingUploads(
         pairing: Pairing,
         operation: PairingOperationToken,
-        forceRetry: Bool
+        forceRetry: Bool,
+        includeTerminalFailures: Bool
     ) async throws -> PendingDrainResult {
         let fingerprint = pairing.cacheFingerprint
+        var attemptedTerminalKeys = Set<String>()
         while true {
-            guard isCurrent(operation) else { return .deferred }
+            guard isCurrent(operation) else {
+                return .deferred(blockedLaneKeys: [])
+            }
+            _ = try await outbox.migrateLegacyTerminalEntries(
+                destinationFingerprint: fingerprint
+            )
             let entries = try await outbox.pendingEntries(
                 destinationFingerprint: fingerprint
             )
-            pendingUploadCount = entries.count
-            nextRetryAt = entries.first?.nextAttemptAt
-            guard let entry = entries.first else {
-                nextRetryAt = nil
+            applyQueueStatus(entries)
+            switch HealthKitSyncQueuePolicy.select(
+                from: entries,
+                forceRetry: forceRetry,
+                includeTerminalFailures: includeTerminalFailures,
+                attemptedTerminalKeys: attemptedTerminalKeys,
+                now: Date()
+            ) {
+            case .drained:
                 return .drained
-            }
-            guard forceRetry || entry.isDue(at: Date()) else {
-                return .deferred
-            }
-
-            do {
-                _ = try await api.uploadHealthKit(
-                    body: entry.body,
-                    idempotencyKey: entry.idempotencyKey,
-                    pairing: pairing
+            case .deferred:
+                return .deferred(
+                    blockedLaneKeys:
+                        HealthKitSyncQueuePolicy.blockedLaneKeys(
+                            in: entries
+                        )
                 )
-            } catch {
-                _ = try? await outbox.markFailed(
-                    idempotencyKey: entry.idempotencyKey,
-                    destinationFingerprint: fingerprint
+            case .finalize(let entry):
+                let result = try await finalizeAcceptedEntry(
+                    entry,
+                    pairing: pairing,
+                    operation: operation
                 )
-                await refreshQueueStatus(for: pairing)
-                throw error
+                if case .deferred = result {
+                    return result
+                }
+            case .upload(let entry):
+                let result = try await uploadPendingEntry(
+                    entry,
+                    pairing: pairing,
+                    operation: operation,
+                    includeTerminalFailures: includeTerminalFailures
+                )
+                switch result {
+                case .completed:
+                    continue
+                case .failed:
+                    attemptedTerminalKeys.insert(entry.idempotencyKey)
+                case .deferred:
+                    return .deferred(
+                        blockedLaneKeys: entry.laneKeys
+                    )
+                }
             }
+        }
+    }
 
+    private func uploadPendingEntry(
+        _ entry: HealthKitSyncOutboxEntry,
+        pairing: Pairing,
+        operation: PairingOperationToken,
+        includeTerminalFailures: Bool
+    ) async throws -> PendingUploadResult {
+        let fingerprint = pairing.cacheFingerprint
+        let uploadID = UUID()
+        let uploadTask = Task {
+            try await api.uploadHealthKit(
+                body: entry.body,
+                idempotencyKey: entry.idempotencyKey,
+                pairing: pairing
+            )
+        }
+        activeUpload = ActiveUpload(
+            id: uploadID,
+            task: uploadTask
+        )
+        do {
+            _ = try await uploadTask.value
+        } catch {
+            if activeUpload?.id == uploadID {
+                activeUpload = nil
+            }
             guard isCurrent(operation) else {
                 return .deferred
             }
-            try commitAnchors(
-                entry.anchors,
-                pairingFingerprint: fingerprint
-            )
-            try await outbox.markSucceeded(
+            if error is CancellationError {
+                return .deferred
+            }
+            switch HealthKitUploadFailureDisposition.classify(error) {
+            case .retryable:
+                _ = try await outbox.markFailed(
+                    idempotencyKey: entry.idempotencyKey,
+                    destinationFingerprint: fingerprint,
+                    countsTowardAutomaticQuarantine: false,
+                    preserveTerminalFailure:
+                        entry.terminalFailure != nil
+                )
+                if entry.terminalFailure != nil {
+                    try await markPermanentFailure(
+                        entry,
+                        reason:
+                            entry.terminalFailure
+                            ?? "Manual retry did not complete.",
+                        pairingFingerprint: fingerprint
+                    )
+                }
+            case .terminal(let reason):
+                try await markPermanentFailure(
+                    entry,
+                    reason: reason,
+                    pairingFingerprint: fingerprint
+                )
+            }
+            await refreshQueueStatus(for: pairing)
+            return .failed
+        }
+        if activeUpload?.id == uploadID {
+            activeUpload = nil
+        }
+
+        guard isCurrent(operation) else {
+            return .deferred
+        }
+        guard
+            let accepted = try await outbox.markUploadAccepted(
                 idempotencyKey: entry.idempotencyKey,
                 destinationFingerprint: fingerprint
             )
-            recordSuccessfulUpload(for: fingerprint)
-            guard await refreshQueueStatus(for: pairing) else {
-                return .deferred
-            }
+        else {
+            return .deferred
         }
+        let finalized = try await finalizeAcceptedEntry(
+            accepted,
+            pairing: pairing,
+            operation: operation
+        )
+        switch finalized {
+        case .drained:
+            return .completed
+        case .deferred:
+            return .deferred
+        }
+    }
+
+    private func finalizeAcceptedEntry(
+        _ entry: HealthKitSyncOutboxEntry,
+        pairing: Pairing,
+        operation: PairingOperationToken
+    ) async throws -> PendingDrainResult {
+        let fingerprint = pairing.cacheFingerprint
+        guard isCurrent(operation) else {
+            return .deferred(blockedLaneKeys: entry.laneKeys)
+        }
+        try commitAnchors(
+            entry.anchors,
+            pairingFingerprint: fingerprint
+        )
+        guard isCurrent(operation) else {
+            return .deferred(blockedLaneKeys: entry.laneKeys)
+        }
+        try await outbox.markSucceeded(
+            idempotencyKey: entry.idempotencyKey,
+            destinationFingerprint: fingerprint
+        )
+        recordSuccessfulUpload(for: fingerprint)
+        guard await refreshQueueStatus(for: pairing) else {
+            return .deferred(blockedLaneKeys: entry.laneKeys)
+        }
+        return .drained
+    }
+
+    private func markPermanentFailure(
+        _ entry: HealthKitSyncOutboxEntry,
+        reason: String,
+        pairingFingerprint: String
+    ) async throws {
+        _ = try await outbox.markTerminal(
+            idempotencyKey: entry.idempotencyKey,
+            destinationFingerprint: pairingFingerprint,
+            reason: reason,
+            anchorsCommitted: false,
+            anchorCommitPending: false
+        )
     }
 
     private var quantitySpecs: [QuantitySpec] {
@@ -426,7 +876,7 @@ final class HealthKitSyncManager: ObservableObject {
         )
     }
 
-    private struct Batch {
+    private struct BatchLane {
         let payload: HealthKitIngestPayload
         let anchors: [String: HKQueryAnchor]
         let hasMore: Bool
@@ -440,21 +890,38 @@ final class HealthKitSyncManager: ObservableObject {
         }
     }
 
-    private func collectBatch(pairingFingerprint: String) async throws -> Batch {
-        var metrics: [HealthKitIngestPayload.Metric] = []
-        var sleepRows: [HealthKitIngestPayload.Sleep] = []
-        var workouts: [HealthKitIngestPayload.Workout] = []
-        var deletions: [HealthKitIngestPayload.Deletion] = []
-        var anchors: [String: HKQueryAnchor] = [:]
-        var hasMore = false
+    private struct Batch {
+        let lanes: [BatchLane]
+
+        var hasChanges: Bool {
+            lanes.contains(where: \.hasChanges)
+        }
+
+        var hasMore: Bool {
+            lanes.contains(where: \.hasMore)
+        }
+    }
+
+    private func collectBatch(
+        pairingFingerprint: String,
+        excludingLaneKeys: Set<String>
+    ) async throws -> Batch {
+        if excludingLaneKeys.contains(
+            HealthKitSyncQueuePolicy.legacyGlobalLane
+        ) {
+            return Batch(lanes: [])
+        }
+        var lanes: [BatchLane] = []
 
         for spec in quantitySpecs {
             let key = spec.type.identifier
+            guard !excludingLaneKeys.contains(key) else { continue }
             let result = try await anchoredSamples(
                 type: spec.type,
                 anchor: loadAnchor(key: key, pairingFingerprint: pairingFingerprint)
             )
-            metrics += result.samples.compactMap { sample in
+            let metrics: [HealthKitIngestPayload.Metric] =
+                result.samples.compactMap { sample in
                 guard let quantity = sample as? HKQuantitySample else { return nil }
                 return .init(
                     id: quantity.uuid.uuidString.lowercased(),
@@ -467,101 +934,156 @@ final class HealthKitSyncManager: ObservableObject {
                     source: Self.sourceInfo(for: quantity)
                 )
             }
-            deletions += result.deleted.map {
+            let deletions: [HealthKitIngestPayload.Deletion] =
+                result.deleted.map {
                 .init(id: $0.uuid.uuidString.lowercased(), type: key)
             }
-            anchors[key] = result.anchor
-            hasMore = hasMore || result.hasMore
+            lanes.append(
+                BatchLane(
+                    payload: .init(
+                        data: .init(
+                            records: metrics,
+                            deletions: deletions
+                        )
+                    ),
+                    anchors: [key: result.anchor],
+                    hasMore: result.hasMore
+                )
+            )
         }
 
         if let sleepType = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) {
             let key = sleepType.identifier
-            let result = try await anchoredSamples(
-                type: sleepType,
-                anchor: loadAnchor(key: key, pairingFingerprint: pairingFingerprint)
-            )
-            sleepRows += result.samples.compactMap { sample in
-                guard let category = sample as? HKCategorySample else { return nil }
-                return .init(
-                    id: category.uuid.uuidString.lowercased(),
-                    stage: Self.sleepStage(category.value),
-                    startDate: category.startDate,
-                    endDate: category.endDate,
-                    zoneOffset: HealthKitWireFormat.zoneOffset(for: category.startDate),
-                    source: Self.sourceInfo(for: category)
+            if !excludingLaneKeys.contains(key) {
+                let result = try await anchoredSamples(
+                    type: sleepType,
+                    anchor: loadAnchor(
+                        key: key,
+                        pairingFingerprint: pairingFingerprint
+                    )
+                )
+                let sleepRows: [HealthKitIngestPayload.Sleep] =
+                    result.samples.compactMap { sample in
+                    guard
+                        let category = sample as? HKCategorySample
+                    else {
+                        return nil
+                    }
+                    return .init(
+                        id: category.uuid.uuidString.lowercased(),
+                        stage: Self.sleepStage(category.value),
+                        startDate: category.startDate,
+                        endDate: category.endDate,
+                        zoneOffset:
+                            HealthKitWireFormat.zoneOffset(
+                                for: category.startDate
+                            ),
+                        source: Self.sourceInfo(for: category)
+                    )
+                }
+                let deletions: [HealthKitIngestPayload.Deletion] =
+                    result.deleted.map {
+                    .init(
+                        id: $0.uuid.uuidString.lowercased(),
+                        type: key
+                    )
+                }
+                lanes.append(
+                    BatchLane(
+                        payload: .init(
+                            data: .init(
+                                sleep: sleepRows,
+                                deletions: deletions
+                            )
+                        ),
+                        anchors: [key: result.anchor],
+                        hasMore: result.hasMore
+                    )
                 )
             }
-            deletions += result.deleted.map {
-                .init(id: $0.uuid.uuidString.lowercased(), type: key)
-            }
-            anchors[key] = result.anchor
-            hasMore = hasMore || result.hasMore
         }
 
         let workoutType = HKObjectType.workoutType()
         let workoutKey = workoutType.identifier
-        let workoutResult = try await anchoredSamples(
-            type: workoutType,
-            anchor: loadAnchor(
-                key: workoutKey,
-                pairingFingerprint: pairingFingerprint
-            )
-        )
-        workouts += workoutResult.samples.compactMap { sample in
-            guard let workout = sample as? HKWorkout else { return nil }
-            var values = [
-                HealthKitIngestPayload.Statistic(
-                    type: "duration",
-                    unit: "s",
-                    value: workout.duration
+        if !excludingLaneKeys.contains(workoutKey) {
+            let workoutResult = try await anchoredSamples(
+                type: workoutType,
+                anchor: loadAnchor(
+                    key: workoutKey,
+                    pairingFingerprint: pairingFingerprint
                 )
-            ]
-            if let energy = workout.totalEnergyBurned {
-                values.append(
-                    .init(
-                        type: "calories",
-                        unit: "kcal",
-                        value: energy.doubleValue(for: .kilocalorie())
+            )
+            let workouts: [HealthKitIngestPayload.Workout] =
+                workoutResult.samples.compactMap { sample in
+                guard let workout = sample as? HKWorkout else {
+                    return nil
+                }
+                var values = [
+                    HealthKitIngestPayload.Statistic(
+                        type: "duration",
+                        unit: "s",
+                        value: workout.duration
                     )
+                ]
+                if let energy = workout.totalEnergyBurned {
+                    values.append(
+                        .init(
+                            type: "calories",
+                            unit: "kcal",
+                            value:
+                                energy.doubleValue(
+                                    for: .kilocalorie()
+                                )
+                        )
+                    )
+                }
+                if let distance = workout.totalDistance {
+                    values.append(
+                        .init(
+                            type: "distance",
+                            unit: "m",
+                            value: distance.doubleValue(for: .meter())
+                        )
+                    )
+                }
+                return .init(
+                    id: workout.uuid.uuidString.lowercased(),
+                    type:
+                        Self.workoutType(
+                            workout.workoutActivityType
+                        ),
+                    startDate: workout.startDate,
+                    endDate: workout.endDate,
+                    values: values,
+                    zoneOffset:
+                        HealthKitWireFormat.zoneOffset(
+                            for: workout.startDate
+                        ),
+                    source: Self.sourceInfo(for: workout)
                 )
             }
-            if let distance = workout.totalDistance {
-                values.append(
-                    .init(
-                        type: "distance",
-                        unit: "m",
-                        value: distance.doubleValue(for: .meter())
-                    )
+            let deletions: [HealthKitIngestPayload.Deletion] =
+                workoutResult.deleted.map {
+                .init(
+                    id: $0.uuid.uuidString.lowercased(),
+                    type: workoutKey
                 )
             }
-            return .init(
-                id: workout.uuid.uuidString.lowercased(),
-                type: Self.workoutType(workout.workoutActivityType),
-                startDate: workout.startDate,
-                endDate: workout.endDate,
-                values: values,
-                zoneOffset: HealthKitWireFormat.zoneOffset(for: workout.startDate),
-                source: Self.sourceInfo(for: workout)
+            lanes.append(
+                BatchLane(
+                    payload: .init(
+                        data: .init(
+                            workouts: workouts,
+                            deletions: deletions
+                        )
+                    ),
+                    anchors: [workoutKey: workoutResult.anchor],
+                    hasMore: workoutResult.hasMore
+                )
             )
         }
-        deletions += workoutResult.deleted.map {
-            .init(id: $0.uuid.uuidString.lowercased(), type: workoutKey)
-        }
-        anchors[workoutKey] = workoutResult.anchor
-        hasMore = hasMore || workoutResult.hasMore
 
-        return Batch(
-            payload: .init(
-                data: .init(
-                    records: metrics,
-                    sleep: sleepRows,
-                    workouts: workouts,
-                    deletions: deletions
-                )
-            ),
-            anchors: anchors,
-            hasMore: hasMore
-        )
+        return Batch(lanes: lanes)
     }
 
     private struct AnchoredResult {
@@ -633,8 +1155,13 @@ final class HealthKitSyncManager: ObservableObject {
             let query = HKObserverQuery(sampleType: type, predicate: nil) {
                 _, completion, _ in
                 Task { @MainActor in
-                    await self.sync()
-                    completion()
+                    await HealthKitObserverLifecycle
+                        .synchronizeAndAcknowledge(
+                            completion: completion,
+                            synchronize: {
+                                await self.sync()
+                            }
+                        )
                 }
             }
             observerQueries.append(query)
@@ -680,16 +1207,36 @@ final class HealthKitSyncManager: ObservableObject {
             guard PairingStore.shared.load() == pairing else {
                 return false
             }
-            pendingUploadCount = entries.count
-            nextRetryAt = entries.first?.nextAttemptAt
+            applyQueueStatus(entries)
+            queueStatusError = nil
             return true
         } catch {
             if PairingStore.shared.load() == pairing {
                 pendingUploadCount = 0
+                terminalFailureCount = 0
+                latestTerminalFailure = nil
                 nextRetryAt = nil
+                queueStatusError = error.localizedDescription
                 state = .failed(error.localizedDescription)
             }
             return false
+        }
+    }
+
+    private func applyQueueStatus(
+        _ entries: [HealthKitSyncOutboxEntry]
+    ) {
+        let summary = HealthKitSyncQueueSummary(entries: entries)
+        pendingUploadCount = summary.pendingCount
+        terminalFailureCount = summary.terminalFailureCount
+        latestTerminalFailure = summary.latestTerminalFailure
+        nextRetryAt = summary.nextRetryAt
+    }
+
+    private func waitForSyncToQuiesce() async {
+        guard syncInProgress else { return }
+        await withCheckedContinuation { continuation in
+            quiescenceWaiters.append(continuation)
         }
     }
 
@@ -702,23 +1249,14 @@ final class HealthKitSyncManager: ObservableObject {
         syncOperationGate.invalidate()
         lastUploadAt = nil
         pendingUploadCount = 0
+        terminalFailureCount = 0
+        latestTerminalFailure = nil
         nextRetryAt = nil
+        queueStatusError = nil
         isPaused = false
         if state != .unavailable {
             state = .notRequested
         }
-    }
-
-    private func clearPersistedState(for pairing: Pairing) {
-        let fingerprint = pairing.cacheFingerprint
-        let anchorPrefix = "healthmes.healthkit.anchor.\(fingerprint)."
-        defaults.removeObject(forKey: lastUploadKey(fingerprint))
-        defaults.removeObject(forKey: pauseKey(fingerprint))
-        for key in defaults.dictionaryRepresentation().keys
-        where key.hasPrefix(anchorPrefix) {
-            defaults.removeObject(forKey: key)
-        }
-        isPaused = false
     }
 
     private func recordSuccessfulUpload(for pairingFingerprint: String) {

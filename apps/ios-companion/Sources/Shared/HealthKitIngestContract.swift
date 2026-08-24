@@ -231,6 +231,28 @@ public struct HealthKitIngestAck: Codable, Equatable {
         guard sha256.lowercased() == expectedHash else {
             throw HealthKitIngestAckValidationError.hashMismatch
         }
+        guard parseStatus == "parsed" else {
+            throw HealthKitIngestAckValidationError.unsupportedParseStatus(
+                parseStatus
+            )
+        }
+        switch forwardStatus {
+        case "queued", "nothing_mapped":
+            return
+        case "deletions_recorded":
+            // Older servers could persist a tombstone without removing the
+            // canonical derivative. Never advance a deletion anchor on that
+            // acknowledgement; the current server uses HTTP 503 instead.
+            throw HealthKitIngestAckValidationError.deletionForwardingPending
+        case "forward_failed", "skipped_no_user":
+            throw HealthKitIngestAckValidationError.forwardingPending(
+                status: forwardStatus
+            )
+        default:
+            throw HealthKitIngestAckValidationError.unsupportedForwardStatus(
+                forwardStatus
+            )
+        }
     }
 }
 
@@ -242,6 +264,10 @@ public enum HealthKitIngestAckValidationError:
     case notDurable
     case sizeMismatch(expected: Int, received: Int)
     case hashMismatch
+    case unsupportedParseStatus(String)
+    case deletionForwardingPending
+    case forwardingPending(status: String)
+    case unsupportedForwardStatus(String)
 
     public var errorDescription: String? {
         switch self {
@@ -251,6 +277,14 @@ public enum HealthKitIngestAckValidationError:
             return "The HealthKit acknowledgement size did not match the uploaded bytes."
         case .hashMismatch:
             return "The HealthKit acknowledgement hash did not match the uploaded bytes."
+        case .unsupportedParseStatus:
+            return "The personal server did not parse the first-party HealthKit batch."
+        case .deletionForwardingPending:
+            return "The personal server has not removed HealthKit deletions from its canonical data."
+        case .forwardingPending:
+            return "The personal server stored the HealthKit batch but has not finished forwarding it."
+        case .unsupportedForwardStatus:
+            return "The personal server returned an unsupported HealthKit forwarding status."
         }
     }
 }
@@ -285,14 +319,49 @@ public enum HealthKitUploadFailureDisposition: Equatable, Sendable {
                 return .terminal(reason: "HealthMes is not paired.")
             }
         }
-        if error is HealthKitIngestAckValidationError
-            || error is HealthKitUploadRequestError
-        {
+        if let error = error as? HealthKitIngestAckValidationError {
+            if case .forwardingPending = error {
+                return .retryable
+            }
+            if case .deletionForwardingPending = error {
+                return .retryable
+            }
+            return .terminal(
+                reason: "The HealthKit acknowledgement contract failed."
+            )
+        }
+        if error is HealthKitUploadRequestError {
             return .terminal(
                 reason: "The HealthKit acknowledgement contract failed."
             )
         }
         return .retryable
+    }
+
+    public static func shouldQuarantineAfterAutomaticRetries(
+        _: Error,
+        failedAttempts _: Int,
+        isManualRetry _: Bool = false,
+        retryPolicy _: HealthKitSyncRetryPolicy = .default
+    ) -> Bool {
+        false
+    }
+
+    public static func countsTowardAutomaticQuarantine(
+        _: Error,
+        isManualRetry _: Bool = false
+    ) -> Bool {
+        false
+    }
+
+    /// Raw durability alone is not canonical replay durability. Until the
+    /// server owns a transactional replay worker, every unsuccessful upload
+    /// keeps its exact body, idempotency key, and candidate anchor fail-closed.
+    public static func permitsAnchorAdvance(
+        _: Error,
+        isManualRetry _: Bool = false
+    ) -> Bool {
+        false
     }
 
     private static func isRetryable(status: Int) -> Bool {

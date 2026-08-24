@@ -1540,7 +1540,7 @@ private struct WorkspaceAgentCanvas: View {
     }
 
     private var executionSummary: String {
-        guard let scene else { return "승인할 변경 없음" }
+        guard scene != nil else { return "승인할 변경 없음" }
         if activeDecision != nil {
             return busyProposalID == nil ? "사용자 승인 대기" : "Calendar 반영 요청 중"
         }

@@ -57,7 +57,7 @@ pairing별 encrypted outbox
 POST /v1/ingest/healthkit
             |
             v
-durable ACK -> anchor 확정
+durable ACK + accepted forward status -> anchor 확정
 ```
 
 대시보드 카드 하나를 갱신하기 위해 Hermes를 호출하지 않는다. 반대로 사용자의
@@ -224,6 +224,23 @@ pairing 변경 시 진행 중 upload를 취소하고 현재 operation이 여전�
 fingerprint인지 다시 확인한다. A에서 만든 payload를 B로 보내거나 A의 anchor를
 B의 수집 시작점으로 사용하는 것은 금지한다.
 
+pairing 교체와 해제는 persisted transition journal을 사용한다. candidate
+credential을 별도 Keychain slot에 먼저 저장한 뒤 journal을 `prepared`로
+확정한다. journal을 쓰기 전 `PairingRelayGate`가 새 Watch/notification relay를
+차단하고 이미 lease를 얻은 이전 pairing relay가 끝날 때까지 기다린다. 그 뒤
+이전 pairing의 queue와 anchor 정리를 시작하기 직전에
+`cleanupStarted`를 기록한다. journal이 존재하는 동안 iPhone, Watch, widget과
+macOS reader는 active pairing과 cache identity를 노출하지 않는 fail-closed
+상태다. 앱이 종료되어도 다음 foreground/background lifecycle이 정리를
+재실행하고 전환을 commit한다. `cleanupStarted` 이후에는 일반 clear/abort가
+journal을 지울 수 없다.
+
+사용자가 명시적으로 연결 해제를 요청했는데 손상된 pairing record에서 이전
+fingerprint를 검증할 수 없다면 특정 namespace만 안전하게 고를 수 없다. 이때는
+HealthKit encrypted outbox 전체와 모든 HealthKit anchor, pause, last-upload
+로컬 상태를 privacy purge한다. 자동 복구나 pairing 교체에서는 이 전역 삭제를
+수행하지 않고 fail-closed 상태를 유지한다.
+
 outbox payload는 기기 저장소에 평문으로 두지 않는다. 현재 outbox primitive는
 AES-GCM sealed file과
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` Keychain key를 사용한다.
@@ -246,7 +263,7 @@ queue에는 최소한 다음 값을 원자적으로 보존한다.
 1. HealthKit에서 next batch와 candidate anchors를 읽음
 2. exact bytes + Idempotency-Key + candidate anchors를 encrypted outbox에 저장
 3. 저장된 exact bytes를 POST /v1/ingest/healthkit으로 전송
-4. HTTP 202, durable=true, sha256와 size_bytes 일치를 검증
+4. HTTP 202, durable=true, sha256와 size_bytes 및 accepted forward status를 검증
 5. candidate anchors를 해당 pairing namespace에 확정
 6. outbox item 삭제
 ```
@@ -261,8 +278,26 @@ queue에는 최소한 다음 값을 원자적으로 보존한다.
 - 같은 `Idempotency-Key` + 다른 bytes: `409 idempotency_conflict`
 - native `healthmes.healthkit.v1`: `Idempotency-Key` 필수
 
-`durable=true`는 raw payload와 receipt가 서버의 durability 경계를 통과했다는
-뜻이다. Open Wearables 정규화 완료를 뜻하지 않는다.
+`durable=true`는 raw payload가 서버의 durability 경계를 통과했다는 뜻이다.
+그러나 iPhone은 `queued` 또는 `nothing_mapped`만 accepted 상태로 보고
+anchor를 확정한다. 현재 서버가 삭제가 포함된 native batch에 반환하는
+`503 healthkit_deletion_pending`은 raw payload와 tombstone이 durable하더라도
+canonical Open Wearables 데이터까지 삭제하지 못했다는 뜻이다. iPhone은 이
+응답에서 deletion anchor를 확정하거나 outbox item을 삭제하지 않고 같은 exact
+bytes와 key로 재시도한다. 구버전 서버가 반환할 수 있는 `202
+forward_status=deletions_recorded`도 같은 이유로 retryable로 처리하며 accepted
+상태로 사용하지 않는다. `forward_failed`와 `skipped_no_user`에서도 서버 receipt와
+iPhone outbox를 미완료로 유지하고 같은 exact bytes와 key로 재시도한다.
+
+`forward_failed`, `skipped_no_user`, 일반 네트워크·`5xx` 실패는 모두 candidate
+anchor를 확정하지 않고 encrypted outbox에서 exponential backoff로 재시도한다.
+영구적인 client-side 거부는 terminal 항목으로 보존하고 해당 HealthKit lane만
+차단한다. 다른 lane은 계속 수집·전송할 수 있으며 사용자는 Settings에서 terminal
+항목을 확인하고 수동 재시도하거나 queue를 제거할 수 있다. 폐기된 구버전 정책이
+남긴 미확정 terminal 항목은 다음 drain에서 retryable 상태로 마이그레이션한다.
+삭제 보류(`503 healthkit_deletion_pending` 또는 legacy
+`deletions_recorded`)도 deletion anchor를 건너뛰지 않고 같은 exact bytes와 key로
+계속 재시도한다.
 
 ## 6. Legacy Health Auto Export 호환
 
@@ -317,16 +352,20 @@ Apple UI/Main 통합 브랜치가 소유하는 범위:
 - Swift native payload/ACK 모델과 anchored HealthKit query
 - AES-GCM encrypted `HealthKitSyncOutbox`와 격리·재시도 단위 테스트
 - manager의 outbox-first 저장, stable `Idempotency-Key` 재전송과 ACK hash/size 검증
-- durable ACK 뒤 pairing별 anchor 확정과 queue 삭제
+- durable ACK와 accepted forward status 뒤 pairing별 anchor 확정과 queue 삭제
+- forwarding 실패에서 anchor를 확정하지 않는 fail-closed retry와 lane별 차단
+- 구버전 미확정 terminal journal을 retryable 상태로 복구하는 encrypted migration
+- pairing relay lease/fence와 fingerprint 불명 명시적 unpair의 전체 privacy purge
 - Settings의 pending 수, retry, pause/resume와 현재 pairing queue 삭제
 - idempotency header가 있는 excessive-depth JSON의 raw-first 보존 회귀 테스트
 - receipt/tombstone migration head, metadata parity와 populated downgrade test
 
-Open Wearables 전달은 raw durability 뒤의 best-effort 후처리다. Open Wearables SDK
-endpoint가 HealthMes idempotency key를 받지 않으므로 외부 `202` 직후 프로세스
-종료까지 포함한 upstream exactly-once를 이 adapter만으로 주장하지 않는다. 원문은
-Main raw store에 남아 재처리 가능한 정본이고, iPhone에는 서버 durable ACK만
-collector anchor 확정 조건으로 사용한다.
+Open Wearables 전달은 raw durability 뒤의 후처리다. 전달 실패나 사용자 연결
+미완료 ACK에서는 같은 receipt와 iPhone outbox를 유지해 재시도한다. Open
+Wearables SDK endpoint가 HealthMes idempotency key를 받지 않으므로 외부 `202`
+직후 프로세스 종료까지 포함한 upstream exactly-once를 이 adapter만으로
+주장하지 않는다. 원문은 Main raw store에 남고, iPhone은 durable ACK와 accepted
+forward status를 모두 collector anchor 확정 조건으로 사용한다.
 
 저장소 검증과 제품 enablement도 구분한다. simulator contract/outbox test와
 unsigned iOS/watchOS/macOS build는 repository 범위에서 검증하지만, 실제 HealthKit
@@ -340,7 +379,8 @@ signed hardware QA가 필요하다.
 1. 같은 batch 재시도에서 `Idempotency-Key`와 body bytes가 동일하다.
 2. 같은 key에 다른 whitespace 또는 key order의 body를 보내면 `409`가 난다.
 3. ACK가 유실되어도 raw graph와 upstream enqueue가 중복되지 않는다.
-4. `durable=true`와 hash/size가 일치하기 전에는 anchor가 이동하지 않는다.
+4. `durable=true`, hash/size와 accepted forward status가 일치하기 전에는
+   어떤 retry 횟수에서도 anchor가 이동하지 않는다.
 5. pairing 변경 뒤 이전 queue가 새 server로 전송되지 않는다.
 6. outbox 파일만으로 HealthKit 원문을 평문 복구할 수 없다.
 7. 앱 종료, 네트워크 단절과 재실행 뒤 pending batch가 복구된다.

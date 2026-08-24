@@ -7,7 +7,8 @@ import WatchConnectivity
 /// context is delivered whenever the watch app next runs.
 final class PhoneWatchSync: NSObject, WCSessionDelegate {
     static let shared = PhoneWatchSync()
-    private var pendingContext: [String: Any]?
+    private let pendingContext =
+        LockedLatestValue<[String: Any]>()
     private var pendingUserInfo: [[String: Any]] = []
     private let pendingUserInfoLock = NSLock()
 
@@ -20,40 +21,59 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
     }
 
     func pushPairing(baseURL: String, token: String) {
-        push([
-            PairingSyncKeys.baseURL: baseURL,
-            PairingSyncKeys.token: token,
-        ])
+        guard
+            let state = try? PairingStore.shared.stableSyncState(),
+            let pairing = state.pairing,
+            pairing.baseURL.absoluteString == baseURL,
+            pairing.token == Pairing(baseURL: pairing.baseURL, token: token).token
+        else {
+            return
+        }
+        push(PairingSyncKeys.context(for: state))
     }
 
     func pushUnpair() {
-        push([PairingSyncKeys.baseURL: "", PairingSyncKeys.token: ""])
+        guard
+            let state = try? PairingStore.shared.stableSyncState(),
+            state.pairing == nil
+        else {
+            return
+        }
+        push(PairingSyncKeys.context(for: state))
     }
 
     private func push(_ context: [String: Any]) {
         guard WCSession.isSupported() else { return }
-        pendingContext = context
+        clearPendingUserInfo()
+        replacePendingContext(with: context)
         deliverPendingContext()
     }
 
     private func queuePersistedPairing() {
-        pendingContext = PairingSyncKeys.context(
-            for: PairingStore.shared.load()
-        )
+        guard
+            let context = try? PairingStore.shared.stableSyncState()
+        else { return }
+        replacePendingContext(with: PairingSyncKeys.context(for: context))
     }
 
     private func deliverPendingContext() {
         guard
             WCSession.isSupported(),
-            WCSession.default.activationState == .activated,
-            let pendingContext
+            WCSession.default.activationState == .activated
         else { return }
         do {
-            try WCSession.default.updateApplicationContext(pendingContext)
-            self.pendingContext = nil
+            try pendingContext.deliver { context in
+                try WCSession.default.updateApplicationContext(context)
+            }
         } catch {
             // Retained and retried after the next activation transition.
         }
+    }
+
+    private func replacePendingContext(
+        with context: [String: Any]
+    ) {
+        pendingContext.replace(with: context)
     }
 
     // MARK: WCSessionDelegate (iOS)
@@ -78,7 +98,16 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         guard
             let command = userInfo[SpeakCommandSyncKeys.command] as? String,
-            !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            let generation = PairingScope.generation(
+                from: userInfo[SpeakCommandSyncKeys.pairingGeneration]
+            ),
+            let pairing = PairingScope.matchingPairing(
+                fingerprint:
+                    userInfo[SpeakCommandSyncKeys.pairingFingerprint]
+                    as? String,
+                generation: generation
+            )
         else { return }
 
         let requestID =
@@ -92,7 +121,9 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
             await relayToHealthMes(
                 command: command,
                 requestID: requestID,
-                proposalID: proposalID
+                proposalID: proposalID,
+                pairing: pairing,
+                generation: generation
             )
         }
     }
@@ -106,8 +137,19 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
     private func relayToHealthMes(
         command: String,
         requestID: String,
-        proposalID: UUID?
+        proposalID: UUID?,
+        pairing: Pairing,
+        generation: UInt64
     ) async {
+        guard
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing
+            )
+        else { return }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
+        guard PairingStore.shared.load() == pairing else { return }
         do {
             let presentation = try await HealthMesAPI().createWellnessDecision(
                 question: WellnessDecisionWatchRelay.question(
@@ -115,24 +157,32 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
                     proposalID: proposalID
                 ),
                 idempotencyKey: requestID,
-                lens: proposalID == nil ? .now : .coordinate
+                lens: proposalID == nil ? .now : .coordinate,
+                pairing: pairing
             )
             let scene = presentation.scene
             let detail = AlertNotificationContent.compactLine(
                 scene.summary,
                 limit: 120
             )
+            guard PairingStore.shared.load() == pairing else { return }
             sendSpeakResult(
                 requestID: requestID,
                 status: presentation.output.status.rawValue,
                 title: scene.title,
-                detail: detail
+                detail: detail,
+                pairingFingerprint: pairing.cacheFingerprint,
+                pairingGeneration: generation
             )
-            await NotificationManager.shared.postOutcome(
-                title: String(localized: "HealthMes processed your instruction"),
-                body: detail
-            )
+            if PairingStore.shared.load() == pairing {
+                await NotificationManager.shared.postOutcome(
+                    title: String(localized: "HealthMes processed your instruction"),
+                    body: detail,
+                    pairing: pairing
+                )
+            }
         } catch {
+            guard PairingStore.shared.load() == pairing else { return }
             let detail = String(
                 localized:
                     "Check the connection to your paired HealthMes instance and try again."
@@ -141,11 +191,14 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
                 requestID: requestID,
                 status: "failed",
                 title: String(localized: "HealthMes could not process the instruction"),
-                detail: detail
+                detail: detail,
+                pairingFingerprint: pairing.cacheFingerprint,
+                pairingGeneration: generation
             )
             await NotificationManager.shared.postOutcome(
                 title: String(localized: "HealthMes command failed"),
-                body: detail
+                body: detail,
+                pairing: pairing
             )
         }
     }
@@ -154,11 +207,17 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
         requestID: String,
         status: String,
         title: String,
-        detail: String
+        detail: String,
+        pairingFingerprint: String,
+        pairingGeneration: UInt64
     ) {
         guard WCSession.isSupported() else { return }
         enqueueUserInfo([
             SpeakCommandSyncKeys.requestID: requestID,
+            SpeakCommandSyncKeys.pairingFingerprint: pairingFingerprint,
+            SpeakCommandSyncKeys.pairingGeneration: NSNumber(
+                value: pairingGeneration
+            ),
             SpeakCommandSyncKeys.resultStatus: status,
             SpeakCommandSyncKeys.resultTitle: title,
             SpeakCommandSyncKeys.resultDetail: detail,
@@ -174,7 +233,7 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
             WCSession.default.activate()
             return
         }
-        for userInfo in takePendingUserInfo() {
+        for userInfo in takePendingUserInfo() where isCurrent(userInfo) {
             WCSession.default.transferUserInfo(userInfo)
         }
     }
@@ -191,5 +250,28 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
         let queued = pendingUserInfo
         pendingUserInfo.removeAll()
         return queued
+    }
+
+    private func clearPendingUserInfo() {
+        pendingUserInfoLock.lock()
+        defer { pendingUserInfoLock.unlock() }
+        pendingUserInfo.removeAll()
+    }
+
+    private func isCurrent(_ userInfo: [String: Any]) -> Bool {
+        guard
+            let fingerprint = userInfo[
+                SpeakCommandSyncKeys.pairingFingerprint
+            ] as? String,
+            let generation = PairingScope.generation(
+                from: userInfo[SpeakCommandSyncKeys.pairingGeneration]
+            )
+        else {
+            return false
+        }
+        return PairingScope.matchingPairing(
+            fingerprint: fingerprint,
+            generation: generation
+        ) != nil
     }
 }

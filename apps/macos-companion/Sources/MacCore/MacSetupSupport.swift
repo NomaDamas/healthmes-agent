@@ -30,7 +30,7 @@ struct MacSetupEvent: Decodable, Equatable, Identifiable {
 
 enum MacSetupSupport {
     static let defaultRuntimeRevision =
-        "31208ad4a7a87d0fc751a7c97f8173f78be1f03f"
+        "beda2d7cc88536979a0aa24f490629f9d88d6a25"
     static let officialRepositoryURL = URL(
         string: "https://github.com/NomaDamas/healthmes-agent.git"
     )!

@@ -15,8 +15,14 @@ struct HealthMesMacApp: App {
         let router = MacAppRouter()
         let dashboardStore = MacDashboardStore()
         notifications.bootstrap()
-        store.onAlertsRefreshed = { alerts, proposals in
-            notifications.process(alerts: alerts, pendingProposals: proposals)
+        store.onAlertsRefreshed = { alerts, proposals, pairing in
+            Task {
+                await notifications.process(
+                    alerts: alerts,
+                    pendingProposals: proposals,
+                    pairing: pairing
+                )
+            }
         }
         store.start()
         _store = StateObject(wrappedValue: store)

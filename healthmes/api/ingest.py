@@ -8,8 +8,10 @@ forward into open-wearables so the energy loop sees them.
 ``POST /v1/ingest/raw`` accepts anything from any future source.
 
 Bearer auth comes from the global /v1 middleware (healthmes/api/auth.py).
-Responses are 202 whenever the raw payload is durable — parse and forward
-outcomes are reported in the body, never as request failures.
+Raw bytes remain durable even when parsing or forwarding fails. First-party
+deletion batches fail closed with a retryable 503 until open-wearables can
+remove the corresponding canonical records; all other forward outcomes are
+reported in the 202 response body.
 """
 
 import hashlib
@@ -19,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 import anyio
 import anyio.to_thread
@@ -38,7 +40,9 @@ from healthmes.durable_files import (
 from healthmes.ingest import (
     HealthKitNativeBatch,
     IngestForwardError,
+    InvalidHealthKitPayloadError,
     forward_sdk_sync,
+    is_healthkit_v1_payload,
     store_raw,
     transform_hae,
     transform_healthkit_v1,
@@ -686,13 +690,17 @@ def _native_forward_status(
     *,
     user_id: str,
 ) -> str:
+    if batch.deletions:
+        # The open-wearables SDK sync contract has no deletion field, and its
+        # event DELETE routes require internal record UUIDs rather than the
+        # HealthKit sample IDs carried here. Do not partially forward a mixed
+        # batch or acknowledge deletion anchors until that contract exists.
+        return "deletion_pending"
     has_forwardable_rows = bool(
         batch.records or batch.sleep or batch.workouts
     )
     if has_forwardable_rows:
         return "pending" if user_id else "skipped_no_user"
-    if batch.deletions:
-        return "deletions_recorded"
     return "nothing_mapped"
 
 
@@ -701,7 +709,7 @@ async def _ingest_native_healthkit(
     *,
     bind,
     body: bytes,
-    batch: HealthKitNativeBatch,
+    payload: Any,
 ) -> IngestAck:
     settings = request.app.state.settings
     idempotency_key = _native_idempotency_key(request)
@@ -742,6 +750,35 @@ async def _ingest_native_healthkit(
                     "HealthKit receipt references a missing raw ingest row"
                 )
             persistence_uncertain = False
+
+        try:
+            batch = transform_healthkit_v1(payload)
+            assert batch is not None
+        except InvalidHealthKitPayloadError as exc:
+            rejection_detail = str(exc)[:255]
+            rejection_path = exc.path
+            await anyio.to_thread.run_sync(
+                lambda: _update_healthkit_state(
+                    bind,
+                    initial,
+                    parse_status="parsed",
+                    forward_status="rejected_invalid_payload",
+                    forward_detail=rejection_detail,
+                    records_forwarded=0,
+                )
+            )
+            raise APIError(
+                422,
+                "invalid_healthkit_payload",
+                (
+                    "The first-party HealthKit payload does not match "
+                    "its wire contract."
+                ),
+                detail={
+                    "raw_id": str(initial.raw_id),
+                    "path": rejection_path,
+                },
+            ) from exc
 
         suppressed_ids = await anyio.to_thread.run_sync(
             lambda: receipt_store.apply_deletions(
@@ -799,6 +836,20 @@ async def _ingest_native_healthkit(
                 records_forwarded=records_forwarded,
             )
         )
+        if forward_status == "deletion_pending":
+            raise APIError(
+                503,
+                "healthkit_deletion_pending",
+                (
+                    "HealthKit deletions are durable in HealthMes but cannot "
+                    "be removed from the Open Wearables canonical query layer "
+                    "with its current public API."
+                ),
+                detail={
+                    "raw_id": str(initial.raw_id),
+                    "deletions_received": len(batch.deletions),
+                },
+            )
         ack = _ack(
             status_update.ack_state,
             records_forwarded=records_forwarded,
@@ -812,7 +863,6 @@ async def _ingest_native_healthkit(
         )
         if forward_status in {
             "queued",
-            "deletions_recorded",
             "nothing_mapped",
         }:
             stored_ack = await anyio.to_thread.run_sync(
@@ -859,8 +909,7 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
             payload = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             pass
-        native_batch = transform_healthkit_v1(payload)
-        if native_batch is not None:
+        if is_healthkit_v1_payload(payload):
             try:
                 _native_idempotency_key(request)
             except APIError as exc:
@@ -875,7 +924,7 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
                 request,
                 bind=bind,
                 body=body,
-                batch=native_batch,
+                payload=payload,
             )
 
     persisted = await anyio.to_thread.run_sync(
@@ -896,7 +945,34 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         parse_status = "stored_unparsed"
 
-    if transform_healthkit_v1(payload) is not None:
+    if is_healthkit_v1_payload(payload):
+        try:
+            transform_healthkit_v1(payload)
+        except InvalidHealthKitPayloadError as exc:
+            rejection_detail = str(exc)[:255]
+            rejection_path = exc.path
+            await anyio.to_thread.run_sync(
+                lambda: _update_healthkit_state(
+                    bind,
+                    initial,
+                    parse_status="parsed",
+                    forward_status="rejected_invalid_payload",
+                    forward_detail=rejection_detail,
+                    records_forwarded=0,
+                )
+            )
+            raise APIError(
+                422,
+                "invalid_healthkit_payload",
+                (
+                    "The first-party HealthKit payload does not match "
+                    "its wire contract."
+                ),
+                detail={
+                    "raw_id": str(initial.raw_id),
+                    "path": rejection_path,
+                },
+            )
         await anyio.to_thread.run_sync(
             lambda: _update_healthkit_state(
                 bind,

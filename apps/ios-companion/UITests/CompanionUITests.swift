@@ -220,7 +220,11 @@ final class CompanionUITests: XCTestCase {
     /// the HealthMes app.
     func testExpandedDecisionNotificationShowsNoYesAndInlineSpeak() throws {
         let app = XCUIApplication()
-        app.launchArguments += ["-healthmes-notification-demo"]
+        app.launchArguments += [
+            "-healthmes-ui-test-base-url",
+            "http://127.0.0.1:8201",
+            "-healthmes-notification-demo",
+        ]
 
         addUIInterruptionMonitor(withDescription: "Notification permission") { alert in
             let allow = alert.buttons["허용"].exists ? alert.buttons["허용"] : alert.buttons["Allow"]

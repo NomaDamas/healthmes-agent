@@ -29,10 +29,26 @@ public final class MacNotificationManager: NSObject, ObservableObject {
 
     private let api: HealthMesAPI
     private let seenStore: SeenAlertsStore
+    private let pairingStore: PairingStore
+    private let defaults: UserDefaults
+    private let notificationOperations: MacNotificationOperations?
+    private var notificationGeneration: UInt64 = 0
+    private var isProcessing = false
+    private var processWaiters: [CheckedContinuation<Void, Never>] = []
 
-    public init(api: HealthMesAPI = HealthMesAPI(), seenStore: SeenAlertsStore = .shared) {
+    public init(
+        api: HealthMesAPI = HealthMesAPI(),
+        seenStore: SeenAlertsStore = .shared,
+        pairingStore: PairingStore = .shared,
+        defaults: UserDefaults = .standard,
+        notificationOperations: MacNotificationOperations? = nil
+    ) {
         self.api = api
         self.seenStore = seenStore
+        self.pairingStore = pairingStore
+        self.defaults = defaults
+        self.notificationOperations =
+            notificationOperations ?? Self.liveNotificationOperations()
         super.init()
     }
 
@@ -44,7 +60,7 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     }
 
     public var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: Self.enabledDefaultsKey)
+        defaults.bool(forKey: Self.enabledDefaultsKey)
     }
 
     /// Called once at app launch: wire the delegate + categories so action
@@ -55,6 +71,17 @@ public final class MacNotificationManager: NSObject, ObservableObject {
         registerCategories(center)
     }
 
+    public func clearAccountSurfaces() async -> Bool {
+        guard let notificationOperations else { return true }
+        let result = await NotificationDeletionBarrier().clear(
+            using: notificationOperations.deletionSurface
+        )
+        if case .success = result {
+            return true
+        }
+        return false
+    }
+
     /// Settings toggle handler. Enabling requests authorization and primes
     /// the seen-store with the current history so an existing backlog never
     /// replays as a notification storm.
@@ -63,8 +90,10 @@ public final class MacNotificationManager: NSObject, ObservableObject {
         currentAlerts: [AlertItem],
         hasLoadedAlerts: Bool
     ) async {
+        notificationGeneration &+= 1
+        let generation = notificationGeneration
         guard enabled else {
-            UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
+            defaults.set(false, forKey: Self.enabledDefaultsKey)
             return
         }
         if hasLoadedAlerts {
@@ -73,23 +102,57 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             seenStore.deferPrimingUntilNextFeed()
         }
         guard let center else {
-            UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
+            defaults.set(false, forKey: Self.enabledDefaultsKey)
             return
         }
         let granted =
             (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+        guard generation == notificationGeneration else { return }
         authorizationDenied = !granted
-        UserDefaults.standard.set(granted, forKey: Self.enabledDefaultsKey)
+        defaults.set(granted, forKey: Self.enabledDefaultsKey)
     }
 
     /// Store hook: post exactly one notification per not-yet-seen alert.
-    public func process(alerts: [AlertItem], pendingProposals _: [ProposalItem]) {
-        guard isEnabled, let center else { return }
+    public func process(
+        alerts: [AlertItem],
+        pendingProposals _: [ProposalItem],
+        pairing: Pairing
+    ) async {
+        await acquireProcessingSlot()
+        defer { releaseProcessingSlot() }
+        let generation = notificationGeneration
+        guard
+            isEnabled,
+            let notificationOperations,
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing,
+                store: pairingStore
+            )
+        else { return }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
         let unseen = seenStore.unseenOrPrime(from: alerts)
         guard !unseen.isEmpty else { return }
+        guard
+            let identity = pairingStore.cacheIdentity(for: pairing)
+        else {
+            return
+        }
 
+        var scheduled: [AlertItem] = []
+        var shouldRetry = false
         for alert in unseen {
-            let content = AlertNotificationContent.from(alert: alert)
+            guard
+                generation == notificationGeneration,
+                isEnabled,
+                currentPairing(identity: identity) == pairing
+            else { break }
+            let content = AlertNotificationContent.from(
+                alert: alert,
+                pairingFingerprint: identity.fingerprint,
+                pairingGeneration: identity.generation
+            )
             let unContent = UNMutableNotificationContent()
             unContent.title = content.title
             unContent.subtitle = content.subtitle
@@ -98,15 +161,146 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             unContent.threadIdentifier = content.threadID
             unContent.userInfo = content.userInfo
             unContent.sound = .default
-            center.add(
-                UNNotificationRequest(
-                    identifier: "healthmes-alert-\(alert.id.uuidString.lowercased())",
+            let identifier =
+                "healthmes-alert-\(alert.id.uuidString.lowercased())"
+            do {
+                let request = UNNotificationRequest(
+                    identifier: identifier,
                     content: unContent,
                     trigger: nil
                 )
+                try await pairingStore.withPairingLease(
+                    for: pairing
+                ) {
+                    try await notificationOperations.add(request)
+                }
+                guard
+                    generation == notificationGeneration,
+                    isEnabled
+                else {
+                    removeNotification(
+                        identifier,
+                        using: notificationOperations
+                    )
+                    break
+                }
+            } catch {
+                if let pairingError = error as? PairingError,
+                    pairingError == .storageLockFailed
+                    || pairingError == .transitionInProgress
+                {
+                    shouldRetry = true
+                }
+                continue
+            }
+            guard currentPairing(identity: identity) == pairing else {
+                removeNotification(identifier, using: notificationOperations)
+                continue
+            }
+            scheduled.append(alert)
+        }
+        seenStore.markSeen(scheduled)
+        guard shouldRetry,
+            generation == notificationGeneration,
+            isEnabled
+        else { return }
+        scheduleRetry(
+            alerts: alerts,
+            pairing: pairing,
+            generation: generation
+        )
+    }
+
+    private func removeNotification(
+        _ identifier: String,
+        using operations: MacNotificationOperations
+    ) {
+        operations.removePending([identifier])
+        operations.removeDelivered([identifier])
+    }
+
+    private func acquireProcessingSlot() async {
+        if !isProcessing {
+            isProcessing = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            processWaiters.append(continuation)
+        }
+    }
+
+    private func releaseProcessingSlot() {
+        if processWaiters.isEmpty {
+            isProcessing = false
+        } else {
+            processWaiters.removeFirst().resume()
+        }
+    }
+
+    private func scheduleRetry(
+        alerts: [AlertItem],
+        pairing: Pairing,
+        generation: UInt64
+    ) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard
+                let self,
+                self.notificationGeneration == generation,
+                self.isEnabled
+            else { return }
+            await self.process(
+                alerts: alerts,
+                pendingProposals: [],
+                pairing: pairing
             )
         }
-        seenStore.markSeen(unseen)
+    }
+
+    private func currentPairing(
+        identity: PairingCacheIdentity
+    ) -> Pairing? {
+        PairingScope.matchingPairing(
+            fingerprint: identity.fingerprint,
+            generation: identity.generation,
+            store: pairingStore
+        )
+    }
+
+    private static func liveNotificationOperations()
+        -> MacNotificationOperations?
+    {
+        guard Bundle.main.bundleIdentifier != nil else { return nil }
+        let center = UNUserNotificationCenter.current()
+        return MacNotificationOperations(
+            add: { request in
+                try await center.add(request)
+            },
+            removePending: { identifiers in
+                center.removePendingNotificationRequests(
+                    withIdentifiers: identifiers
+                )
+            },
+            removeDelivered: { identifiers in
+                center.removeDeliveredNotifications(
+                    withIdentifiers: identifiers
+                )
+            },
+            deletionSurface: NotificationSurface(
+                removeAll: {
+                    center.removeAllPendingNotificationRequests()
+                    center.removeAllDeliveredNotifications()
+                },
+                snapshot: {
+                    async let pending = center.pendingNotificationRequests()
+                    async let delivered = center.deliveredNotifications()
+                    return await NotificationSurfaceSnapshot(
+                        pendingCount: pending.count,
+                        deliveredCount: delivered.count
+                    )
+                }
+            )
+        )
     }
 
     private func registerCategories(_ center: UNUserNotificationCenter) {
@@ -136,6 +330,19 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     }
 
     private func handle(actionIdentifier: String, userInfo: [String: String]) async {
+        guard
+            let pairing = PairingScope.matchingPairing(
+                fingerprint: userInfo[
+                    AlertNotificationContent.userInfoPairingFingerprint
+                ],
+                generation: PairingScope.generation(
+                    from: userInfo[
+                        AlertNotificationContent.userInfoPairingGeneration
+                    ]
+                ),
+                store: pairingStore
+            )
+        else { return }
         let decisionURL = userInfo[AlertNotificationContent.userInfoDecisionURL]
             .flatMap(URL.init(string:))
 
@@ -148,10 +355,25 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             let action: ProposalAction = actionIdentifier == ActionID.yes ? .accept : .decline
             let outcome: ProposalOutcome
             do {
-                let proposal = try await api.getProposal(proposalID)
+                guard
+                    let relayLease = PairingRelayGate.shared.begin(
+                        pairing: pairing,
+                        store: pairingStore
+                    )
+                else { return }
+                defer {
+                    PairingRelayGate.shared.end(relayLease)
+                }
+                let proposal = try await api.getProposal(
+                    proposalID,
+                    pairing: pairing
+                )
                 if proposal.isActionable {
                     let resolved = try await api.resolveProposal(
-                        proposal, action: action, surface: "mac_notification"
+                        proposal,
+                        action: action,
+                        surface: "mac_notification",
+                        pairing: pairing
                     )
                     outcome = ProposalOutcome.from(
                         action: action,
@@ -166,12 +388,15 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             } catch {
                 outcome = .failed
             }
-            postOutcomeNotification(outcome)
+            guard pairingStore.load() == pairing else { return }
+            await postOutcomeNotification(
+                outcome,
+                pairing: pairing
+            )
 
         case UNNotificationDefaultActionIdentifier:
             if let decisionURL {
                 if
-                    let pairing = PairingStore.shared.load(),
                     ViewerURL.hasSameOrigin(decisionURL, as: pairing.baseURL)
                 {
                     NSWorkspace.shared.open(
@@ -187,8 +412,58 @@ public final class MacNotificationManager: NSObject, ObservableObject {
         }
     }
 
-    private func postOutcomeNotification(_ outcome: ProposalOutcome) {
-        guard let center else { return }
+    private func postOutcomeNotification(
+        _ outcome: ProposalOutcome,
+        pairing: Pairing
+    ) async {
+        let generation = notificationGeneration
+        guard
+            isEnabled,
+            let notificationOperations,
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing,
+                store: pairingStore
+            )
+        else {
+            return
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
+        guard let identity = pairingStore.cacheIdentity(for: pairing) else {
+            return
+        }
+        let content = Self.outcomeNotificationContent(
+            outcome,
+            identity: identity
+        )
+        let identifier = "healthmes-outcome-\(UUID().uuidString)"
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: nil
+        )
+        do {
+            try await pairingStore.withPairingLease(for: pairing) {
+                try await notificationOperations.add(request)
+            }
+        } catch {
+            return
+        }
+        guard
+            generation == notificationGeneration,
+            isEnabled,
+            currentPairing(identity: identity) == pairing
+        else {
+            removeNotification(identifier, using: notificationOperations)
+            return
+        }
+    }
+
+    static func outcomeNotificationContent(
+        _ outcome: ProposalOutcome,
+        identity: PairingCacheIdentity
+    ) -> UNMutableNotificationContent {
         let content = UNMutableNotificationContent()
         switch outcome {
         case .accepted:
@@ -205,13 +480,32 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             content.title = String(localized: "proposal.actionFailed")
         }
         content.categoryIdentifier = AlertNotificationContent.infoCategoryID
-        center.add(
-            UNNotificationRequest(
-                identifier: "healthmes-outcome-\(UUID().uuidString)",
-                content: content,
-                trigger: nil
-            )
-        )
+        content.userInfo = [
+            AlertNotificationContent.userInfoPairingFingerprint:
+                identity.fingerprint,
+            AlertNotificationContent.userInfoPairingGeneration:
+                String(identity.generation)
+        ]
+        return content
+    }
+}
+
+public struct MacNotificationOperations {
+    public let add: (UNNotificationRequest) async throws -> Void
+    public let removePending: ([String]) -> Void
+    public let removeDelivered: ([String]) -> Void
+    public let deletionSurface: NotificationSurface
+
+    public init(
+        add: @escaping (UNNotificationRequest) async throws -> Void,
+        removePending: @escaping ([String]) -> Void,
+        removeDelivered: @escaping ([String]) -> Void = { _ in },
+        deletionSurface: NotificationSurface
+    ) {
+        self.add = add
+        self.removePending = removePending
+        self.removeDelivered = removeDelivered
+        self.deletionSurface = deletionSurface
     }
 }
 

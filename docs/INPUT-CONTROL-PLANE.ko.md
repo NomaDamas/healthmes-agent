@@ -138,7 +138,8 @@ retention과 Decision 접근 동의는 같은 one-page Settings에서 서버 sou
 first-party HealthKit upload는 pairing fingerprint별 encrypted outbox를 거친다.
 각 outbox item은 exact request bytes, stable `Idempotency-Key`와 candidate
 anchors를 함께 보존한다. 서버가 `202`, `durable=true`, 일치하는 `sha256`와
-`size_bytes`를 반환한 뒤에만 해당 pairing namespace의 anchor를 확정한다.
+`size_bytes`, 그리고 accepted forward status를 반환한 뒤에만 해당 pairing
+namespace의 anchor를 확정한다.
 
 ### 설정 변경
 
@@ -692,8 +693,8 @@ raw-first는 정상 payload에만 적용되는 설명이 아니라 모든 수신
 11. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
 12. iPhone과 macOS는 one-page Settings에서 같은 `/v1/inputs` 서버 정본을
     렌더링한다. 한 앱의 local copy를 다른 앱의 정본으로 사용하지 않는다.
-13. HealthKit outbox와 anchor는 pairing fingerprint별로 격리하고, durable ACK
-    전에는 anchor를 이동하지 않는다.
+13. HealthKit outbox와 anchor는 pairing fingerprint별로 격리하고, durable ACK,
+    hash/size와 accepted forward status 확인 전에는 anchor를 이동하지 않는다.
 14. Health Auto Export를 설치 필수 단계로 안내하지 않는다. 외부 exporter는
     기존 사용자를 위한 optional legacy adapter로만 표시한다.
 

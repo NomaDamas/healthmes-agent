@@ -599,8 +599,12 @@ public final class HealthMesAPI {
     }
 
     public func setupReadiness() async throws -> SetupReadiness {
+        try await setupReadiness(pairing: try pairing())
+    }
+
+    public func setupReadiness(pairing: Pairing) async throws -> SetupReadiness {
         try await perform(
-            Self.setupReadinessRequest(pairing: try pairing()),
+            Self.setupReadinessRequest(pairing: pairing),
             expecting: SetupReadiness.self
         )
     }
@@ -778,16 +782,35 @@ public final class HealthMesAPI {
         guard let resolutionToken = proposal.resolutionToken(for: action) else {
             throw HealthMesAPIError.httpStatus(422)
         }
-        return try await perform(
-            Self.proposalActionRequest(
+        guard
+            let relayLease = PairingRelayGate.shared.begin(
                 pairing: pairing,
-                proposalID: proposal.id,
-                action: action,
-                resolutionToken: resolutionToken,
-                surface: surface
-            ),
-            expecting: ProposalItem.self
-        )
+                store: pairingStore
+            )
+        else {
+            throw HealthMesAPIError.notPaired
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
+        do {
+            return try await pairingStore.withPairingLease(
+                for: pairing
+            ) {
+                try await perform(
+                    Self.proposalActionRequest(
+                        pairing: pairing,
+                        proposalID: proposal.id,
+                        action: action,
+                        resolutionToken: resolutionToken,
+                        surface: surface
+                    ),
+                    expecting: ProposalItem.self
+                )
+            }
+        } catch is PairingError {
+            throw HealthMesAPIError.notPaired
+        }
     }
 
     public func uploadMedia(data: Data, mediaType: CaptureMediaType) async throws -> MediaUpload {

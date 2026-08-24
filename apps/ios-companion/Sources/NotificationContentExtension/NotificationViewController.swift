@@ -16,6 +16,8 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private let noButton = UIButton(type: .system)
     private let yesButton = UIButton(type: .system)
     private var proposalID: UUID?
+    private var pairing: Pairing?
+    private var pairingGeneration: UInt64?
     private var expiresAt: Date?
     private let brand = UIColor(red: 0.89, green: 0.29, blue: 0.15, alpha: 1)
     private let decisionBlue = UIColor(red: 0.24, green: 0.44, blue: 0.84, alpha: 1)
@@ -173,21 +175,45 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     func didReceive(_ notification: UNNotification) {
         let content = notification.request.content
         let info = content.userInfo
+        let pairingFingerprint =
+            info[NotificationUserInfoKey.pairingFingerprint] as? String
+        pairingGeneration = PairingScope.generation(
+            from: info[NotificationUserInfoKey.pairingGeneration]
+        )
+        pairing = PairingScope.matchingPairing(
+            fingerprint: pairingFingerprint,
+            generation: pairingGeneration
+        )
+        #if DEBUG && targetEnvironment(simulator)
+            if pairing == nil, pairingGeneration != nil {
+                pairing = PairingScope.debugSimulatorLoopbackPairing(
+                    baseURLString: info[
+                        PairingScope
+                            .debugSimulatorLoopbackBaseURLUserInfoKey
+                    ] as? String,
+                    fingerprint: pairingFingerprint
+                )
+            }
+        #endif
         // Keep No / Yes in the custom card. Speak stays a native text-input
         // action so dictation and transcript review happen inside the
         // notification instead of opening the application.
-        extensionContext?.notificationActions = [
-            UNTextInputNotificationAction(
-                identifier: "HEALTHMES_SPEAK",
-                title: String(localized: "Speak"),
-                options: [],
-                icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
-                textInputButtonTitle: String(localized: "Apply"),
-                textInputPlaceholder: String(
-                    localized: "Speak, review the text, then apply"
+        if pairing != nil {
+            extensionContext?.notificationActions = [
+                UNTextInputNotificationAction(
+                    identifier: "HEALTHMES_SPEAK",
+                    title: String(localized: "Speak"),
+                    options: [],
+                    icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
+                    textInputButtonTitle: String(localized: "Apply"),
+                    textInputPlaceholder: String(
+                        localized: "Speak, review the text, then apply"
+                    )
                 )
-            )
-        ]
+            ]
+        } else {
+            extensionContext?.notificationActions = []
+        }
         proposalID = (info["healthmes_proposal_id"] as? String).flatMap(UUID.init(uuidString:))
         actionLabel.text =
             (info[NotificationUserInfoKey.action] as? String)
@@ -201,6 +227,13 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         detailLabel.attributedText = detailText(info: info)
         contentScrollView.setContentOffset(.zero, animated: false)
         detailScrollView.setContentOffset(.zero, animated: false)
+        guard pairing != nil else {
+            showTerminal(
+                String(localized: "This decision belongs to another HealthMes connection."),
+                color: .secondaryLabel
+            )
+            return
+        }
 
         let formatter = ISO8601DateFormatter()
         let timeDisplay = DateFormatter()
@@ -347,9 +380,14 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private func performResolution(proposalID: UUID, action: DecisionAction) {
         Task {
             do {
+                guard let pairing, let pairingGeneration else {
+                    throw NotificationResolutionError.notPaired
+                }
                 let status = try await NotificationDecisionResolver().resolve(
                     proposalID: proposalID,
-                    action: action
+                    action: action,
+                    pairing: pairing,
+                    pairingGeneration: pairingGeneration
                 )
                 await MainActor.run {
                     guard let proposalStatus = NotificationProposalStatus(rawValue: status) else {
@@ -431,8 +469,13 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         }
         Task {
             do {
+                guard let pairing, let pairingGeneration else {
+                    throw NotificationResolutionError.notPaired
+                }
                 let proposal = try await NotificationDecisionResolver().currentProposal(
-                    proposalID: proposalID
+                    proposalID: proposalID,
+                    pairing: pairing,
+                    pairingGeneration: pairingGeneration
                 )
                 guard !proposal.isActionable else { return }
                 await MainActor.run {
@@ -448,6 +491,8 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
 }
 
 private enum NotificationUserInfoKey {
+    static let pairingFingerprint = "healthmes_pairing_fingerprint"
+    static let pairingGeneration = "healthmes_pairing_generation"
     static let observation = "healthmes_decision_observation"
     static let evidence = "healthmes_decision_evidence"
     static let action = "healthmes_decision_action"
@@ -517,8 +562,20 @@ private struct NotificationDecisionResolver {
         }
     }
 
-    func resolve(proposalID: UUID, action: DecisionAction) async throws -> String {
-        guard let pairing = PairingStore.shared.load() else {
+    func resolve(
+        proposalID: UUID,
+        action: DecisionAction,
+        pairing: Pairing,
+        pairingGeneration: UInt64
+    ) async throws -> String {
+        let pairingLease = try PairingStore.shared
+            .acquirePairingLease(for: pairing)
+        defer { pairingLease.release() }
+        guard
+            pairingLease.cacheIdentity.fingerprint
+                == pairing.cacheFingerprint,
+            pairingLease.cacheIdentity.generation == pairingGeneration
+        else {
             throw NotificationResolutionError.notPaired
         }
         let proposalURL = pairing.baseURL.appendingPathComponent(
@@ -532,7 +589,6 @@ private struct NotificationDecisionResolver {
         guard proposal.status == "proposed", let token = proposal.token(for: action) else {
             throw NotificationResolutionError.notActionable(status: proposal.status)
         }
-
         var postRequest = URLRequest(
             url: proposalURL.appendingPathComponent(action.rawValue)
         )
@@ -548,8 +604,19 @@ private struct NotificationDecisionResolver {
         return try JSONDecoder().decode(Proposal.self, from: resolvedData).status
     }
 
-    fileprivate func currentProposal(proposalID: UUID) async throws -> Proposal {
-        guard let pairing = PairingStore.shared.load() else {
+    fileprivate func currentProposal(
+        proposalID: UUID,
+        pairing: Pairing,
+        pairingGeneration: UInt64
+    ) async throws -> Proposal {
+        let pairingLease = try PairingStore.shared
+            .acquirePairingLease(for: pairing)
+        defer { pairingLease.release() }
+        guard
+            pairingLease.cacheIdentity.fingerprint
+                == pairing.cacheFingerprint,
+            pairingLease.cacheIdentity.generation == pairingGeneration
+        else {
             throw NotificationResolutionError.notPaired
         }
         let proposalURL = pairing.baseURL.appendingPathComponent(

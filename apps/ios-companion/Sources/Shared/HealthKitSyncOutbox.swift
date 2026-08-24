@@ -180,18 +180,23 @@ public struct HealthKitSyncOutboxKeychainProvider:
 public struct HealthKitSyncRetryPolicy: Equatable, Sendable {
     public let initialDelay: TimeInterval
     public let maximumDelay: TimeInterval
+    public let maximumAutomaticAttempts: Int
 
     public static let `default` = HealthKitSyncRetryPolicy(
         initialDelay: 60,
-        maximumDelay: 6 * 60 * 60
+        maximumDelay: 6 * 60 * 60,
+        maximumAutomaticAttempts: 8
     )
 
     public init(
         initialDelay: TimeInterval,
-        maximumDelay: TimeInterval
+        maximumDelay: TimeInterval,
+        maximumAutomaticAttempts: Int = 8
     ) {
         self.initialDelay = max(0, initialDelay)
         self.maximumDelay = max(self.initialDelay, maximumDelay)
+        self.maximumAutomaticAttempts =
+            max(1, maximumAutomaticAttempts)
     }
 
     public func nextAttemptDate(
@@ -202,6 +207,12 @@ public struct HealthKitSyncRetryPolicy: Equatable, Sendable {
         let multiplier = pow(2.0, Double(exponent))
         let delay = min(maximumDelay, initialDelay * multiplier)
         return now.addingTimeInterval(delay)
+    }
+
+    public func shouldPauseAutomaticRetry(
+        afterFailedAttempts failedAttempts: Int
+    ) -> Bool {
+        failedAttempts >= maximumAutomaticAttempts
     }
 }
 
@@ -238,13 +249,279 @@ public struct HealthKitSyncOutboxEntry: Codable, Equatable, Sendable {
     public var failedAttempts: Int
     public var nextAttemptAt: Date
     public var terminalFailure: String?
+    public var terminalAnchorsCommitted: Bool? = nil
+    public var terminalAnchorCommitPending: Bool? = nil
+    public var forwardingFailedAttempts: Int? = nil
+    public var uploadAccepted: Bool? = nil
+    /// `true` marks a permanent failure written by the fail-closed queue.
+    /// Missing values belong to older queue versions and are migrated.
+    public var terminalFailureIsPermanent: Bool? = nil
+
+    public var laneKeys: Set<String> {
+        Set(anchors.keys)
+    }
 
     public var isDue: Bool {
         isDue(at: Date())
     }
 
     public func isDue(at now: Date) -> Bool {
-        terminalFailure == nil && nextAttemptAt <= now
+        uploadAccepted != true
+            && terminalFailure == nil
+            && nextAttemptAt <= now
+    }
+}
+
+public enum HealthKitSyncQueueSelection: Equatable, Sendable {
+    case upload(HealthKitSyncOutboxEntry)
+    case finalize(HealthKitSyncOutboxEntry)
+    case deferred
+    case drained
+}
+
+public enum HealthKitSyncQueuePolicy {
+    static let legacyGlobalLane = "__healthmes_legacy_global__"
+
+    public static func select(
+        from entries: [HealthKitSyncOutboxEntry],
+        forceRetry: Bool,
+        includeTerminalFailures: Bool,
+        attemptedTerminalKeys: Set<String> = [],
+        now: Date
+    ) -> HealthKitSyncQueueSelection {
+        var blockedLanes = Set<String>()
+        var hasDeferredEntry = false
+        for entry in entries {
+            let lanes = effectiveLanes(for: entry)
+            if conflicts(lanes, with: blockedLanes) {
+                blockedLanes.formUnion(lanes)
+                hasDeferredEntry = true
+                continue
+            }
+            if entry.uploadAccepted == true {
+                return .finalize(entry)
+            }
+            if entry.terminalFailure != nil {
+                if attemptedTerminalKeys.contains(entry.idempotencyKey) {
+                    blockedLanes.formUnion(lanes)
+                    hasDeferredEntry = true
+                    continue
+                }
+                if includeTerminalFailures, forceRetry {
+                    return .upload(entry)
+                }
+                if entry.terminalAnchorsCommitted == true {
+                    continue
+                }
+                blockedLanes.formUnion(lanes)
+                hasDeferredEntry = true
+                continue
+            }
+            if attemptedTerminalKeys.contains(entry.idempotencyKey) {
+                blockedLanes.formUnion(lanes)
+                hasDeferredEntry = true
+                continue
+            }
+            if forceRetry || entry.isDue(at: now) {
+                return .upload(entry)
+            }
+            blockedLanes.formUnion(lanes)
+            hasDeferredEntry = true
+        }
+        return hasDeferredEntry ? .deferred : .drained
+    }
+
+    public static func blockedLaneKeys(
+        in entries: [HealthKitSyncOutboxEntry]
+    ) -> Set<String> {
+        entries.reduce(into: Set<String>()) { blocked, entry in
+            guard
+                !(
+                    entry.terminalFailure != nil
+                        && entry.terminalAnchorsCommitted == true
+                )
+            else {
+                return
+            }
+            blocked.formUnion(effectiveLanes(for: entry))
+        }
+    }
+
+    private static func effectiveLanes(
+        for entry: HealthKitSyncOutboxEntry
+    ) -> Set<String> {
+        entry.laneKeys.isEmpty
+            ? [legacyGlobalLane]
+            : entry.laneKeys
+    }
+
+    private static func conflicts(
+        _ lanes: Set<String>,
+        with blockedLanes: Set<String>
+    ) -> Bool {
+        blockedLanes.contains(legacyGlobalLane)
+            || lanes.contains(legacyGlobalLane)
+                && !blockedLanes.isEmpty
+            || !lanes.isDisjoint(with: blockedLanes)
+    }
+}
+
+enum HealthKitObserverLifecycle {
+    static func synchronizeAndAcknowledge(
+        completion: () -> Void,
+        synchronize: () async -> Void
+    ) async {
+        defer { completion() }
+        await synchronize()
+    }
+}
+
+/// Owns one BGTask execution and guarantees that expiration and normal
+/// completion race through a single completion gate.
+final class HealthKitBackgroundTaskRunner: @unchecked Sendable {
+    typealias Operation = @Sendable () async -> Bool
+    typealias Completion = @Sendable (Bool) -> Void
+
+    private let operation: Operation
+    private let lock = NSLock()
+    private var completion: Completion?
+    private var work: Task<Void, Never>?
+
+    init(
+        operation: @escaping Operation,
+        completion: @escaping Completion
+    ) {
+        self.operation = operation
+        self.completion = completion
+    }
+
+    func start() {
+        lock.lock()
+        guard work == nil, completion != nil else {
+            lock.unlock()
+            return
+        }
+        let operation = operation
+        let task = Task { [self] in
+            let success = await operation()
+            finish(
+                success: success && !Task.isCancelled,
+                cancelWork: false
+            )
+        }
+        work = task
+        lock.unlock()
+    }
+
+    func expire() {
+        finish(success: false, cancelWork: true)
+    }
+
+    private func finish(
+        success: Bool,
+        cancelWork: Bool
+    ) {
+        lock.lock()
+        guard let completion else {
+            lock.unlock()
+            return
+        }
+        self.completion = nil
+        let work = work
+        self.work = nil
+        lock.unlock()
+
+        if cancelWork {
+            work?.cancel()
+        }
+        completion(success)
+    }
+
+    deinit {
+        lock.lock()
+        let work = work
+        self.work = nil
+        completion = nil
+        lock.unlock()
+        work?.cancel()
+    }
+}
+
+public struct HealthKitSyncQueueSummary: Equatable, Sendable {
+    public let pendingCount: Int
+    public let terminalFailureCount: Int
+    public let latestTerminalFailure: String?
+    public let nextRetryAt: Date?
+
+    public init(entries: [HealthKitSyncOutboxEntry]) {
+        pendingCount = entries.count
+        let terminalEntries = entries.filter {
+            $0.terminalFailure != nil
+        }
+        terminalFailureCount = terminalEntries.count
+        latestTerminalFailure = terminalEntries.last?.terminalFailure
+        var retryAt: Date?
+        for entry in entries {
+            if entry.terminalFailure != nil {
+                if entry.terminalAnchorsCommitted == true {
+                    continue
+                }
+                break
+            }
+            retryAt = entry.nextAttemptAt
+            break
+        }
+        nextRetryAt = retryAt
+    }
+}
+
+public enum HealthKitSyncLocalState {
+    private static let namespacePrefix = "healthmes.healthkit."
+    private static let anchorPrefix = "\(namespacePrefix)anchor."
+    private static let lastUploadPrefix =
+        "\(namespacePrefix)lastUploadAt."
+    private static let pausePrefix = "\(namespacePrefix)paused."
+
+    public static func clear(
+        fingerprint: String,
+        defaults: UserDefaults
+    ) {
+        defaults.removeObject(
+            forKey: "\(lastUploadPrefix)\(fingerprint)"
+        )
+        defaults.removeObject(
+            forKey: "\(pausePrefix)\(fingerprint)"
+        )
+        let scopedAnchorPrefix = "\(anchorPrefix)\(fingerprint)."
+        for key in defaults.dictionaryRepresentation().keys
+        where key.hasPrefix(scopedAnchorPrefix) {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    public static func clearAll(defaults: UserDefaults) {
+        for key in defaults.dictionaryRepresentation().keys
+        where key.hasPrefix(namespacePrefix) {
+            defaults.removeObject(forKey: key)
+        }
+    }
+}
+
+public enum HealthKitSyncRemovalScope: Equatable, Sendable {
+    case none
+    case destination(String)
+    case all
+}
+
+public enum HealthKitSyncRemovalPolicy {
+    public static func scope(
+        fingerprint: String?,
+        userDirectedRemoval: Bool
+    ) -> HealthKitSyncRemovalScope {
+        if let fingerprint {
+            return .destination(fingerprint)
+        }
+        return userDirectedRemoval ? .all : .none
     }
 }
 
@@ -267,7 +544,8 @@ public actor HealthKitSyncOutbox {
         static let minimumSealedDataBytes = 12 + 16
     }
 
-    public static let defaultMaximumEntries = 8
+    public static let defaultMaximumEntries = 32
+    public static let defaultMaximumTerminalEntries = 8
     public static let defaultMaximumBytes = 32 * 1_024 * 1_024
 
     public static let shared = HealthKitSyncOutbox(
@@ -278,6 +556,7 @@ public actor HealthKitSyncOutbox {
     private let fileURL: URL
     private let keyProvider: any HealthKitSyncOutboxKeyProviding
     private let maximumEntries: Int
+    private let maximumTerminalEntries: Int
     private let maximumBytes: Int
     private let retryPolicy: HealthKitSyncRetryPolicy
     private let fileManager: FileManager
@@ -289,6 +568,7 @@ public actor HealthKitSyncOutbox {
         keyProvider: any HealthKitSyncOutboxKeyProviding =
             HealthKitSyncOutboxKeychainProvider(),
         maximumEntries: Int = HealthKitSyncOutbox.defaultMaximumEntries,
+        maximumTerminalEntries: Int? = nil,
         maximumBytes: Int = HealthKitSyncOutbox.defaultMaximumBytes,
         retryPolicy: HealthKitSyncRetryPolicy = .default,
         fileManager: FileManager = .default
@@ -296,6 +576,10 @@ public actor HealthKitSyncOutbox {
         self.fileURL = fileURL
         self.keyProvider = keyProvider
         self.maximumEntries = max(1, maximumEntries)
+        self.maximumTerminalEntries = max(
+            1,
+            maximumTerminalEntries ?? maximumEntries
+        )
         self.maximumBytes = max(1, maximumBytes)
         self.retryPolicy = retryPolicy
         self.fileManager = fileManager
@@ -341,8 +625,20 @@ public actor HealthKitSyncOutbox {
         var candidate = entries
         candidate.append(entry)
         candidate.sort(by: entryOrder)
+        candidate = compactCommittedTerminalEntries(candidate)
         try validateQueue(candidate)
-        try persist(candidate)
+        while true {
+            do {
+                try persist(candidate)
+                break
+            } catch HealthKitSyncOutboxError.fileTooLarge(_) {
+                guard removeOldestCommittedTerminal(from: &candidate) else {
+                    throw HealthKitSyncOutboxError.fileTooLarge(
+                        maxBytes: maximumBytes
+                    )
+                }
+            }
+        }
         entries = candidate
         return entry
     }
@@ -402,9 +698,35 @@ public actor HealthKitSyncOutbox {
     }
 
     @discardableResult
+    public func markUploadAccepted(
+        idempotencyKey: String,
+        destinationFingerprint: String
+    ) throws -> HealthKitSyncOutboxEntry? {
+        try ensureLoaded()
+        guard let index = entries.firstIndex(where: {
+            $0.idempotencyKey == idempotencyKey
+                && $0.destinationFingerprint == destinationFingerprint
+        }) else {
+            return nil
+        }
+        guard entries[index].uploadAccepted != true else {
+            return entries[index]
+        }
+
+        var candidate = entries
+        candidate[index].uploadAccepted = true
+        try validateQueue(candidate)
+        try persist(candidate)
+        entries = candidate
+        return candidate[index]
+    }
+
+    @discardableResult
     public func markFailed(
         idempotencyKey: String,
         destinationFingerprint: String,
+        countsTowardAutomaticQuarantine: Bool = false,
+        preserveTerminalFailure: Bool = false,
         now: Date = Date()
     ) throws -> HealthKitSyncOutboxEntry? {
         try ensureLoaded()
@@ -417,21 +739,60 @@ public actor HealthKitSyncOutbox {
 
         var candidate = entries
         candidate[index].failedAttempts += 1
+        if countsTowardAutomaticQuarantine {
+            candidate[index].forwardingFailedAttempts =
+                (candidate[index].forwardingFailedAttempts ?? 0) + 1
+        }
         candidate[index].nextAttemptAt = retryPolicy.nextAttemptDate(
             afterFailedAttempts: candidate[index].failedAttempts,
             now: now
         )
-        candidate[index].terminalFailure = nil
+        if !preserveTerminalFailure {
+            candidate[index].terminalFailure = nil
+        }
         try persist(candidate)
         entries = candidate
         return candidate[index]
+    }
+
+    /// Old builds could pause a retryable forwarding failure and prepare its
+    /// anchor for commit. Restore every uncommitted legacy entry to retryable
+    /// state; a permanent failure written by this build is explicitly marked.
+    @discardableResult
+    public func migrateLegacyTerminalEntries(
+        destinationFingerprint: String,
+        now: Date = Date()
+    ) throws -> Int {
+        try ensureLoaded()
+        var candidate = entries
+        var migrated = 0
+        for index in candidate.indices
+        where candidate[index].destinationFingerprint
+            == destinationFingerprint
+            && candidate[index].terminalFailure != nil
+            && candidate[index].terminalAnchorsCommitted != true
+            && candidate[index].terminalFailureIsPermanent != true
+        {
+            candidate[index].terminalFailure = nil
+            candidate[index].terminalAnchorsCommitted = nil
+            candidate[index].terminalAnchorCommitPending = nil
+            candidate[index].nextAttemptAt = now
+            migrated += 1
+        }
+        guard migrated > 0 else { return 0 }
+        try validateQueue(candidate)
+        try persist(candidate)
+        entries = candidate
+        return migrated
     }
 
     @discardableResult
     public func markTerminal(
         idempotencyKey: String,
         destinationFingerprint: String,
-        reason: String
+        reason: String,
+        anchorsCommitted: Bool = false,
+        anchorCommitPending: Bool = false
     ) throws -> HealthKitSyncOutboxEntry? {
         try ensureLoaded()
         guard let index = entries.firstIndex(where: {
@@ -443,9 +804,48 @@ public actor HealthKitSyncOutbox {
 
         var candidate = entries
         candidate[index].terminalFailure = String(reason.prefix(256))
+        candidate[index].terminalAnchorsCommitted = anchorsCommitted
+        candidate[index].terminalAnchorCommitPending =
+            !anchorsCommitted && anchorCommitPending
+        candidate[index].terminalFailureIsPermanent = true
+        candidate = compactCommittedTerminalEntries(candidate)
+        try validateQueue(candidate)
         try persist(candidate)
         entries = candidate
-        return candidate[index]
+        return candidate.first {
+            $0.idempotencyKey == idempotencyKey
+                && $0.destinationFingerprint == destinationFingerprint
+        }
+    }
+
+    @discardableResult
+    public func markTerminalAnchorsCommitted(
+        idempotencyKey: String,
+        destinationFingerprint: String
+    ) throws -> HealthKitSyncOutboxEntry? {
+        try ensureLoaded()
+        guard let index = entries.firstIndex(where: {
+            $0.idempotencyKey == idempotencyKey
+                && $0.destinationFingerprint == destinationFingerprint
+                && $0.terminalFailure != nil
+        }) else {
+            return nil
+        }
+        guard entries[index].terminalAnchorsCommitted != true else {
+            return entries[index]
+        }
+
+        var candidate = entries
+        candidate[index].terminalAnchorsCommitted = true
+        candidate[index].terminalAnchorCommitPending = false
+        candidate = compactCommittedTerminalEntries(candidate)
+        try validateQueue(candidate)
+        try persist(candidate)
+        entries = candidate
+        return candidate.first {
+            $0.idempotencyKey == idempotencyKey
+                && $0.destinationFingerprint == destinationFingerprint
+        }
     }
 
     /// Removes only the selected destination while retaining other pairings.
@@ -488,6 +888,13 @@ public actor HealthKitSyncOutbox {
     @discardableResult
     public func purgeAll() throws -> Int {
         try purgeAll(requireKeyDeletion: true)
+    }
+
+    /// User-directed privacy removal succeeds once the ciphertext is gone.
+    /// Deleting the now-orphaned random key remains best effort.
+    @discardableResult
+    public func purgeAllForUserRemoval() throws -> Int {
+        try purgeAll(requireKeyDeletion: false)
     }
 
     @discardableResult
@@ -581,7 +988,12 @@ public actor HealthKitSyncOutbox {
             enqueuedAt: enqueuedAt,
             failedAttempts: 0,
             nextAttemptAt: enqueuedAt,
-            terminalFailure: nil
+            terminalFailure: nil,
+            terminalAnchorsCommitted: nil,
+            terminalAnchorCommitPending: nil,
+            forwardingFailedAttempts: nil,
+            uploadAccepted: nil,
+            terminalFailureIsPermanent: nil
         )
         try validateEntry(entry)
         return entry
@@ -673,7 +1085,16 @@ public actor HealthKitSyncOutbox {
                 envelope.version
             )
         }
-        guard envelope.entries.count <= maximumEntries else {
+        let activeEntries = envelope.entries.filter {
+            !isCommittedTerminal($0)
+        }
+        let committedTerminalEntries = envelope.entries.filter(
+            isCommittedTerminal
+        )
+        guard
+            activeEntries.count <= maximumEntries,
+            committedTerminalEntries.count <= maximumTerminalEntries
+        else {
             throw HealthKitSyncOutboxError.storedEntryCountExceeded(
                 maxEntries: maximumEntries
             )
@@ -777,7 +1198,16 @@ public actor HealthKitSyncOutbox {
     private func validateQueue(
         _ candidate: [HealthKitSyncOutboxEntry]
     ) throws {
-        guard candidate.count <= maximumEntries else {
+        let activeEntries = candidate.filter {
+            !isCommittedTerminal($0)
+        }
+        let committedTerminalEntries = candidate.filter(
+            isCommittedTerminal
+        )
+        guard
+            activeEntries.count <= maximumEntries,
+            committedTerminalEntries.count <= maximumTerminalEntries
+        else {
             throw HealthKitSyncOutboxError.queueTooLarge(
                 maxEntries: maximumEntries
             )
@@ -792,6 +1222,38 @@ public actor HealthKitSyncOutbox {
         }
     }
 
+    private func compactCommittedTerminalEntries(
+        _ candidate: [HealthKitSyncOutboxEntry]
+    ) -> [HealthKitSyncOutboxEntry] {
+        var compacted = candidate.sorted(by: entryOrder)
+        while compacted.filter(isCommittedTerminal).count
+            > maximumTerminalEntries
+        {
+            guard removeOldestCommittedTerminal(from: &compacted) else {
+                break
+            }
+        }
+        return compacted
+    }
+
+    private func removeOldestCommittedTerminal(
+        from candidate: inout [HealthKitSyncOutboxEntry]
+    ) -> Bool {
+        guard let index = candidate.firstIndex(where: isCommittedTerminal)
+        else {
+            return false
+        }
+        candidate.remove(at: index)
+        return true
+    }
+
+    private func isCommittedTerminal(
+        _ entry: HealthKitSyncOutboxEntry
+    ) -> Bool {
+        entry.terminalFailure != nil
+            && entry.terminalAnchorsCommitted == true
+    }
+
     private func validateEntry(
         _ entry: HealthKitSyncOutboxEntry
     ) throws {
@@ -804,7 +1266,13 @@ public actor HealthKitSyncOutbox {
             !entry.destinationFingerprint.isEmpty,
             entry.destinationFingerprint.count <= 256,
             entry.failedAttempts >= 0,
+            (entry.forwardingFailedAttempts ?? 0) >= 0,
             (entry.terminalFailure?.count ?? 0) <= 256,
+            entry.terminalAnchorCommitPending != true
+                || (
+                    entry.terminalFailure != nil
+                        && entry.terminalAnchorsCommitted != true
+                ),
             entry.enqueuedAt.timeIntervalSinceReferenceDate.isFinite,
             entry.nextAttemptAt.timeIntervalSinceReferenceDate.isFinite
         else {

@@ -34,6 +34,7 @@ struct HealthMesWatchApp: App {
 /// talks to anything but the paired healthmes instance.
 final class WatchPairingReceiver: NSObject, WCSessionDelegate {
     static let shared = WatchPairingReceiver()
+    private let contextCoordinator = PairingContextCoordinator.shared
     private var pendingUserInfo: [[String: Any]] = []
     private let pendingUserInfoLock = NSLock()
 
@@ -64,13 +65,34 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
         guard
             let title = userInfo[SpeakCommandSyncKeys.resultTitle] as? String,
             let detail = userInfo[SpeakCommandSyncKeys.resultDetail] as? String,
-            userInfo[SpeakCommandSyncKeys.resultStatus] as? String != nil
+            userInfo[SpeakCommandSyncKeys.resultStatus] as? String != nil,
+            let generation = PairingScope.generation(
+                from: userInfo[SpeakCommandSyncKeys.pairingGeneration]
+            ),
+            let pairing = PairingContextCoordinator.matchingSourcePairing(
+                fingerprint:
+                    userInfo[SpeakCommandSyncKeys.pairingFingerprint]
+                    as? String,
+                generation: generation
+            )
         else { return }
 
         Task {
+            guard
+                let relayLease = PairingRelayGate.shared.begin(
+                    pairing: pairing
+                )
+            else {
+                return
+            }
+            defer {
+                PairingRelayGate.shared.end(relayLease)
+            }
             await WatchNotificationManager.shared.postSpokenCommandOutcome(
                 title: title,
-                detail: detail
+                detail: detail,
+                pairing: pairing,
+                sourceGeneration: generation
             )
         }
     }
@@ -78,13 +100,26 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
     func sendSpokenCommand(
         _ command: String,
         requestID: String,
-        proposalID: UUID
+        proposalID: UUID,
+        pairing expectedPairing: Pairing? = nil
     ) -> Bool {
-        guard WCSession.isSupported() else { return false }
+        guard
+            WCSession.isSupported(),
+            let pairing = expectedPairing ?? PairingStore.shared.load(),
+            PairingStore.shared.load() == pairing,
+            let identity =
+                PairingContextCoordinator.persistedSourceIdentity(),
+            identity.fingerprint == pairing.cacheFingerprint
+        else { return false }
         enqueueUserInfo([
             SpeakCommandSyncKeys.command: command,
             SpeakCommandSyncKeys.requestID: requestID,
             SpeakCommandSyncKeys.proposalID: proposalID.uuidString.lowercased(),
+            SpeakCommandSyncKeys.pairingFingerprint:
+                pairing.cacheFingerprint,
+            SpeakCommandSyncKeys.pairingGeneration: NSNumber(
+                value: identity.generation
+            ),
         ])
         deliverPendingUserInfo()
         return true
@@ -99,18 +134,40 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
     #endif
 
     private func applyContext(_ context: [String: Any]) {
-        guard let baseURL = context[PairingSyncKeys.baseURL] as? String else { return }
-        let token = context[PairingSyncKeys.token] as? String ?? ""
-        guard PairingContextApplication.apply(
-            baseURLString: baseURL,
-            token: token
-        ) else { return }
-        if baseURL.isEmpty {
+        Task {
+            let result = await contextCoordinator.apply(
+                context: context
+            ) { [weak self] _, _ in
+                guard
+                    await WatchNotificationManager.shared
+                        .clearAccountSurfaces()
+                else {
+                    return false
+                }
+                self?.clearPendingUserInfo()
+                await MainActor.run {
+                    WatchDecisionInbox.shared.clear()
+                }
+                return true
+            }
+            guard
+                case .applied(_, let current) = result
+            else {
+                return
+            }
             GlanceSnapshotCache.shared.clear()
-        }
-        Task { @MainActor in
-            NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
-            WidgetCenter.shared.reloadAllTimelines()
+            if current == nil {
+                SeenAlertsStore.shared.clear()
+            } else {
+                SeenAlertsStore.shared.resetForPairingChange()
+            }
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: .healthmesPairingChanged,
+                    object: nil
+                )
+                WidgetCenter.shared.reloadAllTimelines()
+            }
         }
     }
 
@@ -122,7 +179,8 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
             WCSession.default.activate()
             return
         }
-        for userInfo in takePendingUserInfo() {
+        for userInfo in takePendingUserInfo()
+        where isCurrentSourceUserInfo(userInfo) {
             WCSession.default.transferUserInfo(userInfo)
         }
     }
@@ -139,5 +197,26 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
         let queued = pendingUserInfo
         pendingUserInfo.removeAll()
         return queued
+    }
+
+    private func clearPendingUserInfo() {
+        pendingUserInfoLock.lock()
+        defer { pendingUserInfoLock.unlock() }
+        pendingUserInfo.removeAll()
+    }
+
+    private func isCurrentSourceUserInfo(
+        _ userInfo: [String: Any]
+    ) -> Bool {
+        PairingContextCoordinator.matchingSourcePairing(
+            fingerprint:
+                userInfo[SpeakCommandSyncKeys.pairingFingerprint]
+                as? String,
+            generation: PairingScope.generation(
+                from: userInfo[
+                    SpeakCommandSyncKeys.pairingGeneration
+                ]
+            )
+        ) != nil
     }
 }

@@ -58,19 +58,23 @@ final class BackgroundRefreshManager {
         // Always keep the chain alive first — even if this run fails.
         schedule()
 
-        let work = Task {
-            async let productRefresh =
-                RefreshCoordinator.shared.sync(isForeground: false)
-            async let healthKitRefresh =
-                HealthKitSyncManager.shared.backgroundSync()
-            let productSuccess = await productRefresh
-            let healthKitSuccess = await healthKitRefresh
-            let success = productSuccess || healthKitSuccess
-            task.setTaskCompleted(success: success)
-        }
+        let runner = HealthKitBackgroundTaskRunner(
+            operation: {
+                async let productRefresh =
+                    RefreshCoordinator.shared.sync(isForeground: false)
+                async let healthKitRefresh =
+                    HealthKitSyncManager.shared.backgroundSync()
+                let productSuccess = await productRefresh
+                let healthKitSuccess = await healthKitRefresh
+                return productSuccess || healthKitSuccess
+            },
+            completion: { success in
+                task.setTaskCompleted(success: success)
+            }
+        )
         task.expirationHandler = {
-            work.cancel()
-            task.setTaskCompleted(success: false)
+            runner.expire()
         }
+        runner.start()
     }
 }

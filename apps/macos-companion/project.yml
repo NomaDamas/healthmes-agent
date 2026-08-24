@@ -61,7 +61,7 @@ targets:
         NSSpeechRecognitionUsageDescription: HealthMes converts your spoken command into text so you can confirm it before anything changes.
         # Immutable runtime compatibility pin. Release builds may override
         # this through HEALTHMES_RUNTIME_REVISION without following mutable main.
-        HealthMesRuntimeRevision: 31208ad4a7a87d0fc751a7c97f8173f78be1f03f
+        HealthMesRuntimeRevision: beda2d7cc88536979a0aa24f490629f9d88d6a25
         # Keep ATS scoped for loopback development. Pairing validation permits
         # HTTP only for localhost/127.0.0.0/8/::1 and requires HTTPS for every
         # remote host, including private-LAN addresses.
@@ -145,6 +145,10 @@ targets:
       - ../ios-companion/Sources/Shared
       - Sources/MacCore
       - Sources/Saver
+      - Sources/App/MacSetupCoordinator.swift
+      - Sources/App/MacSetupReadinessModel.swift
+      - Sources/MenuBar/GlanceStore.swift
+      - Sources/MenuBar/MacNotificationManager.swift
       - path: Tests
       - path: ../ios-companion/Tests/Fixtures
         buildPhase: resources

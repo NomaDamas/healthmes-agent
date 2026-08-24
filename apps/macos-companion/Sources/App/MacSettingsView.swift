@@ -8,9 +8,8 @@ struct MacSettingsView: View {
 
     @State private var notificationsEnabled = MacNotificationManager.shared.isEnabled
     @State private var showAdvanced = false
-    @State private var serverReadiness: SetupReadiness?
-    @State private var readinessError: String?
     @StateObject private var setup = MacSetupCoordinator()
+    @StateObject private var readiness = MacSetupReadinessModel()
     @StateObject private var inputControl = InputControlPlaneModel()
 
     var body: some View {
@@ -60,13 +59,15 @@ struct MacSettingsView: View {
             .padding(32)
         }
         .task {
-            await loadReadiness()
+            await readiness.load()
             await inputControl.load()
         }
         .onChange(of: glanceStore.pairingRevision) { _, _ in
+            setup.resetForPairingChange()
+            readiness.reset()
             inputControl.reset()
             Task {
-                await loadReadiness()
+                await readiness.load()
                 await inputControl.load()
             }
         }
@@ -105,7 +106,7 @@ struct MacSettingsView: View {
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                if let health = serverReadiness?.check("health") {
+                if let health = readiness.readiness?.check("healthkit") {
                     Label(
                         health.state == .ready ? "Health data ready" : health.detail,
                         systemImage: health.state == .ready
@@ -115,8 +116,8 @@ struct MacSettingsView: View {
                         health.state == .ready ? MacHealthMesStyle.moss : .orange
                     )
                 }
-                if let readinessError {
-                    Text(verbatim: readinessError)
+                if let errorMessage = readiness.errorMessage {
+                    Text(verbatim: errorMessage)
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -515,7 +516,7 @@ struct MacSettingsView: View {
         fallback: String,
         icon: String
     ) -> some View {
-        if let check = serverReadiness?.check(key) {
+        if let check = readiness.readiness?.check(key) {
             Label(
                 check.state == .ready ? "\(fallback) · Ready" : check.detail,
                 systemImage: check.state == .ready
@@ -530,13 +531,4 @@ struct MacSettingsView: View {
         }
     }
 
-    private func loadReadiness() async {
-        guard glanceStore.isPaired else { return }
-        do {
-            serverReadiness = try await HealthMesAPI().setupReadiness()
-            readinessError = nil
-        } catch {
-            readinessError = "Could not verify setup readiness."
-        }
-    }
 }

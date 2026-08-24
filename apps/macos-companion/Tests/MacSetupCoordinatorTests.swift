@@ -51,6 +51,10 @@ final class MacSetupSupportTests: XCTestCase {
 
     func testRuntimeRevisionIsPinnedAndSupportsReleaseOverride() {
         XCTAssertEqual(
+            MacSetupSupport.defaultRuntimeRevision,
+            "beda2d7cc88536979a0aa24f490629f9d88d6a25"
+        )
+        XCTAssertEqual(
             MacSetupSupport.runtimeRevision(
                 environment: [:],
                 bundleValue: nil
@@ -140,5 +144,166 @@ final class MacSetupSupportTests: XCTestCase {
         ])
         XCTAssertEqual(events.map(\.state), ["ready", "action_required"])
         XCTAssertEqual(events.last?.detail, "Connect iCloud CalDAV.")
+    }
+}
+
+@MainActor
+final class MacSetupReadinessTests: XCTestCase {
+    func testSettingsReadinessDropsLateResponseAfterPairingChanges()
+        async throws
+    {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.store.save(
+            baseURLString: "https://old.healthmes.example",
+            token: "old-secret"
+        )
+
+        let requestStarted = expectation(description: "readiness request started")
+        let gate = ReadinessGate()
+        let model = MacSetupReadinessModel(
+            pairingStore: fixture.store,
+            loader: { _ in
+                requestStarted.fulfill()
+                await gate.wait()
+                return Self.readyFixture
+            }
+        )
+
+        let refresh = Task {
+            await model.load()
+        }
+        await fulfillment(of: [requestStarted], timeout: 2)
+
+        _ = try fixture.store.save(
+            baseURLString: "https://new.healthmes.example",
+            token: "new-secret"
+        )
+        model.reset()
+        await gate.release()
+        await refresh.value
+
+        XCTAssertNil(model.readiness)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testVerifyPairingDoesNotPublishStaleReadinessAfterPairingChanges()
+        async throws
+    {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.store.save(
+            baseURLString: "https://old.healthmes.example",
+            token: "old-secret"
+        )
+
+        let requestStarted = expectation(description: "readiness request started")
+        let gate = ReadinessGate()
+        let coordinator = MacSetupCoordinator(
+            pairingStore: fixture.store,
+            readinessLoader: { _ in
+                requestStarted.fulfill()
+                await gate.wait()
+                return Self.readyFixture
+            }
+        )
+
+        let verification = Task {
+            await coordinator.verifyPairing()
+        }
+        await fulfillment(of: [requestStarted], timeout: 2)
+
+        _ = try fixture.store.save(
+            baseURLString: "https://new.healthmes.example",
+            token: "new-secret"
+        )
+        coordinator.resetForPairingChange()
+        await gate.release()
+        await verification.value
+
+        XCTAssertTrue(coordinator.events.isEmpty)
+        XCTAssertNil(coordinator.failure)
+    }
+
+    private static let readyFixture = SetupReadiness(
+        overall: .ready,
+        checks: [
+            SetupReadinessCheck(
+                key: "instance",
+                label: "HealthMes instance",
+                state: .ready,
+                detail: "Authenticated API is reachable."
+            ),
+        ]
+    )
+
+    private func makeFixture() throws -> SetupFixture {
+        let suite = "healthmes-mac-readiness-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        let lockURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("healthmes-mac-readiness-\(UUID().uuidString)")
+        let tokenStore = SetupTestPairingTokenStore()
+        return SetupFixture(
+            suite: suite,
+            defaults: defaults,
+            lockURL: lockURL,
+            store: PairingStore(
+                defaults: defaults,
+                keychain: tokenStore,
+                lockURL: lockURL
+            )
+        )
+    }
+}
+
+private actor ReadinessGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isReleased = false
+
+    func wait() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private final class SetupTestPairingTokenStore: PairingTokenStoring {
+    private var values: [String: String] = [:]
+
+    func readToken(identifier: String) -> String? {
+        values[identifier]
+    }
+
+    func writeToken(_ token: String, identifier: String) throws {
+        values[identifier] = token
+    }
+
+    func deleteToken(identifier: String) {
+        values.removeValue(forKey: identifier)
+    }
+
+    func deleteTokenForCleanup(identifier: String) throws {
+        values.removeValue(forKey: identifier)
+    }
+}
+
+private struct SetupFixture {
+    let suite: String
+    let defaults: UserDefaults
+    let lockURL: URL
+    let store: PairingStore
+
+    func cleanup() {
+        defaults.removePersistentDomain(forName: suite)
+        try? FileManager.default.removeItem(at: lockURL)
     }
 }

@@ -176,9 +176,12 @@ final class AppRouter: ObservableObject {
     private func importPairing(_ url: URL) async {
         do {
             let exchanged = try await PairingExchangeClient().exchange(url)
-            let pairing = try PairingStore.shared.save(
+            let candidate = try PairingStore.validatedPairing(
                 baseURLString: exchanged.baseURL.absoluteString,
                 token: exchanged.token ?? ""
+            )
+            let pairing = try await HealthKitSyncManager.shared.replacePairing(
+                with: candidate
             )
             PhoneWatchSync.shared.pushPairing(
                 baseURL: pairing.baseURL.absoluteString,
@@ -197,9 +200,11 @@ final class AppRouter: ObservableObject {
                 await HealthKitSyncManager.shared.requestAuthorizationAndSync()
             }
         } catch let error as PairingError {
+            await HealthKitSyncManager.shared.pairingDidChange()
             pairingImportMessage = error.localizedDescription
             modal = .settings
         } catch {
+            await HealthKitSyncManager.shared.pairingDidChange()
             pairingImportMessage = "HealthMes could not complete pairing. Try again."
             modal = .settings
         }

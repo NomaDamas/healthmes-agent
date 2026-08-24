@@ -80,8 +80,9 @@ HealthMes 서비스
   Open Wearables를 직접 호출하지 않는다.
 - **Apple Health ↔ Main:** Apple Watch 데이터는 iPhone HealthKit을 거쳐
   first-party collector의 pairing별 encrypted outbox에 저장된 뒤
-  `POST /v1/ingest/healthkit`으로 전송한다. durable ACK 뒤에만 anchor를 확정한다.
-  외부 Health Auto Export 계열 앱은 같은 endpoint의 optional legacy 호환이다.
+  `POST /v1/ingest/healthkit`으로 전송한다. durable ACK, hash/size와 accepted
+  forward status를 확인한 뒤에만 anchor를 확정한다. 외부 Health Auto Export
+  계열 앱은 같은 endpoint의 optional legacy 호환이다.
 - **글루 위치:** 루트에 `healthmes/`(uv 패키지, Python 3.12), `config/`, `scripts/`, 루트 `docker-compose.yml`(postgres+redis+open-wearables+healthmes+hermes). 벤더에 닿는 유일한 산출물은 `HERMES_HOME`에 렌더되는 config 파일과 스킬 심링크 — 둘 다 벤더 트리 밖.
 
 ## 1.5 지표 카탈로그 → 의사결정 도구 레이어 (스킬/MCP 설계)
@@ -591,7 +592,7 @@ native app은 기존 REST와 Input Control Plane을 소비하는 adapter만 추�
 | 연동 | 목표 경험 | 방법 | 상태 |
 |---|---|---|---|
 | 애플워치 백필 | 파일 하나 업로드 | Health 앱 내보내기 ZIP → `healthmes import apple <file>` → OW `/import/apple/xml/direct` (`healthmes/apple_import.py`) | ✅ 구현 |
-| 애플워치 연속 수집 | HealthMes iPhone만 설치하면 자동 증분 업로드 | Apple Watch → iPhone HealthKit → pairing별 encrypted outbox → native `healthmes.healthkit.v1` exact bytes + stable `Idempotency-Key` → `POST /v1/ingest/healthkit`. 서버의 durable ACK와 hash/size를 확인한 뒤에만 anchor 확정 | ✅ repository 통합·focused test·unsigned build, signed hardware QA 필요 |
+| 애플워치 연속 수집 | HealthMes iPhone만 설치하면 자동 증분 업로드 | Apple Watch → iPhone HealthKit → pairing별 encrypted outbox → native `healthmes.healthkit.v1` exact bytes + stable `Idempotency-Key` → `POST /v1/ingest/healthkit`. 서버의 durable ACK, hash/size와 accepted forward status를 확인한 뒤에만 anchor 확정 | ✅ repository 통합·focused test·unsigned build, signed hardware QA 필요 |
 | 외부 HealthKit exporter | 기존 자동화만 선택적으로 유지 | 같은 `POST /v1/ingest/healthkit`이 headerless legacy payload를 raw-first로 저장하고 `transform_hae()`로 best-effort 전달. Health Auto Export 설치는 필수 아님 | ✅ 정상·malformed·deep raw-first 호환 test |
 | 구글 캘린더 | 브라우저 로그인 한 번 | 프로젝트 명의 OAuth 클라이언트(설치형 앱, gcloud/rclone 패턴)를 동봉 — 코드는 이미 `HEALTHMES_GOOGLE_CLIENT_SECRET_FILE`+표준 경로 폴백 구조라 등록된 클라이언트 JSON만 실으면 됨. 민감 스코프 심사(수일~수주)는 병행 신청 | ⏳ 소유자 콘솔 등록 대기 |
 | iCloud 캘린더 | 앱 암호 1회 (구조적 한계 — 애플이 CalDAV OAuth 미제공) | 기존 `connect icloud` 안내 흐름 유지 | ✅ |

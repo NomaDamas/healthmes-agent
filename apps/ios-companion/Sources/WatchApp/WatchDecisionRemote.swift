@@ -460,6 +460,7 @@ struct WatchDecisionRemoteView: View {
     @State private var isSpeaking = false
     @State private var spokenDraft: String?
     @State private var speakStatus: String?
+    @State private var speechOperationID: UUID?
     private let brand = Color(red: 1.0, green: 0.38, blue: 0.22)
     private let decisionBlue = Color(red: 0.35, green: 0.55, blue: 0.95)
 
@@ -477,6 +478,13 @@ struct WatchDecisionRemoteView: View {
         }
         .sheet(item: $detail) { detail in
             WatchDecisionDetailView(detail: detail)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .healthmesPairingChanged
+            )
+        ) { _ in
+            resetPairingScopedState()
         }
         .environment(\.timeZone, TimeZone(identifier: model.timezone) ?? .current)
     }
@@ -674,7 +682,15 @@ struct WatchDecisionRemoteView: View {
     }
 
     private func presentSpeakInput(for decision: PendingDecision) {
-        guard !isSpeaking else { return }
+        guard
+            !isSpeaking,
+            let sourceIdentity =
+                PairingContextCoordinator.persistedSourceIdentity()
+        else {
+            return
+        }
+        let operationID = UUID()
+        speechOperationID = operationID
         isSpeaking = true
         speakStatus = nil
         WKExtension.shared().visibleInterfaceController?.presentTextInputController(
@@ -682,7 +698,17 @@ struct WatchDecisionRemoteView: View {
             allowedInputMode: .plain
         ) { results in
             Task { @MainActor in
-                defer { isSpeaking = false }
+                guard
+                    speechOperationID == operationID,
+                    PairingContextCoordinator
+                        .persistedSourceIdentity() == sourceIdentity
+                else {
+                    return
+                }
+                defer {
+                    isSpeaking = false
+                    speechOperationID = nil
+                }
                 guard
                     let spoken = results?.first as? String
                 else { return }
@@ -691,6 +717,14 @@ struct WatchDecisionRemoteView: View {
                 spokenDraft = clean
             }
         }
+    }
+
+    private func resetPairingScopedState() {
+        speechOperationID = nil
+        isSpeaking = false
+        spokenDraft = nil
+        speakStatus = nil
+        detail = nil
     }
 
     private func decisionButton(

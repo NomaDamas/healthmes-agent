@@ -292,8 +292,9 @@ The visualizer can display a proposal but cannot create a hidden mutation.
 6. The planner, trigger owner, approval gateway, and outcome recorder own
    decision creation and result linkage. The visualizer may display their
    identifiers and states but must not create duplicate decision or outcome
-   records. An owning runtime may use `mcp__healthmes__record_decision`; the
-   visualizer itself must not call it merely because a scene was rendered.
+   records. The owning HealthMes Decision Service records them through its
+   canonical runtime contract; the visualizer must not create one merely
+   because a scene was rendered.
 7. Render `approved` and `applied_to_calendar` as different states. Approval
    is not proof that Apple or Google Calendar accepted the write.
 8. A later `decision_outcome` scene may compare the decision with a measured

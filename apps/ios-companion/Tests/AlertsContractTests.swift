@@ -116,6 +116,78 @@ final class SeenAlertsStoreTests: XCTestCase {
         XCTAssertEqual(store.unseenOrPrime(from: [later, existing]).map(\.id), [later.id])
     }
 
+    func testPairingChangeDropsOldSeenStateAndPrimesNewHistory() {
+        let (store, _) = makeStore()
+        let old = alert(UUID())
+        let existingOnNewServer = alert(UUID())
+        let later = alert(UUID())
+        store.markSeen([old])
+
+        store.resetForPairingChange()
+
+        XCTAssertTrue(
+            store.unseenOrPrime(from: [existingOnNewServer]).isEmpty
+        )
+        XCTAssertEqual(
+            store.unseenOrPrime(
+                from: [later, existingOnNewServer]
+            ).map(\.id),
+            [later.id]
+        )
+    }
+
+    func testStalePairingBaselineCannotOverwriteNewAccountPriming()
+        throws
+    {
+        let suite = "seen-alerts-pairing-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let pairingStore = PairingStore(
+            defaults: defaults,
+            keychain: AlertsPairingTokenStore(),
+            lockURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "seen-alerts-pairing-\(UUID().uuidString).lock"
+                )
+        )
+        let store = SeenAlertsStore(defaults: defaults)
+        let oldPairing = try pairingStore.save(
+            baseURLString: "https://old.healthmes.example",
+            token: "old-token"
+        )
+        let candidate = try PairingStore.validatedPairing(
+            baseURLString: "https://new.healthmes.example",
+            token: "new-token"
+        )
+        _ = try pairingStore.beginReplacement(with: candidate)
+        try pairingStore.markPendingTransitionCleanupStarted()
+        _ = try pairingStore.commitPendingTransition()
+        store.resetForPairingChange()
+
+        XCTAssertFalse(
+            store.applyPairingScopedBaseline(
+                [alert(UUID())],
+                for: oldPairing,
+                pairingStore: pairingStore
+            )
+        )
+
+        let existingOnNewServer = alert(UUID())
+        let later = alert(UUID())
+        XCTAssertTrue(
+            store.unseenOrPrime(from: [existingOnNewServer]).isEmpty
+        )
+        XCTAssertEqual(
+            store.unseenOrPrime(
+                from: [later, existingOnNewServer]
+            ).map(\.id),
+            [later.id]
+        )
+    }
+
     func testSuccessfulEmptyBaselineDoesNotSwallowTheNextAlert() {
         let (store, _) = makeStore()
         let first = alert(UUID())
@@ -183,5 +255,21 @@ final class SeenAlertsStoreTests: XCTestCase {
         XCTAssertEqual(store.seenIDs().count, SeenAlertsStore.capacity)
         // The most recently marked alerts must survive the trim.
         XCTAssertTrue(store.unseen(from: Array(overflow.suffix(5))).isEmpty)
+    }
+}
+
+private final class AlertsPairingTokenStore: PairingTokenStoring {
+    private var tokens: [String: String] = [:]
+
+    func readToken(identifier: String) -> String? {
+        tokens[identifier]
+    }
+
+    func writeToken(_ token: String, identifier: String) throws {
+        tokens[identifier] = token
+    }
+
+    func deleteToken(identifier: String) {
+        tokens.removeValue(forKey: identifier)
     }
 }

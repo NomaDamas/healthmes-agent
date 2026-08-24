@@ -38,6 +38,17 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         ])
     }
 
+    func clearAccountSurfaces() async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        let result = await NotificationDeletionBarrier().clear(
+            using: notificationSurface(center)
+        )
+        if case .success = result {
+            return true
+        }
+        return false
+    }
+
     #if DEBUG
         func postDecisionDemo() async {
             let center = UNUserNotificationCenter.current()
@@ -70,7 +81,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             content.body = AlertNotificationContent.targetLine(after: proposedStart)
             content.categoryIdentifier = AlertNotificationContent.actionableCategoryID
             content.sound = .default
-            content.userInfo = [
+            var userInfo: [String: String] = [
                 AlertNotificationContent.userInfoProposalID:
                     "00000000-0000-0000-0000-000000000091",
                 AlertNotificationContent.userInfoDecisionTitle:
@@ -90,6 +101,20 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                 AlertNotificationContent.userInfoDecisionEndsAt:
                     formatter.string(from: proposedEnd),
             ]
+            if
+                let identity = PairingContextCoordinator
+                    .persistedSourceIdentity()
+            {
+                userInfo[
+                    AlertNotificationContent
+                        .userInfoPairingFingerprint
+                ] = identity.fingerprint
+                userInfo[
+                    AlertNotificationContent
+                        .userInfoPairingGeneration
+                ] = String(identity.generation)
+            }
+            content.userInfo = userInfo
 
             let request = UNNotificationRequest(
                 identifier: "healthmes-watch-decision-demo",
@@ -114,9 +139,22 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
+        let userInfo = response.notification.request.content.userInfo
         guard
+            let sourceGeneration = PairingScope.generation(
+                from: userInfo[
+                    AlertNotificationContent.userInfoPairingGeneration
+                ]
+            ),
+            let pairing = PairingContextCoordinator
+                .matchingSourcePairing(
+                fingerprint: userInfo[
+                    AlertNotificationContent.userInfoPairingFingerprint
+                ] as? String,
+                generation: sourceGeneration
+            ),
             let proposalText =
-                response.notification.request.content.userInfo[
+                userInfo[
                     AlertNotificationContent.userInfoProposalID
                 ] as? String,
             let proposalID = UUID(uuidString: proposalText)
@@ -133,7 +171,6 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             action = .decline
         case AlertNotificationActionID.speak,
             AlertNotificationActionID.legacyAlternative:
-            let userInfo = response.notification.request.content.userInfo
             let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
             let requestID = UUID().uuidString.lowercased()
             let command = SpeakCommand.compose(
@@ -147,7 +184,8 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             let queued = WatchPairingReceiver.shared.sendSpokenCommand(
                 command,
                 requestID: requestID,
-                proposalID: proposalID
+                proposalID: proposalID,
+                pairing: pairing
             )
             Task {
                 let title =
@@ -166,7 +204,9 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                     )
                 await postSpokenCommandOutcome(
                     title: title,
-                    detail: detail
+                    detail: detail,
+                    pairing: pairing,
+                    sourceGeneration: sourceGeneration
                 )
                 completionHandler()
             }
@@ -187,10 +227,25 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         Task {
             defer { completionHandler() }
             do {
+                guard
+                    let relayLease = PairingRelayGate.shared.begin(
+                        pairing: pairing
+                    )
+                else { return }
+                defer {
+                    PairingRelayGate.shared.end(relayLease)
+                }
                 let api = HealthMesAPI()
-                let proposal = try await api.getProposal(proposalID)
+                let proposal = try await api.getProposal(
+                    proposalID,
+                    pairing: pairing
+                )
                 guard proposal.isActionable else {
-                    await postOutcome(resultForResolvedProposal(proposal))
+                    await postOutcome(
+                        resultForResolvedProposal(proposal),
+                        pairing: pairing,
+                        sourceGeneration: sourceGeneration
+                    )
                     center.removeDeliveredNotifications(withIdentifiers: [
                         response.notification.request.identifier
                     ])
@@ -199,18 +254,39 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                 let resolved = try await api.resolveProposal(
                     proposal,
                     action: action,
-                    surface: "apple_watch_notification"
+                    surface: "apple_watch_notification",
+                    pairing: pairing
                 )
-                await postOutcome(resultForStatus(resolved.status.rawValue, alreadyResolved: false))
+                await postOutcome(
+                    resultForStatus(
+                        resolved.status.rawValue,
+                        alreadyResolved: false
+                    ),
+                    pairing: pairing,
+                    sourceGeneration: sourceGeneration
+                )
                 center.removeDeliveredNotifications(withIdentifiers: [
                     response.notification.request.identifier
                 ])
             } catch let error as HealthMesAPIError where error.isAlreadyResolved {
-                await postOutcome(resultForStatus(error.alreadyResolvedStatus))
+                guard PairingStore.shared.load() == pairing else { return }
+                await postOutcome(
+                    resultForStatus(error.alreadyResolvedStatus),
+                    pairing: pairing,
+                    sourceGeneration: sourceGeneration
+                )
             } catch let error as HealthMesAPIError where error.isProposalExpired {
-                await postOutcome(.expired)
+                await postOutcome(
+                    .expired,
+                    pairing: pairing,
+                    sourceGeneration: sourceGeneration
+                )
             } catch {
-                await postOutcome(.offline)
+                await postOutcome(
+                    .offline,
+                    pairing: pairing,
+                    sourceGeneration: sourceGeneration
+                )
             }
         }
     }
@@ -241,7 +317,25 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         }
     }
 
-    private func postOutcome(_ result: WatchDecisionResult) async {
+    private func postOutcome(
+        _ result: WatchDecisionResult,
+        pairing: Pairing,
+        sourceGeneration: UInt64
+    ) async {
+        guard
+            PairingContextCoordinator.matchingSourcePairing(
+                fingerprint: pairing.cacheFingerprint,
+                generation: sourceGeneration
+            ) == pairing,
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing
+            )
+        else {
+            return
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
         let content = UNMutableNotificationContent()
         content.title = result.title
         content.body = result.detail
@@ -254,7 +348,26 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         try? await UNUserNotificationCenter.current().add(request)
     }
 
-    func postSpokenCommandOutcome(title: String, detail: String) async {
+    func postSpokenCommandOutcome(
+        title: String,
+        detail: String,
+        pairing: Pairing,
+        sourceGeneration: UInt64
+    ) async {
+        guard
+            PairingContextCoordinator.matchingSourcePairing(
+                fingerprint: pairing.cacheFingerprint,
+                generation: sourceGeneration
+            ) == pairing,
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing
+            )
+        else {
+            return
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = detail
@@ -265,5 +378,26 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             trigger: nil
         )
         try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    private func notificationSurface(
+        _ center: UNUserNotificationCenter
+    ) -> NotificationSurface {
+        NotificationSurface(
+            removeAll: {
+                center.removeAllPendingNotificationRequests()
+                center.removeAllDeliveredNotifications()
+            },
+            snapshot: {
+                async let pending =
+                    center.pendingNotificationRequests()
+                async let delivered =
+                    center.deliveredNotifications()
+                return await NotificationSurfaceSnapshot(
+                    pendingCount: pending.count,
+                    deliveredCount: delivered.count
+                )
+            }
+        )
     }
 }

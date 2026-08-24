@@ -56,8 +56,8 @@ struct HealthMesCompanionApp: App {
                 // throttles BGAppRefreshTask; Telegram stays the guaranteed
                 // channel).
                 Task {
-                    await RefreshCoordinator.shared.sync(isForeground: true)
                     await HealthKitSyncManager.shared.resume()
+                    await RefreshCoordinator.shared.sync(isForeground: true)
                 }
                 Task {
                     await ScreenTimeActivityRuntime.shared.foregroundCatchUp()

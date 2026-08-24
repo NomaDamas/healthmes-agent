@@ -28,7 +28,7 @@ public struct SaverDataSource {
     }
 
     public func briefing(hideNumbers: Bool, now: Date = Date()) -> SaverBriefing {
-        let isPaired = defaults.string(forKey: Self.pairedBaseURLDefaultsKey) != nil
+        let isPaired = PairingStore.hasPersistedPairing(defaults: defaults)
         let identity = PairingStore.persistedCacheIdentity(defaults: defaults)
         let cached = identity.flatMap { cache.load(for: $0) }
         let payload = cached.flatMap { try? GlanceJSON.decodePayload($0.payloadData) }

@@ -151,7 +151,7 @@ public final class GlanceClient {
             } catch {
                 throw GlanceClientError.decoding(underlying: error)
             }
-            cache.store(
+            try storeIfCurrent(
                 CachedGlance(
                     pairingFingerprint: cacheIdentity.fingerprint,
                     pairingGeneration: cacheIdentity.generation,
@@ -159,7 +159,9 @@ public final class GlanceClient {
                     fetchedAt: now,
                     maxAgeSeconds: maxAge,
                     payloadData: data
-                )
+                ),
+                pairing: pairing,
+                expectedIdentity: cacheIdentity
             )
             return GlanceSnapshot(
                 payload: payload, fetchedAt: now, revalidated: false, nextRefresh: nextRefresh
@@ -174,7 +176,7 @@ public final class GlanceClient {
             }
             // Same data, refreshed validity window (304 carries the same
             // ETag/Cache-Control per the endpoint contract).
-            cache.store(
+            try storeIfCurrent(
                 CachedGlance(
                     pairingFingerprint: cacheIdentity.fingerprint,
                     pairingGeneration: cacheIdentity.generation,
@@ -182,7 +184,9 @@ public final class GlanceClient {
                     fetchedAt: now,
                     maxAgeSeconds: maxAge,
                     payloadData: cached.payloadData
-                )
+                ),
+                pairing: pairing,
+                expectedIdentity: cacheIdentity
             )
             return GlanceSnapshot(
                 payload: payload, fetchedAt: now, revalidated: true, nextRefresh: nextRefresh
@@ -193,6 +197,25 @@ public final class GlanceClient {
 
         default:
             throw GlanceClientError.httpStatus(http.statusCode)
+        }
+    }
+
+    private func storeIfCurrent(
+        _ snapshot: CachedGlance,
+        pairing: Pairing,
+        expectedIdentity: PairingCacheIdentity
+    ) throws {
+        do {
+            let pairingLease = try pairingStore.acquirePairingLease(
+                for: pairing
+            )
+            defer { pairingLease.release() }
+            guard pairingLease.cacheIdentity == expectedIdentity else {
+                throw GlanceClientError.notPaired
+            }
+            _ = cache.store(snapshot)
+        } catch is PairingError {
+            throw GlanceClientError.notPaired
         }
     }
 }

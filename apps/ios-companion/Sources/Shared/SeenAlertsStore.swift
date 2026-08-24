@@ -88,6 +88,35 @@ public final class SeenAlertsStore {
         defaults.set(true, forKey: Self.pendingBaselineKey)
     }
 
+    /// Applies an enable-time baseline only while the originating pairing is
+    /// still stable. Holding the pairing storage lock makes a later account
+    /// transition reset this state after the stale response, never before it.
+    @discardableResult
+    public func applyPairingScopedBaseline(
+        _ alerts: [AlertItem]?,
+        for pairing: Pairing,
+        pairingStore: PairingStore = .shared
+    ) -> Bool {
+        do {
+            return try pairingStore.withStablePairing { activePairing in
+                guard activePairing == pairing else { return false }
+                if let alerts {
+                    primeWithoutNotifying(alerts)
+                } else {
+                    deferPrimingUntilNextFeed()
+                }
+                return true
+            }
+        } catch {
+            return false
+        }
+    }
+
+    public func resetForPairingChange() {
+        clear()
+        deferPrimingUntilNextFeed()
+    }
+
     public func clear() {
         defaults.removeObject(forKey: Self.defaultsKey)
         defaults.removeObject(forKey: Self.initializedKey)

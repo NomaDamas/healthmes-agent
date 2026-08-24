@@ -56,8 +56,16 @@ final class SharedContractMacTests: XCTestCase {
         // action before exposing Yes/No.
         let page = try GlanceJSON.decoder().decode(AlertsPage.self, from: fixtureData("alerts"))
         let alert = page.data[0]
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example.com")!,
+            token: "secret"
+        )
 
-        let plain = AlertNotificationContent.from(alert: alert)
+        let plain = AlertNotificationContent.from(
+            alert: alert,
+            pairingFingerprint: pairing.cacheFingerprint,
+            pairingGeneration: 7
+        )
         XCTAssertEqual(plain.title, "Move the 14:00 block to tomorrow?")
         XCTAssertEqual(plain.subtitle, "Recovery 38 today.")
         XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pct -18")
@@ -68,9 +76,21 @@ final class SharedContractMacTests: XCTestCase {
             plain.userInfo[AlertNotificationContent.userInfoProposalID],
             "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
         )
+        XCTAssertEqual(
+            plain.userInfo[AlertNotificationContent.userInfoPairingFingerprint],
+            pairing.cacheFingerprint
+        )
+        XCTAssertEqual(
+            plain.userInfo[AlertNotificationContent.userInfoPairingGeneration],
+            "7"
+        )
 
         let proposalID = UUID()
-        let actionable = AlertNotificationContent.from(alert: alert, pendingProposalID: proposalID)
+        let actionable = AlertNotificationContent.from(
+            alert: alert,
+            pendingProposalID: proposalID,
+            pairingFingerprint: pairing.cacheFingerprint
+        )
         XCTAssertEqual(actionable.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(
             actionable.userInfo[AlertNotificationContent.userInfoProposalID],
