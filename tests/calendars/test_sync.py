@@ -19,6 +19,7 @@ from healthmes.calendars.base import (
     calendar_identity_external_id,
     coerce_utc,
 )
+from healthmes.calendars.intake import intake_calendar_tasks
 from healthmes.calendars.sleep_event_rendering import observation_fingerprint
 from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
@@ -34,7 +35,13 @@ from healthmes.calendars.state import (
     InMemoryPendingDiffStore,
     InMemorySyncStateStore,
 )
-from healthmes.calendars.sync import CalendarMirrorService, ChangeKind, SyncDiff
+from healthmes.calendars.sync import (
+    CalendarMirrorService,
+    ChangeKind,
+    EventChange,
+    SyncDiff,
+)
+from healthmes.storage import update_retention_policy
 from healthmes.store import CalendarEventMirror, CalendarSource, Task
 
 
@@ -96,6 +103,148 @@ class TestBootstrap:
         fake_backend.queue_changes([], {"sync_token": "tok-1"})
         service.sync_backend(fake_backend)
         assert state_store.load(fake_backend.source) == {"sync_token": "tok-1"}
+
+    def test_sync_does_not_restore_rows_expired_by_retention(
+        self,
+        service,
+        fake_backend,
+        session,
+        make_event,
+    ) -> None:
+        now = datetime.now(UTC)
+        expired_start = now - timedelta(days=3)
+        expired_end = now - timedelta(days=2)
+        session.add(
+            CalendarEventMirror(
+                external_id="expired-meeting",
+                calendar_source=fake_backend.source,
+                summary="Expired",
+                start_at=expired_start,
+                end_at=expired_end,
+                is_all_day=False,
+            )
+        )
+        session.commit()
+        update_retention_policy(
+            session,
+            "calendar_mirror",
+            "1d",
+            now=now,
+        )
+        session.commit()
+        assert "expired-meeting" not in rows(session)
+
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "expired-meeting",
+                    start=expired_start,
+                    end=expired_end,
+                )
+            ],
+            {"sync_token": "expired-sync"},
+        )
+        service.sync_backend(fake_backend)
+
+        assert "expired-meeting" not in rows(session)
+
+    def test_sync_retires_intake_task_when_provider_row_is_expired(
+        self,
+        service,
+        fake_backend,
+        session,
+        make_event,
+    ) -> None:
+        now = datetime.now(UTC)
+        update_retention_policy(
+            session,
+            "calendar_mirror",
+            "1d",
+            now=now,
+        )
+        intake_task = Task(title="Expired provider intake")
+        session.add(intake_task)
+        session.flush()
+        expired_start = now - timedelta(days=3)
+        expired_end = now - timedelta(days=2)
+        session.add(
+            CalendarEventMirror(
+                external_id="expired-provider-intake",
+                calendar_source=fake_backend.source,
+                summary="[HM] Expired provider intake",
+                start_at=expired_start,
+                end_at=expired_end,
+                intake_task_id=intake_task.id,
+            )
+        )
+        session.commit()
+        task_id = intake_task.id
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "expired-provider-intake",
+                    start=expired_start,
+                    end=expired_end,
+                )
+            ],
+            {"sync_token": "expired-intake-sync"},
+        )
+
+        service.sync_backend(fake_backend)
+
+        assert "expired-provider-intake" not in rows(session)
+        assert session.get(Task, task_id).status == "cancelled"
+
+    def test_empty_delta_retires_task_after_natural_retention_expiry(
+        self,
+        service,
+        fake_backend,
+        session,
+    ) -> None:
+        now = utc(2026, 8, 14, 12)
+        update_retention_policy(
+            session,
+            "calendar_mirror",
+            "1d",
+            now=now,
+        )
+        session.commit()
+        fake_backend.queue_changes([], {"sync_token": "baseline"})
+        service.sync_backend(fake_backend, now=now)
+
+        mirror = CalendarEventMirror(
+            external_id="naturally-expiring-intake",
+            calendar_source=fake_backend.source,
+            summary="[HM] Finish launch notes",
+            start_at=now - timedelta(hours=24),
+            end_at=now - timedelta(hours=23),
+            organizer_self=True,
+            has_attendees=False,
+            is_recurring=False,
+            event_type="default",
+            status="confirmed",
+            etag="natural-expiry-1",
+        )
+        session.add(mirror)
+        session.commit()
+        [task] = intake_calendar_tasks(
+            session,
+            fake_backend.source,
+            UTC,
+            now=now,
+        )
+        session.commit()
+        task_id = task.id
+        assert task.status == "todo"
+
+        fake_backend.queue_changes([], {"sync_token": "no-delta"})
+        service.sync_backend(
+            fake_backend,
+            now=now + timedelta(hours=2),
+        )
+
+        assert "naturally-expiring-intake" not in rows(session)
+        assert session.get(Task, task_id).status == "cancelled"
 
     def test_first_sync_mirrors_provider_metadata(
         self, service, fake_backend, session, make_event
@@ -1214,6 +1363,43 @@ class TestPendingDiffJournal:
         # deletion so the trigger still learns of it; the journal then clears.
         diff = service.sync_backend(fake_backend)
         assert [change.external_id for change in diff.deleted] == ["meet-1"]
+        assert pending.load(fake_backend.source) is None
+
+    def test_expired_pending_diff_is_not_replayed(
+        self,
+        session,
+        fake_backend,
+    ) -> None:
+        state = InMemorySyncStateStore()
+        state.save(fake_backend.source, {"sync_token": "tok-1"})
+        pending = InMemoryPendingDiffStore()
+        pending.save(
+            fake_backend.source,
+            SyncDiff(
+                deleted=[
+                    EventChange(
+                        calendar_source=fake_backend.source,
+                        external_id="expired-private-event",
+                        kind=ChangeKind.DELETED,
+                        summary="Expired private event",
+                        is_agent_created=False,
+                        old_start_at=utc(2026, 1, 1, 9),
+                        old_end_at=utc(2026, 1, 1, 10),
+                    )
+                ]
+            ).to_payload(),
+        )
+        fake_backend.queue_changes([], {"sync_token": "tok-2"})
+        service = CalendarMirrorService(
+            session,
+            [fake_backend],
+            state,
+            pending,
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert not diff.has_changes
         assert pending.load(fake_backend.source) is None
 
 

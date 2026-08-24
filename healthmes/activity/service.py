@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     rebuild_affected_days,
     summary_raw_provenance_complete,
@@ -311,7 +312,7 @@ def ingest_activity_batch(
     prevalidated_summary_scopes: set[ActivityLocalScope] | None = None,
     update_permission_status: bool = False,
 ) -> ActivityIngestResult:
-    current = (now or datetime.now(UTC)).astimezone(UTC)
+    current = (now or clock.utc_now()).astimezone(UTC)
     with activity_write_lock():
         lock_activity_write_plane(session)
         _reject_future_data(batch, now=current)

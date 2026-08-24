@@ -13,13 +13,19 @@ stable surface: the protocol itself, the snapshot descriptor, and the error
 hierarchy shared by all implementations.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from healthmes.backup.snapshot import RestoreResult
 
 __all__ = [
     "BackupError",
+    "BackupPublicationError",
     "BackupProvider",
     "SnapshotInfo",
     "SnapshotIntegrityError",
@@ -33,6 +39,19 @@ class BackupError(RuntimeError):
     Raised with an actionable, single-line message; CLI and scheduler
     surfaces print it without a traceback.
     """
+
+
+class BackupPublicationError(BackupError):
+    """A backup entry exists although publication did not fully acknowledge."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        destination_created: bool,
+    ) -> None:
+        super().__init__(message)
+        self.destination_created = destination_created
 
 
 class WrongPassphraseError(BackupError):
@@ -60,13 +79,15 @@ class SnapshotInfo:
     ``path`` is a provider-scoped locator: a real filesystem path for
     ``LocalDirectoryProvider``, an object key rendered as a path for remote
     vaults. ``created_at`` is the timezone-aware creation instant baked into
-    both the snapshot name and its manifest.
+    both the snapshot name and its manifest. ``version_id`` pins an immutable
+    remote object generation when the provider supports versioned locators.
     """
 
     name: str
     path: Path
     created_at: datetime
     size_bytes: int
+    version_id: str | None = None
 
 
 @runtime_checkable
@@ -87,7 +108,12 @@ class BackupProvider(Protocol):
         """
         ...
 
-    def restore(self, path: Path | str) -> None:
+    def restore(
+        self,
+        path: Path | str,
+        *,
+        allow_cross_store_partial: bool = False,
+    ) -> RestoreResult:
         """Restore the snapshot at ``path`` over the live data locations.
 
         ``path`` is a locator previously returned in ``SnapshotInfo.path``

@@ -13,8 +13,15 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
-# Runtime state (media, hermes home, backups, pg/redis data) — never committed
-data/
+# Runtime state (media, hermes home, backups, pg/redis data) — never committed.
+# Keep the decision bind source itself in the checkout so a core-only Compose
+# boot cannot create it as root and block a later host-side bootstrap.
+data/*
+!data/hermes/
+data/hermes/*
+!data/hermes/decision/
+data/hermes/decision/*
+!data/hermes/decision/.gitkeep
 *.pid
 *.log
 

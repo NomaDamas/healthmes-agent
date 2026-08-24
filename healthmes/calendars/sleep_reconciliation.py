@@ -85,9 +85,27 @@ class SleepCalendarWriteBlocked(RuntimeError):
 
 
 class SleepCalendarReconciler:
-    def __init__(self, session: Session, backend: CalendarBackend) -> None:
+    def __init__(
+        self,
+        session: Session,
+        backend: CalendarBackend,
+        *,
+        account_generation: str | None = None,
+    ) -> None:
         self._session = session
         self._backend = backend
+        self._account_generation = account_generation
+
+    def _scope_current_generation(
+        self,
+        statement: sa.Select,
+    ) -> sa.Select:
+        if self._account_generation is None:
+            return statement
+        return statement.where(
+            CalendarEventMirror.connection_generation
+            == self._account_generation
+        )
 
     def reconcile(self, observation: ActualSleepObservation) -> SleepCalendarResult:
         with calendar_write_lock(self._session, self._backend.source):
@@ -164,6 +182,7 @@ class SleepCalendarReconciler:
                     self._session,
                     self._backend.source,
                     observation,
+                    account_generation=self._account_generation,
                 )
                 canonical = canonical_actual_sleep_mirror(
                     rows,
@@ -216,17 +235,26 @@ class SleepCalendarReconciler:
                 identity,
             )
             row = self._session.scalar(
-                sa.select(CalendarEventMirror).where(
-                    CalendarEventMirror.calendar_source == self._backend.source,
-                    CalendarEventMirror.external_id == external_id,
+                self._scope_current_generation(
+                    sa.select(CalendarEventMirror).where(
+                        CalendarEventMirror.calendar_source
+                        == self._backend.source,
+                        CalendarEventMirror.external_id == external_id,
+                    )
                 )
             )
             identity_row = self._session.scalar(
-                sa.select(CalendarEventMirror).where(
-                    CalendarEventMirror.calendar_source == self._backend.source,
-                    CalendarEventMirror.healthmes_kind == identity.kind.value,
-                    CalendarEventMirror.healthmes_source == identity.source,
-                    CalendarEventMirror.healthmes_source_key == identity.source_key,
+                self._scope_current_generation(
+                    sa.select(CalendarEventMirror).where(
+                        CalendarEventMirror.calendar_source
+                        == self._backend.source,
+                        CalendarEventMirror.healthmes_kind
+                        == identity.kind.value,
+                        CalendarEventMirror.healthmes_source
+                        == identity.source,
+                        CalendarEventMirror.healthmes_source_key
+                        == identity.source_key,
+                    )
                 )
             )
             if (
@@ -252,6 +280,17 @@ class SleepCalendarReconciler:
                     retryable=False,
                     invalidated_proposal_ids=tuple(invalidated),
                 )
+
+            if self._account_generation is not None and row is None:
+                proposal.status = ProposalStatus.INVALIDATED
+                self._session.commit()
+                invalidated.append(proposal_id)
+                logger.warning(
+                    "Invalidated pushed proposal %s after calendar account "
+                    "change without touching the current account.",
+                    proposal.id,
+                )
+                continue
 
             try:
                 remote = self._backend.read_event(external_id)
@@ -343,10 +382,13 @@ class SleepCalendarReconciler:
         proposal: ScheduleProposal,
     ) -> bool:
         candidates = self._session.scalars(
-            sa.select(CalendarEventMirror).where(
-                CalendarEventMirror.calendar_source == self._backend.source,
-                CalendarEventMirror.is_agent_created.is_(True),
-                CalendarEventMirror.agent_task_id == proposal.task_id,
+            self._scope_current_generation(
+                sa.select(CalendarEventMirror).where(
+                    CalendarEventMirror.calendar_source
+                    == self._backend.source,
+                    CalendarEventMirror.is_agent_created.is_(True),
+                    CalendarEventMirror.agent_task_id == proposal.task_id,
+                )
             )
         ).all()
         start_at = coerce_utc(proposal.proposed_start)
@@ -385,18 +427,21 @@ class SleepCalendarReconciler:
 
         rows = list(
             self._session.scalars(
-                sa.select(CalendarEventMirror)
-                .where(
-                    CalendarEventMirror.calendar_source == self._backend.source,
-                    CalendarEventMirror.is_agent_created.is_(True),
-                    CalendarEventMirror.healthmes_kind
-                    == HealthmesEventKind.ACTUAL_SLEEP.value,
-                    CalendarEventMirror.sleep_local_date.is_not(None),
-                )
-                .order_by(
-                    CalendarEventMirror.sleep_local_date,
-                    CalendarEventMirror.updated_at.desc(),
-                    CalendarEventMirror.id,
+                self._scope_current_generation(
+                    sa.select(CalendarEventMirror)
+                    .where(
+                        CalendarEventMirror.calendar_source
+                        == self._backend.source,
+                        CalendarEventMirror.is_agent_created.is_(True),
+                        CalendarEventMirror.healthmes_kind
+                        == HealthmesEventKind.ACTUAL_SLEEP.value,
+                        CalendarEventMirror.sleep_local_date.is_not(None),
+                    )
+                    .order_by(
+                        CalendarEventMirror.sleep_local_date,
+                        CalendarEventMirror.updated_at.desc(),
+                        CalendarEventMirror.id,
+                    )
                 )
             ).all()
         )
@@ -529,16 +574,22 @@ class SleepCalendarReconciler:
         current_keys: set[str],
     ) -> tuple[str, ...]:
         rows = self._session.scalars(
-            sa.select(CalendarEventMirror).where(
-                CalendarEventMirror.calendar_source == self._backend.source,
-                CalendarEventMirror.is_agent_created.is_(True),
-                CalendarEventMirror.healthmes_kind
-                == HealthmesEventKind.ACTUAL_SLEEP.value,
-                CalendarEventMirror.sleep_local_date == observation.local_date,
-                CalendarEventMirror.healthmes_source_key.like(
-                    f"{observation.source_key}:segment:%"
-                ),
-                CalendarEventMirror.healthmes_source_key.not_in(current_keys),
+            self._scope_current_generation(
+                sa.select(CalendarEventMirror).where(
+                    CalendarEventMirror.calendar_source
+                    == self._backend.source,
+                    CalendarEventMirror.is_agent_created.is_(True),
+                    CalendarEventMirror.healthmes_kind
+                    == HealthmesEventKind.ACTUAL_SLEEP.value,
+                    CalendarEventMirror.sleep_local_date
+                    == observation.local_date,
+                    CalendarEventMirror.healthmes_source_key.like(
+                        f"{observation.source_key}:segment:%"
+                    ),
+                    CalendarEventMirror.healthmes_source_key.not_in(
+                        current_keys
+                    ),
+                )
             )
         ).all()
         deleted: list[str] = []
@@ -594,12 +645,19 @@ class SleepCalendarReconciler:
                     expected_etag=expected_etag,
                 )
                 row = self._session.scalar(
-                    sa.select(CalendarEventMirror).where(
-                        CalendarEventMirror.calendar_source == self._backend.source,
-                        CalendarEventMirror.external_id == result.external_id,
-                        CalendarEventMirror.healthmes_kind == identity.kind.value,
-                        CalendarEventMirror.healthmes_source == identity.source,
-                        CalendarEventMirror.healthmes_source_key == identity.source_key,
+                    self._scope_current_generation(
+                        sa.select(CalendarEventMirror).where(
+                            CalendarEventMirror.calendar_source
+                            == self._backend.source,
+                            CalendarEventMirror.external_id
+                            == result.external_id,
+                            CalendarEventMirror.healthmes_kind
+                            == identity.kind.value,
+                            CalendarEventMirror.healthmes_source
+                            == identity.source,
+                            CalendarEventMirror.healthmes_source_key
+                            == identity.source_key,
+                        )
                     )
                 )
                 if row is not None:
@@ -622,6 +680,7 @@ class SleepCalendarReconciler:
             self._session,
             self._backend.source,
             observation,
+            account_generation=self._account_generation,
         )
         row = canonical_actual_sleep_mirror(rows, identity)
         duplicates = list(rows)
@@ -710,6 +769,7 @@ class SleepCalendarReconciler:
                     remote,
                     pending_observation,
                     pending_fingerprint,
+                    account_generation=self._account_generation,
                 )
                 result = created_sleep_result(
                     row.external_id,
@@ -863,6 +923,7 @@ class SleepCalendarReconciler:
             self._session,
             self._backend,
             observation,
+            account_generation=self._account_generation,
         )
         return replace(
             result,
@@ -886,41 +947,98 @@ class SleepCalendarReconciler:
                 CalendarEventMirror.external_id == external_id,
             )
         )
+        remote = None
         if existing is not None:
-            remote = self._backend.read_event(external_id)
-            expected_etag = assert_remote_actual_sleep(
-                remote,
-                self._backend.source,
-                identity,
-                None,
+            stale_generation = (
+                self._account_generation is not None
+                and existing.connection_generation
+                != self._account_generation
             )
-            adopt_remote_actual_sleep(existing, remote, identity)
-            self._session.commit()
-            if pending_remote_matches(remote, observation):
-                finalize_sleep_mirror(
-                    self._session,
+            try:
+                remote = self._backend.read_event(external_id)
+            except EventNotFoundError:
+                if not stale_generation:
+                    raise
+                self._session.delete(existing)
+                self._session.commit()
+                existing = None
+            if existing is not None:
+                assert remote is not None
+                expected_etag = assert_remote_actual_sleep(
+                    remote,
+                    self._backend.source,
+                    identity,
+                    None if stale_generation else existing.etag,
+                )
+                adopt_remote_actual_sleep(
                     existing,
                     remote,
+                    identity,
+                    account_generation=self._account_generation,
+                )
+                self._session.commit()
+                if pending_remote_matches(remote, observation):
+                    finalize_sleep_mirror(
+                        self._session,
+                        existing,
+                        remote,
+                        observation,
+                        fingerprint,
+                        account_generation=self._account_generation,
+                    )
+                    return self._noop_result(external_id, fingerprint)
+                return self._update(
+                    existing,
                     observation,
                     fingerprint,
+                    expected_etag,
                 )
-                return self._noop_result(external_id, fingerprint)
-            return self._update(
-                existing,
-                observation,
-                fingerprint,
-                expected_etag,
-            )
 
+        self._quarantine_stale_identity_conflicts(
+            identity,
+            expected_external_id=external_id,
+        )
         row = pending_sleep_mirror(
             self._backend.source,
             observation,
             identity,
             fingerprint,
+            account_generation=self._account_generation,
         )
         self._session.add(row)
         self._session.commit()
         return self._create_remote(row, observation, identity, fingerprint)
+
+    def _quarantine_stale_identity_conflicts(
+        self,
+        identity: CalendarEventIdentity,
+        *,
+        expected_external_id: str,
+    ) -> None:
+        if self._account_generation is None:
+            return
+        rows = self._session.scalars(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source
+                == self._backend.source,
+                CalendarEventMirror.healthmes_kind
+                == identity.kind.value,
+                CalendarEventMirror.healthmes_source == identity.source,
+                CalendarEventMirror.healthmes_source_key
+                == identity.source_key,
+                CalendarEventMirror.connection_generation
+                != self._account_generation,
+            )
+        ).all()
+        changed = False
+        for row in rows:
+            if row.external_id == expected_external_id:
+                self._session.delete(row)
+            else:
+                quarantine_sleep_identity(row)
+            changed = True
+        if changed:
+            self._session.commit()
 
     def _create_remote(
         self,
@@ -969,6 +1087,7 @@ class SleepCalendarReconciler:
             created,
             observation,
             fingerprint,
+            account_generation=self._account_generation,
         )
         return created_sleep_result(row.external_id, fingerprint)
 
@@ -993,6 +1112,7 @@ class SleepCalendarReconciler:
             observation,
             fingerprint,
             expected_etag,
+            account_generation=self._account_generation,
         )
         return self._update_remote(row, observation, fingerprint, expected_etag)
 
@@ -1017,6 +1137,7 @@ class SleepCalendarReconciler:
                 remote,
                 observation,
                 fingerprint,
+                account_generation=self._account_generation,
             )
             return updated_sleep_result(row.external_id, fingerprint)
         if row.etag is not None and remote_etag != row.etag:
@@ -1070,5 +1191,6 @@ class SleepCalendarReconciler:
             updated,
             observation,
             fingerprint,
+            account_generation=self._account_generation,
         )
         return updated_sleep_result(row.external_id, fingerprint)

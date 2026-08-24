@@ -811,6 +811,34 @@ def test_ios_contract_reports_unavailable_without_fake_samples() -> None:
         )
 
 
+def test_ios_contract_reports_restricted_without_fake_samples() -> None:
+    report = IOSCapabilityReport(
+        device_id="iphone-restricted",
+        timezone="Asia/Seoul",
+        capability="aggregate",
+        permission_status=ActivityPermissionStatus.RESTRICTED,
+        reason="family_controls_restricted",
+    )
+
+    assert report.samples == []
+
+    with pytest.raises(ValidationError):
+        IOSCapabilityReport(
+            device_id="iphone-restricted",
+            timezone="Asia/Seoul",
+            capability="aggregate",
+            permission_status=ActivityPermissionStatus.RESTRICTED,
+            samples=[
+                {
+                    "source_record_id": "fake-zero",
+                    "bucket_start": "2026-08-01T10:00:00Z",
+                    "foreground_seconds": 0,
+                    "category": "other",
+                }
+            ],
+        )
+
+
 def test_activitywatch_missing_afk_events_does_not_advance_cursor(session) -> None:
     class MissingAfkClient:
         def list_buckets(self):

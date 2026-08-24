@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from threading import Event
 from time import sleep
 from types import SimpleNamespace
@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import healthmes.nutrition.intake_service as intake_service_module
+from healthmes import clock
 from healthmes.api.intake_interactions import AnalyzeInteractionInput
 from healthmes.nutrition.contracts import (
     Confidence,
@@ -39,7 +40,13 @@ from healthmes.nutrition.vision import VisionUnavailable
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
+
+
+def _recent_utc() -> str:
+    return (clock.utc_now() - timedelta(minutes=1)).isoformat()
 
 
 class FakeVision:
@@ -211,8 +218,8 @@ def _photo_observation(client) -> str:
         "/v1/nutrition-observations/analyze",
         json={
             "media_path": media_path,
-            "captured_at": "2026-08-06T08:30:00+09:00",
-            "timezone": "Asia/Seoul",
+            "captured_at": _recent_utc(),
+            "timezone": "UTC",
             "source": "ios-photo",
             "location": None,
             "metadata_provenance": {
@@ -782,6 +789,7 @@ def test_uploaded_media_cannot_be_reused_by_another_capture(client, freeze_reten
         "nutrition_intake",
     )
     media_path = _upload(client, b"fake-m4a", "audio/m4a", "meal.m4a")
+    observed_at = _recent_utc()
     first = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(
@@ -789,6 +797,8 @@ def test_uploaded_media_cannot_be_reused_by_another_capture(client, freeze_reten
             source_text="아침에 바나나와 우유를 먹었어",
             media_path=media_path,
             items=[],
+            observed_at=observed_at,
+            timezone="UTC",
         ),
     )
     assert first.status_code == 201
@@ -800,6 +810,8 @@ def test_uploaded_media_cannot_be_reused_by_another_capture(client, freeze_reten
             source_text="같은 음성을 다시 연결",
             media_path=media_path,
             items=[],
+            observed_at=observed_at,
+            timezone="UTC",
         ),
     )
 
@@ -813,12 +825,13 @@ def test_free_text_is_automatically_analyzed_and_retry_is_idempotent(
     provider = FakeAnalysis()
     client.app.state.nutrition_analysis_provider = provider
     operation_id = str(uuid.uuid4())
+    observed_at = _recent_utc()
     body = {
         "operation_id": operation_id,
         "intent": "log_consumed",
         "modality": "text",
-        "observed_at": "2026-08-06T08:30:00+09:00",
-        "timezone": "Asia/Seoul",
+        "observed_at": observed_at,
+        "timezone": "UTC",
         "source": "ios-device",
         "source_text": "아침에 바나나와 우유를 먹었어",
         "allow_remote_analysis": False,
@@ -946,7 +959,7 @@ def test_analysis_failure_does_not_commit_or_rollback_caller_session(
             source="test",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=clock.utc_now(),
             allow_remote_analysis=False,
             provider=UnavailableAnalysis(),
         )
@@ -981,7 +994,7 @@ def test_analysis_reservation_does_not_commit_flushed_caller_state(
             source="test",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=clock.utc_now(),
             allow_remote_analysis=False,
             provider=UnavailableAnalysis(),
         )
@@ -1041,7 +1054,7 @@ def test_expired_analysis_lease_can_be_reclaimed(client, session):
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1134,7 +1147,7 @@ def test_final_transaction_rollback_releases_analysis_reservation(
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1182,7 +1195,7 @@ def test_savepoint_rollback_keeps_analysis_reservation(client, session):
                         source="test",
                         source_text="I ate lunch",
                         media_path=None,
-                        recorded_at=datetime.now(UTC),
+                        recorded_at=clock.utc_now(),
                         allow_remote_analysis=False,
                         provider=FakeAnalysis(),
                     )
@@ -1204,7 +1217,7 @@ def test_savepoint_rollback_keeps_analysis_reservation(client, session):
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=SavepointRollbackAnalysis(),
     )
@@ -1247,7 +1260,7 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
         source="test",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1255,8 +1268,8 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
         WellnessEvent(
             event_type="fixture.conflict",
             schema_version=1,
-            observed_at=datetime.now(UTC),
-            recorded_at=datetime.now(UTC),
+            observed_at=clock.utc_now(),
+            recorded_at=clock.utc_now(),
             timezone="UTC",
             source_provider="nutrition-operation",
             source_device=None,
@@ -1289,7 +1302,11 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
     assert "nutrition_analysis_reservations" not in session.info
 
 
-def test_expired_sqlite_reservation_rejects_late_owner(client, session):
+def test_expired_sqlite_reservation_rejects_late_owner(
+    client,
+    session,
+    fixture_clock,
+):
     operation_id = uuid.uuid4()
     fingerprint = operation_fingerprint({"fixture": "late-owner"})
 
@@ -1302,9 +1319,9 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
                 reservation = (
                     intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key]
                 )
-                reservation["lease_expires_at"] = datetime.now(
-                    UTC
-                ) - timedelta(seconds=1)
+                reservation["lease_expires_at"] = fixture_clock() - timedelta(
+                    seconds=1
+                )
             with Session(bind=session.get_bind()) as winner_session:
                 create_analyzed_interaction(
                     winner_session,
@@ -1325,7 +1342,7 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
                     source="winner",
                     source_text=text,
                     media_path=None,
-                    recorded_at=datetime.now(UTC),
+                    recorded_at=fixture_clock(),
                     allow_remote_analysis=False,
                     provider=FakeAnalysis(),
                 )
@@ -1348,7 +1365,7 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
             source="late-owner",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=fixture_clock(),
             allow_remote_analysis=False,
             provider=ReclaimedDuringAnalysis(),
         )
@@ -1378,7 +1395,7 @@ def test_persisting_sqlite_reservation_cannot_be_reclaimed(
     with intake_service_module._STATIC_ANALYSIS_RESERVATIONS_LOCK:
         intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key][
             "lease_expires_at"
-        ] = datetime.now(UTC) - timedelta(seconds=1)
+        ] = clock.utc_now() - timedelta(seconds=1)
 
     with Session(bind=session.get_bind()) as contender:
         with pytest.raises(IntakeAnalysisInProgress):
@@ -1404,8 +1421,8 @@ def test_persistent_reservation_completion_uses_token_cas(
     marker = WellnessEvent(
         event_type="nutrition.operation.v1",
         schema_version=1,
-        observed_at=datetime.now(UTC),
-        recorded_at=datetime.now(UTC),
+        observed_at=clock.utc_now(),
+        recorded_at=clock.utc_now(),
         timezone=None,
         source_provider="nutrition-operation",
         source_device=None,
@@ -1460,7 +1477,7 @@ def test_persistent_reservation_completion_uses_token_cas(
             SimpleNamespace(
                 interaction_id=operation_id,
                 operation_fingerprint=fingerprint,
-                recorded_at=datetime.now(UTC),
+                recorded_at=clock.utc_now(),
             ),
             reservation_token="owner-a",
         )
@@ -1483,7 +1500,7 @@ def test_session_close_releases_sqlite_analysis_reservation(client, session):
         source="first",
         source_text="I ate lunch",
         media_path=None,
-        recorded_at=datetime.now(UTC),
+        recorded_at=clock.utc_now(),
         allow_remote_analysis=False,
         provider=FakeAnalysis(),
     )
@@ -1502,7 +1519,7 @@ def test_session_close_releases_sqlite_analysis_reservation(client, session):
             source="first",
             source_text="I ate lunch",
             media_path=None,
-            recorded_at=datetime.now(UTC),
+            recorded_at=clock.utc_now(),
             allow_remote_analysis=False,
             provider=FakeAnalysis(),
         )
@@ -1524,8 +1541,8 @@ def test_voice_is_transcribed_locally_then_automatically_analyzed(
             "operation_id": str(uuid.uuid4()),
             "intent": "log_consumed",
             "modality": "voice",
-            "observed_at": "2026-08-06T08:30:00+09:00",
-            "timezone": "Asia/Seoul",
+            "observed_at": _recent_utc(),
+            "timezone": "UTC",
             "source": "android-device",
             "media_path": media_path,
             "allow_remote_analysis": False,
@@ -1790,11 +1807,15 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
         reviewed.json()["review_id"]
     )
 
+    observation_day = observation_event.observed_at
+    if observation_day.tzinfo is None:
+        observation_day = observation_day.replace(tzinfo=UTC)
+    local_date = observation_day.astimezone(UTC).date()
     daily = client.post(
         "/v1/nutrition-observations/daily-confirmations",
         json={
-            "local_date": "2026-08-06",
-            "timezone": "Asia/Seoul",
+            "local_date": local_date.isoformat(),
+            "timezone": "UTC",
             "observation_ids": [observation_id],
             "total_intake_complete": True,
             "source": "desktop-web",
@@ -1804,8 +1825,8 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     session.expire_all()
     caffeine = known_caffeine_for_day(
         session,
-        local_date=date(2026, 8, 6),
-        timezone="Asia/Seoul",
+        local_date=local_date,
+        timezone="UTC",
     )
     assert caffeine["status"] == "known"
     assert caffeine["confirmed_caffeine_mg"] == 95
@@ -1841,6 +1862,44 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     assert str(colliding_review.id) not in (
         comparison_context.json()["evidence_event_ids"]
     )
+
+
+def test_expired_photo_review_retry_returns_operation_conflict(
+    client,
+    session,
+    fixture_clock,
+):
+    observation_id = _photo_observation(client)
+    review_body = {
+        "operation_id": str(uuid.uuid4()),
+        "status": "confirmed",
+        "source": "desktop-web",
+    }
+    created = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json=review_body,
+    )
+    assert created.status_code == 201
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.review.v1",
+            WellnessEvent.source_record_id == review_body["operation_id"],
+        )
+    )
+    assert event is not None
+    event.expires_at = fixture_clock()
+    session.commit()
+
+    retried = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json=review_body,
+    )
+
+    assert retried.status_code == 409
+    assert retried.json()["error"]["code"] == (
+        "nutrition_review_operation_conflict"
+    )
+    assert "expired nutrition review cannot be retried" in retried.text
 
 
 def test_rejected_photo_observation_cannot_create_interaction(client):
@@ -2308,8 +2367,10 @@ def test_legacy_warnings_are_migrated_for_the_remaining_raw_ttl(
 ):
     warning = "portion is uncertain"
     item_warning = "milk type is unknown"
+    observed_at = clock.utc_now() - timedelta(days=1)
     body = _text_interaction(
-        observed_at="2026-08-06T12:30:00+09:00",
+        observed_at=observed_at.isoformat(),
+        timezone="UTC",
         warnings=[warning],
     )
     body["items"][0]["warnings"] = [item_warning]
@@ -2340,7 +2401,7 @@ def test_legacy_warnings_are_migrated_for_the_remaining_raw_ttl(
     run_storage_maintenance(
         session,
         client.app.state.settings,
-        now=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        now=observed_at + timedelta(days=1),
     )
     session.commit()
     session.expire_all()
@@ -2500,11 +2561,12 @@ def test_expired_raw_capture_is_hidden_before_maintenance(client):
 def test_expired_structured_interaction_cannot_be_read_or_promoted(
     client,
     session,
+    fixture_clock,
 ):
     created = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(
-            observed_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+            observed_at=(fixture_clock() - timedelta(minutes=1)).isoformat(),
             timezone="UTC",
         ),
     )
@@ -2517,7 +2579,7 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
         )
     )
     assert structured is not None
-    structured.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    structured.expires_at = fixture_clock() - timedelta(seconds=1)
     session.commit()
 
     assert (
@@ -2533,7 +2595,7 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
             "operation_id": str(uuid.uuid4()),
             "status": "consumed",
             "source": "test",
-            "consumed_at": datetime.now(UTC).isoformat(),
+            "consumed_at": fixture_clock().isoformat(),
         },
     )
     assert outcome.status_code == 422
@@ -2548,7 +2610,11 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
     assert decision.status_code == 422
 
 
-def test_expired_snapshots_cannot_restore_an_interaction(client, session):
+def test_expired_snapshots_cannot_restore_an_interaction(
+    client,
+    session,
+    fixture_clock,
+):
     created = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(),
@@ -2589,7 +2655,7 @@ def test_expired_snapshots_cannot_restore_an_interaction(client, session):
         )
     )
     for event in events:
-        event.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        event.expires_at = fixture_clock() - timedelta(seconds=1)
     session.commit()
 
     assert (
@@ -2605,7 +2671,11 @@ def test_expired_snapshots_cannot_restore_an_interaction(client, session):
     )
 
 
-def test_expired_direct_capture_retry_returns_conflict(client, session):
+def test_expired_direct_capture_retry_returns_conflict(
+    client,
+    session,
+    fixture_clock,
+):
     body = _text_interaction()
     created = client.post("/v1/intake-interactions", json=body)
     assert created.status_code == 201
@@ -2617,7 +2687,7 @@ def test_expired_direct_capture_retry_returns_conflict(client, session):
         )
     )
     assert event is not None
-    event.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    event.expires_at = fixture_clock() - timedelta(seconds=1)
     session.commit()
 
     retried = client.post("/v1/intake-interactions", json=body)
@@ -2744,7 +2814,11 @@ def test_provider_warnings_cannot_preserve_raw_owner_text(client, session):
     assert owner_text not in str(event.quality_flags)
 
 
-def test_raw_warnings_never_copy_into_unlimited_snapshots(client, session):
+def test_raw_warnings_never_copy_into_unlimited_snapshots(
+    client,
+    session,
+    fixture_clock,
+):
     owner_text = "private owner text: medication X at 8pm"
 
     class WarningEchoAnalysis(FakeAnalysis):
@@ -2758,7 +2832,7 @@ def test_raw_warnings_never_copy_into_unlimited_snapshots(client, session):
             return extraction
 
     client.app.state.nutrition_analysis_provider = WarningEchoAnalysis()
-    observed_at = datetime.now(UTC).replace(microsecond=0)
+    observed_at = fixture_clock().replace(microsecond=0)
     created = client.post(
         "/v1/intake-interactions/analyze",
         json={
@@ -2864,7 +2938,7 @@ def test_maintenance_scrubs_legacy_warnings_from_durable_snapshots(
     run_storage_maintenance(
         session,
         client.app.state.settings,
-        now=datetime.now(UTC),
+        now=clock.utc_now(),
     )
     session.commit()
     session.expire_all()

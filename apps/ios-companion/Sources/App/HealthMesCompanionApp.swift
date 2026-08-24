@@ -10,6 +10,7 @@ struct HealthMesCompanionApp: App {
         // 1. BGTaskScheduler handlers must be registered before the app
         //    finishes launching.
         BackgroundRefreshManager.shared.register()
+        ScreenTimeActivityRuntime.shared.register()
         // 2. The notification delegate must exist before a notification tap
         //    can deliver its response.
         NotificationManager.shared.configure()
@@ -58,8 +59,12 @@ struct HealthMesCompanionApp: App {
                     await RefreshCoordinator.shared.sync(isForeground: true)
                     await HealthKitSyncManager.shared.resume()
                 }
+                Task {
+                    await ScreenTimeActivityRuntime.shared.foregroundCatchUp()
+                }
             case .background:
                 BackgroundRefreshManager.shared.schedule()
+                ScreenTimeActivityRuntime.shared.schedule()
             default:
                 break
             }

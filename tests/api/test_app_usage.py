@@ -90,8 +90,9 @@ def _set_generation(
 
 @pytest.fixture(autouse=True)
 def register_default_generation(client):
-    # Build FastAPI before freezing datetime to avoid lazy schema compilation
-    # seeing freezegun's date subclass.
+    # Build FastAPI outside freezegun, then keep the dated payloads inside the
+    # default retention window without exposing lazy schema compilation to
+    # freezegun's date subclass.
     assert client.get("/v1/activity/devices/clock-prime/collection").status_code == 200
     with freeze_time("2026-08-14 12:00:00", tick=True, real_asyncio=True):
         response = _set_generation(

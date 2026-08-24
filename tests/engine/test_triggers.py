@@ -6,6 +6,7 @@ cutoff from the same frozen local clock. All persisted datetimes are
 normalized to UTC by the engine.
 """
 
+import threading
 import uuid
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
@@ -15,8 +16,11 @@ from freezegun import freeze_time
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+import healthmes.engine.triggers as trigger_module
+from healthmes.calendars import creds
 from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
+from healthmes.engine.decision_dispatch import DecisionDispatchResult
 from healthmes.engine.rules import (
     RecoverySnapshot,
     StressSnapshot,
@@ -36,7 +40,7 @@ from healthmes.engine.triggers import (
     default_now_provider,
     is_in_quiet_hours,
 )
-from healthmes.engine.webhook import WebhookResult
+from healthmes.storage import update_retention_policy
 from healthmes.store import Base, create_db_engine
 from healthmes.store.enums import (
     CalendarMutationOperation,
@@ -126,14 +130,18 @@ class FakeAlertSender:
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult:
+    ) -> DecisionDispatchResult:
         self.sent.append((fire, fired_at, trigger_event_id))
         if self.ok:
-            return WebhookResult(ok=True, status_code=202)
-        return WebhookResult(
+            return DecisionDispatchResult(
+                ok=True,
+                status_code=202,
+                channel="test",
+            )
+        return DecisionDispatchResult(
             ok=False,
             status_code=502,
-            detail="gateway unavailable",
+            detail="delivery unavailable",
             retryable=self.retryable,
         )
 
@@ -142,11 +150,11 @@ class RaisingAlertSender:
     """AlertSender double whose send() *raises* (transport blew up mid-send).
 
     Distinct from ``FakeAlertSender(ok=False)``, which returns a clean
-    ``WebhookResult(ok=False)`` — a gateway that answered non-2xx.
+    ``DecisionDispatchResult(ok=False)`` — a sender that answered non-2xx.
     """
 
     def __init__(self, exc: Exception | None = None) -> None:
-        self.exc = exc if exc is not None else RuntimeError("webhook transport exploded")
+        self.exc = exc if exc is not None else RuntimeError("delivery transport exploded")
         self.calls = 0
 
     def send(
@@ -155,9 +163,86 @@ class RaisingAlertSender:
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult:
+    ) -> DecisionDispatchResult:
         self.calls += 1
         raise self.exc
+
+
+class RetentionChangingSender:
+    """Shrink retention while reasoning is in flight, then return an answer."""
+
+    requires_reasoning = True
+
+    def __init__(self, session_factory, *, now: datetime) -> None:
+        self._session_factory = session_factory
+        self._now = now
+        self.calls = 0
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> DecisionDispatchResult:
+        del fire, fired_at, trigger_event_id
+        self.calls += 1
+        with self._session_factory() as session:
+            update_retention_policy(
+                session,
+                "alert",
+                "1d",
+                now=self._now,
+            )
+            session.commit()
+        return DecisionDispatchResult(
+            ok=False,
+            status_code=204,
+            ready_for_native=True,
+            channel="app_poll",
+            message="This answer completed after its alert expired.",
+        )
+
+
+class AppAvailableAlertSender:
+    """Return one generated answer for the finalization-race tests."""
+
+    requires_reasoning = True
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> DecisionDispatchResult:
+        del fire, fired_at, trigger_event_id
+        return DecisionDispatchResult(
+            ok=False,
+            status_code=204,
+            ready_for_native=True,
+            channel="app_poll",
+            message="Generated answer awaiting app display.",
+        )
+
+
+class MisreportedNativeSuccessSender:
+    """Simulate a broken adapter claiming native transport success."""
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> DecisionDispatchResult:
+        del fire, fired_at, trigger_event_id
+        return DecisionDispatchResult(
+            ok=True,
+            status_code=202,
+            channel="native",
+            message="Must not be exposed while native delivery is disabled.",
+        )
 
 
 class FakeHealthReader:
@@ -272,10 +357,14 @@ def test_fresh_fire_is_persisted_and_pushed(settings, session_factory, alert_sen
     assert event.alert_sent is True
     assert event.payload["summary"] == fire.summary
     assert event.payload["evidence"]["recent_value"] == 85.0
-    assert event.payload["push"] == {"sent": True, "status_code": 202, "channel": "webhook"}
+    assert event.payload["push"] == {
+        "sent": True,
+        "status_code": 202,
+        "channel": "test",
+    }
 
 
-def test_trigger_event_is_committed_before_webhook_dispatch(settings, tmp_path) -> None:
+def test_trigger_event_is_committed_before_alert_dispatch(settings, tmp_path) -> None:
     engine = create_db_engine(f"sqlite+pysqlite:///{tmp_path / 'trigger-visibility.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -320,7 +409,7 @@ def test_dispatching_event_retries_with_same_correlation_id(
                 "summary": "observation",
                 "proposal": "proposal",
                 "evidence": {},
-                "push": {"state": "dispatching", "channel": "webhook"},
+                "push": {"state": "dispatching", "channel": "delivery"},
             },
         )
         with session_factory() as session:
@@ -341,6 +430,572 @@ def test_dispatching_event_retries_with_same_correlation_id(
     [stored] = all_events(session_factory)
     assert stored.id == event_id
     assert stored.alert_sent is True
+
+
+def test_retention_expired_dispatch_never_invokes_sender(
+    settings,
+    session_factory,
+) -> None:
+    sender = FakeAlertSender()
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        event = TriggerEvent(
+            fired_at=utc(now - timedelta(days=1)),
+            rule_id="scheduled_briefing.morning",
+            dedup_key="scheduled_briefing.morning:2026-07-08",
+            alert_sent=False,
+            payload={
+                "summary": "Expired morning trigger.",
+                "proposal": "Generate an expired briefing.",
+                "evidence": {},
+                "message": "Stale answer must not survive.",
+                "push": {
+                    "state": "dispatching",
+                    "channel": "decision",
+                },
+            },
+        )
+        with session_factory() as session:
+            update_retention_policy(
+                session,
+                "alert",
+                "1d",
+                now=now,
+            )
+            session.add(event)
+            session.commit()
+            event_id = event.id
+
+        report = make_evaluator(
+            settings,
+            session_factory,
+            sender,
+            rules=(),
+        ).evaluate_once()
+
+    assert report.outcomes == ()
+    assert sender.sent == []
+    with session_factory() as session:
+        stored = session.get(TriggerEvent, event_id)
+        assert stored is not None
+        assert stored.alert_sent is False
+        assert "message" not in stored.payload
+        assert stored.payload["push"]["state"] == "expired"
+
+
+def test_retention_shrink_during_reasoning_never_persists_answer(
+    settings,
+    tmp_path,
+) -> None:
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'trigger-retention-race.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    try:
+        with freeze_time("2026-07-09 14:00:00"):
+            now = local_now()
+            event = TriggerEvent(
+                fired_at=utc(now - timedelta(days=2)),
+                rule_id="scheduled_briefing.morning",
+                dedup_key="scheduled_briefing.morning:2026-07-07",
+                alert_sent=False,
+                payload={
+                    "summary": "A retained scheduled prompt.",
+                    "proposal": "Generate a briefing.",
+                    "evidence": {},
+                    "push": {
+                        "state": "dispatching",
+                        "channel": "decision",
+                    },
+                },
+            )
+            with factory() as session:
+                update_retention_policy(
+                    session,
+                    "alert",
+                    "7d",
+                    now=now,
+                )
+                session.add(event)
+                session.commit()
+                event_id = event.id
+
+            sender = RetentionChangingSender(factory, now=now)
+            report = make_evaluator(
+                settings,
+                factory,
+                sender,
+                rules=(),
+            ).evaluate_once()
+
+        assert sender.calls == 1
+        assert report.count("suppressed") == 1
+        assert report.outcomes[0].reason == "retention_expired"
+        with factory() as session:
+            stored = session.get(TriggerEvent, event_id)
+            assert stored is not None
+            assert stored.alert_sent is False
+            assert "message" not in stored.payload
+            assert stored.payload["push"]["state"] == "expired"
+    finally:
+        engine.dispose()
+
+
+def test_retention_shrink_after_final_check_scrubs_committed_answer(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 7, 9, 14, tzinfo=UTC)
+    fired_at = now - timedelta(days=2)
+    with session_factory() as session:
+        update_retention_policy(
+            session,
+            "alert",
+            "7d",
+            now=now,
+        )
+        session.commit()
+
+    original_check = trigger_module.alert_retention_is_expired
+    post_reasoning_check = threading.Event()
+    release_finalization = threading.Event()
+    check_lock = threading.Lock()
+    check_count = 0
+
+    def block_after_final_check(session, event, *, now):
+        nonlocal check_count
+        expired = original_check(session, event, now=now)
+        with check_lock:
+            check_count += 1
+            should_block = check_count == 4
+        if should_block:
+            post_reasoning_check.set()
+            if not release_finalization.wait(timeout=5):
+                raise TimeoutError("test did not release alert finalization")
+        return expired
+
+    monkeypatch.setattr(
+        trigger_module,
+        "alert_retention_is_expired",
+        block_after_final_check,
+    )
+    evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=AppAvailableAlertSender(),
+        rules=(),
+        now_provider=lambda: now,
+    )
+    report_box: list[Any] = []
+    errors: list[BaseException] = []
+
+    def evaluate() -> None:
+        try:
+            report_box.append(
+                evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="retention_race",
+                        dedup_key="retention_race:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=fired_at,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    retention_done = threading.Event()
+
+    def shorten_retention() -> None:
+        try:
+            with session_factory() as session:
+                update_retention_policy(
+                    session,
+                    "alert",
+                    "1d",
+                    now=now,
+                )
+                session.commit()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            retention_done.set()
+
+    evaluation_thread = threading.Thread(target=evaluate)
+    evaluation_thread.start()
+    assert post_reasoning_check.wait(timeout=2)
+
+    retention_thread = threading.Thread(target=shorten_retention)
+    retention_thread.start()
+    assert not retention_done.wait(timeout=0.05)
+    release_finalization.set()
+    evaluation_thread.join(timeout=5)
+    retention_thread.join(timeout=5)
+
+    assert not evaluation_thread.is_alive()
+    assert not retention_thread.is_alive()
+    assert errors == []
+    assert report_box[0].status == "available"
+    [stored] = all_events(session_factory)
+    assert stored.alert_sent is False
+    assert "message" not in stored.payload
+    assert stored.payload["push"]["state"] == "expired"
+
+
+def test_expired_dispatch_lease_takeover_rejects_stale_publisher(
+    settings,
+    session_factory,
+) -> None:
+    first_now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    takeover_now = first_now + timedelta(seconds=2)
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class BlockingSender:
+        requires_reasoning = True
+
+        def send(
+            self,
+            fire: TriggerFire,
+            *,
+            fired_at: datetime,
+            trigger_event_id: uuid.UUID,
+        ) -> DecisionDispatchResult:
+            del fire, fired_at, trigger_event_id
+            first_started.set()
+            assert release_first.wait(timeout=5)
+            return DecisionDispatchResult(
+                ok=False,
+                status_code=204,
+                ready_for_native=True,
+                channel="app_poll",
+                message="Stale worker answer.",
+            )
+
+    class WinningSender:
+        requires_reasoning = True
+
+        def send(
+            self,
+            fire: TriggerFire,
+            *,
+            fired_at: datetime,
+            trigger_event_id: uuid.UUID,
+        ) -> DecisionDispatchResult:
+            del fire, fired_at, trigger_event_id
+            return DecisionDispatchResult(
+                ok=False,
+                status_code=204,
+                ready_for_native=True,
+                channel="app_poll",
+                message="Canonical takeover answer.",
+            )
+
+    first_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=BlockingSender(),
+        rules=(),
+        now_provider=lambda: first_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    takeover_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=WinningSender(),
+        rules=(),
+        now_provider=lambda: takeover_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    first_outcomes: list[Any] = []
+    failures: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            first_outcomes.append(
+                first_evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="lease_takeover",
+                        dedup_key="lease_takeover:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=first_now,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_first)
+    try:
+        worker.start()
+        assert first_started.wait(timeout=5)
+
+        takeover_report = takeover_evaluator.evaluate_once()
+        release_first.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert takeover_report.count("available") == 1
+        assert len(first_outcomes) == 1
+        assert first_outcomes[0].status == "deduplicated"
+        [stored] = all_events(session_factory)
+        assert stored.alert_sent is False
+        assert stored.payload["message"] == "Canonical takeover answer."
+        assert stored.payload["push"]["state"] == "app_available"
+        assert stored.dispatch_owner_token is None
+        assert stored.dispatch_lease_expires_at is None
+        assert stored.dispatch_generation == 2
+    finally:
+        release_first.set()
+        worker.join(timeout=5)
+
+
+def test_late_sweep_claim_and_sender_preflight_use_fresh_clock(
+    settings,
+    session_factory,
+) -> None:
+    sweep_started_at = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    claimed_at = sweep_started_at + timedelta(seconds=10)
+    preflight_at = claimed_at + timedelta(seconds=1)
+    completed_at = preflight_at + timedelta(seconds=1)
+    clock_values = iter(
+        (sweep_started_at, claimed_at, preflight_at, completed_at)
+    )
+    observed_leases: list[datetime] = []
+
+    class LeaseInspectingSender:
+        requires_reasoning = False
+
+        def send(
+            self,
+            fire: TriggerFire,
+            *,
+            fired_at: datetime,
+            trigger_event_id: uuid.UUID,
+        ) -> DecisionDispatchResult:
+            del fire, fired_at
+            with session_factory() as session:
+                event = session.get(TriggerEvent, trigger_event_id)
+                assert event is not None
+                assert event.dispatch_lease_expires_at is not None
+                observed_leases.append(
+                    trigger_module._ensure_utc(
+                        event.dispatch_lease_expires_at
+                    )
+                )
+            return DecisionDispatchResult(
+                ok=True,
+                status_code=202,
+                channel="test",
+            )
+
+    evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=LeaseInspectingSender(),
+        rules=(fixed_rule,),
+        now_provider=lambda: next(clock_values),
+        dispatch_lease_duration=timedelta(seconds=5),
+    )
+
+    report = evaluator.evaluate_once()
+
+    assert report.count("pushed") == 1
+    assert observed_leases == [
+        preflight_at + timedelta(seconds=5)
+    ]
+
+
+def test_takeover_before_sender_preflight_fences_old_worker(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    first_now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    takeover_now = first_now + timedelta(seconds=2)
+    preflight_waiting = threading.Event()
+    release_preflight = threading.Event()
+    first_sender = FakeAlertSender()
+    takeover_sender = FakeAlertSender()
+    first_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=first_sender,
+        rules=(),
+        now_provider=lambda: first_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    takeover_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=takeover_sender,
+        rules=(),
+        now_provider=lambda: takeover_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    original_preflight = first_evaluator._preflight_dispatch_claim
+
+    def delayed_preflight(session, claim):
+        preflight_waiting.set()
+        assert release_preflight.wait(timeout=5)
+        return original_preflight(session, claim)
+
+    monkeypatch.setattr(
+        first_evaluator,
+        "_preflight_dispatch_claim",
+        delayed_preflight,
+    )
+    first_outcomes: list[Any] = []
+    failures: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            first_outcomes.append(
+                first_evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="preflight_takeover",
+                        dedup_key="preflight_takeover:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=first_now,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_first)
+    try:
+        worker.start()
+        assert preflight_waiting.wait(timeout=5)
+
+        takeover_report = takeover_evaluator.evaluate_once()
+        release_preflight.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert first_sender.sent == []
+        assert len(takeover_sender.sent) == 1
+        assert takeover_report.count("pushed") == 1
+        assert len(first_outcomes) == 1
+        assert first_outcomes[0].status == "deduplicated"
+        [stored] = all_events(session_factory)
+        assert stored.alert_sent is True
+        assert stored.dispatch_generation == 2
+        assert stored.dispatch_owner_token is None
+        assert stored.dispatch_lease_expires_at is None
+    finally:
+        release_preflight.set()
+        worker.join(timeout=5)
+
+
+def test_retention_expiry_during_sender_preflight_suppresses_sender(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    fired_at = now - timedelta(days=2)
+    with session_factory() as session:
+        update_retention_policy(
+            session,
+            "alert",
+            "7d",
+            now=now,
+        )
+        session.commit()
+
+    sender = FakeAlertSender()
+    evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=sender,
+        rules=(),
+        now_provider=lambda: now,
+    )
+    preflight_waiting = threading.Event()
+    release_preflight = threading.Event()
+    original_preflight = evaluator._preflight_dispatch_claim
+
+    def delayed_preflight(session, claim):
+        preflight_waiting.set()
+        assert release_preflight.wait(timeout=5)
+        return original_preflight(session, claim)
+
+    monkeypatch.setattr(
+        evaluator,
+        "_preflight_dispatch_claim",
+        delayed_preflight,
+    )
+    outcomes: list[Any] = []
+    failures: list[BaseException] = []
+
+    def dispatch() -> None:
+        try:
+            outcomes.append(
+                evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="preflight_retention",
+                        dedup_key="preflight_retention:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=fired_at,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=dispatch)
+    try:
+        worker.start()
+        assert preflight_waiting.wait(timeout=5)
+        with session_factory() as session:
+            update_retention_policy(
+                session,
+                "alert",
+                "1d",
+                now=now,
+            )
+            session.commit()
+        release_preflight.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert sender.sent == []
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "suppressed"
+        assert outcomes[0].reason == "retention_expired"
+        [stored] = all_events(session_factory)
+        assert stored.alert_sent is False
+        assert stored.payload["push"]["state"] == "expired"
+        assert stored.dispatch_owner_token is None
+        assert stored.dispatch_lease_expires_at is None
+    finally:
+        release_preflight.set()
+        worker.join(timeout=5)
 
 
 def test_retryable_result_is_recovered_without_rule_refiring(
@@ -404,29 +1059,28 @@ def test_failed_push_is_recorded_and_not_retried(settings, session_factory) -> N
     assert event.payload["push"]["status_code"] == 502
 
 
-def test_native_delivery_surfaces_alert_without_webhook(settings, session_factory) -> None:
-    """native_alert_delivery on: a fired trigger is marked delivered even when
-    the webhook is absent/fails, so the companion apps surface it via
-    /v1/alerts + glance (phone alerts without Telegram — user request). Alert
-    hygiene still gates it."""
+def test_native_setting_does_not_claim_delivery_when_sender_fails(
+    settings,
+    session_factory,
+) -> None:
+    """A setting is not transport evidence; only sender ok marks delivery."""
     native_settings = settings.model_copy(update={"native_alert_delivery": True})
-    sender = FakeAlertSender(ok=False)  # no Hermes webhook configured / unreachable
+    sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00"):
         evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
 
-    assert [o.status for o in report.outcomes] == ["pushed"]
+    assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
-    # Surfaced for native polling (glance/alerts filter on alert_sent) despite
-    # the webhook failure — the phone gets it without Telegram.
-    assert event.alert_sent is True
-    assert event.payload["push"]["channel"] == "native"
-    assert event.payload["push"]["webhook_ok"] is False
+    assert event.alert_sent is False
+    assert event.payload["push"]["suppressed_reason"] == "push_failed"
 
 
-def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_factory) -> None:
-    """Native off (explicit — the default is on per PLAN §13): a failed
-    webhook leaves the alert undelivered."""
+def test_native_delivery_off_keeps_failed_sender_undelivered(
+    settings,
+    session_factory,
+) -> None:
+    """Native off leaves a failed non-reasoning sender undelivered."""
     off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00"):
@@ -436,6 +1090,32 @@ def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_fact
     assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
     assert event.alert_sent is False
+
+
+def test_native_delivery_off_rejects_misreported_native_success(
+    settings,
+    session_factory,
+) -> None:
+    off_settings = settings.model_copy(
+        update={"native_alert_delivery": False}
+    )
+    sender = MisreportedNativeSuccessSender()
+    with freeze_time("2026-07-09 14:00:00"):
+        report = make_evaluator(
+            off_settings,
+            session_factory,
+            sender,
+            rules=(fixed_rule,),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in report.outcomes] == ["suppressed"]
+    [event] = all_events(session_factory)
+    assert event.alert_sent is False
+    assert "message" not in event.payload
+    assert (
+        event.payload["push"]["suppressed_reason"]
+        == "native_alert_delivery_disabled"
+    )
 
 
 def test_sender_exception_native_off_does_not_burn_dedup(settings, session_factory) -> None:
@@ -476,21 +1156,22 @@ def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> N
     assert event.alert_sent is True
 
 
-def test_sender_exception_native_on_delivers_natively(settings, session_factory) -> None:
-    """native on: a raising sender still surfaces the alert to companion apps —
-    the row is kept, marked delivered natively, webhook flagged as failed."""
+def test_sender_exception_native_on_stays_undelivered(
+    settings,
+    session_factory,
+) -> None:
+    """A transport exception cannot be represented as delivered."""
     native_settings = settings.model_copy(update={"native_alert_delivery": True})
     sender = RaisingAlertSender()
     with freeze_time("2026-07-09 14:00:00"):
         evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
 
-    assert [o.status for o in report.outcomes] == ["pushed"]
+    assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
-    assert event.alert_sent is True
-    assert event.payload["push"]["channel"] == "native"
-    assert event.payload["push"]["webhook_ok"] is False
-    assert "webhook_error" in event.payload["push"]
+    assert event.alert_sent is False
+    assert event.payload["push"]["state"] == "dispatching"
+    assert "last_error" in event.payload["push"]
 
 
 # ---------------------------------------------------------------------------
@@ -614,10 +1295,17 @@ def test_is_in_quiet_hours_plain_and_disabled_windows() -> None:
 
 
 def test_calendar_task_intake_invokes_planner_once(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-29 14:00:00") as frozen:
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="백오피스 작업", est_minutes=45)
             session.add(task)
@@ -627,6 +1315,9 @@ def test_calendar_task_intake_invokes_planner_once(
                 CalendarEventMirror(
                     external_id="hm-backoffice",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     summary="[HM] 백오피스 작업",
                     start_at=utc(now + timedelta(hours=1)),
                     end_at=utc(now + timedelta(hours=1, minutes=45)),
@@ -684,10 +1375,18 @@ def test_calendar_task_intake_invokes_planner_once(
 
 
 def test_schedule_changed_fires_from_calendar_mirror_diff(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 14:00:00") as frozen:
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            CalendarSource.CALDAV,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="Write report", est_minutes=120)
             session.add(task)
@@ -705,6 +1404,9 @@ def test_schedule_changed_fires_from_calendar_mirror_diff(
                 CalendarEventMirror(
                     external_id="agent-1",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     summary="Deep work",
                     start_at=utc(now + timedelta(hours=2)),
                     end_at=utc(now + timedelta(hours=3)),
@@ -719,6 +1421,9 @@ def test_schedule_changed_fires_from_calendar_mirror_diff(
                 CalendarEventMirror(
                     external_id="ext-9",
                     calendar_source=CalendarSource.CALDAV,
+                    connection_generation=generations[
+                        CalendarSource.CALDAV
+                    ],
                     summary="Dentist",
                     start_at=utc(now + timedelta(hours=4)),
                     end_at=utc(now + timedelta(hours=4, minutes=30)),
@@ -755,9 +1460,18 @@ def test_schedule_changed_fires_from_calendar_mirror_diff(
     assert len(all_events(session_factory)) == 1
 
 
-def test_untouched_external_events_do_not_fire(settings, session_factory, alert_sender) -> None:
+def test_untouched_external_events_do_not_fire(
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
+) -> None:
     with freeze_time("2026-07-09 14:00:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             # Fresh external event that conflicts with nothing (e.g. initial
             # sync import) must not alert.
@@ -765,6 +1479,9 @@ def test_untouched_external_events_do_not_fire(settings, session_factory, alert_
                 CalendarEventMirror(
                     external_id="ext-1",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     summary="Lunch",
                     start_at=utc(now + timedelta(hours=1)),
                     end_at=utc(now + timedelta(hours=2)),
@@ -782,10 +1499,17 @@ def test_untouched_external_events_do_not_fire(settings, session_factory, alert_
 
 
 def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 14:00:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="Write report", est_minutes=60)
             session.add(task)
@@ -804,6 +1528,9 @@ def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
             mirror = CalendarEventMirror(
                 external_id="ext-adjusted",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generations[
+                    CalendarSource.GOOGLE
+                ],
                 summary="Confirmed shortening",
                 start_at=start,
                 end_at=proposed_end,
@@ -817,6 +1544,9 @@ def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
             session.add(
                 CalendarMutationProposal(
                     calendar_source=CalendarSource.GOOGLE,
+                    account_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     mirror_event_id=mirror.id,
                     external_event_id=mirror.external_id,
                     operation=CalendarMutationOperation.SHORTEN,
@@ -852,10 +1582,17 @@ def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
 
 
 def test_external_change_after_internal_adjustment_still_fires(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 14:00:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="Write report", est_minutes=60)
             session.add(task)
@@ -874,6 +1611,9 @@ def test_external_change_after_internal_adjustment_still_fires(
             mirror = CalendarEventMirror(
                 external_id="ext-adjusted",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generations[
+                    CalendarSource.GOOGLE
+                ],
                 summary="Externally changed after apply",
                 start_at=start,
                 end_at=externally_moved_end,
@@ -887,6 +1627,9 @@ def test_external_change_after_internal_adjustment_still_fires(
             session.add(
                 CalendarMutationProposal(
                     calendar_source=CalendarSource.GOOGLE,
+                    account_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     mirror_event_id=mirror.id,
                     external_event_id=mirror.external_id,
                     operation=CalendarMutationOperation.SHORTEN,
@@ -1000,10 +1743,17 @@ def test_deadline_blocks_after_deadline_do_not_count(
 
 
 def test_low_recovery_heavy_afternoon_uses_remaining_afternoon_load(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 12:30:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             half_hour = timedelta(minutes=30)
             events = [
@@ -1017,6 +1767,9 @@ def test_low_recovery_heavy_afternoon_uses_remaining_afternoon_load(
                     CalendarEventMirror(
                         external_id=f"evt-{index}",
                         calendar_source=CalendarSource.GOOGLE,
+                        connection_generation=generations[
+                            CalendarSource.GOOGLE
+                        ],
                         summary=summary,
                         start_at=utc(start),
                         end_at=utc(end),
@@ -1044,6 +1797,90 @@ def test_low_recovery_heavy_afternoon_uses_remaining_afternoon_load(
     fire = report.outcomes[0].fire
     assert fire.evidence["afternoon_busy_minutes"] == 30 + 120 + 90
     assert fire.evidence["afternoon_event_count"] == 3
+
+
+def test_stale_calendar_generation_is_not_used_for_trigger(
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        old_generation = "c" * 32
+        new_generation = "d" * 32
+        connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            generations={CalendarSource.GOOGLE: old_generation},
+            synced_at=utc(now - timedelta(minutes=2)),
+        )
+        with session_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="stale-agent-block",
+                    calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=old_generation,
+                    summary="Old account block",
+                    start_at=utc(now + timedelta(hours=1)),
+                    end_at=utc(now + timedelta(hours=2)),
+                    is_agent_created=True,
+                    etag="old-etag",
+                    created_at=utc(now - timedelta(days=2)),
+                    updated_at=utc(now - timedelta(minutes=1)),
+                )
+            )
+            session.commit()
+
+        connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            generations={CalendarSource.GOOGLE: new_generation},
+            synced_at=utc(now),
+        )
+        report = make_evaluator(
+            settings,
+            session_factory,
+            alert_sender,
+            rules=(schedule_changed,),
+        ).evaluate_once()
+
+    assert report.outcomes == ()
+    assert alert_sender.sent == []
+    assert all_events(session_factory) == []
+
+
+def test_calendar_trigger_is_not_persisted_after_disconnect(
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
+
+        def disconnect_before_fire(_context: TriggerContext) -> TriggerFire:
+            assert creds.delete_google_token(settings.data_dir) is True
+            return TriggerFire(
+                rule_id="schedule_changed",
+                dedup_key="schedule_changed:disconnect-race",
+                summary="Calendar changed.",
+                proposal="Review the schedule.",
+                evidence={},
+            )
+
+        report = make_evaluator(
+            settings,
+            session_factory,
+            alert_sender,
+            rules=(disconnect_before_fire,),
+        ).evaluate_once()
+
+    assert report.outcomes == ()
+    assert alert_sender.sent == []
+    assert all_events(session_factory) == []
 
 
 # ---------------------------------------------------------------------------

@@ -12,10 +12,29 @@ ALL_ENV_VARS = [
     "HEALTHMES_OW_BASE_URL",
     "HEALTHMES_OW_API_KEY",
     "HEALTHMES_OW_USER_ID",
-    "HEALTHMES_HERMES_WEBHOOK_URL",
-    "HEALTHMES_HERMES_WEBHOOK_SECRET",
+    "HEALTHMES_DECISION_HERMES_BASE_URL",
+    "HEALTHMES_DECISION_HERMES_API_KEY",
+    "HEALTHMES_DECISION_CORRELATION_SECRET",
+    "HEALTHMES_DECISION_HERMES_MODEL",
+    "HEALTHMES_DECISION_HERMES_PROVIDER",
+    "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+    "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+    "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
+    "HEALTHMES_DECISION_HERMES_ALLOW_ATTESTED_PRIVATE_HTTP",
+    "HEALTHMES_DECISION_HERMES_DISCOVERY_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_HERMES_SESSION_TTL_SECONDS",
+    "HEALTHMES_DECISION_HERMES_SESSION_PURGE_INTERVAL_SECONDS",
+    "HEALTHMES_DECISION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_EXECUTION_SCOPE",
+    "HEALTHMES_DECISION_MAX_PENDING_REQUESTS",
+    "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
     "HEALTHMES_PUBLIC_BASE_URL",
     "HEALTHMES_DATA_DIR",
+    "HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS",
+    "HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES",
+    "HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES",
     "HEALTHMES_PORT",
     "HEALTHMES_HOST",
     "HEALTHMES_API_TOKEN",
@@ -26,6 +45,7 @@ ALL_ENV_VARS = [
     "HEALTHMES_TIMEZONE",
     "HEALTHMES_BACKUP_DIR",
     "HEALTHMES_BACKUP_PASSPHRASE",
+    "HEALTHMES_BACKUP_POSTGRES_TOOL_TIMEOUT_SECONDS",
     "HEALTHMES_OW_DATABASE_URL",
     "HEALTHMES_HERMES_HOME",
     "HEALTHMES_QUIET_HOURS_START",
@@ -60,12 +80,32 @@ def test_defaults(monkeypatch) -> None:
     assert settings.ow_base_url == "http://localhost:8000"
     assert settings.ow_api_key.get_secret_value() == ""
     assert settings.ow_user_id is None
-    # 8644 = DEFAULT_PORT in vendor/hermes-agent/gateway/platforms/webhook.py;
-    # 'healthmes-alerts' is the route name in config/hermes-config.yaml.tmpl.
-    assert settings.hermes_webhook_url == "http://localhost:8644/webhooks/healthmes-alerts"
-    assert settings.hermes_webhook_secret.get_secret_value() == ""
+    assert settings.decision_hermes_base_url is None
+    assert settings.decision_hermes_api_key.get_secret_value() == ""
+    assert settings.decision_correlation_secret.get_secret_value() == ""
+    assert settings.decision_hermes_model is None
+    assert settings.decision_hermes_provider is None
+    assert settings.decision_hermes_profile_path is None
+    assert settings.decision_hermes_runtime_manifest_path is None
+    assert settings.decision_hermes_attestation_key_path is None
+    assert settings.decision_hermes_allow_attested_private_http is False
+    assert settings.decision_hermes_discovery_timeout_seconds == 5
+    assert settings.decision_hermes_max_iteration_timeout_seconds == 120
+    assert settings.decision_hermes_session_ttl_seconds == 900
+    assert (
+        settings.decision_hermes_session_purge_interval_seconds
+        == 60
+    )
+    assert settings.decision_timeout_seconds == 60
+    assert settings.decision_finalization_timeout_seconds == 5
+    assert settings.decision_execution_scope == "local"
+    assert settings.decision_max_pending_requests == 8
+    assert settings.decision_owner_principal_id == "owner"
     assert settings.public_base_url == "http://localhost:8100"
     assert settings.data_dir == Path("data")
+    assert settings.storage_maintenance_timeout_seconds == 10.0
+    assert settings.storage_maintenance_max_hash_bytes == 256 * 1024 * 1024
+    assert settings.storage_maintenance_max_directory_entries == 4096
     assert settings.port == 8100
     # Localhost-native bind + no token by default: the surface stays off the
     # network unless the operator opts in (and then a token is enforced).
@@ -79,6 +119,9 @@ def test_defaults(monkeypatch) -> None:
     # Backup seam (docs/PLAN.md §9): everything optional by default.
     assert settings.backup_dir is None  # -> {data_dir}/backups
     assert settings.backup_passphrase.get_secret_value() == ""
+    assert settings.backup_max_identity_depth == 128
+    assert settings.backup_identity_traversal_timeout_seconds == 300
+    assert settings.backup_postgres_tool_timeout_seconds == 1800
     assert settings.ow_database_url is None
     assert settings.hermes_home is None
     assert settings.quiet_hours_start == datetime.time(22, 30)
@@ -131,6 +174,61 @@ def test_quiet_hours_and_alert_budget_from_env(monkeypatch) -> None:
     assert settings.alert_cooldown_minutes == 120
 
 
+def test_storage_maintenance_budget_from_env(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS",
+        "12.5",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES",
+        "1048576",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES",
+        "128",
+    )
+
+    settings = _clean_settings()
+
+    assert settings.storage_maintenance_timeout_seconds == 12.5
+    assert settings.storage_maintenance_max_hash_bytes == 1048576
+    assert settings.storage_maintenance_max_directory_entries == 128
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_storage_maintenance_timeout_must_be_positive_and_finite(
+    monkeypatch,
+    value,
+) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_STORAGE_MAINTENANCE_TIMEOUT_SECONDS",
+        value,
+    )
+
+    with pytest.raises(ValueError):
+        _clean_settings()
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES", "0"),
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_HASH_BYTES", "-1"),
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES", "0"),
+        ("HEALTHMES_STORAGE_MAINTENANCE_MAX_DIRECTORY_ENTRIES", "-1"),
+    ],
+)
+def test_storage_maintenance_integer_budgets_must_be_positive(
+    monkeypatch,
+    variable,
+    value,
+) -> None:
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(ValueError):
+        _clean_settings()
+
+
 def test_alert_budget_must_be_non_negative() -> None:
     with pytest.raises(ValueError):
         _clean_settings(alert_daily_budget=-1)
@@ -168,6 +266,10 @@ def test_timezone_and_backup_settings_from_env(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_BACKUP_DIR", "/tmp/hm-backups")
     monkeypatch.setenv("HEALTHMES_BACKUP_PASSPHRASE", "correct horse battery staple")
     monkeypatch.setenv(
+        "HEALTHMES_BACKUP_POSTGRES_TOOL_TIMEOUT_SECONDS",
+        "2400.5",
+    )
+    monkeypatch.setenv(
         "HEALTHMES_OW_DATABASE_URL", "postgresql://ow:ow@localhost:5432/open-wearables"
     )
     monkeypatch.setenv("HEALTHMES_HERMES_HOME", "/tmp/hermes-home")
@@ -177,9 +279,24 @@ def test_timezone_and_backup_settings_from_env(monkeypatch) -> None:
     assert settings.timezone == "Asia/Seoul"
     assert settings.backup_dir == Path("/tmp/hm-backups")
     assert settings.backup_passphrase.get_secret_value() == "correct horse battery staple"
+    assert settings.backup_postgres_tool_timeout_seconds == 2400.5
     assert "correct horse battery staple" not in repr(settings)
     assert settings.ow_database_url == "postgresql://ow:ow@localhost:5432/open-wearables"
     assert settings.hermes_home == Path("/tmp/hermes-home")
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_postgres_backup_tool_timeout_must_be_positive_and_finite(
+    monkeypatch,
+    value,
+) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_BACKUP_POSTGRES_TOOL_TIMEOUT_SECONDS",
+        value,
+    )
+
+    with pytest.raises(ValueError):
+        _clean_settings()
 
 
 def test_blank_optional_env_vars_behave_like_unset(monkeypatch) -> None:
@@ -191,6 +308,9 @@ def test_blank_optional_env_vars_behave_like_unset(monkeypatch) -> None:
         "HEALTHMES_OW_DATABASE_URL",
         "HEALTHMES_HERMES_HOME",
         "HEALTHMES_OW_USER_ID",
+        "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+        "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+        "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
     ):
         monkeypatch.setenv(var, "")
 
@@ -201,6 +321,9 @@ def test_blank_optional_env_vars_behave_like_unset(monkeypatch) -> None:
     assert settings.ow_database_url is None
     assert settings.hermes_home is None
     assert settings.ow_user_id is None
+    assert settings.decision_hermes_profile_path is None
+    assert settings.decision_hermes_runtime_manifest_path is None
+    assert settings.decision_hermes_attestation_key_path is None
 
 
 def test_unprefixed_env_vars_are_ignored(monkeypatch) -> None:
@@ -214,8 +337,15 @@ def test_unprefixed_env_vars_are_ignored(monkeypatch) -> None:
 
 def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_OW_API_KEY", "super-secret-key")
-    monkeypatch.setenv("HEALTHMES_HERMES_WEBHOOK_SECRET", "hmac-secret")
     monkeypatch.setenv("HEALTHMES_API_TOKEN", "bearer-secret")
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_API_KEY",
+        "decision-runtime-secret",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_CORRELATION_SECRET",
+        "decision-correlation-secret",
+    )
     monkeypatch.setenv(
         "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
         "calendar-adjustment-secret-that-is-long-enough",
@@ -224,12 +354,20 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     settings = _clean_settings()
 
     assert "super-secret-key" not in repr(settings)
-    assert "hmac-secret" not in repr(settings)
     assert "bearer-secret" not in repr(settings)
+    assert "decision-runtime-secret" not in repr(settings)
+    assert "decision-correlation-secret" not in repr(settings)
     assert "calendar-adjustment-secret-that-is-long-enough" not in repr(settings)
     assert settings.ow_api_key.get_secret_value() == "super-secret-key"
-    assert settings.hermes_webhook_secret.get_secret_value() == "hmac-secret"
     assert settings.api_token.get_secret_value() == "bearer-secret"
+    assert (
+        settings.decision_hermes_api_key.get_secret_value()
+        == "decision-runtime-secret"
+    )
+    assert (
+        settings.decision_correlation_secret.get_secret_value()
+        == "decision-correlation-secret"
+    )
     assert (
         settings.calendar_adjustment_secret.get_secret_value()
         == "calendar-adjustment-secret-that-is-long-enough"
@@ -244,6 +382,145 @@ def test_host_and_api_token_from_env(monkeypatch) -> None:
 
     assert settings.host == "0.0.0.0"
     assert settings.api_token.get_secret_value() == "tok"
+
+
+def test_decision_runtime_bundle_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_BASE_URL",
+        "http://127.0.0.1:8644",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_MODEL",
+        "gpt-5.6-sol",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_PROVIDER",
+        "openai",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+        "/tmp/hermes-decision/config.yaml",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+        "/tmp/hermes-decision/runtime-manifest.json",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
+        "/tmp/hermes-decision/runtime-attestation.key",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_ALLOW_ATTESTED_PRIVATE_HTTP",
+        "true",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
+        " local-owner ",
+    )
+
+    settings = _clean_settings()
+
+    assert settings.decision_hermes_base_url == "http://127.0.0.1:8644"
+    assert settings.decision_hermes_model == "gpt-5.6-sol"
+    assert settings.decision_hermes_provider == "openai"
+    assert settings.decision_hermes_profile_path == Path(
+        "/tmp/hermes-decision/config.yaml"
+    )
+    assert settings.decision_hermes_runtime_manifest_path == Path(
+        "/tmp/hermes-decision/runtime-manifest.json"
+    )
+    assert settings.decision_hermes_attestation_key_path == Path(
+        "/tmp/hermes-decision/runtime-attestation.key"
+    )
+    assert settings.decision_hermes_allow_attested_private_http is True
+    assert settings.decision_owner_principal_id == "local-owner"
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        {"decision_hermes_base_url": "http://127.0.0.1:8644"},
+        {"decision_hermes_model": "gpt-5.6-sol"},
+        {"decision_hermes_provider": "openai"},
+        {
+            "decision_hermes_base_url": "http://127.0.0.1:8644",
+            "decision_hermes_model": "gpt-5.6-sol",
+        },
+    ],
+)
+def test_decision_runtime_bundle_is_all_or_none(configured) -> None:
+    with pytest.raises(
+        ValueError,
+        match="must be configured together",
+    ):
+        _clean_settings(**configured)
+
+
+def test_decision_owner_has_a_distinct_validation_error() -> None:
+    with pytest.raises(
+        ValueError,
+        match="decision owner principal ID must not be blank",
+    ):
+        _clean_settings(decision_owner_principal_id=" ")
+
+
+def test_local_decision_scope_rejects_remote_hermes_origin() -> None:
+    configured = {
+        "decision_hermes_base_url": "https://hermes.example.com",
+        "decision_hermes_model": "gpt-5.6-sol",
+        "decision_hermes_provider": "openai",
+    }
+    with pytest.raises(
+        ValueError,
+        match="local decision execution requires a loopback",
+    ):
+        _clean_settings(**configured)
+
+    hosted = _clean_settings(
+        **configured,
+        decision_execution_scope="hosted",
+    )
+    assert hosted.decision_execution_scope == "hosted"
+
+
+def test_local_decision_scope_allows_explicit_attested_private_origin() -> None:
+    settings = _clean_settings(
+        decision_hermes_base_url="http://hermes-decision:8645",
+        decision_hermes_model="gpt-5.6-sol",
+        decision_hermes_provider="openai",
+        decision_hermes_allow_attested_private_http=True,
+    )
+
+    assert settings.decision_execution_scope == "local"
+    assert settings.decision_hermes_base_url == (
+        "http://hermes-decision:8645"
+    )
+
+
+def test_decision_capacity_bounds() -> None:
+    with pytest.raises(ValueError):
+        _clean_settings(decision_max_pending_requests=0)
+    with pytest.raises(ValueError):
+        _clean_settings(decision_max_pending_requests=129)
+
+
+def test_decision_session_maintenance_bounds() -> None:
+    with pytest.raises(
+        ValueError,
+        match="session TTL must exceed",
+    ):
+        _clean_settings(
+            decision_timeout_seconds=60,
+            decision_hermes_session_ttl_seconds=60,
+        )
+    with pytest.raises(
+        ValueError,
+        match="purge interval must not exceed",
+    ):
+        _clean_settings(
+            decision_hermes_session_ttl_seconds=120,
+            decision_hermes_session_purge_interval_seconds=121,
+        )
 
 
 def test_is_loopback_host() -> None:

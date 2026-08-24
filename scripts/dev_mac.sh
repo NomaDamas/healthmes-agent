@@ -235,9 +235,8 @@ load_ow_env() {
     export UV_PROJECT_ENVIRONMENT="$OW_VENV_DIR"
     # Never let uv rewrite the vendored uv.lock (vendor/ is read-only):
     # UV_FROZEN=1 makes both our `uv sync` and the bare `uv run` inside the
-    # vendor scripts/start/*.sh behave like --frozen — symmetric with the
-    # hermes config template and the ow-mcp compose service, which pass
-    # --frozen explicitly.
+    # vendor scripts/start/*.sh behave like --frozen, so the native backend
+    # path cannot rewrite vendor/open-wearables/backend/uv.lock.
     export UV_FROZEN=1
 }
 

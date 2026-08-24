@@ -10,8 +10,8 @@
 #     (postgres + redis + healthmes) and curls :8100/health — the live half of
 #     the PLAN §11 "compose boot + Phase-0 demo query" smoke. The demo-query
 #     half needs real Telegram/Anthropic/wearable credentials, which CI does
-#     not have; its contracts (webhook signing, MCP registration, config
-#     render) are pinned by pytest instead.
+#     not have; its MCP registration and config-render contracts are pinned
+#     by pytest instead.
 #
 # Tests make no external network calls. Linux uses only its disposable
 # localhost postgres service; macOS keeps the zero-service sqlite path.

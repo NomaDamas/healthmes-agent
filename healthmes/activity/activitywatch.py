@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     rebuild_affected_days,
     summary_raw_provenance_complete,
@@ -1036,7 +1037,7 @@ def prepare_activitywatch_import(
     The reservation is intentionally committed before network I/O. Callers
     must treat this adapter operation as its own transaction boundary.
     """
-    current = (now or datetime.now(UTC)).astimezone(UTC)
+    current = (now or clock.utc_now()).astimezone(UTC)
     if request.end_at is not None and request.end_at > current + MAX_FUTURE_SKEW:
         raise ActivityWatchRequestError(
             "ActivityWatch import end cannot be in the future"

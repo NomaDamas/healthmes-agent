@@ -22,20 +22,23 @@ FAKE_JPEG = b"\xff\xd8\xff\xe0" + bytes(range(256)) * 3
 # Remote-vault env vars that must never leak from the developer's shell into
 # the suite (a stray HEALTHMES_BACKUP_PROVIDER=remote_vault would flip every
 # CLI test onto the vault path).
-_VAULT_ENV_VARS = (
+_BACKUP_ENV_VARS = (
     "HEALTHMES_BACKUP_PROVIDER",
+    "HEALTHMES_OW_API_KEY",
+    "HEALTHMES_OW_DATABASE_URL",
     "HEALTHMES_VAULT_ENDPOINT",
     "HEALTHMES_VAULT_BUCKET",
     "HEALTHMES_VAULT_ACCESS_KEY_ID",
     "HEALTHMES_VAULT_SECRET_ACCESS_KEY",
     "HEALTHMES_VAULT_REGION",
     "HEALTHMES_VAULT_PREFIX",
+    "HERMES_HOME",
 )
 
 
 @pytest.fixture(autouse=True)
-def _isolate_vault_env(monkeypatch):
-    for name in _VAULT_ENV_VARS:
+def _isolate_backup_env(monkeypatch):
+    for name in _BACKUP_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 
 

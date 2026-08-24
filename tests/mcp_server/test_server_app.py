@@ -17,7 +17,6 @@ TRANCHE_1_TOOLS = {
     "propose_schedule_blocks",
     "resolve_schedule_proposal",
     "log_food",
-    "record_decision",
     "get_caffeine_proposal",
 }
 TRANCHE_2_TOOLS = {
@@ -54,6 +53,16 @@ ACTIVITY_TOOLS = {
     "get_overwork_context",
     "resolve_wellness_context",
 }
+DOMAIN_SEARCH_TOOLS = {
+    "search_activity",
+    "search_nutrition",
+    "search_calendar",
+    "search_wearable",
+}
+WELLNESS_SKILL_TOOLS = {
+    "list_wellness_skills",
+    "read_wellness_skill",
+}
 EXPECTED_TOOLS = (
     TRANCHE_1_TOOLS
     | TRANCHE_2_TOOLS
@@ -61,6 +70,8 @@ EXPECTED_TOOLS = (
     | NUTRITION_TOOLS
     | CALENDAR_ADJUSTMENT_TOOLS
     | ACTIVITY_TOOLS
+    | DOMAIN_SEARCH_TOOLS
+    | WELLNESS_SKILL_TOOLS
 )
 
 _INITIALIZE = {

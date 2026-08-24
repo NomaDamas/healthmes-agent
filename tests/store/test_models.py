@@ -32,11 +32,13 @@ from healthmes.store import (
     TaskSource,
     TriggerEvent,
     WeeklyGoal,
+    WellnessEvent,
 )
 
 MONDAY = date(2026, 7, 6)
 T0 = datetime(2026, 7, 6, 9, 0, 0)
 T1 = datetime(2026, 7, 6, 10, 30, 0)
+GOOGLE_ACCOUNT_GENERATION = "google-account-generation"
 
 
 def _roundtrip(session, instance):
@@ -206,6 +208,70 @@ class TestCalendarEventMirror:
             session.commit()
         session.rollback()
 
+    def test_same_external_id_allowed_across_account_generations(
+        self,
+        session,
+    ):
+        for generation in ("generation-a", "generation-b"):
+            session.add(
+                CalendarEventMirror(
+                    external_id="evt-reconnected",
+                    calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generation,
+                    start_at=T0,
+                    end_at=T1,
+                )
+            )
+        session.commit()
+
+    def test_connection_generation_cannot_be_null(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="evt-null-generation",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+            ),
+        )
+        assert mirror.connection_generation == "__legacy_unbound__"
+        with pytest.raises(IntegrityError):
+            session.execute(
+                text(
+                    "UPDATE calendar_event_mirror "
+                    "SET connection_generation = NULL "
+                    "WHERE id = :id"
+                ),
+                {"id": mirror.id.hex},
+            )
+        session.rollback()
+
+    def test_legacy_none_predicate_resolves_to_non_null_sentinel(
+        self,
+        session,
+    ):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="evt-legacy-generation-query",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+            ),
+        )
+
+        assert session.scalar(
+            select(CalendarEventMirror).where(
+                CalendarEventMirror.connection_generation.is_(None)
+            )
+        ) is mirror
+        assert session.scalar(
+            text(
+                "SELECT COUNT(*) FROM calendar_event_mirror "
+                "WHERE connection_generation IS NULL"
+            )
+        ) == 0
+
     def test_same_external_id_allowed_across_sources(self, session):
         for source in (CalendarSource.GOOGLE, CalendarSource.CALDAV):
             session.add(
@@ -252,6 +318,8 @@ class TestScheduleProposal:
                 proposed_end=T1,
                 status=ProposalStatus.ACCEPTED,
                 decision_record_id=record.id,
+                intake_account_generation="calendar-account-a",
+                invalidation_reason="calendar_intake_changed",
             ),
         )
         assert proposal.task_id == task.id
@@ -259,6 +327,8 @@ class TestScheduleProposal:
         assert proposal.proposed_end == T1
         assert proposal.status is ProposalStatus.ACCEPTED
         assert proposal.decision_record_id == record.id
+        assert proposal.intake_account_generation == "calendar-account-a"
+        assert proposal.invalidation_reason == "calendar_intake_changed"
 
     def test_status_defaults_to_proposed(self, session):
         task = _roundtrip(session, Task(title="t"))
@@ -310,6 +380,7 @@ class TestCalendarMutationProposal:
         proposal = _roundtrip(
             session,
             CalendarMutationProposal(
+                account_generation=GOOGLE_ACCOUNT_GENERATION,
                 mirror_event_id=mirror.id,
                 external_event_id="google-event-1",
                 original_start_at=T0,
@@ -364,6 +435,7 @@ class TestCalendarMutationProposal:
         proposal = _roundtrip(
             session,
             CalendarMutationProposal(
+                account_generation=GOOGLE_ACCOUNT_GENERATION,
                 mirror_event_id=mirror.id,
                 external_event_id="google-event-defaults",
                 original_start_at=T0,
@@ -388,6 +460,7 @@ class TestCalendarMutationProposal:
     def test_requires_existing_mirror(self, session):
         session.add(
             CalendarMutationProposal(
+                account_generation=GOOGLE_ACCOUNT_GENERATION,
                 mirror_event_id=uuid.uuid4(),
                 external_event_id="missing",
                 original_start_at=T0,
@@ -418,6 +491,7 @@ class TestCalendarMutationProposal:
         for external_event_id in ("google-event-dedup", "google-event-dedup-again"):
             session.add(
                 CalendarMutationProposal(
+                    account_generation=GOOGLE_ACCOUNT_GENERATION,
                     mirror_event_id=mirror.id,
                     external_event_id=external_event_id,
                     original_start_at=T0,
@@ -450,6 +524,7 @@ class TestCalendarMutationProposal:
         for dedup_key in ("calendar-nudge:attempt-1", "calendar-nudge:attempt-2"):
             session.add(
                 CalendarMutationProposal(
+                    account_generation=GOOGLE_ACCOUNT_GENERATION,
                     mirror_event_id=mirror.id,
                     external_event_id="google-event-attempt",
                     original_start_at=T0,
@@ -491,6 +566,7 @@ class TestCalendarMutationProposal:
         proposal_id = _roundtrip(
             session,
             CalendarMutationProposal(
+                account_generation=GOOGLE_ACCOUNT_GENERATION,
                 mirror_event_id=mirror.id,
                 external_event_id="google-event-decision",
                 original_start_at=T0,
@@ -513,6 +589,63 @@ class TestCalendarMutationProposal:
         loaded = session.get(CalendarMutationProposal, proposal_id)
         assert loaded.proposal_decision_record_id is None
         assert loaded.outcome_decision_record_id is None
+
+    @pytest.mark.parametrize(
+        "account_generation",
+        (None, "__legacy_unbound__"),
+    )
+    @pytest.mark.parametrize(
+        "status",
+        (
+            CalendarMutationStatus.PENDING,
+            CalendarMutationStatus.APPLYING,
+        ),
+    )
+    def test_active_status_requires_real_account_generation(
+        self,
+        session,
+        account_generation,
+        status,
+    ):
+        session.add(
+            CalendarMutationProposal(
+                account_generation=account_generation,
+                external_event_id="generationless-active",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=T1,
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-active",
+                expires_at=T1,
+                status=status,
+                dedup_key=f"generationless:{account_generation}:{status.value}",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_terminal_status_can_preserve_legacy_proposal(self, session):
+        proposal = _roundtrip(
+            session,
+            CalendarMutationProposal(
+                account_generation="__legacy_unbound__",
+                external_event_id="legacy-terminal",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=T1,
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-terminal",
+                expires_at=T1,
+                status=CalendarMutationStatus.CONFLICTED,
+                dedup_key="legacy-terminal",
+            ),
+        )
+        assert proposal.account_generation == "__legacy_unbound__"
 
 
 class TestFoodLog:
@@ -587,6 +720,47 @@ class TestAppUsageSample:
         assert len(session.scalars(select(AppUsageSample)).all()) == 2
 
 
+class TestWellnessEvent:
+    @pytest.mark.parametrize(
+        "source_provider",
+        (
+            "Manual",
+            " manual ",
+            "   ",
+            "-manual",
+            ".manual",
+            "_manual",
+            "\tmanual\t",
+            "ÄPFEL",
+            "CAFÉ",
+            "Σ",
+            "straße",
+            "K",
+            "manual\x00a",
+            "a" * 65,
+        ),
+    )
+    def test_source_provider_must_be_canonical(
+        self,
+        session,
+        source_provider,
+    ):
+        session.add(
+            WellnessEvent(
+                event_type="subjective_energy",
+                observed_at=T0,
+                recorded_at=T0,
+                source_provider=source_provider,
+                source_record_id="noncanonical-provider",
+                payload={"score": 4},
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+
 class TestCognitiveEnergyEstimate:
     def test_roundtrip_with_json_components(self, session):
         components = {
@@ -640,6 +814,37 @@ class TestDecisionRecord:
         assert record.llm_model == "claude-fable-5"
         assert record.tokens == 1234
 
+    def test_roundtrip_with_private_evidence_refs(self, session):
+        evidence_refs = {
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "whoop-recovery-row",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "whoop",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-07-08T07:00:00+09:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                }
+            ],
+            "cycle_ids": {
+                "recovery": "cycle-2026-07-08",
+                "day_strain": "cycle-2026-07-08",
+            },
+        }
+        record = _roundtrip(
+            session,
+            DecisionRecord(
+                kind=DecisionKind.INSIGHT,
+                tree={"id": "root", "type": "input", "label": "whoop", "children": []},
+                summary="WHOOP package",
+                evidence_refs=evidence_refs,
+            ),
+        )
+
+        assert record.evidence_refs == evidence_refs
+
     def test_alert_decision_roundtrips_trigger_correlation(self, session):
         trigger = TriggerEvent(
             fired_at=T0,
@@ -658,6 +863,31 @@ class TestDecisionRecord:
             ),
         )
         assert record.trigger_event_id == trigger.id
+
+    def test_wellness_retention_metadata_roundtrips(self, session):
+        request_id = uuid.uuid4()
+        turn_id = uuid.uuid4()
+        record = _roundtrip(
+            session,
+            DecisionRecord(
+                kind=DecisionKind.INSIGHT,
+                tree={"id": "healthmes-decision", "children": []},
+                summary="Compact wellness outcome",
+                decision_request_id=request_id,
+                decision_turn_id=turn_id,
+                decision_request_fingerprint="f" * 64,
+                decision_payload={
+                    "schema": "healthmes.decision-private.v3"
+                },
+                decision_payload_digest="d" * 64,
+                retention_basis_at=T0,
+                expires_at=T1,
+            ),
+        )
+
+        assert record.decision_request_id == request_id
+        assert record.retention_basis_at == T0
+        assert record.expires_at == T1
 
 
 class TestInsight:

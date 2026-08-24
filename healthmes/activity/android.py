@@ -9,6 +9,7 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityBatchOut,
@@ -109,7 +110,7 @@ def android_batch(
         platform=ActivityPlatform.ANDROID,
         capability=ActivityCapability.AGGREGATE,
         timezone=timezone,
-        collected_at=collected_at or datetime.now(UTC),
+        collected_at=collected_at or clock.utc_now(),
         collection_revision=collection_revision,
         records=[
             AppHourRecord(
@@ -191,7 +192,7 @@ def backfill_android_canonical_events(
     timezone: str,
     now: datetime | None = None,
 ) -> ActivityIngestResult | None:
-    current = (now or datetime.now(UTC)).astimezone(UTC)
+    current = (now or clock.utc_now()).astimezone(UTC)
     with activity_write_lock():
         lock_activity_write_plane(session)
         raw_policy = ensure_activity_policies(session)[ACTIVITY_RAW_CLASS]

@@ -1,6 +1,5 @@
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Shared glue for the issue #7 companion surfaces (:companion phone widget,
@@ -23,13 +22,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.18.0")
     // EncryptedSharedPreferences for base URL + token at rest (same artifact
     // and pattern as the :app collector's CollectorPrefs).
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import timedelta
 
 import pytest
 from fastmcp.exceptions import ToolError
 
+from healthmes import clock
 from healthmes.mcp_server import server as server_module
 from healthmes.nutrition.contracts import (
     Confidence,
@@ -19,6 +20,8 @@ from healthmes.nutrition.schema import VLMEstimate, VLMExtraction, VLMItem
 from healthmes.nutrition.transcription import TranscriptionResult
 from healthmes.storage import register_storage_object
 from healthmes.trusted_session import issue_trusted_session_proof
+
+pytestmark = pytest.mark.usefixtures("fixture_clock")
 
 
 def _trusted(tool_name, arguments):
@@ -164,6 +167,7 @@ async def test_mcp_transcribes_local_voice_before_nutrition_analysis(
         lambda settings: FakeTranscriber(),
     )
     settings = server_module._active_settings()
+    observed_at = clock.utc_now() - timedelta(minutes=1)
     media_path = "media/2026/08/meal.m4a"
     target = settings.data_dir / media_path
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -176,7 +180,7 @@ async def test_mcp_transcribes_local_voice_before_nutrition_analysis(
             data_class="media",
             content_type="audio/mp4",
             size_bytes=5,
-            observed_at=datetime(2026, 8, 6, 3, 30, tzinfo=UTC),
+            observed_at=observed_at,
         )
         session.commit()
     arguments = {
@@ -184,7 +188,7 @@ async def test_mcp_transcribes_local_voice_before_nutrition_analysis(
         "intent": "log_consumed",
         "modality": "voice",
         "source_text": None,
-        "observed_at": "2026-08-06T03:30:00Z",
+        "observed_at": observed_at.isoformat(),
         "media_path": media_path,
         "allow_remote_analysis": False,
     }

@@ -6,22 +6,40 @@ exactly ``/mcp`` — the URL Hermes registers per vendor/hermes-agent/tools/
 mcp_tool.py), and the in-process APScheduler loops.
 """
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import asyncio
+import logging
+import uuid
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from threading import Event
 
+from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI
+from sqlalchemy import Engine, inspect, text
+from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from starlette.types import Receive, Scope, Send
 
+from alembic import command
 from healthmes import __version__
 from healthmes.activity import api as activity_api
 from healthmes.activity.aggregation import (
     migrate_activity_summary_derivations,
 )
 from healthmes.activity.android import backfill_android_canonical_events
+from healthmes.activity.jobs import build_activitywatch_job
 from healthmes.activity.locking import (
+    activate_runtime_extended_write_fence,
     activity_write_lock,
+    fenced_core_transaction,
     lock_activity_write_plane,
+    set_sqlite_busy_timeout_ms,
+    sqlite_busy_timeout_ms,
 )
 from healthmes.activity.maintenance import (
     build_activity_maintenance_job,
@@ -32,42 +50,602 @@ from healthmes.api.auth import install_auth
 from healthmes.api.google_oauth import install_google_oauth
 from healthmes.api.local_session import install_local_sessions
 from healthmes.backup.local import build_backup_job
+from healthmes.backup.snapshot import recovered_runtime_guard, resolve_data_locations
 from healthmes.calendars.jobs import build_calendar_jobs
 from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.config import Settings, get_settings, resolve_timezone
+from healthmes.decision import (
+    HealthMesDecisionService,
+    build_configured_decision_engine,
+    build_decision_context_search_session_service,
+    build_decision_recovery_finalizer,
+    ensure_decision_domain_policies,
+)
+from healthmes.decision.domain_providers import WearableReader
+from healthmes.decision.responses import HermesResponsesTransport
 from healthmes.engine.cognitive_energy import build_energy_job
+from healthmes.engine.decision_dispatch import (
+    DecisionAlertSender,
+    DecisionServiceThreadBridge,
+)
 from healthmes.engine.scheduler import (
     create_scheduler,
+    register_activitywatch_job,
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_calendar_job,
     register_energy_job,
+    register_scheduled_briefing_jobs,
     register_sleep_reconciliation_job,
     register_storage_maintenance_job,
     shutdown_scheduler,
     start_scheduler,
 )
 from healthmes.mcp_server import server as mcp_server
-from healthmes.storage import build_storage_maintenance_job
-from healthmes.store import Base, dispose_engine, init_engine, session_scope
+from healthmes.storage import (
+    build_storage_maintenance_job,
+    ensure_default_policies,
+    reconcile_staging_files,
+)
+from healthmes.store import (
+    create_db_engine,
+    dispose_engine,
+    get_session_factory,
+    init_engine,
+    session_scope,
+)
+from healthmes.store.decision_receipts import (
+    DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+    DEFAULT_RECEIPT_MAINTENANCE_MAX_ROWS,
+    DecisionReceiptMaintenanceBatch,
+    maintain_decision_receipt_results,
+)
+from healthmes.timing import steady_time
+
+_LOGGER = logging.getLogger(__name__)
+_DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS = 30.0
+_DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS = 5.0
+_DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS = 1.0
+_RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY = "healthmes_receipt_sqlite_busy_timeout"
+_POSTGRES_RECEIPT_TIMEOUT_STATES = frozenset({"55P03", "57014"})
+
+
+class _DecisionReceiptMaintenanceCancelled(RuntimeError):
+    """Raised by a worker after its owning async task requests cancellation."""
+
+
+def _receipt_maintenance_cancellation_check(
+    cancellation: Event | None,
+) -> None:
+    if cancellation is not None and cancellation.is_set():
+        raise _DecisionReceiptMaintenanceCancelled
+
+
+def _receipt_maintenance_remaining(deadline: float) -> float:
+    remaining = deadline - steady_time()
+    if remaining <= 0:
+        raise TimeoutError("timed out waiting for decision receipt maintenance")
+    return remaining
+
+
+def _configure_receipt_maintenance_database_timeout(
+    session: Session,
+    *,
+    deadline: float,
+) -> None:
+    remaining = _receipt_maintenance_remaining(deadline)
+    dialect = session.get_bind().dialect.name
+    timeout_ms = max(1, int(remaining * 1_000))
+    if dialect == "postgresql":
+        timeout_value = f"{timeout_ms}ms"
+        session.execute(
+            text("SELECT set_config('lock_timeout', :timeout, true)"),
+            {"timeout": timeout_value},
+        )
+        session.execute(
+            text("SELECT set_config('statement_timeout', :timeout, true)"),
+            {"timeout": timeout_value},
+        )
+        return
+    if dialect != "sqlite":
+        return
+    connection = session.connection()
+    if _RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY not in session.info:
+        original_timeout_ms = sqlite_busy_timeout_ms(connection)
+        session.info[_RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY] = (
+            connection,
+            original_timeout_ms,
+        )
+    set_sqlite_busy_timeout_ms(connection, timeout_ms)
+
+
+def _restore_receipt_sqlite_busy_timeout(session: Session) -> None:
+    state = session.info.pop(
+        _RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY,
+        None,
+    )
+    if state is None:
+        return
+    connection, original_timeout_ms = state
+    try:
+        set_sqlite_busy_timeout_ms(connection, original_timeout_ms)
+        if sqlite_busy_timeout_ms(connection) != original_timeout_ms:
+            raise RuntimeError("SQLite busy timeout cleanup could not be verified")
+    except Exception as exc:
+        try:
+            connection.invalidate(exc)
+        except Exception:
+            pass
+
+
+def _receipt_maintenance_database_timeout(exc: DBAPIError) -> bool:
+    original = exc.orig
+    state = getattr(original, "sqlstate", None) or getattr(
+        original,
+        "pgcode",
+        None,
+    )
+    if state in _POSTGRES_RECEIPT_TIMEOUT_STATES:
+        return True
+    return "database is locked" in str(original).casefold()
+
+
+@contextmanager
+def _receipt_maintenance_connection_guard(
+    session: Session,
+) -> Iterator[None]:
+    """Keep SQLite's connection-local timeout state checked out to cleanup."""
+
+    bind = session.get_bind()
+    if bind.dialect.name != "sqlite" or isinstance(bind, Connection):
+        yield
+        return
+    original_bind = session.bind
+    with bind.connect() as connection:
+        session.bind = connection
+        try:
+            yield
+        finally:
+            session.bind = original_bind
+
+
+def _run_receipt_maintenance_transaction[Result](
+    operation: Callable[[Session], Result],
+    *,
+    deadline: float,
+    cancellation: Event | None,
+) -> Result:
+    def cancellation_check() -> None:
+        _receipt_maintenance_cancellation_check(cancellation)
+
+    with activity_write_lock(
+        timeout_seconds=_receipt_maintenance_remaining(deadline),
+        cancellation_check=cancellation_check,
+    ):
+        session = get_session_factory()()
+        try:
+            with _receipt_maintenance_connection_guard(session):
+                try:
+                    lock_activity_write_plane(
+                        session,
+                        timeout_seconds=_receipt_maintenance_remaining(deadline),
+                        cancellation_check=cancellation_check,
+                    )
+                    _configure_receipt_maintenance_database_timeout(
+                        session,
+                        deadline=deadline,
+                    )
+                    result = operation(session)
+                    cancellation_check()
+                    _configure_receipt_maintenance_database_timeout(
+                        session,
+                        deadline=deadline,
+                    )
+                    session.commit()
+                    return result
+                except DBAPIError as exc:
+                    session.rollback()
+                    if _receipt_maintenance_database_timeout(exc):
+                        raise TimeoutError(
+                            "timed out waiting for decision receipt maintenance"
+                        ) from exc
+                    raise
+                except BaseException:
+                    session.rollback()
+                    raise
+                finally:
+                    _restore_receipt_sqlite_busy_timeout(session)
+        finally:
+            session.close()
+
+
+logger = logging.getLogger(__name__)
+_ALEMBIC_CONFIG_PATH = Path(__file__).resolve().parents[1] / "alembic.ini"
+_SQLITE_MEMORY_DATABASES = (None, "", ":memory:")
+
+
+class DatabaseSchemaError(RuntimeError):
+    """The configured database cannot safely serve the current application."""
+
+
+def _migration_config(database_url: str) -> Config:
+    config = Config(str(_ALEMBIC_CONFIG_PATH))
+    config.set_main_option("sqlalchemy.url", database_url)
+    return config
+
+
+def _expected_database_heads(database_url: str) -> tuple[str, ...]:
+    script = ScriptDirectory.from_config(_migration_config(database_url))
+    return tuple(sorted(script.get_heads()))
+
+
+def _current_database_heads(engine: Engine) -> tuple[str, ...]:
+    with engine.connect() as connection:
+        migration = MigrationContext.configure(connection)
+        return tuple(sorted(migration.get_current_heads()))
+
+
+def _schema_error(
+    *,
+    current: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> DatabaseSchemaError:
+    current_label = ", ".join(current) if current else "none"
+    expected_label = ", ".join(expected) if expected else "none"
+    return DatabaseSchemaError(
+        "HealthMes database schema is not at Alembic head "
+        f"(current: {current_label}; expected: {expected_label}). "
+        "Run: uv run alembic upgrade head"
+    )
+
+
+def _require_database_head(engine: Engine, database_url: str) -> None:
+    expected = _expected_database_heads(database_url)
+    current = _current_database_heads(engine)
+    if current != expected:
+        raise _schema_error(current=current, expected=expected)
+
+
+def _bootstrap_empty_sqlite(engine: Engine, database_url: str) -> None:
+    """Run the real migration chain atomically for zero-setup SQLite."""
+    config = _migration_config(database_url)
+    with engine.connect() as supplied_connection:
+        dbapi_connection = supplied_connection.connection.driver_connection
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys")
+            restore_foreign_keys = bool(cursor.fetchone()[0])
+            if restore_foreign_keys:
+                cursor.execute("PRAGMA foreign_keys=OFF")
+                cursor.execute("PRAGMA foreign_keys")
+                if cursor.fetchone()[0] != 0:
+                    raise RuntimeError("could not disable SQLite foreign keys for bootstrap")
+        finally:
+            cursor.close()
+        try:
+            with fenced_core_transaction(supplied_connection) as connection:
+                # SQLAlchemy has opened a logical transaction, but pysqlite
+                # has not emitted BEGIN yet. Reserve the writer before the
+                # first CREATE.
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                config.attributes["connection"] = connection
+                command.upgrade(config, "heads")
+        finally:
+            if supplied_connection.in_transaction():
+                supplied_connection.rollback()
+            if restore_foreign_keys:
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA foreign_keys=ON")
+                    cursor.execute("PRAGMA foreign_keys")
+                    if cursor.fetchone()[0] != 1:
+                        raise RuntimeError("could not restore SQLite foreign keys after bootstrap")
+                finally:
+                    cursor.close()
+
+
+def ensure_database_schema(engine: Engine, database_url: str) -> None:
+    """Bootstrap only an empty SQLite DB; reject every existing non-head DB."""
+    tables = set(inspect(engine).get_table_names())
+    if engine.dialect.name == "sqlite" and not tables:
+        _bootstrap_empty_sqlite(engine, database_url)
+    _require_database_head(engine, database_url)
+
+
+def preflight_database_schema(settings: Settings) -> None:
+    """Reject an existing non-head DB before the CLI starts Uvicorn."""
+    database = make_url(settings.database_url)
+    if database.get_backend_name() == "sqlite" and database.database in (_SQLITE_MEMORY_DATABASES):
+        # The app lifespan owns the only connection that can initialize an
+        # in-memory database.
+        return
+    engine = create_db_engine(
+        settings.database_url,
+        enforce_runtime_write_fence=False,
+    )
+    try:
+        tables = set(inspect(engine).get_table_names())
+        if engine.dialect.name == "sqlite" and not tables:
+            return
+        _require_database_head(engine, settings.database_url)
+    finally:
+        engine.dispose()
+
+
+async def _close_decision_engine_durably(decision_engine) -> None:
+    """Drain accepted decisions before propagating external cancellation."""
+
+    cancelled: asyncio.CancelledError | None = None
+    current = asyncio.current_task()
+    while True:
+        cancelling_before = current.cancelling() if current is not None else 0
+        try:
+            await decision_engine.aclose()
+            break
+        except asyncio.CancelledError as exc:
+            cancelling_after = current.cancelling() if current is not None else 0
+            if current is None or cancelling_after <= cancelling_before:
+                raise
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+
+
+async def _close_decision_runtime_durably(
+    decision_service,
+    decision_engine,
+) -> None:
+    """Close the engine, then drain service-owned receipt completion."""
+
+    decision_service.begin_shutdown()
+    failures: list[BaseException] = []
+    cancelled: asyncio.CancelledError | None = None
+    for component in (decision_engine, decision_service):
+        if component is None:
+            continue
+        try:
+            await _close_decision_engine_durably(component)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except BaseException as exc:
+            failures.append(exc)
+
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup(
+            "HealthMes decision runtime shutdown failed",
+            failures,
+        )
+    if cancelled is not None:
+        raise cancelled
 
 
 def _initialize_activity_storage(
     session: Session,
     *,
     timezone: str,
+    decision_owner_principal_id: str,
 ) -> None:
-    """Bootstrap activity policies and derivations under the global write lock."""
+    """Bootstrap local data policies under the global write-plane lock."""
     with activity_write_lock():
         lock_activity_write_plane(session)
+        ensure_default_policies(session)
         backfill_android_canonical_events(
             session,
             timezone=timezone,
         )
         migrate_activity_summary_derivations(session)
+        ensure_decision_domain_policies(
+            session,
+            decision_owner_principal_id,
+        )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def _run_mandatory_decision_receipt_maintenance(
+    *,
+    now: datetime | None = None,
+    batch_size: int = DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+    max_rows: int = DEFAULT_RECEIPT_MAINTENANCE_MAX_ROWS,
+    after_id: uuid.UUID | None = None,
+    timeout_seconds: float = (_DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS),
+    cancellation: Event | None = None,
+) -> tuple[int, uuid.UUID | None]:
+    """Commit bounded cleanup batches independently from optional scheduling."""
+
+    if batch_size < 1:
+        raise ValueError("decision receipt batch_size must be positive")
+    if max_rows < 1:
+        raise ValueError("decision receipt max_rows must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError("decision receipt maintenance timeout must be positive")
+    current = now or datetime.now(UTC)
+    processed = 0
+    cursor = after_id
+    deadline = steady_time() + timeout_seconds
+
+    def cancellation_check() -> None:
+        _receipt_maintenance_cancellation_check(cancellation)
+
+    while processed < max_rows:
+        cancellation_check()
+        current_batch_size = min(batch_size, max_rows - processed)
+        batch = _run_receipt_maintenance_transaction(
+            lambda session: maintain_decision_receipt_results(
+                session,
+                now=current,
+                batch_size=current_batch_size,
+                after_id=cursor,
+            ),
+            deadline=deadline,
+            cancellation=cancellation,
+        )
+        processed += batch.scanned
+        cursor = batch.next_cursor
+        if cursor is None:
+            break
+    return processed, cursor
+
+
+def _run_one_decision_receipt_maintenance_batch(
+    *,
+    now: datetime | None = None,
+    after_id: uuid.UUID | None = None,
+    timeout_seconds: float = (_DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS),
+    cancellation: Event | None = None,
+) -> DecisionReceiptMaintenanceBatch:
+    """Run one short recurring transaction so normal writes regain the lock."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("decision receipt maintenance timeout must be positive")
+    deadline = steady_time() + timeout_seconds
+    return _run_receipt_maintenance_transaction(
+        lambda session: maintain_decision_receipt_results(
+            session,
+            now=now or datetime.now(UTC),
+            batch_size=DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+            after_id=after_id,
+        ),
+        deadline=deadline,
+        cancellation=cancellation,
+    )
+
+
+async def _run_receipt_maintenance_durably(
+    *,
+    after_id: uuid.UUID | None = None,
+    timeout_seconds: float = (_DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS),
+) -> DecisionReceiptMaintenanceBatch:
+    if timeout_seconds <= 0:
+        raise ValueError("decision receipt maintenance timeout must be positive")
+    cancellation = Event()
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _run_one_decision_receipt_maintenance_batch,
+            after_id=after_id,
+            timeout_seconds=timeout_seconds,
+            cancellation=cancellation,
+        )
+    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=(timeout_seconds + _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS),
+        )
+    except asyncio.CancelledError:
+        cancellation.set()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=(timeout_seconds + _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS),
+            )
+        except (
+            TimeoutError,
+            _DecisionReceiptMaintenanceCancelled,
+        ):
+            pass
+        raise
+    except TimeoutError:
+        cancellation.set()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=(_DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS),
+            )
+        except (
+            TimeoutError,
+            _DecisionReceiptMaintenanceCancelled,
+        ):
+            pass
+        raise TimeoutError("decision receipt maintenance exceeded its deadline") from None
+    except _DecisionReceiptMaintenanceCancelled:
+        raise asyncio.CancelledError from None
+
+
+async def _decision_receipt_maintenance_loop(
+    stop: asyncio.Event,
+    *,
+    initial_cursor: uuid.UUID | None = None,
+) -> None:
+    cursor = initial_cursor
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=(_DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS),
+            )
+        except TimeoutError:
+            try:
+                batch = await _run_receipt_maintenance_durably(
+                    after_id=cursor,
+                )
+                cursor = batch.next_cursor
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("mandatory decision receipt maintenance failed")
+
+
+async def _stop_decision_receipt_maintenance(
+    task: asyncio.Task[None],
+    stop: asyncio.Event,
+    *,
+    timeout_seconds: float = (
+        _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS
+        + _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+    ),
+) -> None:
+    """Stop the loop and attempt one final scrub within bounded deadlines."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("decision receipt shutdown timeout must be positive")
+    stop.set()
+    cancellation: asyncio.CancelledError | None = None
+    current = asyncio.current_task()
+    cancelling_before = current.cancelling() if current is not None else 0
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=timeout_seconds,
+        )
+    except asyncio.CancelledError as exc:
+        cancelling_after = current.cancelling() if current is not None else 0
+        if current is None or cancelling_after <= cancelling_before:
+            raise
+        cancellation = exc
+    except TimeoutError:
+        task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=(_DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS),
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+        _LOGGER.warning("decision receipt maintenance loop exceeded shutdown deadline")
+
+    try:
+        await _run_receipt_maintenance_durably(
+            timeout_seconds=min(
+                timeout_seconds,
+                _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS,
+            )
+        )
+    except TimeoutError:
+        _LOGGER.warning("final decision receipt maintenance exceeded shutdown deadline")
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+    if cancellation is not None:
+        raise cancellation
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    decision_transport: HermesResponsesTransport | None = None,
+    decision_wearable_reader: WearableReader | None = None,
+    decision_clock: Callable[[], datetime] | None = None,
+) -> FastAPI:
     """Build the HealthMes FastAPI application.
 
     Feature layers (store, engine, calendars, mcp_server, api) are wired here;
@@ -82,58 +660,202 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # it every /mcp request 500s).
     mcp_app = mcp_server.build_mcp_http_app()
 
+    def build_decision_service(app: FastAPI) -> HealthMesDecisionService:
+        return HealthMesDecisionService(
+            settings=settings,
+            engine_provider=lambda: app.state.decision_engine,
+            session_factory_provider=get_session_factory,
+            recovery_provider=(
+                lambda: app.state.decision_recovery_finalizer
+            ),
+            clock=decision_clock,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Bind the process-wide store engine to *this* app's settings so
-        # SessionDep / session_scope() hit the configured database instead of
-        # lazily reading the environment at first use.
-        engine = init_engine(settings)
-        if engine.dialect.name == "sqlite":
-            Base.metadata.create_all(engine)
-        with session_scope() as session:
-            _initialize_activity_storage(
-                session,
-                timezone=str(resolve_timezone(settings)),
+        app.state.scheduler = None
+        app.state.decision_engine = None
+        app.state.decision_recovery_finalizer = None
+        app.state.decision_receipt_maintenance_task = None
+        app.state.staging_reconciliation = None
+        async with AsyncExitStack() as cleanup:
+            # Register each cleanup immediately after ownership is acquired.
+            # LIFO then guarantees scheduler -> decisions -> MCP -> DB even
+            # when a later startup step fails.
+            cleanup.enter_context(recovered_runtime_guard(resolve_data_locations(settings)))
+            engine = init_engine(settings)
+            cleanup.callback(dispose_engine)
+            ensure_database_schema(engine, settings.database_url)
+            activate_runtime_extended_write_fence(engine)
+            with session_scope() as session:
+                _initialize_activity_storage(
+                    session,
+                    timezone=str(resolve_timezone(settings)),
+                    decision_owner_principal_id=(settings.decision_owner_principal_id),
+                )
+            staging_report = reconcile_staging_files(engine, settings)
+            app.state.staging_reconciliation = staging_report
+            if staging_report.unresolved or staging_report.truncated or staging_report.errors:
+                logger.warning(
+                    "startup staging reconciliation requires follow-up: %s",
+                    staging_report,
+                )
+            _, receipt_maintenance_cursor = _run_mandatory_decision_receipt_maintenance()
+
+            receipt_maintenance_stop = asyncio.Event()
+            receipt_maintenance_task = asyncio.create_task(
+                _decision_receipt_maintenance_loop(
+                    receipt_maintenance_stop,
+                    initial_cursor=receipt_maintenance_cursor,
+                ),
+                name="healthmes-decision-receipt-maintenance",
             )
-        # MCP tools resolve settings through the same override hook the tests
-        # use, so tools always agree with the app about endpoints/keys.
-        mcp_server.set_settings(settings)
-        # Background loops: the 10-minute trigger sweep (created with the
-        # scheduler), the hourly cognitive-energy persist (PLAN §3), the
-        # weekly encrypted backup (PLAN §9), and one calendar mirror poll per
-        # enabled backend (PLAN §6 — Google 5 min / CalDAV 10 min; the write
-        # backend also pushes accepted proposals to the external calendar).
-        # All of them only ever run when settings.scheduler_enabled is True —
-        # start_scheduler returns None otherwise (the gate lives inside it).
-        scheduler = create_scheduler(settings)
-        register_energy_job(scheduler, build_energy_job(settings))
-        register_backup_job(scheduler, build_backup_job(settings))
-        register_storage_maintenance_job(scheduler, build_storage_maintenance_job(settings))
-        register_activity_maintenance_job(
-            scheduler,
-            build_activity_maintenance_job(),
-        )
-        register_calendar_adjustment_maintenance_job(
-            scheduler, mcp_server.expire_and_reconcile_calendar_adjustments
-        )
-        for spec in build_calendar_jobs(settings):
-            register_calendar_job(
-                scheduler, spec.job, job_id=spec.job_id, minutes=spec.interval_minutes
+            app.state.decision_receipt_maintenance_task = receipt_maintenance_task
+
+            async def stop_receipt_maintenance() -> None:
+                try:
+                    await _stop_decision_receipt_maintenance(
+                        receipt_maintenance_task,
+                        receipt_maintenance_stop,
+                    )
+                finally:
+                    app.state.decision_receipt_maintenance_task = None
+
+            cleanup.push_async_callback(stop_receipt_maintenance)
+
+            mcp_server.set_settings(settings)
+            cleanup.callback(mcp_server.set_settings, None)
+            await cleanup.enter_async_context(mcp_app.lifespan(mcp_app))
+
+            wearable_reader = (
+                decision_wearable_reader
+                if decision_wearable_reader is not None
+                else lambda day: mcp_server.get_daily_readiness_context(day.isoformat())
             )
-        sleep_job = build_sleep_reconciliation_job(settings)
-        if sleep_job is not None:
-            register_sleep_reconciliation_job(scheduler, sleep_job)
-        app.state.scheduler = start_scheduler(settings, scheduler=scheduler)
-        try:
-            # Chain the MCP app's lifespan: it starts the StreamableHTTP
-            # session manager serving POST /mcp.
-            async with mcp_app.lifespan(mcp_app):
-                yield
-        finally:
-            shutdown_scheduler(app.state.scheduler)
-            app.state.scheduler = None
-            mcp_server.set_settings(None)
-            dispose_engine()
+            decision_search_service = build_decision_context_search_session_service(
+                settings=settings,
+                session_factory=get_session_factory(),
+                wearable_reader=wearable_reader,
+                clock=decision_clock,
+            )
+            mcp_server.set_decision_search_session_service(decision_search_service)
+            decision_recovery_finalizer = build_decision_recovery_finalizer(
+                settings=settings,
+                session_factory=get_session_factory(),
+                search_service=decision_search_service,
+                clock=decision_clock,
+            )
+            app.state.decision_recovery_finalizer = decision_recovery_finalizer
+            if decision_recovery_finalizer is not None:
+
+                async def close_decision_recovery_finalizer() -> None:
+                    try:
+                        await decision_recovery_finalizer.aclose()
+                    finally:
+                        app.state.decision_recovery_finalizer = None
+
+                cleanup.push_async_callback(close_decision_recovery_finalizer)
+
+            decision_service = app.state.decision_service
+            if decision_service is None:
+                decision_service = build_decision_service(app)
+                app.state.decision_service = decision_service
+
+            decision_engine = None
+
+            async def close_decision_runtime() -> None:
+                try:
+                    await _close_decision_runtime_durably(
+                        decision_service,
+                        decision_engine,
+                    )
+                finally:
+                    app.state.decision_engine = None
+                    app.state.decision_service = None
+
+            cleanup.push_async_callback(close_decision_runtime)
+
+            decision_engine = build_configured_decision_engine(
+                settings=settings,
+                session_factory=get_session_factory(),
+                transport=decision_transport,
+                search_service=decision_search_service,
+                wearable_reader=wearable_reader,
+                clock=decision_clock,
+            )
+            app.state.decision_engine = decision_engine
+
+            decision_alert_sender = None
+            if decision_engine is not None:
+                decision_alert_sender = DecisionAlertSender(
+                    settings,
+                    bridge=DecisionServiceThreadBridge(
+                        service=decision_service,
+                        loop=asyncio.get_running_loop(),
+                        timeout_seconds=(
+                            settings.decision_timeout_seconds
+                            + settings.decision_finalization_timeout_seconds
+                        ),
+                    ),
+                )
+
+            # Background loops are prepared even when globally disabled so
+            # their configuration remains testable. Register shutdown before
+            # job setup so a partial scheduler startup cannot leak a thread.
+            scheduler = create_scheduler(
+                settings,
+                alert_sender=decision_alert_sender,
+            )
+
+            def stop_scheduler() -> None:
+                try:
+                    shutdown_scheduler(scheduler)
+                finally:
+                    app.state.scheduler = None
+
+            cleanup.callback(stop_scheduler)
+            register_energy_job(scheduler, build_energy_job(settings))
+            register_backup_job(scheduler, build_backup_job(settings))
+            register_storage_maintenance_job(
+                scheduler,
+                build_storage_maintenance_job(settings),
+            )
+            if decision_alert_sender is not None:
+                register_scheduled_briefing_jobs(
+                    scheduler,
+                    settings,
+                    alert_sender=decision_alert_sender,
+                )
+            register_activity_maintenance_job(
+                scheduler,
+                build_activity_maintenance_job(),
+            )
+            activitywatch_job = build_activitywatch_job(settings)
+            if activitywatch_job is not None:
+                register_activitywatch_job(
+                    scheduler,
+                    activitywatch_job,
+                    minutes=settings.activitywatch_interval_minutes,
+                )
+            register_calendar_adjustment_maintenance_job(
+                scheduler,
+                mcp_server.expire_and_reconcile_calendar_adjustments,
+            )
+            for spec in build_calendar_jobs(settings):
+                register_calendar_job(
+                    scheduler,
+                    spec.job,
+                    job_id=spec.job_id,
+                    minutes=spec.interval_minutes,
+                )
+            sleep_job = build_sleep_reconciliation_job(settings)
+            if sleep_job is not None:
+                register_sleep_reconciliation_job(scheduler, sleep_job)
+            app.state.scheduler = start_scheduler(
+                settings,
+                scheduler=scheduler,
+            )
+            yield
 
     app = FastAPI(
         title="HealthMes Agent",
@@ -143,6 +865,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.decision_clock = decision_clock
+    app.state.decision_engine = None
+    app.state.decision_recovery_finalizer = None
+    app.state.decision_service = build_decision_service(app)
+    app.state.scheduler = None
+    app.state.decision_receipt_maintenance_task = None
+    app.state.staging_reconciliation = None
     install_local_sessions(app)
     install_google_oauth(app)
 

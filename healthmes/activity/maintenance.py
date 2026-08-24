@@ -12,6 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     BASELINE_DAYS,
     refresh_existing_day_baseline,
@@ -95,6 +96,29 @@ def _is_utc_hour_boundary(value: datetime) -> bool:
         normalized.minute == 0
         and normalized.second == 0
         and normalized.microsecond == 0
+    )
+
+
+def _matches_stored_aggregate_boundaries(
+    *,
+    start: datetime | None,
+    end: datetime | None,
+    spans: list[tuple[datetime, datetime]],
+) -> bool:
+    if not spans:
+        return False
+    normalized_start = as_utc(start) if start is not None else None
+    normalized_end = as_utc(end) if end is not None else None
+    if (
+        normalized_start is not None
+        and not _is_utc_hour_boundary(normalized_start)
+        and all(normalized_start != span_start for span_start, _ in spans)
+    ):
+        return False
+    return not (
+        normalized_end is not None
+        and not _is_utc_hour_boundary(normalized_end)
+        and all(normalized_end != span_end for _, span_end in spans)
     )
 
 
@@ -285,7 +309,7 @@ def run_activity_maintenance(
 ) -> ActivityMaintenanceReport:
     with activity_write_lock():
         lock_activity_write_plane(session)
-        current = as_utc(now or datetime.now(UTC))
+        current = as_utc(now or clock.utc_now())
         policies = ensure_activity_policies(session)
         expired = list(
             session.scalars(
@@ -404,7 +428,7 @@ def delete_activity_data(
 ) -> ActivityDeleteReport:
     with activity_write_lock():
         lock_activity_write_plane(session)
-        current = as_utc(now or datetime.now(UTC))
+        current = as_utc(now or clock.utc_now())
         effective_end = min(as_utc(end), current) if end is not None else current
         selection_end = (
             None
@@ -420,17 +444,6 @@ def delete_activity_data(
                 or not _is_utc_hour_boundary(selection_end)
             )
         )
-        if partial_hour_range and (
-            device_id is None
-            or not _device_supports_partial_interval_deletion(
-                session,
-                device_id=device_id,
-            )
-        ):
-            raise ActivityDeletionGranularityError(
-                "partial-hour deletion requires a known detailed activity device; "
-                "aggregate or unknown devices can only be deleted as complete buckets"
-            )
 
         raw_stmt = select(WellnessEvent).where(
             WellnessEvent.event_type.in_(RAW_EVENT_TYPES)
@@ -553,6 +566,36 @@ def delete_activity_data(
                 raise ActivityDeletionGranularityError(
                     "hourly compatibility activity can only be deleted as complete buckets"
                 )
+        if partial_hour_range and (
+            device_id is None
+            or (
+                not _device_supports_partial_interval_deletion(
+                    session,
+                    device_id=device_id,
+                )
+                and not _matches_stored_aggregate_boundaries(
+                    start=start,
+                    end=selection_end,
+                    spans=[
+                        _event_bounds(row)
+                        for row in raw_rows
+                        if row.event_type == APP_HOUR_EVENT
+                    ]
+                    + [
+                        (
+                            as_utc(row.bucket_start),
+                            as_utc(row.bucket_start)
+                            + timedelta(hours=1),
+                        )
+                        for row in compatibility_rows
+                    ],
+                )
+            )
+        ):
+            raise ActivityDeletionGranularityError(
+                "partial-hour deletion requires a known detailed activity "
+                "device or the exact bounds of stored complete buckets"
+            )
 
         fragments = [
             fragment

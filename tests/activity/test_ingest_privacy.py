@@ -42,15 +42,18 @@ from healthmes.activity.service import (
 )
 from healthmes.store import RetentionPolicy, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("fixture_clock")
+
 
 def _hour_batch(
     *,
+    source_provider: str = "test-collector",
     source_record_id: str = "hour-1",
     foreground_seconds: int = 600,
     collection_revision: int | None = None,
 ) -> ActivityBatchIn:
     return ActivityBatchIn(
-        source_provider="test-collector",
+        source_provider=source_provider,
         source_device="test-device",
         platform=ActivityPlatform.ANDROID,
         capability=ActivityCapability.AGGREGATE,
@@ -93,6 +96,68 @@ def test_ingest_is_idempotent_and_rejects_source_identity_reuse(session) -> None
     changed = _hour_batch(foreground_seconds=900)
     with pytest.raises(ActivityConflictError):
         ingest_activity_batch(session, changed, rebuild_summaries=False)
+
+
+def test_source_provider_is_canonical_before_idempotency_lookup(session) -> None:
+    first_batch = _hour_batch(source_provider="  Test-Collector  ")
+    retry_batch = _hour_batch(source_provider="test-collector")
+
+    first = ingest_activity_batch(
+        session,
+        first_batch,
+        rebuild_summaries=False,
+    )
+    retry = ingest_activity_batch(
+        session,
+        retry_batch,
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+
+    assert first_batch.source_provider == "test-collector"
+    assert first.response.created == 1
+    assert retry.response.duplicates == 1
+    assert len(events) == 1
+    assert events[0].source_provider == "test-collector"
+
+
+def test_source_provider_length_is_checked_after_ascii_space_trim() -> None:
+    provider = "A" * 64
+
+    batch = _hour_batch(source_provider=f" {provider} ")
+
+    assert batch.source_provider == provider.lower()
+    assert len(batch.source_provider) == 64
+
+
+@pytest.mark.parametrize(
+    "source_provider",
+    (
+        "   ",
+        "-test-collector",
+        " HealthMes-Activity-Aggregator ",
+        123,
+        "ÄPFEL",
+        "CAFÉ",
+        "Σ",
+        "straße",
+        "K",
+        "test\x00collector",
+        "\ttest-collector\t",
+        "a" * 65,
+    ),
+)
+def test_source_provider_rejects_invalid_canonical_value(
+    source_provider: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        _hour_batch(source_provider=source_provider)
 
 
 def test_raw_activity_uses_the_activity_retention_policy(session) -> None:

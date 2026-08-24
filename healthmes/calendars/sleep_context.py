@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Mapping
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.base import HealthmesEventKind, coerce_utc
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
 
 
@@ -14,11 +17,14 @@ def actual_sleep_context(
     session: Session,
     local_date: dt.date,
     timezone: dt.tzinfo,
+    *,
+    account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> dict[str, object]:
     context, _ = actual_sleep_context_with_source_ref(
         session,
         local_date,
         timezone,
+        account_generations=account_generations,
     )
     return context
 
@@ -27,8 +33,14 @@ def actual_sleep_context_with_source_ref(
     session: Session,
     local_date: dt.date,
     timezone: dt.tzinfo,
+    *,
+    account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
-    row = _actual_sleep_for_date(session, local_date)
+    row = _actual_sleep_for_date(
+        session,
+        local_date,
+        account_generations=account_generations,
+    )
     if row is None:
         return (
             {
@@ -59,6 +71,8 @@ def actual_sleep_context_with_source_ref(
             "upstream_provider": source,
             "resource_type": "actual_sleep",
             "observed_at": coerce_utc(row.end_at).isoformat(),
+            "calendar_source": row.calendar_source.value,
+            "account_generation": row.connection_generation,
             "schema_version": 1,
             "derived_by": "healthmes.actual-sleep-mirror.v1",
         },
@@ -89,17 +103,30 @@ def actual_sleep_violation(
     start: dt.datetime,
     end: dt.datetime,
     timezone: dt.tzinfo,
+    *,
+    account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> str | None:
     start_utc = coerce_utc(start)
     end_utc = coerce_utc(end)
-    row = session.scalar(
-        sa.select(CalendarEventMirror)
-        .where(
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
-            CalendarEventMirror.start_at < end_utc,
-            CalendarEventMirror.end_at > start_utc,
+    statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
+        CalendarEventMirror.start_at < end_utc,
+        CalendarEventMirror.end_at > start_utc,
+    )
+    if account_generations is not None:
+        filters = tuple(
+            sa.and_(
+                CalendarEventMirror.calendar_source == source,
+                CalendarEventMirror.connection_generation == generation,
+            )
+            for source, generation in account_generations.items()
         )
+        if not filters:
+            return None
+        statement = statement.where(sa.or_(*filters))
+    row = session.scalar(
+        retained_calendar_statement(session, statement)
         .order_by(CalendarEventMirror.end_at.desc())
         .limit(1)
     )
@@ -115,14 +142,27 @@ def actual_sleep_violation(
 def _actual_sleep_for_date(
     session: Session,
     local_date: dt.date,
+    *,
+    account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> CalendarEventMirror | None:
-    return session.scalar(
-        sa.select(CalendarEventMirror)
-        .where(
-            CalendarEventMirror.is_agent_created.is_(True),
-            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
-            CalendarEventMirror.sleep_local_date == local_date,
+    statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.is_agent_created.is_(True),
+        CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
+        CalendarEventMirror.sleep_local_date == local_date,
+    )
+    if account_generations is not None:
+        filters = tuple(
+            sa.and_(
+                CalendarEventMirror.calendar_source == source,
+                CalendarEventMirror.connection_generation == generation,
+            )
+            for source, generation in account_generations.items()
         )
+        if not filters:
+            return None
+        statement = statement.where(sa.or_(*filters))
+    return session.scalar(
+        retained_calendar_statement(session, statement)
         .order_by(
             CalendarEventMirror.sleep_duration_minutes.desc(),
             CalendarEventMirror.end_at.desc(),

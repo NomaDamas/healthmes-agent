@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from healthmes import clock
 from healthmes.activity.contracts import (
     ActivityPermissionStatus,
     ActivityRecord,
@@ -15,6 +16,7 @@ from healthmes.activity.contracts import (
 
 BLOCKED_PERMISSION_STATES = {
     ActivityPermissionStatus.DENIED.value,
+    ActivityPermissionStatus.RESTRICTED.value,
     ActivityPermissionStatus.REVOKED.value,
     ActivityPermissionStatus.UNAVAILABLE.value,
 }
@@ -88,7 +90,7 @@ def collection_gate(
     *,
     now: datetime | None = None,
 ) -> CollectionGate:
-    current = _as_utc(now) or datetime.now(UTC)
+    current = _as_utc(now) or clock.utc_now()
     if not bool(state.get("enabled", True)):
         return CollectionGate(False, "collection_disabled")
     permission = str(state.get("permission_status", "unknown"))

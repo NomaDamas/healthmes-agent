@@ -114,11 +114,10 @@ async def create_medical_record(body: MedicalRecordCreate, session: SessionDep) 
     "unavailable"}`` when open-wearables cannot be reached — the capture
     itself never fails for infrastructure reasons.
     """
-    # Deliberate reuse of the MCP module's snapshot helper — the single
-    # source of the snapshot + degradation semantics, so REST and Telegram
-    # captures cannot drift apart. Function-local import mirrors server.py's
-    # viewer_url import: the api and mcp_server layers stay off each other's
-    # module import paths (healthmes/mcp_server/server.py::record_decision).
+    # Deliberate reuse of the MCP module's snapshot helper keeps every
+    # capture ingress on the same snapshot and degradation semantics.
+    # Function-local import keeps the api and mcp_server layers off each
+    # other's module import paths.
     from healthmes.mcp_server import server as mcp_server
 
     snapshot = await mcp_server._capture_health_context()

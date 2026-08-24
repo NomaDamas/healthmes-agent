@@ -1,12 +1,16 @@
 """Tests for the schedule router (calendar mirror range list + proposals)."""
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from freezegun import freeze_time
 from pydantic import SecretStr
 
+from healthmes.api import schedule as schedule_api
+from healthmes.calendars import creds
 from healthmes.calendars.adjustments import issue_reply_handle
+from healthmes.calendars.state import FileSyncHealthStore
 from healthmes.schedule_proposals import (
     ScheduleProposalResolutionError,
     invalidate_schedule_proposal,
@@ -21,10 +25,71 @@ from healthmes.store import (
 )
 
 HANDLE_SECRET = "test-calendar-adjustment-secret-32-characters"
+GOOGLE_ACCOUNT_GENERATION = "a" * 32
+CALDAV_ACCOUNT_GENERATION = "b" * 32
+RECONNECTED_GOOGLE_ACCOUNT_GENERATION = "c" * 32
 
 
 def _dt(hour: int, minute: int = 0, day: int = 6) -> datetime:
     return datetime(2026, 7, day, hour, minute, tzinfo=UTC)
+
+
+def _connect_google(
+    client,
+    *,
+    generation: str = GOOGLE_ACCOUNT_GENERATION,
+) -> None:
+    token_path = client.app.state.settings.data_dir / "google" / "calendar_token.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fake-refresh",
+                "client_id": "test.apps.googleusercontent.com",
+                "client_secret": "fake-secret",
+                "_healthmes_account_generation": generation,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _mark_calendar_synced(
+    client,
+    source: CalendarSource,
+    generation: str,
+    *,
+    event_count: int = 1,
+) -> None:
+    FileSyncHealthStore.for_data_dir(client.app.state.settings.data_dir).record_success(
+        source,
+        _dt(8),
+        event_count=event_count,
+        account_generation=generation,
+    )
+
+
+def _make_calendars_visible(client) -> None:
+    _connect_google(client)
+    creds.save_caldav_credentials(
+        client.app.state.settings.data_dir,
+        username="calendar@example.test",
+        app_password="test-app-password",
+        url="https://caldav.test",
+        account_generation=CALDAV_ACCOUNT_GENERATION,
+    )
+    _mark_calendar_synced(
+        client,
+        CalendarSource.GOOGLE,
+        GOOGLE_ACCOUNT_GENERATION,
+        event_count=2,
+    )
+    _mark_calendar_synced(
+        client,
+        CalendarSource.CALDAV,
+        CALDAV_ACCOUNT_GENERATION,
+    )
 
 
 def _seed_events(session):
@@ -32,6 +97,7 @@ def _seed_events(session):
         CalendarEventMirror(
             external_id="inside",
             calendar_source=CalendarSource.GOOGLE,
+            connection_generation=GOOGLE_ACCOUNT_GENERATION,
             summary="Inside",
             start_at=_dt(10),
             end_at=_dt(11),
@@ -39,6 +105,7 @@ def _seed_events(session):
         CalendarEventMirror(
             external_id="overlaps-start",
             calendar_source=CalendarSource.CALDAV,
+            connection_generation=CALDAV_ACCOUNT_GENERATION,
             summary="Overlaps range start",
             start_at=_dt(8),
             end_at=_dt(9, 30),
@@ -46,6 +113,7 @@ def _seed_events(session):
         CalendarEventMirror(
             external_id="outside",
             calendar_source=CalendarSource.GOOGLE,
+            connection_generation=GOOGLE_ACCOUNT_GENERATION,
             summary="After range",
             start_at=_dt(18),
             end_at=_dt(19),
@@ -56,6 +124,7 @@ def _seed_events(session):
 
 
 def test_list_events_returns_overlapping_range_ordered(client, session):
+    _make_calendars_visible(client)
     _seed_events(session)
 
     response = client.get(
@@ -71,6 +140,7 @@ def test_list_events_returns_overlapping_range_ordered(client, session):
 
 
 def test_list_events_filters_by_calendar_source(client, session):
+    _make_calendars_visible(client)
     _seed_events(session)
 
     response = client.get(
@@ -83,6 +153,122 @@ def test_list_events_filters_by_calendar_source(client, session):
     )
 
     assert [e["external_id"] for e in response.json()["data"]] == ["inside", "outside"]
+
+
+def test_list_events_fails_closed_when_calendar_is_disconnected(
+    client,
+    session,
+):
+    _seed_events(session)
+
+    response = client.get(
+        "/v1/schedule/events",
+        params={
+            "start": "2026-07-06T00:00:00Z",
+            "end": "2026-07-07T00:00:00Z",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "calendar_unavailable",
+        "message": (
+            "Calendar events are unavailable until the connected account "
+            "completes a successful sync."
+        ),
+        "detail": {"reason_codes": ["calendar_not_connected"]},
+    }
+
+
+def test_list_events_hides_old_generation_after_unsynced_reconnect(
+    client,
+    session,
+):
+    _connect_google(client)
+    _mark_calendar_synced(
+        client,
+        CalendarSource.GOOGLE,
+        GOOGLE_ACCOUNT_GENERATION,
+    )
+    session.add(
+        CalendarEventMirror(
+            external_id="old-account-event",
+            calendar_source=CalendarSource.GOOGLE,
+            connection_generation=GOOGLE_ACCOUNT_GENERATION,
+            summary="Old account",
+            start_at=_dt(10),
+            end_at=_dt(11),
+        )
+    )
+    session.commit()
+    _connect_google(
+        client,
+        generation=RECONNECTED_GOOGLE_ACCOUNT_GENERATION,
+    )
+
+    response = client.get(
+        "/v1/schedule/events",
+        params={
+            "start": "2026-07-06T00:00:00Z",
+            "end": "2026-07-07T00:00:00Z",
+            "calendar_source": "google",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["detail"] == {"reason_codes": ["calendar_account_not_synced"]}
+
+
+def test_list_events_discards_count_and_rows_when_reconnect_races_read(
+    client,
+    session,
+    monkeypatch,
+):
+    _connect_google(client)
+    _mark_calendar_synced(
+        client,
+        CalendarSource.GOOGLE,
+        GOOGLE_ACCOUNT_GENERATION,
+    )
+    session.add(
+        CalendarEventMirror(
+            external_id="must-not-leak",
+            calendar_source=CalendarSource.GOOGLE,
+            connection_generation=GOOGLE_ACCOUNT_GENERATION,
+            summary="Old account",
+            start_at=_dt(10),
+            end_at=_dt(11),
+        )
+    )
+    session.commit()
+    original_paginate = schedule_api.paginate
+    calls = 0
+
+    def reconnect_after_page(*args, **kwargs):
+        nonlocal calls
+        result = original_paginate(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            _connect_google(
+                client,
+                generation=RECONNECTED_GOOGLE_ACCOUNT_GENERATION,
+            )
+        return result
+
+    monkeypatch.setattr(schedule_api, "paginate", reconnect_after_page)
+
+    response = client.get(
+        "/v1/schedule/events",
+        params={
+            "start": "2026-07-06T00:00:00Z",
+            "end": "2026-07-07T00:00:00Z",
+            "calendar_source": "google",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["detail"] == {"reason_codes": ["calendar_account_not_synced"]}
+    assert calls == 1
 
 
 def test_list_events_requires_start_and_end(client):
@@ -181,6 +367,7 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
 
 
 def test_accept_invalidates_proposal_when_actual_sleep_changed(client, session):
+    _connect_google(client)
     proposal = _seed_proposal(session)
     proposal.proposed_start = _dt(6)
     proposal.proposed_end = _dt(7)
@@ -194,6 +381,7 @@ def test_accept_invalidates_proposal_when_actual_sleep_changed(client, session):
             is_agent_created=True,
             healthmes_kind="actual_sleep",
             sleep_local_date=_dt(7).date(),
+            connection_generation=GOOGLE_ACCOUNT_GENERATION,
         )
     )
     session.commit()

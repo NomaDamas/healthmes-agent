@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     rebuild_affected_days,
     summary_raw_provenance_complete,
@@ -895,7 +896,7 @@ def ingest_batch(
                         session=session,
                         state=state,
                         timezone=timezone,
-                        now=datetime.now(UTC),
+                        now=clock.utc_now(),
                     )
             except ActivityConflictError as exc:
                 raise APIError(

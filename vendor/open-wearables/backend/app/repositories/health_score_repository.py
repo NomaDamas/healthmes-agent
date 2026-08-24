@@ -2,13 +2,14 @@ from datetime import date, datetime, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, tuple_
+from sqlalchemy import DateTime, and_, asc, desc, tuple_
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import HealthScore
 from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
 
@@ -57,6 +58,47 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
         db_session.execute(stmt)
         # Caller is responsible for commit — allows batching with other operations
+
+    def upsert_whoop_day_strain(
+        self,
+        db_session: DbSession,
+        creators: list[HealthScoreCreate],
+    ) -> None:
+        """Insert WHOOP Cycle strain and refresh only newer revisions of the same cycle.
+
+        This is intentionally separate from ``bulk_create``: other provider
+        health scores retain their existing insert-only semantics.
+        """
+        if not creators:
+            return
+
+        for creator in creators:
+            values = creator.model_dump()
+            stmt = insert(HealthScore).values(values)
+            existing_cycle_id = HealthScore.components["cycle_id"]["qualifier"].astext
+            incoming_cycle_id = stmt.excluded.components["cycle_id"]["qualifier"].astext
+            existing_updated_at = sql_cast(
+                HealthScore.components["cycle_updated_at"]["qualifier"].astext,
+                DateTime(timezone=True),
+            )
+            incoming_updated_at = sql_cast(
+                stmt.excluded.components["cycle_updated_at"]["qualifier"].astext,
+                DateTime(timezone=True),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["user_id", "provider", "category", "recorded_at"],
+                set_={
+                    "value": stmt.excluded.value,
+                    "components": stmt.excluded.components,
+                },
+                where=and_(
+                    HealthScore.provider == ProviderName.WHOOP,
+                    HealthScore.category == HealthScoreCategory.DAY_STRAIN,
+                    existing_cycle_id == incoming_cycle_id,
+                    existing_updated_at < incoming_updated_at,
+                ),
+            )
+            db_session.execute(stmt)
 
     def get_latest_by_category(
         self,

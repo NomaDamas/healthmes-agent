@@ -1,10 +1,12 @@
 import datetime as dt
+import json
 import uuid
 
 import pytest
 from fastmcp.exceptions import ToolError
 from sqlalchemy import select
 
+from healthmes.calendars.state import FileSyncHealthStore, SyncCoverageKind
 from healthmes.mcp_server import server as server_module
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
@@ -45,6 +47,35 @@ from healthmes.nutrition.repository import (
 from healthmes.storage import register_storage_object
 from healthmes.store import CalendarEventMirror, CalendarSource
 
+CALENDAR_ACCOUNT_GENERATION = "f" * 32
+
+
+def _ensure_visible_calendar() -> None:
+    settings = server_module._active_settings()
+    token_path = settings.data_dir / "google" / "calendar_token.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fixture-refresh-token",
+                "client_id": "fixture-client-id",
+                "client_secret": "fixture-client-secret",
+                "_healthmes_account_generation": (
+                    CALENDAR_ACCOUNT_GENERATION
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    FileSyncHealthStore.for_data_dir(settings.data_dir).record_success(
+        CalendarSource.GOOGLE,
+        dt.datetime.now(dt.UTC),
+        event_count=0,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=CALENDAR_ACCOUNT_GENERATION,
+    )
+
 
 def _seed_event(
     store_factory,
@@ -53,10 +84,12 @@ def _seed_event(
     end: dt.datetime,
     summary: str = "Focused work",
 ) -> uuid.UUID:
+    _ensure_visible_calendar()
     with store_factory() as session:
         event = CalendarEventMirror(
             external_id=f"caffeine-{uuid.uuid4()}",
             calendar_source=CalendarSource.GOOGLE,
+            connection_generation=CALENDAR_ACCOUNT_GENERATION,
             summary=summary,
             start_at=start,
             end_at=end,
@@ -589,6 +622,46 @@ class TestCaffeineProposalTool:
         assert result["status"] == "insufficient_data"
         assert result["reason"] == "missing_target_event"
         assert result["recommendation"]["maximum_additional_mg"] is None
+        assert mcp_env.requests == []
+
+    async def test_disconnected_event_is_missing_and_never_exposed(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        _, event_start, target_sleep = _local_times(pinned_tz)
+        with store_factory() as session:
+            event = CalendarEventMirror(
+                external_id="disconnected-caffeine-secret",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Secret oncology appointment",
+                start_at=event_start.astimezone(dt.UTC),
+                end_at=(
+                    event_start + dt.timedelta(hours=1)
+                ).astimezone(dt.UTC),
+            )
+            session.add(event)
+            session.flush()
+            event_id = event.id
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "get_caffeine_proposal",
+            _proposal_args(
+                event_id,
+                event_start_local=event_start,
+                target_sleep_local=target_sleep,
+            ),
+        )
+
+        assert result["status"] == "insufficient_data"
+        assert result["reason"] == "missing_target_event"
+        assert result["facts"]["target_event"] is None
+        assert "Secret oncology appointment" not in str(result)
         assert mcp_env.requests == []
 
     async def test_future_event_sleep_is_stale_for_today_proposal(

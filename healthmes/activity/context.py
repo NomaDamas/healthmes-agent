@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from healthmes import clock
 from healthmes.activity.aggregation import (
     LEGACY_SUMMARY_REASON,
     get_daily_summary,
@@ -112,6 +113,7 @@ def _combine_hourly(
             "active_minutes": 0.0,
             "active_minutes_upper": 0.0,
             "launches": 0,
+            "launches_observed": False,
             "longest_block": None,
             "coverage": None,
             "evidence_ids": [],
@@ -124,6 +126,7 @@ def _combine_hourly(
     active = 0.0
     active_upper = 0.0
     launches = 0.0
+    launches_observed = True
     longest_values: list[float] = []
     known_seconds = 0.0
     has_known_coverage = False
@@ -160,6 +163,13 @@ def _combine_hourly(
         active += row_active * fraction
         active_upper += row_active_upper * fraction
         launches += int(payload.get("app_launches_or_switches") or 0) * fraction
+        launch_range = payload.get("app_launches_or_switches_range")
+        if (
+            isinstance(launch_range, dict)
+            and "upper_bound" in launch_range
+            and launch_range.get("upper_bound") is None
+        ):
+            launches_observed = False
         longest = payload.get("longest_active_block_minutes")
         if longest is not None:
             longest_values.append(min(float(longest), overlap_seconds / 60.0))
@@ -182,6 +192,7 @@ def _combine_hourly(
             "active_minutes": 0.0,
             "active_minutes_upper": 0.0,
             "launches": 0,
+            "launches_observed": False,
             "longest_block": None,
             "coverage": None,
             "evidence_ids": [],
@@ -207,6 +218,7 @@ def _combine_hourly(
             ),
         },
         "launches": int(round(launches)),
+        "launches_observed": launches_observed,
         "longest_block": max(longest_values) if longest_values else None,
         "coverage": round(coverage, 4) if coverage is not None else None,
         "evidence_ids": [str(row.id) for row in selected_rows],
@@ -259,6 +271,12 @@ def focus_context(
         now=now,
     ):
         raw_active, raw_active_upper = summary_active_time_range(raw)
+        launch_range = raw.get("app_launches_or_switches_range")
+        launches_observed = not (
+            isinstance(launch_range, dict)
+            and "upper_bound" in launch_range
+            and launch_range.get("upper_bound") is None
+        )
         combined = {
             "status": "ok",
             "active_minutes": raw_active,
@@ -272,6 +290,7 @@ def focus_context(
                 },
             ),
             "launches": int(raw.get("app_launches_or_switches") or 0),
+            "launches_observed": launches_observed,
             "longest_block": raw.get("longest_active_block_minutes"),
             "coverage": raw.get("source_coverage", {}).get("ratio"),
             "evidence_ids": list(raw.get("_evidence_event_ids", [])),
@@ -348,7 +367,11 @@ def focus_context(
     active_hours = combined["active_minutes"] / 60.0
     launches_per_hour = (
         combined["launches"] / active_hours
-        if active_hours > 0 and not active_time_bounded
+        if (
+            active_hours > 0
+            and not active_time_bounded
+            and combined.get("launches_observed", True)
+        )
         else None
     )
     longest = combined["longest_block"]
@@ -369,6 +392,8 @@ def focus_context(
         limitations.append("exact_focus_blocks_unavailable_for_hourly_sources")
     if combined["coverage"] is None:
         limitations.append("coverage_unknown")
+    if not combined.get("launches_observed", True):
+        limitations.append("launches_unavailable_for_some_sources")
     if active_time_bounded:
         if (
             "partial_hourly_activity_time_bounded"
@@ -494,8 +519,10 @@ def overwork_context(
             current_minutes=total,
             lookback_days=lookback_days,
             now=now,
+            include_evidence_ids=True,
         )
     )
+    baseline_evidence_ids = list(baseline.pop("evidence_ids", []))
     if total >= OVERWORK_TOTAL_MINUTES:
         signals.append(
             {
@@ -601,7 +628,10 @@ def overwork_context(
             "lookback_baseline_delta": baseline,
         },
         "coverage": summary.get("source_coverage"),
-        "evidence_ids": [str(event.id)],
+        "evidence_ids": [
+            str(event.id),
+            *baseline_evidence_ids,
+        ],
         "freshness": {
             "recorded_at": _recorded_at(event.recorded_at),
             "status": "stored_summary",
@@ -673,4 +703,4 @@ def recovery_activity_context(
 
 def default_focus_window(day: date, timezone: str | tzinfo) -> tuple[datetime, datetime]:
     start, end = local_day_bounds(day, timezone)
-    return start, min(end, datetime.now(UTC) + timedelta(seconds=1))
+    return start, min(end, clock.utc_now() + timedelta(seconds=1))

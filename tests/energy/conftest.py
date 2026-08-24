@@ -18,6 +18,7 @@ tests/energy/test_cognitive_energy.py (docs/PLAN.md §3):
 """
 
 import datetime as dt
+import json
 import uuid
 from collections.abc import Callable, Iterator
 
@@ -25,6 +26,7 @@ import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.calendars.state import FileSyncHealthStore
 from healthmes.engine.cognitive_energy import CognitiveEnergyEngine, OwRows
 from healthmes.storage import update_retention_policy
 from healthmes.store import (
@@ -38,6 +40,7 @@ from healthmes.store import (
 # The frozen "wall clock" of the vector: 14:23 UTC -> current window is 14:00.
 VECTOR_NOW = dt.datetime(2026, 7, 9, 14, 23, tzinfo=dt.UTC)
 VECTOR_DAY = dt.date(2026, 7, 9)
+GOOGLE_ACCOUNT_GENERATION = "a" * 32
 
 
 @pytest.fixture
@@ -185,13 +188,40 @@ def energy_engine_factory(settings, session_factory, fake_reader_factory):
 
 
 @pytest.fixture
-def seed_calendar_event(session_factory) -> Callable[..., None]:
-    def seed(start: dt.datetime, end: dt.datetime, summary: str = "Team sync") -> None:
+def seed_calendar_event(settings, session_factory) -> Callable[..., None]:
+    def seed(
+        start: dt.datetime,
+        end: dt.datetime,
+        summary: str = "Team sync",
+        *,
+        generation: str = GOOGLE_ACCOUNT_GENERATION,
+    ) -> None:
+        token_path = settings.data_dir / "google" / "calendar_token.json"
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(
+            json.dumps(
+                {
+                    "type": "authorized_user",
+                    "refresh_token": "fake-refresh",
+                    "client_id": "test.apps.googleusercontent.com",
+                    "client_secret": "fake-secret",
+                    "_healthmes_account_generation": generation,
+                }
+            ),
+            encoding="utf-8",
+        )
+        FileSyncHealthStore.for_data_dir(settings.data_dir).record_success(
+            CalendarSource.GOOGLE,
+            VECTOR_NOW - dt.timedelta(minutes=1),
+            event_count=1,
+            account_generation=generation,
+        )
         with session_factory() as session:
             session.add(
                 CalendarEventMirror(
                     external_id=uuid.uuid4().hex,
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generation,
                     summary=summary,
                     start_at=start,
                     end_at=end,

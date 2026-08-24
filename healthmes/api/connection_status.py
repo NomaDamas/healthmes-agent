@@ -13,6 +13,7 @@ from healthmes.mcp_server.ow_client import (
     OWClient,
     OWClientError,
     OWConfigurationError,
+    OWPayloadError,
     resolve_single_user_id,
 )
 
@@ -74,6 +75,8 @@ async def build_oura_card(
         return _oura_error("Open Wearables API key 인증 실패")
     except LookupError:
         return _oura_error("Open Wearables 사용자 선택 필요")
+    except OWPayloadError:
+        return _oura_payload_error("연결")
     except OWClientError:
         return _oura_error(
             "Open Wearables API 연결 또는 응답 오류",

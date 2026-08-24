@@ -22,6 +22,7 @@ from healthmes.mcp_server.interpret import normalize_recovery
 from healthmes.store.enums import (
     CalendarSource,
 )
+from healthmes.store.models import LEGACY_CALENDAR_ACCOUNT_GENERATION
 
 
 def evaluate_event_eligibility(
@@ -38,9 +39,20 @@ def evaluate_event_eligibility(
     end = coerce_utc(_attr(event, "end_at"))
     local_start = start.astimezone(timezone)
     local_end = end.astimezone(timezone)
+    account_generation = _attr(
+        event,
+        "connection_generation",
+        _attr(event, "account_generation", None),
+    )
 
     if _source_value(source) != CalendarSource.GOOGLE.value:
         reasons.append("unsupported_source")
+    if (
+        not isinstance(account_generation, str)
+        or not account_generation.strip()
+        or account_generation == LEGACY_CALENDAR_ACCOUNT_GENERATION
+    ):
+        reasons.append("missing_account_generation")
     if bool(_attr(event, "is_agent_created", False)):
         reasons.append("agent_owned_path_only")
     if not bool(_attr(event, "organizer_self", False)):

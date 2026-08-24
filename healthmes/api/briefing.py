@@ -44,15 +44,16 @@ Data sources and honesty rules:
   pushed proposals already appear via the mirror, so including them twice
   would double-count). ``energy_demand`` comes from the linked task when one
   exists.
-- **alerts** are recent pushed trigger events (``alert_sent`` within
+- **alerts** are recent delivered or app-available trigger events within
   :data:`ALERT_RECENT_HOURS`). The store has no resolution tracking yet, so
   "unresolved" == "recent" — a documented placeholder policy for the domain
   expert to refine. ``top.decision_url`` links the earliest alert-kind
-  decision linked to the trigger event by the webhook correlation ID, else
+  decision linked to the trigger event by the decision-dispatch correlation
+  ID, else
   ``null``.
 - **decision URLs** come from :func:`healthmes.api.auth.viewer_url` — the one
-  construction point shared with the MCP ``record_decision`` tool and the
-  weekly report: ``{public_base_url}/decisions/{id}`` plus the *derived
+  construction point shared by the finalizer, bounded command workflows, and
+  the weekly report: ``{public_base_url}/decisions/{id}`` plus the *derived
   read-only* ``?token=`` credential when an API token is configured, so links
   stay browser-tappable without ever embedding the full-access token.
 
@@ -77,10 +78,23 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 
 from healthmes.api.auth import viewer_url
 from healthmes.api.common import ensure_utc, utc_now
+from healthmes.api.errors import APIError
+from healthmes.calendars.repository import retained_calendar_statement
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+)
 from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.alert_visibility import (
+    AlertDeliveryState,
+    alert_delivery_state,
+    is_user_visible_alert,
+)
 from healthmes.store import (
     CalendarEventMirror,
     CognitiveEnergyEstimate,
@@ -90,6 +104,9 @@ from healthmes.store import (
     ScheduleProposal,
     Task,
     TriggerEvent,
+)
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
 )
 from healthmes.store.session import SessionDep
 
@@ -149,11 +166,12 @@ class GlanceBlockOut(BaseModel):
 
 
 class GlanceAlertOut(BaseModel):
-    """The most recent unresolved alert, notification-grammar shaped."""
+    """The most recent visible alert, notification-grammar shaped."""
 
     id: uuid.UUID
     rule_id: str
     summary: str
+    delivery_state: AlertDeliveryState = "delivered"
     decision_url: str | None
 
 
@@ -191,7 +209,7 @@ def decision_viewer_url(settings: Settings, decision_id: uuid.UUID | str) -> str
     """Browser-tappable viewer link for one decision record.
 
     Thin wrapper over :func:`healthmes.api.auth.viewer_url` — the single
-    construction point shared with the ``record_decision`` MCP tool and the
+    construction point shared with finalizer/internal command records and the
     weekly report, so the derived read-only credential is embedded (never
     re-derived) when an API token is configured.
     """
@@ -218,8 +236,7 @@ def _energy_block(session: Session, tz: tzinfo, now: datetime) -> GlanceEnergyOu
     local_day = now.astimezone(tz).date()
     local_midnight = datetime.combine(local_day, time.min, tzinfo=tz)
     hour_keys = [
-        _floor_hour((local_midnight + timedelta(hours=hour)).astimezone(UTC))
-        for hour in range(24)
+        _floor_hour((local_midnight + timedelta(hours=hour)).astimezone(UTC)) for hour in range(24)
     ]
 
     rows = session.scalars(
@@ -228,13 +245,10 @@ def _energy_block(session: Session, tz: tzinfo, now: datetime) -> GlanceEnergyOu
             CognitiveEnergyEstimate.window_start < hour_keys[-1] + timedelta(hours=1),
         )
     ).all()
-    scores: dict[datetime, int] = {
-        ensure_utc(row.window_start): row.score for row in rows
-    }
+    scores: dict[datetime, int] = {ensure_utc(row.window_start): row.score for row in rows}
 
     curve = [
-        EnergyCurvePointOut(hour=hour, score=scores.get(hour_keys[hour]))
-        for hour in range(24)
+        EnergyCurvePointOut(hour=hour, score=scores.get(hour_keys[hour])) for hour in range(24)
     ]
 
     current_score: int | None = None
@@ -260,19 +274,29 @@ def _energy_block(session: Session, tz: tzinfo, now: datetime) -> GlanceEnergyOu
     return GlanceEnergyOut(score=current_score, confidence=confidence, curve_24h=curve)
 
 
-def _next_blocks(session: Session, now: datetime) -> list[GlanceBlockOut]:
+def _next_blocks(
+    session: Session,
+    now: datetime,
+    visibility: CalendarVisibility,
+) -> list[GlanceBlockOut]:
     """Up to 3 ongoing/upcoming blocks: mirror events + accepted proposals.
 
     Accepted proposals are the ones *not yet written* to the external calendar
     (once pushed they surface through the mirror), so the merge never shows
     the same block twice.
     """
-    events = session.scalars(
+    event_statement = retained_calendar_statement(
+        session,
         select(CalendarEventMirror)
-        .where(CalendarEventMirror.end_at > now)
+        .where(
+            visibility.predicate(),
+            CalendarEventMirror.end_at > now,
+        )
         .order_by(CalendarEventMirror.start_at, CalendarEventMirror.end_at)
-        .limit(MAX_NEXT_BLOCKS)
-    ).all()
+        .limit(MAX_NEXT_BLOCKS),
+        now=now,
+    )
+    events = session.scalars(event_statement).all()
 
     task_ids = {event.agent_task_id for event in events if event.agent_task_id is not None}
     tasks_by_id: dict[uuid.UUID, Task] = {}
@@ -323,26 +347,32 @@ def _next_blocks(session: Session, now: datetime) -> list[GlanceBlockOut]:
 
 
 def _alerts_block(session: Session, settings: Settings, now: datetime) -> GlanceAlertsOut:
-    """Recent pushed alerts, newest first (recency stands in for resolution)."""
+    """Recent visible alerts, newest first (recency stands in for resolution)."""
     cutoff = now - timedelta(hours=ALERT_RECENT_HOURS)
     events = [
         event
         for event in session.scalars(
             select(TriggerEvent)
-            .where(TriggerEvent.alert_sent.is_(True), TriggerEvent.fired_at >= cutoff)
+            .where(TriggerEvent.fired_at >= cutoff)
             .order_by(TriggerEvent.fired_at.desc(), TriggerEvent.created_at.desc())
         ).all()
-        if ensure_utc(event.fired_at) >= cutoff  # sqlite reads are naive; re-verify
+        if ensure_utc(event.fired_at) >= cutoff
+        and is_user_visible_alert(session, event, now=now)
     ]
     if not events:
         return GlanceAlertsOut(unresolved_count=0, top=None)
 
     top = events[0]
+    delivery_state = alert_delivery_state(top)
+    assert delivery_state is not None
     payload: dict[str, Any] = top.payload or {}
-    summary = payload.get("summary")
+    summary = payload.get("message") or payload.get("summary")
     decision = session.scalar(
         select(DecisionRecord)
-        .where(DecisionRecord.trigger_event_id == top.id)
+        .where(
+            DecisionRecord.trigger_event_id == top.id,
+            decision_record_is_available_at(now),
+        )
         .limit(1)
     )
     return GlanceAlertsOut(
@@ -350,6 +380,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
         top=GlanceAlertOut(
             id=top.id,
             rule_id=top.rule_id,
+            delivery_state=delivery_state,
             # The observation line of the notification grammar; the rule id is
             # the honest fallback when a legacy row has no payload.
             summary=str(summary) if summary else top.rule_id,
@@ -360,10 +391,15 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     )
 
 
-def _latest_decision(session: Session, settings: Settings) -> GlanceDecisionOut | None:
+def _latest_decision(
+    session: Session,
+    settings: Settings,
+    now: datetime,
+) -> GlanceDecisionOut | None:
     """Newest decision record (same ordering as the /v1/decisions list)."""
     record = session.scalars(
         select(DecisionRecord)
+        .where(decision_record_is_available_at(now))
         .order_by(DecisionRecord.created_at.desc(), DecisionRecord.id.desc())
         .limit(1)
     ).first()
@@ -377,7 +413,11 @@ def _latest_decision(session: Session, settings: Settings) -> GlanceDecisionOut 
 # ---------------------------------------------------------------------------
 
 
-def _compute_etag(payload: dict[str, Any]) -> str:
+def _compute_etag(
+    payload: dict[str, Any],
+    *,
+    calendar_status: str = "available",
+) -> str:
     """Strong ETag over the payload *content* (``generated_at`` excluded).
 
     The timestamp changes on every request; hashing it would make
@@ -385,6 +425,7 @@ def _compute_etag(payload: dict[str, Any]) -> str:
     ETag identifies the underlying data instead.
     """
     basis = {key: value for key, value in payload.items() if key != "generated_at"}
+    basis["_calendar_status"] = calendar_status
     digest = hashlib.sha256(
         json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -418,17 +459,45 @@ def get_glance_briefing(request: Request, session: SessionDep) -> Response:
     tz = resolve_timezone(settings)
     now = utc_now()
 
-    glance = GlanceOut(
-        generated_at=now,
-        timezone=str(tz),
-        energy=_energy_block(session, tz, now),
-        next_blocks=_next_blocks(session, now),
-        alerts=_alerts_block(session, settings, now),
-        latest_decision=_latest_decision(session, settings),
+    def read_glance(visibility: CalendarVisibility) -> GlanceOut:
+        return GlanceOut(
+            generated_at=now,
+            timezone=str(tz),
+            energy=_energy_block(session, tz, now),
+            next_blocks=_next_blocks(session, now, visibility),
+            alerts=_alerts_block(session, settings, now),
+            latest_decision=_latest_decision(session, settings, now),
+        )
+
+    try:
+        glance, visibility = read_visible_calendar(
+            session,
+            settings,
+            read_glance,
+        )
+    except CalendarVisibilityChanged as exc:
+        session.rollback()
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "calendar_unavailable",
+            "The briefing could not obtain a stable Calendar snapshot. Retry the request.",
+            detail={"reason_codes": ["calendar_visibility_changed"]},
+        ) from exc
+
+    calendar_status = (
+        ",".join(visibility.limitations)
+        if visibility.limitations
+        else "available"
+        if visibility.available
+        else "calendar_not_connected"
     )
     payload = glance.model_dump(mode="json")
-    etag = _compute_etag(payload)
-    headers = {"Cache-Control": CACHE_CONTROL_VALUE, "ETag": etag}
+    etag = _compute_etag(payload, calendar_status=calendar_status)
+    headers = {
+        "Cache-Control": CACHE_CONTROL_VALUE,
+        "ETag": etag,
+        "X-HealthMes-Calendar-Status": calendar_status,
+    }
 
     if _if_none_match_hit(request.headers.get("if-none-match"), etag):
         return Response(status_code=304, headers=headers)
