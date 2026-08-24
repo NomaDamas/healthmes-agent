@@ -8,7 +8,7 @@ import re
 import secrets
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -49,6 +49,12 @@ from healthmes.decision.providers import (
     validate_context_parameters,
 )
 from healthmes.decision.validation import strict_model_validate
+from healthmes.wearables.availability import (
+    OPEN_WEARABLES_BACKED_CAPABILITIES,
+    OPEN_WEARABLES_METADATA_UNAVAILABLE,
+    OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+    OpenWearablesAvailability,
+)
 
 DECISION_SEARCH_SESSION_ID_PATTERN = r"^dss_[A-Za-z0-9_-]{43}$"
 DECISION_RELATED_RECORD_REF_PATTERN = r"^rr_[0-9a-f]{16}$"
@@ -57,6 +63,10 @@ _RELATED_RECORD_DOMAIN_ALIASES = {
 }
 
 AccessPolicyResolver = Callable[[DecisionRequest], ContextAccessPolicy]
+OpenWearablesAvailabilityReader = Callable[
+    [],
+    Awaitable[OpenWearablesAvailability],
+]
 
 
 def _utc(value: datetime) -> datetime:
@@ -149,6 +159,10 @@ class DecisionSearchSessionHandle(BaseModel):
     runtime_question: str = Field(min_length=1, max_length=4_000)
     has_related_records: bool = False
     related_records: tuple[DecisionSearchRelatedRecord, ...] = ()
+    allowed_capabilities: tuple[str, ...] | None = None
+    open_wearables_availability: (
+        OpenWearablesAvailability | None
+    ) = None
 
 
 class DecisionSearchBudgetUsage(BaseModel):
@@ -192,6 +206,10 @@ class DecisionSearchSessionSnapshot(BaseModel):
     tool_trace: tuple[ToolCallRecord, ...] = ()
     source_refs: tuple[SourceRef, ...] = ()
     access_trace: tuple[AccessAuditEntry, ...] = ()
+    allowed_capabilities: tuple[str, ...] | None = None
+    open_wearables_availability: (
+        OpenWearablesAvailability | None
+    ) = None
 
 
 @dataclass(slots=True)
@@ -203,6 +221,10 @@ class _DecisionSearchSession:
     expires_at: datetime
     deadline: float
     related_records: tuple[_DecisionSearchRelatedRecordBinding, ...] = ()
+    allowed_capabilities: frozenset[str] | None = None
+    open_wearables_availability: (
+        OpenWearablesAvailability | None
+    ) = None
     state: DecisionSearchSessionState = DecisionSearchSessionState.ACTIVE
     ended_at: datetime | None = None
     in_flight: int = 0
@@ -359,6 +381,9 @@ class DecisionContextSearchSessionService:
         max_terminal_sessions: int = 1_024,
         clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
+        open_wearables_availability: (
+            OpenWearablesAvailabilityReader | None
+        ) = None,
     ) -> None:
         if not callable(policy_resolver):
             raise TypeError("policy_resolver must be callable")
@@ -379,6 +404,9 @@ class DecisionContextSearchSessionService:
         self._max_terminal_sessions = max_terminal_sessions
         self._clock = clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic_clock or monotonic
+        self._open_wearables_availability = (
+            open_wearables_availability
+        )
         self._lock = Lock()
         self._active: dict[str, _DecisionSearchSession] = {}
         self._terminal: OrderedDict[str, _TerminalSession] = OrderedDict()
@@ -390,8 +418,67 @@ class DecisionContextSearchSessionService:
     ) -> DecisionSearchSessionHandle:
         """Create one opaque session from a server-owned DecisionRequest."""
 
+        return self._begin(
+            request,
+            open_wearables_availability=None,
+            freeze_capability_catalog=False,
+        )
+
+    async def begin_available(
+        self,
+        request: DecisionRequest,
+    ) -> DecisionSearchSessionHandle:
+        """Create a session with one frozen source-availability catalog."""
+
+        availability = await self.resolve_open_wearables_availability()
+        return self.begin_with_availability(
+            request,
+            open_wearables_availability=availability,
+        )
+
+    async def resolve_open_wearables_availability(
+        self,
+    ) -> OpenWearablesAvailability | None:
+        """Resolve availability without performing synchronous session work."""
+
+        if self._open_wearables_availability is None:
+            return None
+        return await self._open_wearables_availability()
+
+    def begin_with_availability(
+        self,
+        request: DecisionRequest,
+        *,
+        open_wearables_availability: OpenWearablesAvailability | None,
+    ) -> DecisionSearchSessionHandle:
+        """Create a frozen session after async availability is resolved."""
+
+        return self._begin(
+            request,
+            open_wearables_availability=open_wearables_availability,
+            freeze_capability_catalog=True,
+        )
+
+    def _begin(
+        self,
+        request: DecisionRequest,
+        *,
+        open_wearables_availability: (
+            OpenWearablesAvailability | None
+        ),
+        freeze_capability_catalog: bool,
+    ) -> DecisionSearchSessionHandle:
         canonical_request = strict_model_validate(DecisionRequest, request)
         policy = self._resolve_policy(canonical_request)
+        allowed_capabilities = (
+            self._allowed_capabilities(
+                canonical_request,
+                policy=policy,
+                open_wearables_availability=open_wearables_availability,
+            )
+            if freeze_capability_catalog
+            else None
+        )
         now = _utc(self._clock())
         current_monotonic = self._monotonic()
         related_records = _related_record_bindings(
@@ -419,6 +506,10 @@ class DecisionContextSearchSessionService:
                 expires_at=now + timedelta(seconds=self._ttl_seconds),
                 deadline=current_monotonic + self._ttl_seconds,
                 related_records=related_records,
+                allowed_capabilities=allowed_capabilities,
+                open_wearables_availability=(
+                    open_wearables_availability
+                ),
             )
             record.context_bytes = self._base_snapshot_size(record)
             if (
@@ -448,7 +539,43 @@ class DecisionContextSearchSessionService:
                 for item in related_records
                 if item.domain is not None
             ),
+            allowed_capabilities=(
+                tuple(sorted(allowed_capabilities))
+                if allowed_capabilities is not None
+                else None
+            ),
+            open_wearables_availability=open_wearables_availability,
         )
+
+    def _allowed_capabilities(
+        self,
+        request: DecisionRequest,
+        *,
+        policy: ContextAccessPolicy,
+        open_wearables_availability: (
+            OpenWearablesAvailability | None
+        ),
+    ) -> frozenset[str]:
+        allowed: set[str] = set()
+        for descriptor in self.access_layer.registry.discover():
+            grant = policy.grant(descriptor.metadata.domain)
+            if (
+                grant is None
+                or not grant.enabled
+                or request.caller.execution_scope
+                not in grant.execution_scopes
+            ):
+                continue
+            for item in descriptor.metadata.capabilities:
+                if (
+                    item.capability
+                    in OPEN_WEARABLES_BACKED_CAPABILITIES
+                    and open_wearables_availability is not None
+                    and not open_wearables_availability.exposes_capabilities
+                ):
+                    continue
+                allowed.add(item.capability)
+        return frozenset(allowed)
 
     async def search(
         self,
@@ -608,6 +735,13 @@ class DecisionContextSearchSessionService:
         limit: int,
         parameters: Mapping[str, Any],
     ) -> ContextSearchResult:
+        if (
+            record.allowed_capabilities is not None
+            and capability not in record.allowed_capabilities
+        ):
+            raise DecisionSearchPolicyError(
+                "decision_search_capability_not_in_session_catalog"
+            )
         try:
             descriptor, capability_spec = (
                 self.access_layer.registry.capability(
@@ -660,6 +794,37 @@ class DecisionContextSearchSessionService:
         )
         with record.result_lock:
             record.calls_started += 1
+
+        availability_before: OpenWearablesAvailability | None = None
+        if (
+            capability in OPEN_WEARABLES_BACKED_CAPABILITIES
+            and self._open_wearables_availability is not None
+        ):
+            availability_before = (
+                await self._open_wearables_availability()
+            )
+            reason_code = availability_before.blocking_reason_code
+            frozen_availability = record.open_wearables_availability
+            if (
+                reason_code is None
+                and frozen_availability is not None
+                and availability_before.source_policy_revision
+                != frozen_availability.source_policy_revision
+            ):
+                reason_code = OPEN_WEARABLES_SOURCE_POLICY_CHANGED
+            if reason_code is not None:
+                result = record.access_turn.deny(
+                    provider_query,
+                    reason_codes=(reason_code,),
+                )
+                return self._store_result(
+                    record,
+                    query=query,
+                    fallback_effective_query=provider_query,
+                    result=result,
+                    started_at=started_at,
+                    finished_at=_utc(self._clock()),
+                )
 
         try:
             policy_before = self._resolve_policy(record.request)
@@ -727,6 +892,47 @@ class DecisionContextSearchSessionService:
                                 provider_query,
                                 reason_codes=(
                                     "domain_consent_changed",
+                                ),
+                                effective_query=(
+                                    record.access_turn.effective_query_for(
+                                        query.query_id
+                                    )
+                                ),
+                            )
+                    if (
+                        capability in OPEN_WEARABLES_BACKED_CAPABILITIES
+                        and self._open_wearables_availability is not None
+                    ):
+                        try:
+                            availability_after = (
+                                await self._open_wearables_availability()
+                            )
+                            availability_reason = (
+                                availability_after.blocking_reason_code
+                            )
+                        except Exception:
+                            availability_reason = (
+                                OPEN_WEARABLES_METADATA_UNAVAILABLE
+                            )
+                        if availability_reason is not None:
+                            result = record.access_turn.deny(
+                                provider_query,
+                                reason_codes=(availability_reason,),
+                                effective_query=(
+                                    record.access_turn.effective_query_for(
+                                        query.query_id
+                                    )
+                                ),
+                            )
+                        elif (
+                            availability_before is not None
+                            and availability_after.source_policy_revision
+                            != availability_before.source_policy_revision
+                        ):
+                            result = record.access_turn.deny(
+                                provider_query,
+                                reason_codes=(
+                                    OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
                                 ),
                                 effective_query=(
                                     record.access_turn.effective_query_for(
@@ -1408,6 +1614,14 @@ class DecisionContextSearchSessionService:
             tool_trace=tool_trace,
             source_refs=ordered_refs,
             access_trace=access_trace,
+            allowed_capabilities=(
+                tuple(sorted(record.allowed_capabilities))
+                if record.allowed_capabilities is not None
+                else None
+            ),
+            open_wearables_availability=(
+                record.open_wearables_availability
+            ),
         )
 
     def _lookup_active(

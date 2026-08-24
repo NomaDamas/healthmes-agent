@@ -765,6 +765,89 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_serializes_frozen_capability_catalog_and_availability(
+) -> None:
+    availability = SimpleNamespace(
+        model_dump=lambda **_kwargs: {
+            "state": "available",
+            "observed_at": NOW.isoformat(),
+            "reason_codes": [],
+        }
+    )
+    handle = SimpleNamespace(
+        session_id=DECISION_SESSION_ID,
+        allowed_capabilities=("wearable.sleep",),
+        open_wearables_availability=availability,
+    )
+    search = _SearchService(_empty_snapshot(), handle=handle)
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "No search was needed.",
+            }
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+
+    await agent.ask(_request())
+    await agent.aclose()
+
+    serialized = json.loads(
+        transport.response_calls[0]["input"][0]["content"]
+    )
+    assert serialized["allowed_capabilities"] == ["wearable.sleep"]
+    assert serialized["open_wearables_availability"]["state"] == "available"
+    assert "request.allowed_capabilities" in (
+        transport.response_calls[0]["instructions"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_search_outside_session_catalog() -> None:
+    trace, search_result, _source_ref = _activity_trace()
+    snapshot = _empty_snapshot()
+    snapshot.allowed_capabilities = ()
+    snapshot.tool_trace = (trace,)
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "This transcript is invalid.",
+            },
+            output_prefix=_tool_items(
+                search_result,
+                call_id="catalog-violation",
+                trace=trace,
+            ),
+        )
+    )
+    search = _SearchService(snapshot)
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+
+    run = await agent.ask(_request())
+    await agent.aclose()
+
+    assert run.draft.limitations == [
+        "hermes_capability_not_in_session_catalog"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_exposes_only_related_record_alias_to_hermes() -> None:
     package_record_id = uuid.uuid4()
     alias = "rr_0123456789abcdef"
@@ -2197,6 +2280,67 @@ async def test_absolute_deadline_bounds_slow_search_begin() -> None:
         await asyncio.sleep(0.01)
     await agent.aclose()
 
+    assert search.started.is_set()
+    assert elapsed < 0.2
+    assert run.draft.limitations == ["hermes_responses_timeout"]
+    assert search.aborted == 1
+
+
+@pytest.mark.asyncio
+async def test_absolute_deadline_bounds_split_availability_and_sync_begin(
+) -> None:
+    class SlowSplitSearch(_SearchService):
+        def __init__(self) -> None:
+            super().__init__(_empty_snapshot())
+            self.started = ThreadEvent()
+            self.release = ThreadEvent()
+            self.availability_reads = 0
+
+        async def resolve_open_wearables_availability(self):
+            self.availability_reads += 1
+            return SimpleNamespace(state="available")
+
+        def begin_with_availability(
+            self,
+            request: DecisionRequest,
+            *,
+            open_wearables_availability,
+        ) -> SimpleNamespace:
+            assert open_wearables_availability.state == "available"
+            self.started.set()
+            self.release.wait(timeout=1)
+            return self.begin(request)
+
+    search = SlowSplitSearch()
+    agent = HermesResponsesDecisionAgent(
+        transport=_Transport(
+            _final_response(
+                {
+                    "status": "completed",
+                    "answer": "This must not execute.",
+                }
+            )
+        ),
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=0.03,
+        session_ttl_seconds=1,
+        session_purge_interval_seconds=0.5,
+        clock=lambda: NOW,
+    )
+
+    started = monotonic()
+    run = await agent.ask(_request())
+    elapsed = monotonic() - started
+    search.release.set()
+    for _ in range(50):
+        if search.aborted == 1:
+            break
+        await asyncio.sleep(0.01)
+    await agent.aclose()
+
+    assert search.availability_reads == 1
     assert search.started.is_set()
     assert elapsed < 0.2
     assert run.draft.limitations == ["hermes_responses_timeout"]

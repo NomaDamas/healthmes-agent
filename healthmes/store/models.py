@@ -76,6 +76,7 @@ __all__ = [
     "DecisionRecord",
     "DecisionRequestReceipt",
     "DecisionDomainPolicy",
+    "InputSourcePolicy",
     "Insight",
     "MedicalRecord",
     "TriggerEvent",
@@ -513,6 +514,34 @@ class DecisionDomainPolicy(Base):
 
     owner_principal_id: Mapped[str_255] = mapped_column(index=True)
     domain: Mapped[str_64] = mapped_column(index=True)
+    enabled: Mapped[bool] = mapped_column(
+        default=True,
+        server_default=true(),
+    )
+    revision: Mapped[int] = mapped_column(
+        default=1,
+        server_default="1",
+    )
+
+
+class InputSourcePolicy(Base):
+    """Owner-controlled enable switch for one independently managed input."""
+
+    __tablename__ = "input_source_policy"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_principal_id",
+            "source_id",
+            name="uq_input_source_policy_owner_source",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="revision_positive",
+        ),
+    )
+
+    owner_principal_id: Mapped[str_255] = mapped_column(index=True)
+    source_id: Mapped[str_255] = mapped_column(index=True)
     enabled: Mapped[bool] = mapped_column(
         default=True,
         server_default=true(),

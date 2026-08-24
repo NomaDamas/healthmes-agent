@@ -11,6 +11,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 import healthmes.decision.domain_providers as domain_providers
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.decision.access import (
     ContextAccessLayer,
     ContextAccessPolicy,
@@ -40,6 +44,7 @@ from healthmes.decision.search import (
 from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
+    InputSourcePolicy,
     RetentionPolicy,
     WellnessEvent,
     create_db_engine,
@@ -646,6 +651,37 @@ def _file_store(tmp_path, name: str):
     return engine, factory
 
 
+def _set_open_wearables_source_policy(
+    factory: sessionmaker[Session],
+    *,
+    owner_principal_id: str,
+    enabled: bool,
+) -> int:
+    with factory() as session, activity_write_lock():
+        lock_activity_write_plane(session)
+        row = session.scalar(
+            select(InputSourcePolicy).where(
+                InputSourcePolicy.owner_principal_id
+                == owner_principal_id,
+                InputSourcePolicy.source_id
+                == "wearable.open-wearables",
+            )
+        )
+        if row is None:
+            row = InputSourcePolicy(
+                owner_principal_id=owner_principal_id,
+                source_id="wearable.open-wearables",
+                enabled=enabled,
+                revision=1,
+            )
+            session.add(row)
+        elif row.enabled != enabled:
+            row.enabled = enabled
+            row.revision += 1
+        session.commit()
+        return int(row.revision)
+
+
 def _service(
     factory: sessionmaker[Session],
     provider: WearableContextProvider,
@@ -665,6 +701,265 @@ def _service(
         ),
         clock=clock,
     )
+
+
+async def test_detail_snapshot_write_fence_rejects_source_disabled_mid_fetch(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "detail-source-off-race.db")
+    _set_open_wearables_source_policy(
+        factory,
+        owner_principal_id="owner",
+        enabled=True,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        started.set()
+        await release.wait()
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": DETAIL_START.isoformat(),
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    try:
+        with factory() as session:
+            task = asyncio.create_task(
+                WearableContextProvider(
+                    search_reader=reader,
+                    snapshot_session_factory=factory,
+                    owner_principal_id="owner",
+                ).query(
+                    session,
+                    ContextQuery(
+                        provider_id="wearable",
+                        capability="wearable.health-scores",
+                        start=DETAIL_START,
+                        end=DETAIL_END,
+                        granularity="record",
+                        parameters={"category": "stress"},
+                    ),
+                    now=NOW,
+                )
+            )
+            await started.wait()
+            _set_open_wearables_source_policy(
+                factory,
+                owner_principal_id="owner",
+                enabled=False,
+            )
+            release.set()
+            result = await task
+
+        assert result.status is ContextStatus.FAILED
+        assert result.source_refs == []
+        assert "wearable_source_policy_changed" in result.limitations
+        with factory() as observer:
+            assert observer.scalar(
+                select(func.count())
+                .select_from(WellnessEvent)
+                .where(
+                    WellnessEvent.event_type
+                    == OPEN_WEARABLES_QUERY_EVENT_TYPE
+                )
+            ) == 0
+    finally:
+        engine.dispose()
+
+
+async def test_daily_snapshot_write_fence_rejects_off_on_revision_race(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "daily-source-revision-race.db")
+    assert _set_open_wearables_source_policy(
+        factory,
+        owner_principal_id="owner",
+        enabled=True,
+    ) == 1
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reader(day: date) -> dict:
+        started.set()
+        await release.wait()
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "stress": {
+                "status": "ok",
+                "value": 38,
+                "recorded_at": "2026-08-16T08:00:00+00:00",
+            },
+            "freshness": {
+                "recorded_at": "2026-08-16T08:00:00+00:00",
+                "status": "current",
+            },
+            "coverage": {"ratio": 1.0},
+            "limitations": [],
+        }
+
+    try:
+        with factory() as session:
+            task = asyncio.create_task(
+                WearableContextProvider(
+                    reader,
+                    snapshot_session_factory=factory,
+                    owner_principal_id="owner",
+                ).query(
+                    session,
+                    ContextQuery(
+                        provider_id="wearable",
+                        capability="wearable.stress",
+                        granularity="day",
+                        parameters={"date": "2026-08-16"},
+                    ),
+                    now=NOW,
+                )
+            )
+            await started.wait()
+            assert _set_open_wearables_source_policy(
+                factory,
+                owner_principal_id="owner",
+                enabled=False,
+            ) == 2
+            assert _set_open_wearables_source_policy(
+                factory,
+                owner_principal_id="owner",
+                enabled=True,
+            ) == 3
+            release.set()
+            result = await task
+
+        assert result.status is ContextStatus.FAILED
+        assert result.source_refs == []
+        assert "wearable_source_policy_changed" in result.limitations
+        with factory() as observer:
+            assert observer.scalar(
+                select(func.count())
+                .select_from(WellnessEvent)
+                .where(
+                    WellnessEvent.event_type
+                    == OPEN_WEARABLES_OBSERVATION_EVENT_TYPE
+                )
+            ) == 0
+    finally:
+        engine.dispose()
+
+
+async def test_snapshot_write_fence_allows_unchanged_owner_policy(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "detail-source-stable.db")
+    _set_open_wearables_source_policy(
+        factory,
+        owner_principal_id="owner",
+        enabled=True,
+    )
+
+    async def reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": DETAIL_START.isoformat(),
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    try:
+        with factory() as session:
+            result = await WearableContextProvider(
+                search_reader=reader,
+                snapshot_session_factory=factory,
+                owner_principal_id="owner",
+            ).query(
+                session,
+                ContextQuery(
+                    provider_id="wearable",
+                    capability="wearable.health-scores",
+                    start=DETAIL_START,
+                    end=DETAIL_END,
+                    granularity="record",
+                    parameters={"category": "stress"},
+                ),
+                now=NOW,
+            )
+
+        assert len(result.source_refs) == 1
+        assert "wearable_source_policy_changed" not in result.limitations
+        with factory() as observer:
+            assert observer.scalar(
+                select(func.count())
+                .select_from(WellnessEvent)
+                .where(
+                    WellnessEvent.event_type
+                    == OPEN_WEARABLES_QUERY_EVENT_TYPE
+                )
+            ) == 1
+    finally:
+        engine.dispose()
+
+
+async def test_snapshot_write_fence_isolates_owner_principal(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "detail-source-owner.db")
+    _set_open_wearables_source_policy(
+        factory,
+        owner_principal_id="owner-b",
+        enabled=False,
+    )
+
+    async def reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": DETAIL_START.isoformat(),
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    try:
+        with factory() as session:
+            result = await WearableContextProvider(
+                search_reader=reader,
+                snapshot_session_factory=factory,
+                owner_principal_id="owner-a",
+            ).query(
+                session,
+                ContextQuery(
+                    provider_id="wearable",
+                    capability="wearable.health-scores",
+                    start=DETAIL_START,
+                    end=DETAIL_END,
+                    granularity="record",
+                    parameters={"category": "stress"},
+                ),
+                now=NOW,
+            )
+
+        assert len(result.source_refs) == 1
+        assert "wearable_source_policy_changed" not in result.limitations
+    finally:
+        engine.dispose()
 
 
 def _legacy_health_score_cursor(
@@ -700,14 +995,18 @@ def _legacy_health_score_cursor(
         )
         if isinstance(record, dict)
     ]
-    normalized = (
-        domain_providers.normalize_retained_wearable_health_scores(
-            public_records,
-            category=str(query.parameters["category"]),
+    normalized = domain_providers.normalize_retained_wearable_search(
+        public_records,
+        request=WearableSearchRequest(
+            capability=query.capability,
             start=snapshot.start,
             end=snapshot.end,
+            timezone=query.timezone,
+            parameters={"category": str(query.parameters["category"])},
+            collected_at=snapshot.collected_at,
+            privacy_level=query.privacy_level,
             retained_after=retained_after,
-        )
+        ),
     )
     records = list(normalized.records)
     record = records[record_index]
@@ -911,6 +1210,165 @@ async def test_detail_date_shorthand_normalizes_before_provider_search(
     )
     assert event is not None
     assert event.payload["query"]["parameters"] == parameters
+
+
+async def test_live_detail_query_with_zero_rows_returns_no_data(
+    session,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(records=())
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            parameters={"category": "stress"},
+        ),
+        now=NOW,
+    )
+
+    assert result.payload["status"] == "no_data"
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.payload["result"]["status"] == "no_data"
+
+
+async def test_body_summary_uses_collection_time_for_record_provenance(
+    session,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "record_kind": "body_summary",
+                    "summary_collected_at": NOW.isoformat(),
+                    "provider": "garmin",
+                    "provider_attribution": "declared",
+                    "slow_changing": {"weight_kg": 72.5},
+                },
+            )
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.body-summary",
+            start=NOW - timedelta(days=1),
+            end=NOW + timedelta(seconds=1),
+            granularity="summary",
+            parameters={
+                "average_period": 7,
+                "latest_window_hours": 4,
+            },
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.OK
+    assert result.payload["records"][0]["provenance"]["observed_at"] == (
+        NOW.isoformat()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parameters", "fetch"),
+    (
+        (
+            {
+                "provider": "polar",
+                "samples": True,
+            },
+            WearableSearchFetch(
+                records=(
+                    {
+                        "record_kind": "provider_workout",
+                        "provider": "polar",
+                        "provider_attribution": "declared",
+                        "provider_workout_id": "polar-workout-1",
+                        "workout_type": "running",
+                        "start_time": DETAIL_START.isoformat(),
+                        "end_time": DETAIL_END.isoformat(),
+                        "granular_truncated": True,
+                    },
+                ),
+                granular_truncated=True,
+            ),
+        ),
+        (
+            {"provider": "garmin"},
+            WearableSearchFetch(
+                records=(
+                    {
+                        "record_kind": "provider_workout",
+                        "provider": "garmin",
+                        "provider_attribution": "declared",
+                        "provider_workout_id": "garmin-workout-1",
+                        "workout_type": "running",
+                        "start_time": DETAIL_START.isoformat(),
+                        "end_time": DETAIL_END.isoformat(),
+                    },
+                ),
+                upstream_truncated=True,
+                upstream_completeness_unverified=True,
+            ),
+        ),
+    ),
+)
+async def test_incomplete_provider_workouts_never_claim_full_coverage(
+    session,
+    parameters: dict[str, object],
+    fetch: WearableSearchFetch,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return fetch
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.provider-workouts",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            privacy_level=(
+                domain_providers.PrivacyLevel.IDENTITY
+                if parameters.get("samples") is True
+                else domain_providers.PrivacyLevel.AGGREGATE
+            ),
+            parameters=parameters,
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.coverage.status is CoverageStatus.UNKNOWN
+    assert result.coverage.ratio is None
+    assert "coverage" not in result.payload
+    if parameters["provider"] == "polar":
+        assert "wearable_granular_data_truncated" in result.limitations
+    else:
+        assert (
+            "wearable_upstream_completeness_unverified"
+            in result.limitations
+        )
 
 
 async def test_exact_retention_boundary_persists_by_oldest_record(
@@ -3112,7 +3570,7 @@ def test_workout_query_snapshot_accepts_exact_end_and_rejects_overrun(
     }
     with pytest.raises(
         ValueError,
-        match="wearable workout result interval is invalid",
+        match="wearable workout interval is invalid",
     ):
         persist_open_wearables_query_snapshot(
             session,

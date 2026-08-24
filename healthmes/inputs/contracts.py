@@ -56,6 +56,7 @@ class InputSettingDefinition(BaseModel):
 
     key: Literal[
         "enabled",
+        "source_enabled",
         "excluded_apps",
         "paused_until",
         "decision_access_enabled",
@@ -67,7 +68,7 @@ class InputSettingDefinition(BaseModel):
         "string_list",
         "retention_map",
     ]
-    scope: Literal["instance", "domain", "data_class"]
+    scope: Literal["instance", "source", "domain", "data_class"]
     allowed_values: list[str] = Field(default_factory=list)
     description: str
 
@@ -135,6 +136,7 @@ class InputSourceDescriptor(BaseModel):
     capabilities: list[str]
     connection_state: InputConnectionState
     collection_state: InputCollectionState
+    source_enabled: bool = True
     decision_access_enabled: bool
     instances: list[InputInstance]
     retention: list[InputRetentionPolicy]
@@ -159,6 +161,7 @@ class InputSettingsUpdate(BaseModel):
     instance_id: str | None = Field(default=None, min_length=1, max_length=255)
     platform: str | None = Field(default=None, min_length=1, max_length=32)
     enabled: bool | None = None
+    source_enabled: bool | None = None
     excluded_apps: list[str] | None = Field(default=None, max_length=500)
     paused_until: AwareDatetime | None = None
     decision_access_enabled: bool | None = None
@@ -203,6 +206,7 @@ class InputSettingsUpdate(BaseModel):
         has_change = (
             self.platform is not None
             or self.enabled is not None
+            or self.source_enabled is not None
             or self.excluded_apps is not None
             or "paused_until" in self.model_fields_set
             or self.decision_access_enabled is not None

@@ -5,6 +5,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -37,11 +38,13 @@ from healthmes.hermes_mcp_inventory import (
     HERMES_DECISION_MCP_TOOL_NAMES,
     HERMES_DECISION_SEARCH_COMMON_ARGUMENTS,
     HERMES_DECISION_SEARCH_PARAMETER_MAP,
+    HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY,
     expected_hermes_mcp_inventory,
     schema_digests_from_mcp_tools,
     validate_model_visible_mcp_inventory,
 )
 from healthmes.mcp_server import server as server_module
+from healthmes.mcp_server.domain_search import register_domain_search_tools
 from healthmes.store import WellnessEvent
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
@@ -75,14 +78,71 @@ SEARCH_CAPABILITIES = {
         "wearable.stress",
         "wearable.whoop-recovery-package",
         "wearable.metric-detail",
+        "wearable.body-summary",
+        "wearable.sleep-sessions",
+        "wearable.menstrual-cycles",
+        "wearable.provider-workouts",
+        "wearable.provider-workout-detail",
     },
+}
+EXPECTED_SEARCH_PARAMETER_MAP = {
+    "search_activity": {
+        "date": "date",
+        "lookback_days": "lookback_days",
+        "cursor": "cursor",
+        "device_id": "device_id",
+        "platform": "platform",
+    },
+    "search_nutrition": {
+        "date": "date",
+        "confirmed_only": "confirmed_only",
+        "intent": "intent",
+        "modality": "modality",
+        "nutrient": "nutrient",
+        "text_query": "query",
+        "request_id": "request_id",
+    },
+    "search_calendar": {
+        "date": "date",
+        "minimum_minutes": "minimum_minutes",
+        "cursor": "cursor",
+    },
+    "search_wearable": {
+        "date": "date",
+        "package_record_id": "package_record_id",
+        "cursor": "cursor",
+        "kind": "kind",
+        "metric": "metric",
+        "category": "category",
+        "summary_kind": "summary_kind",
+        "series_type": "series_type",
+        "resolution": "resolution",
+        "average_period": "average_period",
+        "latest_window_hours": "latest_window_hours",
+        "provider": "provider",
+        "workout_id": "workout_id",
+        "samples": "samples",
+        "zones": "zones",
+        "route": "route",
+    },
+}
+EXPECTED_WEARABLE_DEFAULT_GRANULARITY = {
+    "wearable.whoop-recovery-package": "day",
+    "wearable.health-scores": "record",
+    "wearable.workouts": "record",
+    "wearable.timeseries": "series",
+    "wearable.body-summary": "summary",
+    "wearable.sleep-sessions": "record",
+    "wearable.menstrual-cycles": "record",
+    "wearable.provider-workouts": "record",
+    "wearable.provider-workout-detail": "record",
 }
 SEARCH_PROPERTIES = {
     name: (
         HERMES_DECISION_SEARCH_COMMON_ARGUMENTS
         | frozenset(parameter_map)
     )
-    for name, parameter_map in HERMES_DECISION_SEARCH_PARAMETER_MAP.items()
+    for name, parameter_map in EXPECTED_SEARCH_PARAMETER_MAP.items()
 }
 RESULT_KEYS = {
     "query_id",
@@ -222,6 +282,47 @@ class SensitiveNutritionProvider:
         )
 
 
+class SearchResultProbe:
+    def model_dump(self, *, mode: str) -> dict:
+        assert mode == "json"
+        return {"status": "ok"}
+
+
+class CapturingSearchService:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def search(
+        self,
+        decision_session_id,
+        *,
+        domain,
+        capability,
+        start,
+        end,
+        granularity,
+        fields,
+        privacy_level,
+        limit,
+        parameters,
+    ):
+        self.calls.append(
+            {
+                "decision_session_id": decision_session_id,
+                "domain": domain,
+                "capability": capability,
+                "start": start,
+                "end": end,
+                "granularity": granularity,
+                "fields": fields,
+                "privacy_level": privacy_level,
+                "limit": limit,
+                "parameters": parameters,
+            }
+        )
+        return SearchResultProbe()
+
+
 def _schema_value(schema: dict) -> dict:
     return next(
         (
@@ -328,6 +429,12 @@ def _seed_nutrition_source_ref(
 async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
     mcp_client,
 ) -> None:
+    assert HERMES_DECISION_SEARCH_PARAMETER_MAP == (
+        EXPECTED_SEARCH_PARAMETER_MAP
+    )
+    assert HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY == (
+        EXPECTED_WEARABLE_DEFAULT_GRANULARITY
+    )
     tools = {
         tool.name: tool
         for tool in await mcp_client.list_tools()
@@ -449,6 +556,21 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         "1hour",
     }
     assert "raw" not in _schema_value(wearable["resolution"])["enum"]
+    assert _schema_value(wearable["average_period"])["minimum"] == 1
+    assert _schema_value(wearable["average_period"])["maximum"] == 7
+    assert _schema_value(wearable["latest_window_hours"])["minimum"] == 1
+    assert _schema_value(wearable["latest_window_hours"])["maximum"] == 24
+    assert set(_schema_value(wearable["provider"])["enum"]) == {
+        "garmin",
+        "polar",
+        "suunto",
+    }
+    workout_id = _schema_value(wearable["workout_id"])
+    assert workout_id["minLength"] == 1
+    assert workout_id["maxLength"] == 512
+    assert workout_id["pattern"] == r"^[A-Za-z0-9._:-]{1,512}$"
+    for name in ("samples", "zones", "route"):
+        assert _schema_value(wearable[name])["type"] == "boolean"
     assert set(_schema_value(wearable["granularity"])["enum"]) == {
         "summary",
         "day",
@@ -456,6 +578,89 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         "window",
         "series",
     }
+
+
+async def test_wearable_open_wearables_parameters_forward_exactly() -> None:
+    service = CapturingSearchService()
+    local_mcp = FastMCP("wearable-open-wearables-contract")
+    register_domain_search_tools(
+        local_mcp,
+        service_resolver=lambda: service,  # type: ignore[arg-type]
+    )
+
+    async with Client(local_mcp) as client:
+        common = {
+            "decision_session_id": "dss_" + "a" * 43,
+            "start": "2026-08-16T08:00:00Z",
+            "end": "2026-08-16T09:00:00Z",
+        }
+        calls = (
+            {
+                **common,
+                "capability": "wearable.body-summary",
+                "average_period": 7,
+                "latest_window_hours": 24,
+            },
+            {
+                **common,
+                "capability": "wearable.provider-workouts",
+                "provider": "polar",
+                "samples": True,
+                "zones": False,
+                "route": True,
+            },
+            {
+                **common,
+                "capability": "wearable.provider-workout-detail",
+                "provider": "suunto",
+                "workout_id": "workout:key-123.4",
+            },
+            {
+                **common,
+                "capability": "wearable.sleep-sessions",
+            },
+            {
+                **common,
+                "capability": "wearable.menstrual-cycles",
+            },
+        )
+        results = [
+            await client.call_tool("search_wearable", arguments)
+            for arguments in calls
+        ]
+
+    assert [result.data for result in results] == [
+        {"status": "ok"},
+        {"status": "ok"},
+        {"status": "ok"},
+        {"status": "ok"},
+        {"status": "ok"},
+    ]
+    assert [call["granularity"] for call in service.calls] == [
+        "summary",
+        "record",
+        "record",
+        "record",
+        "record",
+    ]
+    assert [call["parameters"] for call in service.calls] == [
+        {
+            "average_period": 7,
+            "latest_window_hours": 24,
+        },
+        {
+            "provider": "polar",
+            "samples": True,
+            "zones": False,
+            "route": True,
+        },
+        {
+            "provider": "suunto",
+            "workout_id": "workout:key-123.4",
+        },
+        {},
+        {},
+    ]
 
 
 async def test_live_healthmes_mcp_schemas_match_decision_runtime_inventory(

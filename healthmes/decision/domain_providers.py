@@ -90,6 +90,12 @@ from healthmes.nutrition.repository import (
 from healthmes.nutrition.repository import (
     SOURCE_PROVIDER as NUTRITION_OBSERVATION_PROVIDER,
 )
+from healthmes.source_policy import (
+    OPEN_WEARABLES_INPUT_SOURCE_ID,
+    InputSourcePolicyBinding,
+    StaleInputSourcePolicyError,
+    input_source_policy_binding,
+)
 from healthmes.storage import retention_cutoff
 from healthmes.store import CalendarEventMirror, WellnessEvent
 from healthmes.store.enums import CalendarSource
@@ -116,16 +122,14 @@ from healthmes.wearables.provenance import (
 from healthmes.wearables.search import (
     WEARABLE_DETAIL_CAPABILITIES,
     WEARABLE_HEALTH_SCORE_CATEGORIES,
+    WEARABLE_PROVIDER_WORKOUT_PROVIDERS,
     WEARABLE_SUMMARY_KINDS,
     WEARABLE_TIMESERIES_RESOLUTIONS,
     WEARABLE_TIMESERIES_TYPES,
     WearableSearchFetch,
     WearableSearchReader,
     WearableSearchRequest,
-    normalize_retained_wearable_health_scores,
-    normalize_retained_wearable_summaries,
-    normalize_retained_wearable_timeseries,
-    normalize_retained_wearable_workouts,
+    normalize_retained_wearable_search,
     validate_wearable_search_request,
 )
 from healthmes.wearables.whoop_recovery import (
@@ -302,6 +306,45 @@ _WEARABLE_RESOLUTION_PARAMETER = ContextParameterSpec(
     min_length=1,
     max_length=16,
     allowed_values=WEARABLE_TIMESERIES_RESOLUTIONS,
+)
+_WEARABLE_AVERAGE_PERIOD_PARAMETER = ContextParameterSpec(
+    name="average_period",
+    value_type=ContextParameterType.INTEGER,
+    minimum=1,
+    maximum=7,
+)
+_WEARABLE_LATEST_WINDOW_HOURS_PARAMETER = ContextParameterSpec(
+    name="latest_window_hours",
+    value_type=ContextParameterType.INTEGER,
+    minimum=1,
+    maximum=24,
+)
+_WEARABLE_WORKOUT_PROVIDER_PARAMETER = ContextParameterSpec(
+    name="provider",
+    value_type=ContextParameterType.STRING,
+    required=True,
+    min_length=1,
+    max_length=16,
+    allowed_values=WEARABLE_PROVIDER_WORKOUT_PROVIDERS,
+)
+_WEARABLE_WORKOUT_ID_PARAMETER = ContextParameterSpec(
+    name="workout_id",
+    value_type=ContextParameterType.STRING,
+    required=True,
+    min_length=1,
+    max_length=512,
+)
+_WEARABLE_SAMPLES_PARAMETER = ContextParameterSpec(
+    name="samples",
+    value_type=ContextParameterType.BOOLEAN,
+)
+_WEARABLE_ZONES_PARAMETER = ContextParameterSpec(
+    name="zones",
+    value_type=ContextParameterType.BOOLEAN,
+)
+_WEARABLE_ROUTE_PARAMETER = ContextParameterSpec(
+    name="route",
+    value_type=ContextParameterType.BOOLEAN,
 )
 
 CALENDAR_AGGREGATE_SOURCE_PROVIDER = "healthmes-calendar-aggregate"
@@ -518,16 +561,31 @@ _WEARABLE_NESTED_FIELDS = (
     "active_minutes",
     "actual_sleep",
     "advance_minutes",
+    "age",
+    "air_temperature_celsius",
+    "averaged",
+    "avg_cadence",
     "avg_bpm",
     "avg_heart_rate_bpm",
     "avg_hrv_rmssd_ms",
     "avg_hrv_sdnn_ms",
     "avg_pace_sec_per_km",
+    "avg_power_watts",
     "avg_respiratory_rate",
+    "avg_speed_meters_per_second",
     "avg_spo2_percent",
+    "avg_diastolic_mmhg",
+    "avg_systolic_mmhg",
     "awake_minutes",
     "baseline_median",
+    "blood_pressure",
+    "blood_pressure_measured_at",
+    "bmi",
+    "body_fat_percent",
+    "body_temperature_celsius",
+    "body_temperature_measured_at",
     "block",
+    "cadence_steps_per_minute",
     "calories_kcal",
     "category",
     "charge",
@@ -537,17 +595,24 @@ _WEARABLE_NESTED_FIELDS = (
     "confidence",
     "coverage",
     "current",
+    "current_phase",
+    "current_phase_type",
+    "cycle_length",
     "date",
     "deep_minutes",
     "default_minutes",
     "delta",
     "delta_pct",
+    "days_until_next_phase",
+    "day_in_cycle",
+    "data",
     "distance_meters",
     "duration_minutes",
     "duration_seconds",
     "earliest_available_work_time",
     "efficiency_percent",
     "elevation_gain_meters",
+    "elevation_loss_meters",
     "elevation_meters",
     "entries",
     "end",
@@ -555,24 +620,52 @@ _WEARABLE_NESTED_FIELDS = (
     "freshest_at",
     "freshness",
     "floors_climbed",
+    "fertile_window_start",
+    "fix",
+    "granular_truncated",
+    "has_specified_cycle_length",
+    "has_specified_period_length",
+    "heart_rate_bpm",
+    "heart_rate_zones",
     "heart_rate",
+    "height_cm",
     "hrv",
     "index",
     "intensity_minutes",
     "interruptions_count",
     "is_daily_total",
+    "is_nap",
+    "is_predicted_cycle",
     "kind",
     "label",
+    "last_updated_at",
     "last_night",
+    "latest",
+    "latitude",
+    "length_of_current_phase",
+    "length_of_fertile_window",
     "light",
     "light_minutes",
     "local_date",
+    "longitude",
+    "lower_bpm",
     "max_bpm",
+    "max_altitude_meters",
     "max_avg_heart_rate_bpm",
+    "max_cadence",
+    "max_diastolic_mmhg",
     "max_heart_rate_bpm",
+    "max_power_watts",
+    "max_speed_meters_per_second",
+    "max_systolic_mmhg",
     "metric",
     "min_bpm",
+    "min_altitude_meters",
+    "min_diastolic_mmhg",
+    "min_heart_rate_bpm",
+    "min_systolic_mmhg",
     "moderate",
+    "muscle_mass_kg",
     "n_days",
     "nap_count",
     "nap_duration_minutes",
@@ -580,28 +673,52 @@ _WEARABLE_NESTED_FIELDS = (
     "observed_at",
     "observed_on",
     "mode",
+    "period_days",
+    "period_end",
+    "period_length",
+    "period_start",
+    "power_watts",
+    "predicted_cycle_length",
     "provider",
     "provider_attribution",
+    "provider_numeric_workout_id",
+    "provider_workout_id",
+    "provider_workout_type_code",
     "provenance",
     "qualifier",
     "ratio",
     "reason",
     "recorded_at",
+    "record_kind",
+    "recording_rate_seconds",
     "records",
     "recovery_score",
     "rem_minutes",
+    "reading_count",
+    "route",
+    "route_available",
     "resting_heart_rate_bpm",
     "scale",
+    "sample_type",
+    "samples",
+    "satellites",
     "score",
     "sedentary_minutes",
     "series_type",
+    "skin_temperature_celsius",
+    "skin_temperature_measured_at",
     "sleep_debt",
     "sleep_duration_seconds",
     "sleep_efficiency_percent",
+    "sleep_stage_intervals",
+    "sleep_stage_intervals_truncated",
+    "slow_changing",
     "source",
     "source_category",
     "source_ref_id",
+    "speed_meters_per_second",
     "stale_days",
+    "stage",
     "start",
     "start_inclusive",
     "start_time",
@@ -610,6 +727,8 @@ _WEARABLE_NESTED_FIELDS = (
     "state",
     "steps",
     "stress",
+    "summary_as_of",
+    "summary_collected_at",
     "summary_kind",
     "timestamp",
     "time_in_bed_minutes",
@@ -617,14 +736,17 @@ _WEARABLE_NESTED_FIELDS = (
     "total_calories_kcal",
     "total_duration_minutes",
     "total_minutes",
+    "training_load",
     "types",
     "unit",
+    "upper_bpm",
     "upstream_provider",
     "usable_blocks",
     "value",
     "variant",
     "vigorous",
     "wake_time",
+    "weight_kg",
     "wearable_provider",
     "window_days",
     "workout_type",
@@ -636,7 +758,18 @@ _WEARABLE_NESTED_FIELDS = (
     "pace",
     "rest_is_option",
 )
-_WEARABLE_IDENTITY_FIELDS = ("source",)
+_WEARABLE_IDENTITY_FIELDS = (
+    "data",
+    "heart_rate_zones",
+    "latitude",
+    "longitude",
+    "provider_numeric_workout_id",
+    "provider_workout_id",
+    "route",
+    "samples",
+    "sleep_stage_intervals",
+    "source",
+)
 _WEARABLE_PUBLIC_RECORD_FIELDS = frozenset(_WEARABLE_NESTED_FIELDS) - {
     "provenance",
     "row_digest",
@@ -732,6 +865,7 @@ _WEARABLE_LIMITATION_CODES = (
     "unparseable_raw_value",
     "unparseable_recorded_at",
     "wearable_conflicting_duplicate_rows",
+    "wearable_granular_data_truncated",
     "wearable_payload_limit_reached",
     "wearable_readiness_evidence_ids_unavailable",
     "wearable_query_snapshot_fallback_used",
@@ -741,12 +875,14 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_retention_window_trimmed",
     "wearable_rows_discarded",
     "wearable_snapshot_fallback_used",
+    "wearable_source_policy_changed",
     "wearable_snapshot_persistence_failed",
     "wearable_snapshot_writer_unavailable",
     "wearable_source_refs_are_readiness_level",
     "wearable_stream_attribution_unavailable",
     "wearable_summary_window_partial",
     "wearable_upstream_page_limit_reached",
+    "wearable_upstream_completeness_unverified",
     "whoop_day_strain_source_truncated",
     "whoop_recovery_source_truncated",
 )
@@ -755,6 +891,7 @@ _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
         "open_wearables_detail_unavailable",
         "open_wearables_detail_timeout",
         "wearable_conflicting_duplicate_rows",
+        "wearable_granular_data_truncated",
         "wearable_payload_limit_reached",
         "wearable_provider_attribution_unavailable",
         "wearable_query_snapshot_fallback_used",
@@ -763,6 +900,7 @@ _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
         "wearable_stream_attribution_unavailable",
         "wearable_summary_window_partial",
         "wearable_upstream_page_limit_reached",
+        "wearable_upstream_completeness_unverified",
     }
 )
 _WEARABLE_PROVIDER_FAMILIES = frozenset(
@@ -1083,6 +1221,9 @@ def _wearable_fetch_with_required_provider(
     return WearableSearchFetch(
         records=tuple(records),
         upstream_truncated=fetched.upstream_truncated,
+        upstream_completeness_unverified=(
+            fetched.upstream_completeness_unverified
+        ),
         payload_trimmed=fetched.payload_trimmed,
         discarded_rows=(
             fetched.discarded_rows
@@ -1096,6 +1237,7 @@ def _wearable_fetch_with_required_provider(
         stream_attribution_unavailable=(
             fetched.stream_attribution_unavailable
         ),
+        granular_truncated=fetched.granular_truncated,
         package=(
             dict(fetched.package)
             if isinstance(fetched.package, Mapping)
@@ -1110,56 +1252,23 @@ def _wearable_fetch_with_required_provider(
 def _wearable_fetch_with_current_retention(
     fetched: WearableSearchFetch,
     *,
-    query: ContextQuery,
-    start: datetime,
-    end: datetime,
-    retained_after: datetime | None,
+    request: WearableSearchRequest,
 ) -> WearableSearchFetch:
-    if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+    if request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
         return fetched
-    if query.capability == "wearable.health-scores":
-        normalized = normalize_retained_wearable_health_scores(
-            fetched.records,
-            category=(
-                str(query.parameters["category"])
-                if query.parameters.get("category") is not None
-                else None
-            ),
-            start=start,
-            end=end,
-            retained_after=retained_after,
-        )
-    elif query.capability == "wearable.summaries":
-        normalized = normalize_retained_wearable_summaries(
-            fetched.records,
-            kind=str(query.parameters["summary_kind"]),
-            start=start,
-            end=end,
-            timezone=query.timezone,
-            retained_after=retained_after,
-        )
-    elif query.capability == "wearable.workouts":
-        normalized = normalize_retained_wearable_workouts(
-            fetched.records,
-            start=start,
-            end=end,
-            retained_after=retained_after,
-        )
-    else:
-        normalized = normalize_retained_wearable_timeseries(
-            fetched.records,
-            series_type=str(query.parameters["series_type"]),
-            resolution=str(query.parameters["resolution"]),
-            start=start,
-            end=end,
-            stream_attribution_verified=(
-                not fetched.stream_attribution_unavailable
-            ),
-            retained_after=retained_after,
-        )
+    normalized = normalize_retained_wearable_search(
+        fetched.records,
+        request=request,
+        stream_attribution_verified=(
+            not fetched.stream_attribution_unavailable
+        ),
+    )
     return WearableSearchFetch(
         records=normalized.records,
         upstream_truncated=fetched.upstream_truncated,
+        upstream_completeness_unverified=(
+            fetched.upstream_completeness_unverified
+        ),
         payload_trimmed=fetched.payload_trimmed,
         discarded_rows=(
             fetched.discarded_rows + normalized.discarded_rows
@@ -1176,6 +1285,18 @@ def _wearable_fetch_with_current_retention(
             fetched.stream_attribution_unavailable
             or normalized.stream_attribution_unavailable
         ),
+        granular_truncated=(
+            fetched.granular_truncated
+            or normalized.granular_truncated
+        ),
+        package=(
+            dict(fetched.package)
+            if isinstance(fetched.package, Mapping)
+            else None
+        ),
+        private_provenance=tuple(
+            dict(row) for row in fetched.private_provenance
+        ),
     )
 
 
@@ -1186,8 +1307,24 @@ def _wearable_record_observed_at(
     timezone: str,
 ) -> str:
     observed: datetime | None = None
+    if record.get("record_kind") == "body_summary":
+        raw_collected_at = record.get("summary_collected_at")
+        if not isinstance(raw_collected_at, str):
+            raise ValueError(
+                "wearable body summary collection time is missing"
+            )
+        collected_at = datetime.fromisoformat(
+            raw_collected_at.replace("Z", "+00:00")
+        )
+        if collected_at.tzinfo is None:
+            raise ValueError(
+                "wearable body summary collection time must be aware"
+            )
+        observed = collected_at.astimezone(UTC)
     raw_day = record.get("date")
     if (
+        observed is None
+        and
         isinstance(record.get("summary_kind"), str)
         and isinstance(raw_day, str)
     ):
@@ -3437,6 +3574,217 @@ class WearableContextProvider:
                 ),
             ),
             ContextCapability(
+                capability="wearable.body-summary",
+                description=(
+                    "Bounded body composition, averaged vital, and recent "
+                    "measurement summary from Open Wearables."
+                ),
+                granularities=("summary", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=(
+                    "date",
+                    "cursor",
+                    "average_period",
+                    "latest_window_hours",
+                ),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_AVERAGE_PERIOD_PARAMETER,
+                    _WEARABLE_LATEST_WINDOW_HOURS_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded body summary mirrored locally, with retained "
+                    "fallback preserving its collection time."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.sleep-sessions",
+                description=(
+                    "Bounded sleep sessions; stage intervals require identity "
+                    "privacy."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=("date", "cursor"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded sleep-session query mirrored locally, with "
+                    "retained fallback."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.menstrual-cycles",
+                description=(
+                    "Bounded normalized menstrual-cycle records without "
+                    "upstream user identifiers."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=("date", "cursor"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded menstrual-cycle query mirrored locally, with "
+                    "retained fallback."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.provider-workouts",
+                description=(
+                    "Bounded Garmin, Polar, or Suunto workouts; granular "
+                    "samples, zones, and routes require identity privacy."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=(
+                    "date",
+                    "cursor",
+                    "provider",
+                    "samples",
+                    "zones",
+                    "route",
+                ),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_WORKOUT_PROVIDER_PARAMETER,
+                    _WEARABLE_SAMPLES_PARAMETER,
+                    _WEARABLE_ZONES_PARAMETER,
+                    _WEARABLE_ROUTE_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded provider workout query mirrored locally, "
+                    "with retained fallback."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.provider-workout-detail",
+                description=(
+                    "One provider-owned workout by stable upstream workout ID; "
+                    "granular samples, zones, and routes require identity privacy."
+                ),
+                granularities=("record",),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=(
+                    "date",
+                    "cursor",
+                    "provider",
+                    "workout_id",
+                    "samples",
+                    "zones",
+                    "route",
+                ),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_WORKOUT_PROVIDER_PARAMETER,
+                    _WEARABLE_WORKOUT_ID_PARAMETER,
+                    _WEARABLE_SAMPLES_PARAMETER,
+                    _WEARABLE_ZONES_PARAMETER,
+                    _WEARABLE_ROUTE_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded provider workout detail mirrored locally, "
+                    "with retained fallback."
+                ),
+            ),
+            ContextCapability(
                 capability="wearable.summaries",
                 description=(
                     "Bounded daily activity, sleep, or recovery summaries "
@@ -3614,6 +3962,27 @@ class WearableContextProvider:
                 current_session
             )
 
+    def _current_source_policy(
+        self,
+        session: Session,
+    ) -> InputSourcePolicyBinding:
+        factory = self._snapshot_session_factory
+        if (
+            factory is None
+            or isinstance(session.get_bind().pool, StaticPool)
+        ):
+            return input_source_policy_binding(
+                session,
+                owner_principal_id=self._owner_principal_id,
+                source_id=OPEN_WEARABLES_INPUT_SOURCE_ID,
+            )
+        with factory() as current_session:
+            return input_source_policy_binding(
+                current_session,
+                owner_principal_id=self._owner_principal_id,
+                source_id=OPEN_WEARABLES_INPUT_SOURCE_ID,
+            )
+
     async def query(
         self,
         session: Session,
@@ -3622,11 +3991,27 @@ class WearableContextProvider:
         now: datetime,
     ) -> ContextResult:
         _validate_query(self.metadata, query)
+        source_policy = self._current_source_policy(session)
+        if not source_policy.enabled:
+            return ContextResult(
+                query_id=query.query_id,
+                provider_id=query.provider_id,
+                capability=query.capability,
+                status=ContextStatus.DENIED,
+                freshness=ContextFreshness(
+                    status=FreshnessStatus.UNAVAILABLE
+                ),
+                coverage=ContextCoverage(
+                    status=CoverageStatus.UNAVAILABLE
+                ),
+                limitations=["wearable_input_disabled"],
+            )
         if query.capability in WEARABLE_DETAIL_CAPABILITIES:
             return await self._query_detail(
                 session,
                 query,
                 now=now,
+                source_policy=source_policy,
             )
         day = _query_day(query, now=now)
         raw, snapshot, limitations = await self._snapshot_context(
@@ -3634,6 +4019,7 @@ class WearableContextProvider:
             day=day,
             timezone=query.timezone,
             now=now,
+            source_policy=source_policy,
         )
         if raw is None or snapshot is None:
             return ContextResult(
@@ -3643,6 +4029,7 @@ class WearableContextProvider:
                 status=(
                     ContextStatus.FAILED
                     if {
+                        "wearable_source_policy_changed",
                         "wearable_snapshot_persistence_failed",
                         "wearable_snapshot_writer_unavailable",
                     }
@@ -3821,6 +4208,7 @@ class WearableContextProvider:
         query: ContextQuery,
         *,
         now: datetime,
+        source_policy: InputSourcePolicyBinding,
     ) -> ContextResult:
         start, end = self._detail_bounds(query, now=now)
         whoop_as_of = (
@@ -3849,6 +4237,8 @@ class WearableContextProvider:
             end=end,
             timezone=query.timezone,
             parameters=parameters,
+            collected_at=now,
+            privacy_level=query.privacy_level,
             retained_after=retained_after,
             as_of=whoop_as_of,
         )
@@ -4058,13 +4448,21 @@ class WearableContextProvider:
                 limitations.add("wearable_retention_window_trimmed")
 
         if fetched is not None:
+            current_request = WearableSearchRequest(
+                capability=query.capability,
+                start=start,
+                end=end,
+                timezone=query.timezone,
+                parameters=parameters,
+                collected_at=now,
+                privacy_level=query.privacy_level,
+                retained_after=retained_after,
+                as_of=whoop_as_of,
+            )
             fetched = _wearable_fetch_with_required_provider(fetched)
             fetched = _wearable_fetch_with_current_retention(
                 fetched,
-                query=query,
-                start=start,
-                end=end,
-                retained_after=retained_after,
+                request=current_request,
             )
             stored_limitations = {
                 *fetched.limitations,
@@ -4102,6 +4500,7 @@ class WearableContextProvider:
                             ),
                             collected_at=now,
                             now=now,
+                            expected_source_policy=source_policy,
                         )
                     )
             else:
@@ -4109,7 +4508,7 @@ class WearableContextProvider:
                     "status": (
                         "partial"
                         if incomplete_result
-                        else "empty_success"
+                        else "no_data"
                         if not fetched.records
                         else "ok"
                     ),
@@ -4140,6 +4539,7 @@ class WearableContextProvider:
                         result=stored_result,
                         collected_at=now,
                         now=now,
+                        expected_source_policy=source_policy,
                     )
                 )
             if snapshot is not None:
@@ -4163,6 +4563,20 @@ class WearableContextProvider:
                 )
             if store_limitation:
                 limitations.add(store_limitation)
+            if "wearable_source_policy_changed" in limitations:
+                return ContextResult(
+                    query_id=query.query_id,
+                    provider_id=query.provider_id,
+                    capability=query.capability,
+                    status=ContextStatus.FAILED,
+                    freshness=ContextFreshness(
+                        status=FreshnessStatus.UNAVAILABLE
+                    ),
+                    coverage=ContextCoverage(
+                        status=CoverageStatus.UNAVAILABLE
+                    ),
+                    limitations=sorted(limitations),
+                )
 
         retention_policy = self._current_retention_policy(session)
         retained_after = _wearable_retention_cutoff(
@@ -4221,10 +4635,17 @@ class WearableContextProvider:
             )
             fallback_fetch = _wearable_fetch_with_current_retention(
                 fallback_fetch,
-                query=query,
-                start=start,
-                end=end,
-                retained_after=retained_after,
+                request=WearableSearchRequest(
+                    capability=query.capability,
+                    start=start,
+                    end=end,
+                    timezone=query.timezone,
+                    parameters=parameters,
+                    collected_at=retained.collected_at,
+                    privacy_level=query.privacy_level,
+                    retained_after=retained_after,
+                    as_of=whoop_as_of,
+                ),
             )
             fallback_result["status"] = "partial"
             fallback_result["records"] = list(
@@ -4256,6 +4677,7 @@ class WearableContextProvider:
                     result=fallback_result,
                     collected_at=retained.collected_at,
                     now=now,
+                    expected_source_policy=source_policy,
                 )
             )
             if fallback_snapshot is not None:
@@ -4278,6 +4700,7 @@ class WearableContextProvider:
 
         failed = bool(
             {
+                "wearable_source_policy_changed",
                 "wearable_snapshot_persistence_failed",
                 "wearable_snapshot_writer_unavailable",
             }
@@ -4331,6 +4754,7 @@ class WearableContextProvider:
         private_provenance: Sequence[Mapping[str, Any]] | None = None,
         collected_at: datetime,
         now: datetime,
+        expected_source_policy: InputSourcePolicyBinding,
     ) -> tuple[WearableQuerySnapshot | None, str]:
         factory = self._snapshot_session_factory
         if factory is not None:
@@ -4346,7 +4770,10 @@ class WearableContextProvider:
                     private_provenance=private_provenance,
                     collected_at=collected_at,
                     now=now,
+                    expected_source_policy=expected_source_policy,
                 )
+            except StaleInputSourcePolicyError:
+                return None, "wearable_source_policy_changed"
             except RuntimeError:
                 if not isinstance(session, Session):
                     return None, "wearable_snapshot_writer_unavailable"
@@ -4383,7 +4810,10 @@ class WearableContextProvider:
                 private_provenance=private_provenance,
                 collected_at=collected_at,
                 now=now,
+                expected_source_policy=expected_source_policy,
             )
+        except StaleInputSourcePolicyError:
+            return None, "wearable_source_policy_changed"
         except Exception:
             return None, "wearable_snapshot_persistence_failed"
         return snapshot, ""
@@ -4476,55 +4906,29 @@ class WearableContextProvider:
             if isinstance(record, Mapping)
         ]
         retained_limitations = set(_limitations(stored))
-        if query.capability == "wearable.health-scores":
-            normalized_fetch = normalize_retained_wearable_health_scores(
-                public_records,
-                category=(
-                    str(query.parameters["category"])
-                    if query.parameters.get("category") is not None
-                    else None
-                ),
-                start=snapshot.start,
-                end=snapshot.end,
-                retained_after=retained_after,
-            )
-            public_records = list(normalized_fetch.records)
-            retained_limitations.update(normalized_fetch.limitations)
-        elif query.capability == "wearable.summaries":
-            normalized_fetch = normalize_retained_wearable_summaries(
-                public_records,
-                kind=str(query.parameters["summary_kind"]),
+        normalized_fetch = normalize_retained_wearable_search(
+            public_records,
+            request=WearableSearchRequest(
+                capability=query.capability,
                 start=snapshot.start,
                 end=snapshot.end,
                 timezone=query.timezone,
+                parameters={
+                    key: value
+                    for key, value in query.parameters.items()
+                    if key
+                    not in {"cursor", "date", "package_record_id"}
+                },
+                collected_at=snapshot.collected_at,
+                privacy_level=query.privacy_level,
                 retained_after=retained_after,
-            )
-            public_records = list(normalized_fetch.records)
-            retained_limitations.update(normalized_fetch.limitations)
-        elif query.capability == "wearable.workouts":
-            normalized_fetch = normalize_retained_wearable_workouts(
-                public_records,
-                start=snapshot.start,
-                end=snapshot.end,
-                retained_after=retained_after,
-            )
-            public_records = list(normalized_fetch.records)
-            retained_limitations.update(normalized_fetch.limitations)
-        elif query.capability == "wearable.timeseries":
-            normalized_fetch = normalize_retained_wearable_timeseries(
-                public_records,
-                series_type=str(query.parameters["series_type"]),
-                resolution=str(query.parameters["resolution"]),
-                start=snapshot.start,
-                end=snapshot.end,
-                stream_attribution_verified=(
-                    stored.get("stream_attribution_status")
-                    == "verified"
-                ),
-                retained_after=retained_after,
-            )
-            public_records = list(normalized_fetch.records)
-            retained_limitations.update(normalized_fetch.limitations)
+            ),
+            stream_attribution_verified=(
+                stored.get("stream_attribution_status") == "verified"
+            ),
+        )
+        public_records = list(normalized_fetch.records)
+        retained_limitations.update(normalized_fetch.limitations)
         occurrence_by_digest: dict[str, int] = {}
         page_entries: list[dict[str, Any]] = []
         for record in public_records:
@@ -4668,6 +5072,7 @@ class WearableContextProvider:
         day: date,
         timezone: str,
         now: datetime,
+        source_policy: InputSourcePolicyBinding,
     ) -> tuple[
         dict[str, Any] | None,
         WearableSnapshot | None,
@@ -4703,6 +5108,7 @@ class WearableContextProvider:
                 local_day=day,
                 timezone=timezone,
                 now=now,
+                expected_source_policy=source_policy,
             )
             if snapshot is not None:
                 return (
@@ -4711,6 +5117,8 @@ class WearableContextProvider:
                     limitations,
                 )
             limitations.add(store_limitation)
+            if store_limitation == "wearable_source_policy_changed":
+                return None, None, limitations
         elif normalized is not None:
             limitations.add("open_wearables_context_unavailable")
 
@@ -4741,6 +5149,7 @@ class WearableContextProvider:
         local_day: date,
         timezone: str,
         now: datetime,
+        expected_source_policy: InputSourcePolicyBinding,
     ) -> tuple[WearableSnapshot | None, str]:
         factory = self._snapshot_session_factory
         if factory is not None:
@@ -4752,7 +5161,10 @@ class WearableContextProvider:
                     timezone=timezone,
                     collected_at=now,
                     now=now,
+                    expected_source_policy=expected_source_policy,
                 )
+            except StaleInputSourcePolicyError:
+                return None, "wearable_source_policy_changed"
             except RuntimeError:
                 if not isinstance(session, Session):
                     return None, "wearable_snapshot_writer_unavailable"
@@ -4785,7 +5197,10 @@ class WearableContextProvider:
                 timezone=timezone,
                 collected_at=now,
                 now=now,
+                expected_source_policy=expected_source_policy,
             )
+        except StaleInputSourcePolicyError:
+            return None, "wearable_source_policy_changed"
         except Exception:
             return None, "wearable_snapshot_persistence_failed"
         return snapshot, ""

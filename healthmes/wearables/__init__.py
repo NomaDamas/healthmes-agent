@@ -1,5 +1,20 @@
 """Local provenance mirror for normalized wearable context."""
 
+from healthmes.wearables.availability import (
+    OPEN_WEARABLES_BACKED_CAPABILITIES,
+    OPEN_WEARABLES_DISCONNECTED,
+    OPEN_WEARABLES_INPUT_SOURCE_ID,
+    OPEN_WEARABLES_METADATA_DEGRADED,
+    OPEN_WEARABLES_METADATA_UNAVAILABLE,
+    OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+    OPEN_WEARABLES_SOURCE_SETTING_UNAVAILABLE,
+    OPEN_WEARABLES_UNCONFIGURED,
+    WEARABLE_INPUT_DISABLED,
+    OpenWearablesAvailability,
+    OpenWearablesAvailabilityResolver,
+    OpenWearablesAvailabilitySnapshot,
+    OpenWearablesAvailabilityState,
+)
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE,
@@ -13,9 +28,22 @@ from healthmes.wearables.provenance import (
 )
 
 __all__ = [
+    "OPEN_WEARABLES_BACKED_CAPABILITIES",
+    "OPEN_WEARABLES_INPUT_SOURCE_ID",
+    "OPEN_WEARABLES_DISCONNECTED",
+    "OPEN_WEARABLES_METADATA_DEGRADED",
+    "OPEN_WEARABLES_METADATA_UNAVAILABLE",
+    "OPEN_WEARABLES_SOURCE_POLICY_CHANGED",
+    "OPEN_WEARABLES_SOURCE_SETTING_UNAVAILABLE",
+    "OPEN_WEARABLES_UNCONFIGURED",
+    "WEARABLE_INPUT_DISABLED",
     "OPEN_WEARABLES_OBSERVATION_EVENT_TYPE",
     "OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE",
     "OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER",
+    "OpenWearablesAvailability",
+    "OpenWearablesAvailabilityResolver",
+    "OpenWearablesAvailabilitySnapshot",
+    "OpenWearablesAvailabilityState",
     "WearableSnapshot",
     "commit_open_wearables_snapshot",
     "latest_retained_open_wearables_snapshot",

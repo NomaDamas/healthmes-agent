@@ -1716,11 +1716,47 @@ class HermesResponsesDecisionAgent:
 
         handle: Any | None = None
         try:
-            handle = await self._sync_runner.run(
-                lambda: self._search_service.begin(request),
-                deadline=deadline,
-                late_result=self._abort_late_search_handle,
+            resolve_availability = getattr(
+                self._search_service,
+                "resolve_open_wearables_availability",
+                None,
             )
+            begin_with_availability = getattr(
+                self._search_service,
+                "begin_with_availability",
+                None,
+            )
+            begin_available = getattr(
+                self._search_service,
+                "begin_available",
+                None,
+            )
+            if callable(resolve_availability) and callable(
+                begin_with_availability
+            ):
+                availability = await _before_deadline(
+                    resolve_availability(),
+                    deadline,
+                )
+                handle = await self._sync_runner.run(
+                    lambda: begin_with_availability(
+                        request,
+                        open_wearables_availability=availability,
+                    ),
+                    deadline=deadline,
+                    late_result=self._abort_late_search_handle,
+                )
+            elif callable(begin_available):
+                handle = await _before_deadline(
+                    begin_available(request),
+                    deadline,
+                )
+            else:
+                handle = await self._sync_runner.run(
+                    lambda: self._search_service.begin(request),
+                    deadline=deadline,
+                    late_result=self._abort_late_search_handle,
+                )
         except TimeoutError:
             return self._failure_run(
                 request=request,
@@ -1763,6 +1799,21 @@ class HermesResponsesDecisionAgent:
                 ),
                 related_records=tuple(
                     getattr(handle, "related_records", ())
+                ),
+                allowed_capabilities=(
+                    tuple(handle.allowed_capabilities)
+                    if getattr(
+                        handle,
+                        "allowed_capabilities",
+                        None,
+                    )
+                    is not None
+                    else None
+                ),
+                open_wearables_availability=getattr(
+                    handle,
+                    "open_wearables_availability",
+                    None,
                 ),
                 model=self._model,
                 profile_digest=self._profile_digest,
@@ -2132,6 +2183,8 @@ def _responses_request(
     runtime_question: str,
     has_related_records: bool,
     related_records: tuple[DecisionSearchRelatedRecord, ...],
+    allowed_capabilities: tuple[str, ...] | None,
+    open_wearables_availability: Any | None,
     model: str,
     profile_digest: str | None,
     tool_allowlist: frozenset[str],
@@ -2174,6 +2227,19 @@ def _responses_request(
         },
         "budget": request.budget.model_dump(mode="json", round_trip=True),
         "decision_session_id": decision_session_id,
+        "allowed_capabilities": (
+            list(allowed_capabilities)
+            if allowed_capabilities is not None
+            else None
+        ),
+        "open_wearables_availability": (
+            open_wearables_availability.model_dump(
+                mode="json",
+                round_trip=True,
+            )
+            if open_wearables_availability is not None
+            else None
+        ),
     }
     search_tools = sorted(
         tool_allowlist & HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
@@ -2203,7 +2269,9 @@ def _responses_request(
         + ". Search tools "
         + ", ".join(search_tools)
         + " MUST include decision_session_id exactly as provided in the "
-        "request. "
+        "request. Search tools may request only capability values listed in "
+        "request.allowed_capabilities; an omitted capability is unavailable "
+        "for this frozen decision session. "
         + (
             "The read-only skill tools "
             + ", ".join(skill_tools)
@@ -2342,6 +2410,11 @@ def _run_from_response(
         response.output,
         decision_session_id=snapshot.session_id,
         tool_allowlist=tool_allowlist,
+        allowed_capabilities=(
+            frozenset(snapshot.allowed_capabilities)
+            if getattr(snapshot, "allowed_capabilities", None) is not None
+            else None
+        ),
     )
     search_pairs = tuple(
         pair
@@ -2477,6 +2550,7 @@ def _validate_transcript(
     *,
     decision_session_id: str,
     tool_allowlist: frozenset[str],
+    allowed_capabilities: frozenset[str] | None,
 ) -> tuple[
     tuple[tuple[HermesFunctionCallItem, HermesFunctionOutputItem], ...],
     str,
@@ -2525,6 +2599,15 @@ def _validate_transcript(
                 ):
                     raise HermesResponsesContractError(
                         "hermes_decision_session_mismatch"
+                    )
+                if (
+                    call.name in HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
+                    and allowed_capabilities is not None
+                    and arguments.get("capability")
+                    not in allowed_capabilities
+                ):
+                    raise HermesResponsesContractError(
+                        "hermes_capability_not_in_session_catalog"
                     )
                 if call.name in HERMES_DECISION_SKILL_TOOL_ALLOWLIST:
                     _validate_skill_tool_arguments(call.name, arguments)

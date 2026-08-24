@@ -1098,6 +1098,70 @@ def test_summary_retention_uses_summary_day_not_previous_bedtime(
     assert snapshot.retention_basis_at == start
 
 
+def test_body_summary_averaged_retention_uses_full_period_start(
+    session,
+) -> None:
+    period_start = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    period_end = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.body-summary",
+        start=WHOOP_START,
+        end=WHOOP_END,
+        timezone="UTC",
+        parameters={"average_period": 7},
+        result={
+            "status": "ok",
+            "records": [
+                {
+                    "record_kind": "body_summary",
+                    "summary_as_of": period_end.isoformat(),
+                    "averaged": {
+                        "resting_heart_rate_bpm": 58,
+                        "period_days": 7,
+                        "period_start": period_start.isoformat(),
+                        "period_end": period_end.isoformat(),
+                    },
+                }
+            ],
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    assert snapshot.retention_basis_at == period_start
+
+
+def test_body_summary_slow_only_uses_snapshot_collection_observation(
+    session,
+) -> None:
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.body-summary",
+        start=WHOOP_START,
+        end=WHOOP_END,
+        timezone="UTC",
+        parameters={"average_period": 7},
+        result={
+            "status": "ok",
+            "records": [
+                {
+                    "record_kind": "body_summary",
+                    "summary_as_of": "2000-01-01T00:00:00+00:00",
+                    "slow_changing": {"weight_kg": 70},
+                }
+            ],
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    assert snapshot.retention_basis_at == NOW
+
+
 def test_whoop_package_v2_separates_public_result_and_private_provenance(
     session,
 ) -> None:

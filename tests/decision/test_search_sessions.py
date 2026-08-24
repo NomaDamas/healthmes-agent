@@ -36,6 +36,7 @@ from healthmes.decision import (
     DecisionContextSearchSessionService,
     DecisionRequest,
     DecisionSearchBudgetError,
+    DecisionSearchPolicyError,
     DecisionSearchQueryError,
     DecisionSearchSessionState,
     DomainAccessGrant,
@@ -58,6 +59,13 @@ from healthmes.nutrition.intake_contracts import (
 )
 from healthmes.storage import ensure_default_policies
 from healthmes.store import Base, WellnessEvent, create_db_engine
+from healthmes.wearables import (
+    OPEN_WEARABLES_DISCONNECTED,
+    OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+    WEARABLE_INPUT_DISABLED,
+    OpenWearablesAvailabilitySnapshot,
+    OpenWearablesAvailabilityState,
+)
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
 
@@ -196,6 +204,31 @@ class WhoopSearchProvider(SearchProvider):
         self.payload_factory = lambda _query: {"status": "ok"}
 
 
+class MixedWearableSearchProvider(WhoopSearchProvider):
+    metadata = ContextProviderMetadata(
+        provider_id="wearable",
+        domain="wearable",
+        description=(
+            "Provider exposing one Open Wearables capability and one "
+            "independent wearable capability."
+        ),
+        capabilities=(
+            *WhoopSearchProvider.metadata.capabilities,
+            ContextCapability(
+                capability="wearable.local-test",
+                description="Independent local wearable capability.",
+                granularities=("summary",),
+                query_fields=("timezone",),
+                output_fields=("status",),
+                max_lookback_days=1,
+                sensitivity="wearable",
+                provenance=ProvenanceSupport.NONE,
+                freshness_expectation="Local test value.",
+            ),
+        ),
+    )
+
+
 class BlockingWhoopSearchProvider(WhoopSearchProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -207,6 +240,18 @@ class BlockingWhoopSearchProvider(WhoopSearchProvider):
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("expired WHOOP provider call resumed")
+
+
+class ReleasableWhoopSearchProvider(WhoopSearchProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def query(self, session, query, *, now):
+        self.started.set()
+        await self.release.wait()
+        return await super().query(session, query, now=now)
 
 
 class CommitAttemptProvider(SearchProvider):
@@ -431,6 +476,298 @@ async def _search(
     }
     arguments.update(overrides)
     return await service.search(session_id, **arguments)
+
+
+def _availability(
+    state: OpenWearablesAvailabilityState,
+    *,
+    source_policy_revision: int = 0,
+) -> OpenWearablesAvailabilitySnapshot:
+    reason_codes = {
+        OpenWearablesAvailabilityState.DISABLED: (
+            WEARABLE_INPUT_DISABLED,
+        ),
+        OpenWearablesAvailabilityState.DISCONNECTED: (
+            OPEN_WEARABLES_DISCONNECTED,
+        ),
+    }
+    return OpenWearablesAvailabilitySnapshot(
+        state=state,
+        observed_at=NOW,
+        source_policy_revision=source_policy_revision,
+        reason_codes=reason_codes.get(state, ()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_available_session_freezes_wearable_capability_catalog(
+    store_factory: sessionmaker[Session],
+) -> None:
+    provider = WhoopSearchProvider()
+    current = [_availability(OpenWearablesAvailabilityState.AVAILABLE)]
+
+    async def availability() -> OpenWearablesAvailabilitySnapshot:
+        return current[0]
+
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        clock=lambda: NOW,
+        open_wearables_availability=availability,
+    )
+    handle = await service.begin_available(_request())
+    current[0] = _availability(OpenWearablesAvailabilityState.DISABLED)
+
+    assert handle.allowed_capabilities == (
+        "wearable.whoop-recovery-package",
+    )
+    assert (
+        handle.open_wearables_availability.state
+        is OpenWearablesAvailabilityState.AVAILABLE
+    )
+    result = await service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.whoop-recovery-package",
+        granularity="day",
+        parameters={"date": "2026-08-16"},
+    )
+
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == [WEARABLE_INPUT_DISABLED]
+    assert result.access_audit.reason_codes == (WEARABLE_INPUT_DISABLED,)
+    assert provider.queries == []
+    snapshot = service.finish(handle.session_id)
+    assert snapshot.allowed_capabilities == handle.allowed_capabilities
+    assert (
+        snapshot.open_wearables_availability
+        == handle.open_wearables_availability
+    )
+
+
+@pytest.mark.asyncio
+async def test_disabled_session_rejects_capability_outside_frozen_catalog(
+    store_factory: sessionmaker[Session],
+) -> None:
+    provider = WhoopSearchProvider()
+
+    async def availability() -> OpenWearablesAvailabilitySnapshot:
+        return _availability(OpenWearablesAvailabilityState.DISABLED)
+
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        clock=lambda: NOW,
+        open_wearables_availability=availability,
+    )
+    handle = await service.begin_available(_request())
+
+    assert handle.allowed_capabilities == ()
+    with pytest.raises(
+        DecisionSearchPolicyError,
+        match="decision_search_capability_not_in_session_catalog",
+    ):
+        await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.whoop-recovery-package",
+            granularity="day",
+            parameters={"date": "2026-08-16"},
+        )
+    assert provider.queries == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_open_wearables_keeps_independent_wearable_capability(
+    store_factory: sessionmaker[Session],
+) -> None:
+    provider = MixedWearableSearchProvider()
+
+    async def availability() -> OpenWearablesAvailabilitySnapshot:
+        return _availability(OpenWearablesAvailabilityState.DISABLED)
+
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        clock=lambda: NOW,
+        open_wearables_availability=availability,
+    )
+
+    handle = await service.begin_available(_request())
+
+    assert handle.allowed_capabilities == ("wearable.local-test",)
+
+
+@pytest.mark.asyncio
+async def test_frozen_session_rejects_reenabled_source_revision_before_provider(
+    store_factory: sessionmaker[Session],
+) -> None:
+    provider = WhoopSearchProvider()
+    current = [
+        _availability(
+            OpenWearablesAvailabilityState.AVAILABLE,
+            source_policy_revision=1,
+        )
+    ]
+
+    async def availability() -> OpenWearablesAvailabilitySnapshot:
+        return current[0]
+
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        clock=lambda: NOW,
+        open_wearables_availability=availability,
+    )
+    handle = await service.begin_available(_request())
+    current[0] = _availability(
+        OpenWearablesAvailabilityState.AVAILABLE,
+        source_policy_revision=3,
+    )
+
+    result = await service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.whoop-recovery-package",
+        granularity="day",
+        parameters={"date": "2026-08-16"},
+    )
+
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == [OPEN_WEARABLES_SOURCE_POLICY_CHANGED]
+    assert result.access_audit.reason_codes == (
+        OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+    )
+    assert provider.queries == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocked_state", "reason_code"),
+    (
+        (
+            OpenWearablesAvailabilityState.DISABLED,
+            WEARABLE_INPUT_DISABLED,
+        ),
+        (
+            OpenWearablesAvailabilityState.DISCONNECTED,
+            OPEN_WEARABLES_DISCONNECTED,
+        ),
+    ),
+)
+async def test_source_change_during_provider_execution_hides_result(
+    store_factory: sessionmaker[Session],
+    blocked_state: OpenWearablesAvailabilityState,
+    reason_code: str,
+) -> None:
+    provider = ReleasableWhoopSearchProvider()
+    current = [_availability(OpenWearablesAvailabilityState.AVAILABLE)]
+
+    async def availability() -> OpenWearablesAvailabilitySnapshot:
+        return current[0]
+
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        clock=lambda: NOW,
+        open_wearables_availability=availability,
+    )
+    handle = await service.begin_available(_request())
+    search = asyncio.create_task(
+        service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.whoop-recovery-package",
+            granularity="day",
+            parameters={"date": "2026-08-16"},
+        )
+    )
+    await provider.started.wait()
+
+    current[0] = _availability(blocked_state)
+    provider.release.set()
+    result = await search
+
+    assert len(provider.queries) == 1
+    assert result.status is ContextStatus.DENIED
+    assert result.payload == {}
+    assert result.source_refs == []
+    assert result.limitations == [reason_code]
+    assert result.access_audit.reason_codes == (reason_code,)
+
+
+@pytest.mark.asyncio
+async def test_source_revision_change_during_provider_execution_hides_result(
+    store_factory: sessionmaker[Session],
+) -> None:
+    provider = ReleasableWhoopSearchProvider()
+    current = [
+        _availability(
+            OpenWearablesAvailabilityState.AVAILABLE,
+            source_policy_revision=1,
+        )
+    ]
+
+    async def availability() -> OpenWearablesAvailabilitySnapshot:
+        return current[0]
+
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(domain="wearable"),
+        clock=lambda: NOW,
+        open_wearables_availability=availability,
+    )
+    handle = await service.begin_available(_request())
+    search = asyncio.create_task(
+        service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.whoop-recovery-package",
+            granularity="day",
+            parameters={"date": "2026-08-16"},
+        )
+    )
+    await provider.started.wait()
+
+    current[0] = _availability(
+        OpenWearablesAvailabilityState.AVAILABLE,
+        source_policy_revision=3,
+    )
+    provider.release.set()
+    result = await search
+
+    assert len(provider.queries) == 1
+    assert result.status is ContextStatus.DENIED
+    assert result.payload == {}
+    assert result.source_refs == []
+    assert result.limitations == [OPEN_WEARABLES_SOURCE_POLICY_CHANGED]
+    assert result.access_audit.reason_codes == (
+        OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+    )
 
 
 @pytest.mark.skipif(

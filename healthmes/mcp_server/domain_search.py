@@ -93,6 +93,8 @@ RelatedRecordOrUuid = Annotated[
 ]
 LookbackDays = Annotated[int, Field(ge=1, le=90)]
 MinimumMinutes = Annotated[int, Field(ge=1, le=1_440)]
+AveragePeriod = Annotated[int, Field(ge=1, le=7)]
+LatestWindowHours = Annotated[int, Field(ge=1, le=24)]
 PrivacySelection = Literal["aggregate", "identity"]
 
 ActivityCapability = Literal[
@@ -214,6 +216,11 @@ WearableCapability = Literal[
     "wearable.summaries",
     "wearable.workouts",
     "wearable.timeseries",
+    "wearable.body-summary",
+    "wearable.sleep-sessions",
+    "wearable.menstrual-cycles",
+    "wearable.provider-workouts",
+    "wearable.provider-workout-detail",
 ]
 WearableGranularity = Literal[
     "summary",
@@ -265,6 +272,19 @@ WearableTimeseriesType = Literal[
     "vo2_max",
 ]
 WearableTimeseriesResolution = Literal["1min", "5min", "15min", "1hour"]
+WearableWorkoutProvider = Literal["garmin", "polar", "suunto"]
+WearableWorkoutId = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9._:-]{1,512}$",
+        description=(
+            "Provider-owned workout identifier containing only bounded "
+            "letters, digits, dot, underscore, colon, or hyphen."
+        ),
+    ),
+]
 WearableField = Literal[
     "status",
     "reason",
@@ -518,6 +538,13 @@ def register_domain_search_tools(
         summary_kind: WearableSummaryKind | None = None,
         series_type: WearableTimeseriesType | None = None,
         resolution: WearableTimeseriesResolution | None = None,
+        average_period: AveragePeriod | None = None,
+        latest_window_hours: LatestWindowHours | None = None,
+        provider: WearableWorkoutProvider | None = None,
+        workout_id: WearableWorkoutId | None = None,
+        samples: bool | None = None,
+        zones: bool | None = None,
+        route: bool | None = None,
         granularity: WearableGranularity | None = None,
         fields: Annotated[list[WearableField] | None, Field(max_length=64)] = None,
         privacy_level: PrivacySelection = "aggregate",
@@ -549,5 +576,12 @@ def register_domain_search_tools(
                 "summary_kind": summary_kind,
                 "series_type": series_type,
                 "resolution": resolution,
+                "average_period": average_period,
+                "latest_window_hours": latest_window_hours,
+                "provider": provider,
+                "workout_id": workout_id,
+                "samples": samples,
+                "zones": zones,
+                "route": route,
             },
         )

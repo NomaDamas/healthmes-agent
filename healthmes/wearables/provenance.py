@@ -21,6 +21,10 @@ from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
 )
+from healthmes.source_policy import (
+    InputSourcePolicyBinding,
+    assert_input_source_policy_binding,
+)
 from healthmes.storage.service import (
     DEFAULT_RETENTION,
     RETENTION_PRESETS,
@@ -651,10 +655,16 @@ def persist_open_wearables_observation(
     timezone: str,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
 ) -> WearableSnapshot:
     """Persist one observation under the shared wellness write fence."""
     with activity_write_lock():
         lock_activity_write_plane(session)
+        if expected_source_policy is not None:
+            assert_input_source_policy_binding(
+                session,
+                expected_source_policy,
+            )
         return _persist_open_wearables_observation(
             session,
             normalized_context=normalized_context,
@@ -915,6 +925,7 @@ def commit_open_wearables_snapshot(
     timezone: str,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
 ) -> WearableSnapshot:
     """Persist one immutable snapshot in its own commit-on-success transaction."""
     with session_scope(session_factory) as session:
@@ -931,6 +942,7 @@ def commit_open_wearables_snapshot(
             timezone=timezone,
             collected_at=collected_at,
             now=now,
+            expected_source_policy=expected_source_policy,
         )
 
 
@@ -1487,6 +1499,252 @@ def _whoop_package_query_source_record_id(
     return f"query:{query_digest}:{identity_digest}"
 
 
+def _query_timestamp(value: Any, *, field: str) -> datetime:
+    if type(value) is not str:
+        raise ValueError(f"{field} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} is invalid") from exc
+    return _aware_utc(parsed, field=field)
+
+
+def _query_interval(
+    record: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    label: str,
+    allow_future_end: bool = False,
+) -> tuple[datetime, datetime]:
+    interval_start = _query_timestamp(
+        record.get("start_time"),
+        field=f"{label} start_time",
+    )
+    interval_end = _query_timestamp(
+        record.get("end_time"),
+        field=f"{label} end_time",
+    )
+    if (
+        interval_end <= interval_start
+        or not start <= interval_start < end
+        or (not allow_future_end and interval_end > end)
+    ):
+        raise ValueError(f"{label} interval is invalid")
+    return interval_start, interval_end
+
+
+def _validate_nested_provider_timestamps(
+    record: Mapping[str, Any],
+    *,
+    interval_start: datetime,
+    interval_end: datetime,
+) -> None:
+    for collection_name in ("samples", "route"):
+        collection = record.get(collection_name)
+        if collection is None:
+            continue
+        if not isinstance(collection, list):
+            raise ValueError(
+                "wearable provider workout nested collection is invalid"
+            )
+        for item in collection:
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "wearable provider workout nested record is invalid"
+                )
+            if "timestamp" not in item:
+                continue
+            timestamp = _query_timestamp(
+                item.get("timestamp"),
+                field=(
+                    "wearable provider workout "
+                    f"{collection_name} timestamp"
+                ),
+            )
+            if not interval_start <= timestamp <= interval_end:
+                raise ValueError(
+                    "wearable provider workout nested timestamp is invalid"
+                )
+
+
+def _body_summary_observation(
+    record: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    parameters: Mapping[str, Any],
+    collected_at: datetime,
+) -> datetime:
+    observations: list[datetime] = []
+    slow = record.get("slow_changing")
+    averaged = record.get("averaged")
+    latest = record.get("latest")
+    for name, group in (
+        ("slow_changing", slow),
+        ("averaged", averaged),
+        ("latest", latest),
+    ):
+        if group is not None and not isinstance(group, Mapping):
+            raise ValueError(f"wearable body summary {name} is invalid")
+
+    if isinstance(slow, Mapping) and slow:
+        # Slow-changing values have no upstream measurement timestamp.
+        # This anchors the retained snapshot observation, not a measurement.
+        observations.append(collected_at)
+
+    if isinstance(averaged, Mapping) and averaged:
+        metric_keys = set(averaged) - {
+            "period_days",
+            "period_start",
+            "period_end",
+        }
+        period_days = averaged.get("period_days")
+        expected_period_days = parameters.get("average_period", 7)
+        period_start = _query_timestamp(
+            averaged.get("period_start"),
+            field="wearable body summary averaged period_start",
+        )
+        period_end = _query_timestamp(
+            averaged.get("period_end"),
+            field="wearable body summary averaged period_end",
+        )
+        if (
+            not metric_keys
+            or type(period_days) is not int
+            or period_days <= 0
+            or type(expected_period_days) is not int
+            or period_days != expected_period_days
+            or period_start >= period_end
+            or not start <= period_end < end
+        ):
+            raise ValueError(
+                "wearable body summary averaged period is invalid"
+            )
+        observations.append(period_start)
+
+    if isinstance(latest, Mapping) and latest:
+        latest_pairs = {
+            "body_temperature_celsius": "body_temperature_measured_at",
+            "skin_temperature_celsius": "skin_temperature_measured_at",
+            "blood_pressure": "blood_pressure_measured_at",
+        }
+        included_pairs = [
+            (value_field, measured_field)
+            for value_field, measured_field in latest_pairs.items()
+            if value_field in latest or measured_field in latest
+        ]
+        if not included_pairs or set(latest) != {
+            field
+            for pair in included_pairs
+            for field in pair
+        }:
+            raise ValueError("wearable body summary latest values are invalid")
+        for value_field, measured_field in included_pairs:
+            if (
+                latest.get(value_field) is None
+                or latest.get(measured_field) is None
+            ):
+                raise ValueError(
+                    "wearable body summary latest values are invalid"
+                )
+            measured_at = _query_timestamp(
+                latest[measured_field],
+                field=f"wearable body summary latest {measured_field}",
+            )
+            if not start <= measured_at < end:
+                raise ValueError(
+                    "wearable body summary latest observation is invalid"
+                )
+            observations.append(measured_at)
+
+    if not observations:
+        raise ValueError("wearable body summary observation is invalid")
+    return min(observations)
+
+
+def _query_record_observation(
+    record: Mapping[str, Any],
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    parameters: Mapping[str, Any],
+    collected_at: datetime,
+) -> datetime | None:
+    if capability == "wearable.body-summary":
+        return _body_summary_observation(
+            record,
+            start=start,
+            end=end,
+            parameters=parameters,
+            collected_at=collected_at,
+        )
+
+    if capability == "wearable.menstrual-cycles":
+        interval_start, _interval_end = _query_interval(
+            record,
+            start=start,
+            end=end,
+            label="wearable menstrual cycle",
+            allow_future_end=True,
+        )
+        if record.get("last_updated_at") is not None:
+            _query_timestamp(
+                record["last_updated_at"],
+                field="wearable menstrual cycle last_updated_at",
+            )
+        return interval_start
+
+    interval_capabilities = {
+        "wearable.sleep-sessions",
+        "wearable.workouts",
+        "wearable.provider-workout-detail",
+        "wearable.provider-workouts",
+    }
+    if capability not in interval_capabilities:
+        return None
+
+    label = (
+        "wearable sleep session"
+        if capability == "wearable.sleep-sessions"
+        else "wearable workout"
+    )
+    interval_start, interval_end = _query_interval(
+        record,
+        start=start,
+        end=end,
+        label=label,
+    )
+    if capability in {
+        "wearable.provider-workout-detail",
+        "wearable.provider-workouts",
+    }:
+        expected_provider = parameters.get("provider")
+        if (
+            type(expected_provider) is not str
+            or record.get("provider") != expected_provider
+        ):
+            raise ValueError(
+                "wearable provider workout provider is inconsistent"
+            )
+        _validate_nested_provider_timestamps(
+            record,
+            interval_start=interval_start,
+            interval_end=interval_end,
+        )
+    if capability == "wearable.provider-workout-detail":
+        expected_workout_id = parameters.get("workout_id")
+        if (
+            type(expected_workout_id) is not str
+            or record.get("provider_workout_id") != expected_workout_id
+        ):
+            raise ValueError(
+                "wearable provider workout detail identity is inconsistent"
+            )
+    return interval_start
+
+
 def _query_retention_basis(
     result: Mapping[str, Any],
     *,
@@ -1494,6 +1752,7 @@ def _query_retention_basis(
     start: datetime,
     end: datetime,
     timezone: str,
+    parameters: Mapping[str, Any],
     collected_at: datetime,
 ) -> datetime:
     """Use the oldest retained record, not the requested window, for expiry."""
@@ -1514,6 +1773,17 @@ def _query_retention_basis(
             raise ValueError(
                 "wearable query result record is invalid"
             )
+        capability_observation = _query_record_observation(
+            record,
+            capability=capability,
+            start=observed_start,
+            end=observed_end,
+            parameters=parameters,
+            collected_at=collected,
+        )
+        if capability_observation is not None:
+            observations.append(capability_observation)
+            continue
         observation: datetime | None = None
         raw_timestamp: Any = None
         if (
@@ -1573,28 +1843,6 @@ def _query_retention_basis(
             raise ValueError(
                 "wearable query result record observation is invalid"
             )
-        if capability == "wearable.workouts":
-            raw_end = record.get("end_time")
-            if not isinstance(raw_end, str):
-                raise ValueError(
-                    "wearable workout result interval is invalid"
-                )
-            try:
-                workout_end = datetime.fromisoformat(
-                    raw_end.replace("Z", "+00:00")
-                )
-            except ValueError:
-                workout_end = None
-            if (
-                workout_end is None
-                or workout_end.tzinfo is None
-                or not observation
-                < workout_end.astimezone(UTC)
-                <= observed_end
-            ):
-                raise ValueError(
-                    "wearable workout result interval is invalid"
-                )
         observations.append(observation)
     return min(observations)
 
@@ -1691,11 +1939,17 @@ def persist_open_wearables_query_snapshot(
     private_provenance: Sequence[Mapping[str, Any]] | None = None,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
 ) -> WearableQuerySnapshot:
     """Persist one bounded sanitized query result under the wellness fence."""
 
     with activity_write_lock():
         lock_activity_write_plane(session)
+        if expected_source_policy is not None:
+            assert_input_source_policy_binding(
+                session,
+                expected_source_policy,
+            )
         current = _aware_utc(now, field="now")
         collected = _aware_utc(collected_at, field="collected_at")
         if collected > current + _MAX_CLOCK_SKEW:
@@ -1824,6 +2078,7 @@ def persist_open_wearables_query_snapshot(
                 start=datetime.fromisoformat(str(scope["start"])),
                 end=datetime.fromisoformat(str(scope["end"])),
                 timezone=timezone,
+                parameters=scope["parameters"],
                 collected_at=collected,
             )
             source_record_id = _query_source_record_id(
@@ -1930,6 +2185,7 @@ def commit_open_wearables_query_snapshot(
     private_provenance: Sequence[Mapping[str, Any]] | None = None,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
 ) -> WearableQuerySnapshot:
     """Commit one query mirror independently from a read-only search session."""
 
@@ -1951,6 +2207,7 @@ def commit_open_wearables_query_snapshot(
             private_provenance=private_provenance,
             collected_at=collected_at,
             now=now,
+            expected_source_policy=expected_source_policy,
         )
 
 
@@ -2040,6 +2297,7 @@ def _wearable_query_snapshot_v1_from_event(
             start=start,
             end=end,
             timezone=timezone,
+            parameters=expected_scope["parameters"],
             collected_at=collected_at,
         )
         expected_source_record_id = _query_source_record_id(
