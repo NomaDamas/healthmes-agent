@@ -9,6 +9,7 @@ private final class RecordingHealthKitKeyProvider:
     private let key: SymmetricKey
     var isAvailable = true
     var deleteError: HealthKitSyncOutboxError?
+    var loadKeyErrors: [HealthKitSyncOutboxError] = []
     private(set) var deleteCalls = 0
 
     init(seed: UInt8 = 7) {
@@ -22,7 +23,10 @@ private final class RecordingHealthKitKeyProvider:
     }
 
     func loadKey() throws -> SymmetricKey? {
-        isAvailable ? key : nil
+        if !loadKeyErrors.isEmpty {
+            throw loadKeyErrors.removeFirst()
+        }
+        return isAvailable ? key : nil
     }
 
     func deleteKey() throws {
@@ -226,6 +230,46 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         XCTAssertNil(deferred)
     }
 
+    func testTerminalFailurePersistsAndStopsAutomaticRetry() async throws {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let entry = try await fixture.outbox.enqueue(
+            body: Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a",
+            enqueuedAt: now
+        )
+
+        let terminal = try await fixture.outbox.markTerminal(
+            idempotencyKey: entry.idempotencyKey,
+            destinationFingerprint: "destination-a",
+            reason: "HTTP 422 invalid payload"
+        )
+        let reloaded = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+
+        XCTAssertEqual(terminal?.terminalFailure, "HTTP 422 invalid payload")
+        let nextPending = try await reloaded.nextPending(
+            destinationFingerprint: "destination-a",
+            now: now.addingTimeInterval(86_400)
+        )
+        XCTAssertNil(nextPending)
+        let persisted = try await reloaded.pendingEntries(
+            destinationFingerprint: "destination-a"
+        )
+        XCTAssertEqual(persisted.first?.terminalFailure, "HTTP 422 invalid payload")
+
+        let retried = try await reloaded.markFailed(
+            idempotencyKey: entry.idempotencyKey,
+            destinationFingerprint: "destination-a",
+            now: now
+        )
+        XCTAssertNil(retried?.terminalFailure)
+    }
+
     func testNextPendingReturnsDueEntryOnly() async throws {
         let fixture = makeFixture()
         defer { removeFixture(fixture) }
@@ -382,6 +426,34 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         XCTAssertEqual(fixture.keyProvider.deleteCalls, 0)
     }
 
+    func testTransientKeychainReadFailureCanRecoverWithoutRestart() async throws {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        _ = try await fixture.outbox.enqueue(
+            body: Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a"
+        )
+        let reloaded = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+        let transient = HealthKitSyncOutboxError.keychainReadFailed(
+            errSecInteractionNotAllowed
+        )
+        fixture.keyProvider.loadKeyErrors = [transient]
+
+        await assertOutboxError(transient) {
+            _ = try await reloaded.pendingCount(
+                destinationFingerprint: "destination-a"
+            )
+        }
+        let pendingCount = try await reloaded.pendingCount(
+            destinationFingerprint: "destination-a"
+        )
+        XCTAssertEqual(pendingCount, 1)
+    }
+
     func testOversizedFileIsReportedWithoutDeletingUserData() async throws {
         let fixture = makeFixture(maximumBytes: 128)
         defer { removeFixture(fixture) }
@@ -415,6 +487,87 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         XCTAssertEqual(fixture.keyProvider.deleteCalls, 1)
     }
 
+    func testUserRemovalCanDiscardCorruptQueueWhenKeyDeletionFails() async throws {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        try FileManager.default.createDirectory(
+            at: fixture.fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data([0xff, 0x00, 0x01]).write(to: fixture.fileURL)
+        fixture.keyProvider.deleteError = .keychainDeleteFailed(
+            errSecInteractionNotAllowed
+        )
+
+        _ = try await fixture.outbox.purgeForUserRemoval(
+            destinationFingerprint: "destination-a"
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        XCTAssertEqual(fixture.keyProvider.deleteCalls, 1)
+        let pendingCount = try await fixture.outbox.pendingCount()
+        XCTAssertEqual(pendingCount, 0)
+    }
+
+    func testUserRemovalCanDiscardQueueWhenEncryptionKeyIsMissing() async throws {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        _ = try await fixture.outbox.enqueue(
+            body: Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a"
+        )
+        fixture.keyProvider.isAvailable = false
+        fixture.keyProvider.deleteError = .keychainDeleteFailed(
+            errSecInteractionNotAllowed
+        )
+        let reloaded = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+
+        _ = try await reloaded.purgeForUserRemoval(
+            destinationFingerprint: "destination-a"
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        XCTAssertEqual(fixture.keyProvider.deleteCalls, 1)
+        let pendingCount = try await reloaded.pendingCount()
+        XCTAssertEqual(pendingCount, 0)
+    }
+
+    func testUserRemovalPreservesQueueOnTransientKeychainFailure() async throws {
+        let fixture = makeFixture()
+        defer { removeFixture(fixture) }
+        _ = try await fixture.outbox.enqueue(
+            body: Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8),
+            anchors: [:],
+            destinationFingerprint: "destination-a"
+        )
+        let original = try Data(contentsOf: fixture.fileURL)
+        let transient = HealthKitSyncOutboxError.keychainReadFailed(
+            errSecInteractionNotAllowed
+        )
+        fixture.keyProvider.loadKeyErrors = [transient]
+        let reloaded = HealthKitSyncOutbox(
+            fileURL: fixture.fileURL,
+            keyProvider: fixture.keyProvider
+        )
+
+        await assertOutboxError(transient) {
+            _ = try await reloaded.purgeForUserRemoval(
+                destinationFingerprint: "destination-a"
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), original)
+        XCTAssertEqual(fixture.keyProvider.deleteCalls, 0)
+        let pendingCount = try await reloaded.pendingCount(
+            destinationFingerprint: "destination-a"
+        )
+        XCTAssertEqual(pendingCount, 1)
+    }
+
     func testPurgeAllClearsMemoryWhenKeyDeletionFails() async throws {
         let fixture = makeFixture()
         defer { removeFixture(fixture) }
@@ -434,6 +587,73 @@ final class HealthKitSyncOutboxTests: XCTestCase {
         let pendingCount = try await fixture.outbox.pendingCount()
         XCTAssertEqual(pendingCount, 0)
         XCTAssertEqual(fixture.keyProvider.deleteCalls, 1)
+    }
+
+    @MainActor
+    func testPairingReplacementCleansOldPairingBeforeSavingCandidate() async throws {
+        let current = Pairing(
+            baseURL: URL(string: "https://old.healthmes.example")!,
+            token: "old"
+        )
+        let candidate = Pairing(
+            baseURL: URL(string: "https://new.healthmes.example")!,
+            token: "new"
+        )
+        var events: [String] = []
+
+        let saved = try await PairingReplacementTransaction.apply(
+            current: current,
+            candidate: candidate,
+            save: { pairing in
+                events.append("save:\(pairing.baseURL.host ?? "")")
+                return pairing
+            },
+            cleanup: { pairing in
+                events.append("cleanup:\(pairing.baseURL.host ?? "")")
+            }
+        )
+
+        XCTAssertEqual(saved, candidate)
+        XCTAssertEqual(
+            events,
+            [
+                "cleanup:old.healthmes.example",
+                "save:new.healthmes.example",
+            ]
+        )
+    }
+
+    @MainActor
+    func testPairingReplacementDoesNotSaveCandidateWhenCleanupFails() async {
+        let current = Pairing(
+            baseURL: URL(string: "https://old.healthmes.example")!,
+            token: "old"
+        )
+        let candidate = Pairing(
+            baseURL: URL(string: "https://new.healthmes.example")!,
+            token: "new"
+        )
+        var saveCalls = 0
+
+        do {
+            _ = try await PairingReplacementTransaction.apply(
+                current: current,
+                candidate: candidate,
+                save: { pairing in
+                    saveCalls += 1
+                    return pairing
+                },
+                cleanup: { _ in
+                    throw HealthKitSyncOutboxError.persistenceFailed
+                }
+            )
+            XCTFail("Expected cleanup failure")
+        } catch let error as HealthKitSyncOutboxError {
+            XCTAssertEqual(error, .persistenceFailed)
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
+        XCTAssertEqual(saveCalls, 0)
     }
 
     func testEntryTooLargeDoesNotWriteAFile() async throws {

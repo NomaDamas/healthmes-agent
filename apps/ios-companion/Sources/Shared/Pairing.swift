@@ -120,6 +120,25 @@ public struct Pairing: Equatable {
     }
 }
 
+public enum PairingReplacementTransaction {
+    @MainActor
+    public static func apply(
+        current: Pairing?,
+        candidate: Pairing,
+        save: (Pairing) throws -> Pairing,
+        cleanup: (Pairing) async throws -> Void
+    ) async throws -> Pairing {
+        if current == candidate {
+            return try save(candidate)
+        }
+
+        if let current {
+            try await cleanup(current)
+        }
+        return try save(candidate)
+    }
+}
+
 public enum PairingContextApplication {
     @discardableResult
     public static func apply(
@@ -389,17 +408,14 @@ public final class PairingStore {
 
     @discardableResult
     public func save(baseURLString: String, token: String) throws -> Pairing {
-        let url = try Self.normalizeBaseURL(baseURLString)
-        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard Self.isSecurePairingOrigin(url) else {
-            throw PairingError.insecureBaseURL
-        }
-        if !Self.isLoopbackOrigin(url), trimmedToken.isEmpty {
-            throw PairingError.tokenRequired
-        }
+        let pairing = try Self.validatedPairing(
+            baseURLString: baseURLString,
+            token: token
+        )
+        let url = pairing.baseURL
+        let trimmedToken = pairing.token ?? ""
 
         let previousToken = keychain.readToken()
-        let pairing = Pairing(baseURL: url, token: trimmedToken)
         let existingURL = defaults.string(forKey: Self.baseURLDefaultsKey)
             .flatMap { try? Self.normalizeBaseURL($0) }
         let existingToken = Pairing(baseURL: url, token: previousToken).token
@@ -426,6 +442,21 @@ public final class PairingStore {
         defaults.set(pairing.cacheFingerprint, forKey: Self.fingerprintDefaultsKey)
         defaults.set(NSNumber(value: nextGeneration), forKey: Self.generationDefaultsKey)
         return pairing
+    }
+
+    public static func validatedPairing(
+        baseURLString: String,
+        token: String
+    ) throws -> Pairing {
+        let url = try Self.normalizeBaseURL(baseURLString)
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isSecurePairingOrigin(url) else {
+            throw PairingError.insecureBaseURL
+        }
+        if !Self.isLoopbackOrigin(url), trimmedToken.isEmpty {
+            throw PairingError.tokenRequired
+        }
+        return Pairing(baseURL: url, token: trimmedToken)
     }
 
     public func clear() {

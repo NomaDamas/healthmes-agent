@@ -190,10 +190,64 @@ final class HealthKitIngestContractTests: XCTestCase {
         }
     }
 
+    func testDurableRawAckConfirmsAnchorsAcrossTerminalProcessingStates() throws {
+        let body = Data(#"{"schema":"healthmes.healthkit.v1"}"#.utf8)
+        for (parseStatus, forwardStatus) in [
+            ("parsed", "queued"),
+            ("parsed", "forward_failed"),
+            ("parsed", "deletions_recorded"),
+            ("stored_unparsed", "nothing_mapped"),
+        ] {
+            let ack = try makeAck(
+                durable: true,
+                sha256: HealthKitSyncOutboxIdentity.sha256Hex(body),
+                sizeBytes: body.count,
+                parseStatus: parseStatus,
+                forwardStatus: forwardStatus
+            )
+            XCTAssertNoThrow(
+                try ack.validate(exactBody: body),
+                "\(parseStatus)/\(forwardStatus)"
+            )
+        }
+    }
+
+    func testHealthKitUploadFailureDispositionSeparatesPermanentFailures() {
+        assertRetryable(
+            HealthMesAPIError.transport(
+                underlying: URLError(.notConnectedToInternet)
+            )
+        )
+        assertRetryable(HealthMesAPIError.httpStatus(429))
+        assertRetryable(HealthMesAPIError.httpStatus(503))
+        assertRetryable(
+            HealthMesAPIError.server(
+                statusCode: 409,
+                code: "healthkit_ingest_in_progress",
+                message: "still processing",
+                detail: nil
+            )
+        )
+
+        assertTerminal(HealthMesAPIError.unauthorized(statusCode: 401))
+        assertTerminal(HealthMesAPIError.httpStatus(413))
+        assertTerminal(
+            HealthMesAPIError.server(
+                statusCode: 422,
+                code: "invalid_payload",
+                message: "invalid payload",
+                detail: nil
+            )
+        )
+        assertTerminal(HealthKitIngestAckValidationError.hashMismatch)
+    }
+
     private func makeAck(
         durable: Bool,
         sha256: String,
-        sizeBytes: Int
+        sizeBytes: Int,
+        parseStatus: String = "parsed",
+        forwardStatus: String = "queued"
     ) throws -> HealthKitIngestAck {
         let data = try JSONSerialization.data(
             withJSONObject: [
@@ -201,8 +255,8 @@ final class HealthKitIngestContractTests: XCTestCase {
                 "durable": durable,
                 "sha256": sha256,
                 "size_bytes": sizeBytes,
-                "parse_status": "parsed",
-                "forward_status": "queued",
+                "parse_status": parseStatus,
+                "forward_status": forwardStatus,
                 "records_forwarded": 0,
                 "sleep_forwarded": 0,
                 "workouts_forwarded": 0,
@@ -214,5 +268,31 @@ final class HealthKitIngestContractTests: XCTestCase {
             HealthKitIngestAck.self,
             from: data
         )
+    }
+
+    private func assertRetryable(
+        _ error: Error,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(
+            HealthKitUploadFailureDisposition.classify(error),
+            .retryable,
+            file: file,
+            line: line
+        )
+    }
+
+    private func assertTerminal(
+        _ error: Error,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .terminal =
+            HealthKitUploadFailureDisposition.classify(error)
+        else {
+            XCTFail("Expected terminal failure", file: file, line: line)
+            return
+        }
     }
 }

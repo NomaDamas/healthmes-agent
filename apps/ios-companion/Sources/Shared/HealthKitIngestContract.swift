@@ -254,3 +254,52 @@ public enum HealthKitIngestAckValidationError:
         }
     }
 }
+
+public enum HealthKitUploadFailureDisposition: Equatable, Sendable {
+    case retryable
+    case terminal(reason: String)
+
+    public static func classify(_ error: Error) -> Self {
+        if let error = error as? HealthMesAPIError {
+            switch error {
+            case .transport:
+                return .retryable
+            case .httpStatus(let status):
+                return isRetryable(status: status)
+                    ? .retryable
+                    : .terminal(reason: "HTTP \(status)")
+            case .server(let status, let code, _, _):
+                if status == 409, code == "healthkit_ingest_in_progress" {
+                    return .retryable
+                }
+                return isRetryable(status: status)
+                    ? .retryable
+                    : .terminal(reason: "HTTP \(status) \(code)")
+            case .unauthorized(let status):
+                return .terminal(reason: "HTTP \(status) unauthorized")
+            case .decoding:
+                return .terminal(
+                    reason: "The HealthKit acknowledgement was invalid."
+                )
+            case .notPaired:
+                return .terminal(reason: "HealthMes is not paired.")
+            }
+        }
+        if error is HealthKitIngestAckValidationError
+            || error is HealthKitUploadRequestError
+        {
+            return .terminal(
+                reason: "The HealthKit acknowledgement contract failed."
+            )
+        }
+        return .retryable
+    }
+
+    private static func isRetryable(status: Int) -> Bool {
+        status <= 0
+            || status == 408
+            || status == 425
+            || status == 429
+            || (500...599).contains(status)
+    }
+}

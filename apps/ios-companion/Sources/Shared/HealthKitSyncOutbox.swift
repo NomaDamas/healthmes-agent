@@ -237,13 +237,14 @@ public struct HealthKitSyncOutboxEntry: Codable, Equatable, Sendable {
     public let enqueuedAt: Date
     public var failedAttempts: Int
     public var nextAttemptAt: Date
+    public var terminalFailure: String?
 
     public var isDue: Bool {
         isDue(at: Date())
     }
 
     public func isDue(at now: Date) -> Bool {
-        nextAttemptAt <= now
+        terminalFailure == nil && nextAttemptAt <= now
     }
 }
 
@@ -282,7 +283,6 @@ public actor HealthKitSyncOutbox {
     private let fileManager: FileManager
     private var entries: [HealthKitSyncOutboxEntry] = []
     private var didLoad = false
-    private var loadError: HealthKitSyncOutboxError?
 
     public init(
         fileURL: URL,
@@ -421,6 +421,28 @@ public actor HealthKitSyncOutbox {
             afterFailedAttempts: candidate[index].failedAttempts,
             now: now
         )
+        candidate[index].terminalFailure = nil
+        try persist(candidate)
+        entries = candidate
+        return candidate[index]
+    }
+
+    @discardableResult
+    public func markTerminal(
+        idempotencyKey: String,
+        destinationFingerprint: String,
+        reason: String
+    ) throws -> HealthKitSyncOutboxEntry? {
+        try ensureLoaded()
+        guard let index = entries.firstIndex(where: {
+            $0.idempotencyKey == idempotencyKey
+                && $0.destinationFingerprint == destinationFingerprint
+        }) else {
+            return nil
+        }
+
+        var candidate = entries
+        candidate[index].terminalFailure = String(reason.prefix(256))
         try persist(candidate)
         entries = candidate
         return candidate[index]
@@ -442,10 +464,36 @@ public actor HealthKitSyncOutbox {
         return removed
     }
 
+    /// User-directed removal remains possible when selective purge cannot
+    /// decrypt or rewrite the queue. The fallback removes the local ciphertext;
+    /// deleting an orphaned random key is best effort.
+    @discardableResult
+    public func purgeForUserRemoval(
+        destinationFingerprint: String
+    ) throws -> Int {
+        do {
+            return try purge(
+                destinationFingerprint: destinationFingerprint
+            )
+        } catch let error as HealthKitSyncOutboxError {
+            guard Self.requiresFullPurgeForUserRemoval(error) else {
+                throw error
+            }
+            return try purgeAll(requireKeyDeletion: false)
+        }
+    }
+
     /// Explicit crypto-erasure for the entire outbox. This bypasses loading so
     /// a corrupt ciphertext can still be removed by a user-directed action.
     @discardableResult
     public func purgeAll() throws -> Int {
+        try purgeAll(requireKeyDeletion: true)
+    }
+
+    @discardableResult
+    private func purgeAll(
+        requireKeyDeletion: Bool
+    ) throws -> Int {
         let removed = didLoad ? entries.count : 0
         if fileManager.fileExists(atPath: fileURL.path) {
             do {
@@ -458,33 +506,53 @@ public actor HealthKitSyncOutbox {
         // in memory even if best-effort Keychain crypto-erasure fails.
         entries = []
         didLoad = true
-        loadError = nil
         do {
             try keyProvider.deleteKey()
         } catch let error as HealthKitSyncOutboxError {
-            throw error
+            if requireKeyDeletion {
+                throw error
+            }
         } catch {
-            throw HealthKitSyncOutboxError.keychainDeleteFailed(
-                errSecInteractionNotAllowed
-            )
+            if requireKeyDeletion {
+                throw HealthKitSyncOutboxError.keychainDeleteFailed(
+                    errSecInteractionNotAllowed
+                )
+            }
         }
         return removed
     }
 
     private func ensureLoaded() throws {
-        if let loadError {
-            throw loadError
-        }
         guard !didLoad else { return }
-        do {
-            entries = try loadEntries()
-            didLoad = true
-        } catch let error as HealthKitSyncOutboxError {
-            loadError = error
-            throw error
-        } catch {
-            loadError = .invalidFile
-            throw HealthKitSyncOutboxError.invalidFile
+        entries = try loadEntries()
+        didLoad = true
+    }
+
+    private static func requiresFullPurgeForUserRemoval(
+        _ error: HealthKitSyncOutboxError
+    ) -> Bool {
+        switch error {
+        case .fileTooLarge,
+            .storedEntryCountExceeded,
+            .invalidFile,
+            .unsupportedFileVersion,
+            .unsupportedPayloadVersion,
+            .decryptionFailed,
+            .keyUnavailable,
+            .invalidKey,
+            .queueTooLarge,
+            .entryTooLarge,
+            .invalidEntry:
+            return true
+        case .invalidDestinationFingerprint,
+            .invalidBody,
+            .duplicatePayloadConflict,
+            .encryptionFailed,
+            .persistenceFailed,
+            .keychainReadFailed,
+            .keychainWriteFailed,
+            .keychainDeleteFailed:
+            return false
         }
     }
 
@@ -512,7 +580,8 @@ public actor HealthKitSyncOutbox {
             destinationFingerprint: destinationFingerprint,
             enqueuedAt: enqueuedAt,
             failedAttempts: 0,
-            nextAttemptAt: enqueuedAt
+            nextAttemptAt: enqueuedAt,
+            terminalFailure: nil
         )
         try validateEntry(entry)
         return entry
@@ -735,6 +804,7 @@ public actor HealthKitSyncOutbox {
             !entry.destinationFingerprint.isEmpty,
             entry.destinationFingerprint.count <= 256,
             entry.failedAttempts >= 0,
+            (entry.terminalFailure?.count ?? 0) <= 256,
             entry.enqueuedAt.timeIntervalSinceReferenceDate.isFinite,
             entry.nextAttemptAt.timeIntervalSinceReferenceDate.isFinite
         else {
