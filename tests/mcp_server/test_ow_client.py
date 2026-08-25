@@ -29,6 +29,54 @@ class TrackingByteStream(httpx.AsyncByteStream):
             yield chunk
 
 
+def _coverage_payload() -> dict:
+    return {
+        "providers": ["garmin", "whoop"],
+        "timeseries": [
+            {
+                "name": "Heart & Cardiovascular",
+                "metrics": [
+                    {
+                        "code": "heart_rate",
+                        "unit": "bpm",
+                        "providers": ["garmin", "whoop"],
+                    }
+                ],
+            }
+        ],
+        "workout_fields": [
+            {"code": "distance", "providers": ["garmin", "whoop"]}
+        ],
+        "sleep_fields": [
+            {"code": "duration", "providers": ["garmin", "whoop"]}
+        ],
+        "health_scores": [
+            {"code": "recovery", "providers": ["whoop"]}
+        ],
+    }
+
+
+def _data_summary_payload(user_id: str) -> dict:
+    return {
+        "user_id": user_id,
+        "total_data_points": 5,
+        "total_workouts": 2,
+        "total_sleep_events": 1,
+        "series_type_counts": {"heart_rate": 3, "steps": 2},
+        "workout_type_counts": {"running": 2},
+        "by_provider": [
+            {
+                "provider": "garmin",
+                "data_points": 5,
+                "series_counts": {"heart_rate": 3, "steps": 2},
+                "workout_count": 2,
+                "sleep_count": 1,
+            }
+        ],
+        "has_womens_health_data": False,
+    }
+
+
 class TestRequestShape:
     async def test_health_scores_path_params_and_auth_header(
         self, fake_ow, ow_client, ow_user_id, ow_api_key
@@ -167,11 +215,7 @@ class TestRequestShape:
                 )
             return httpx.Response(
                 200,
-                json={
-                    "series_types": [],
-                    "event_types": [],
-                    "providers": [],
-                },
+                json=_data_summary_payload(ow_user_id),
             )
 
         client = OWClient(
@@ -207,7 +251,7 @@ class TestRequestShape:
             "start_date": "2026-07-01",
             "end_date": "2026-07-09",
         }
-        assert data["providers"] == []
+        assert data["by_provider"][0]["provider"] == "garmin"
 
     async def test_provider_metadata_route_signatures(self, ow_api_key):
         requests: list[httpx.Request] = []
@@ -215,7 +259,7 @@ class TestRequestShape:
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
             if request.url.path.endswith("/meta/coverage"):
-                return httpx.Response(200, json={"providers": ["whoop"]})
+                return httpx.Response(200, json=_coverage_payload())
             return httpx.Response(
                 200,
                 json=[{"provider": "whoop", "is_enabled": True}],
@@ -236,7 +280,7 @@ class TestRequestShape:
         coverage_request, providers_request = requests
         assert coverage_request.url.path == "/api/v1/meta/coverage"
         assert coverage_request.headers["X-Open-Wearables-API-Key"] == ow_api_key
-        assert coverage == {"providers": ["whoop"]}
+        assert coverage == _coverage_payload()
         assert providers_request.url.path == "/api/v1/providers"
         assert dict(providers_request.url.params) == {
             "enabled_only": "true",
@@ -561,8 +605,9 @@ class TestErrorMapping:
             transport=httpx.MockTransport(handler),
         )
 
-        with pytest.raises(OWClientError, match="invalid connections response"):
+        with pytest.raises(OWClientError, match="invalid connections response") as exc:
             await client.get_connections(ow_user_id)
+        assert type(exc.value) is OWClientError
 
     async def test_connections_rejects_non_object_rows(
         self, ow_user_id, ow_api_key
@@ -576,7 +621,99 @@ class TestErrorMapping:
             transport=httpx.MockTransport(handler),
         )
 
-        with pytest.raises(OWClientError, match="invalid connections response"):
+        with pytest.raises(OWPayloadError, match="invalid connections response"):
+            await client.get_connections(ow_user_id)
+
+    async def test_connections_mixed_list_rejects_bad_row_as_payload_error(
+        self, ow_user_id, ow_api_key
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {"provider": "whoop", "status": "active"},
+                    "private-provider-user-id",
+                ],
+            )
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid connections response"):
+            await client.get_connections(ow_user_id)
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {"provider": "WHOOP", "status": "active"},
+            {"provider": "whoop_alias", "status": "active"},
+            {"provider": "whoop", "status": "ACTIVE"},
+            {
+                "provider": "whoop",
+                "status": "active",
+                "id": "not-a-uuid",
+            },
+            {
+                "provider": "whoop",
+                "status": "active",
+                "user_id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+            },
+            {
+                "provider": "whoop",
+                "status": "active",
+                "linked_user_ids": ["NOT-A-UUID"],
+            },
+        ],
+    )
+    async def test_connections_rejects_malformed_rows(
+        self, ow_user_id, ow_api_key, row
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[row])
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid connections response"):
+            await client.get_connections(ow_user_id)
+
+    async def test_connections_rejects_duplicate_ids(
+        self, ow_user_id, ow_api_key
+    ):
+        connection_id = "3f0efad3-6acc-4ddd-9128-2be58dfb7556"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": connection_id,
+                        "user_id": ow_user_id,
+                        "provider": "whoop",
+                        "status": "active",
+                    },
+                    {
+                        "id": connection_id,
+                        "user_id": ow_user_id,
+                        "provider": "garmin",
+                        "status": "active",
+                    },
+                ],
+            )
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid connections response"):
             await client.get_connections(ow_user_id)
 
     @pytest.mark.parametrize(
@@ -603,6 +740,309 @@ class TestErrorMapping:
 
         with pytest.raises(OWClientError, match="invalid data sources response"):
             await client.get_user_data_sources(ow_user_id)
+
+    async def test_data_sources_preserves_valid_vendored_shape(
+        self, ow_user_id, ow_api_key
+    ):
+        source_id = "3f0efad3-6acc-4ddd-9128-2be58dfb7556"
+        connection_id = "0611817f-24cc-4d20-8d86-e55b93e9402c"
+        payload = {
+            "items": [
+                {
+                    "id": source_id,
+                    "user_id": ow_user_id,
+                    "provider": "whoop",
+                    "user_connection_id": connection_id,
+                    "device_model": None,
+                    "software_version": None,
+                    "source": "whoop",
+                    "device_type": None,
+                    "original_source_name": None,
+                    "display_name": "Whoop",
+                }
+            ],
+            "total": 1,
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert await client.get_user_data_sources(ow_user_id) == payload
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {
+                "items": [
+                    {
+                        "id": "not-a-uuid",
+                        "user_id": "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e",
+                        "provider": "whoop",
+                    }
+                ],
+                "total": 1,
+            },
+            {
+                "items": [
+                    {
+                        "id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+                        "user_id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+                        "provider": "whoop",
+                    }
+                ],
+                "total": 1,
+            },
+            {
+                "items": [
+                    {
+                        "id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+                        "user_id": "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e",
+                        "provider": "apple_health",
+                    }
+                ],
+                "total": 1,
+            },
+            {
+                "items": [
+                    {
+                        "id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+                        "user_id": "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e",
+                        "provider": "whoop",
+                    }
+                ],
+                "total": 2,
+            },
+            {
+                "items": [
+                    {
+                        "id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+                        "user_id": "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e",
+                        "provider": "whoop",
+                    },
+                    {
+                        "id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+                        "user_id": "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e",
+                        "provider": "whoop",
+                    },
+                ],
+                "total": 2,
+            },
+        ],
+    )
+    async def test_data_sources_rejects_invalid_rows_and_totals(
+        self, ow_user_id, ow_api_key, payload
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid data sources response"):
+            await client.get_user_data_sources(ow_user_id)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [],
+            {
+                **_coverage_payload(),
+                "providers": ["whoop", "whoop"],
+            },
+            {
+                **_coverage_payload(),
+                "providers": ["apple_health", "whoop"],
+            },
+            {
+                **_coverage_payload(),
+                "timeseries": [
+                    {
+                        "name": "Heart",
+                        "metrics": [
+                            {
+                                "code": "",
+                                "unit": "bpm",
+                                "providers": ["whoop"],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                **_coverage_payload(),
+                "workout_fields": [
+                    {"code": "distance", "providers": ["polar"]}
+                ],
+            },
+            {
+                **_coverage_payload(),
+                "health_scores": [
+                    {"code": "made_up_score", "providers": ["whoop"]}
+                ],
+            },
+        ],
+    )
+    async def test_provider_coverage_rejects_malformed_metadata(
+        self, ow_api_key, payload
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid provider coverage"):
+            await client.get_provider_coverage()
+
+    async def test_provider_coverage_rejects_duplicate_metric_codes(
+        self, ow_api_key
+    ):
+        payload = _coverage_payload()
+        payload["timeseries"].append(
+            {
+                "name": "Duplicate",
+                "metrics": [
+                    {
+                        "code": "heart_rate",
+                        "unit": "bpm",
+                        "providers": ["whoop"],
+                    }
+                ],
+            }
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid provider coverage"):
+            await client.get_provider_coverage()
+
+    async def test_data_summary_preserves_valid_vendored_shape(
+        self, ow_user_id, ow_api_key
+    ):
+        payload = _data_summary_payload(ow_user_id)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert await client.get_data_summary(ow_user_id) == payload
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "user_id": "3f0efad3-6acc-4ddd-9128-2be58dfb7556",
+            },
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "total_data_points": True,
+            },
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "series_type_counts": {"": 5},
+            },
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "by_provider": [
+                    {
+                        "provider": "garmin_connect",
+                        "data_points": 5,
+                        "series_counts": {"heart_rate": 3, "steps": 2},
+                        "workout_count": 2,
+                        "sleep_count": 1,
+                    }
+                ],
+            },
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "by_provider": [
+                    {
+                        "provider": "garmin",
+                        "data_points": 5,
+                        "series_counts": {"heart_rate": 3, "steps": 2},
+                        "workout_count": 2,
+                        "sleep_count": 1,
+                    },
+                    {
+                        "provider": "garmin",
+                        "data_points": 0,
+                        "series_counts": {},
+                        "workout_count": 0,
+                        "sleep_count": 0,
+                    },
+                ],
+            },
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "total_workouts": 3,
+            },
+            {
+                **_data_summary_payload(
+                    "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
+                ),
+                "by_provider": [
+                    {
+                        "provider": "garmin",
+                        "data_points": 4,
+                        "series_counts": {"heart_rate": 3, "steps": 2},
+                        "workout_count": 2,
+                        "sleep_count": 1,
+                    }
+                ],
+            },
+        ],
+    )
+    async def test_data_summary_rejects_malformed_or_conflicting_counts(
+        self, ow_user_id, ow_api_key, payload
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWPayloadError, match="invalid data summary"):
+            await client.get_data_summary(ow_user_id)
 
     async def test_configured_providers_rejects_non_list_response(
         self, ow_api_key

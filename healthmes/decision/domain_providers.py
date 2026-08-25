@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import re
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from math import isfinite
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -27,6 +29,10 @@ from healthmes.activity.context import (
     recovery_activity_context,
 )
 from healthmes.activity.contracts import ActivityPlatform
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.activity.repository import (
     APP_INTERVAL_EVENT,
     RAW_EVENT_TYPES,
@@ -94,12 +100,23 @@ from healthmes.source_policy import (
     OPEN_WEARABLES_INPUT_SOURCE_ID,
     InputSourcePolicyBinding,
     StaleInputSourcePolicyError,
+    assert_input_source_policy_binding,
     input_source_policy_binding,
 )
 from healthmes.storage import retention_cutoff
 from healthmes.store import CalendarEventMirror, WellnessEvent
 from healthmes.store.enums import CalendarSource
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.availability import (
+    OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
+)
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    OpenWearablesProviderBindingChangedError,
+    ProviderBoundWearableContext,
+    current_open_wearables_execution_binding,
+)
+from healthmes.wearables.lineage import OpenWearablesLineageMode
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
     OPEN_WEARABLES_QUERY_EVENT_TYPE,
@@ -111,6 +128,7 @@ from healthmes.wearables.provenance import (
     commit_open_wearables_snapshot,
     latest_retained_open_wearables_query_snapshot,
     latest_retained_open_wearables_snapshot,
+    open_wearables_daily_execution_scope_digest,
     open_wearables_retention_policy_binding,
     persist_open_wearables_observation,
     persist_open_wearables_query_snapshot,
@@ -137,7 +155,19 @@ from healthmes.wearables.whoop_recovery import (
     WHOOP_RECOVERY_SNAPSHOT_DERIVER,
 )
 
-WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
+LegacyWearableReader = Callable[[date], Awaitable[dict[str, Any]]]
+
+
+class ProviderBoundWearableReader(Protocol):
+    async def __call__(
+        self,
+        day: date,
+        *,
+        provider_binding: OpenWearablesExecutionBinding,
+    ) -> ProviderBoundWearableContext: ...
+
+
+WearableReader = LegacyWearableReader | ProviderBoundWearableReader
 CalendarSourceResolver = Callable[[], Sequence[CalendarSource]]
 CalendarAccountGenerationResolver = Callable[
     [CalendarSource],
@@ -857,6 +887,8 @@ _WEARABLE_LIMITATION_CODES = (
     "open_wearables_context_timeout",
     "open_wearables_detail_unavailable",
     "open_wearables_detail_timeout",
+    "open_wearables_source_lineage_unverified",
+    OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
     "primary_signal_unavailable",
     "raw_value_out_of_range",
     "source_record_id_missing",
@@ -902,6 +934,12 @@ _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
         "wearable_upstream_page_limit_reached",
         "wearable_upstream_completeness_unverified",
     }
+)
+_WEARABLE_FALLBACK_CURSOR_REASONS = (
+    "open_wearables_detail_unavailable",
+    "open_wearables_detail_timeout",
+    "wearable_snapshot_persistence_failed",
+    "wearable_snapshot_writer_unavailable",
 )
 _WEARABLE_PROVIDER_FAMILIES = frozenset(
     {
@@ -1135,6 +1173,7 @@ def _wearable_cursor_scope(
     retention_window: Mapping[str, Any],
     records: Sequence[Mapping[str, Any]],
     stored: Mapping[str, Any],
+    response_limitations: Sequence[str] = (),
 ) -> dict[str, Any]:
     scope = _cursor_scope(query)
     scope["wearable_snapshot"] = {
@@ -1151,9 +1190,30 @@ def _wearable_cursor_scope(
                 "stream_attribution_status"
             ),
         },
+        "response_limitations": sorted(
+            value for value in response_limitations if value
+        ),
         "window": dict(retention_window),
     }
     return scope
+
+
+def _fallback_cursor_limitation_candidates(
+) -> tuple[tuple[str, ...], ...]:
+    """Enumerate immutable fallback states that a signed cursor may resume."""
+
+    fallback = {"wearable_query_snapshot_fallback_used"}
+    candidates: list[tuple[str, ...]] = []
+    for trimmed in (False, True):
+        base = set(fallback)
+        if trimmed:
+            base.add("wearable_retention_window_trimmed")
+        candidates.append(tuple(sorted(base)))
+        candidates.extend(
+            tuple(sorted({*base, reason}))
+            for reason in _WEARABLE_FALLBACK_CURSOR_REASONS
+        )
+    return tuple(candidates)
 
 
 def _canonical_digest(value: Mapping[str, Any]) -> str:
@@ -1218,26 +1278,14 @@ def _wearable_fetch_with_required_provider(
         _normalized_public_wearable_record(record)
         for record in fetched.records
     ]
-    return WearableSearchFetch(
+    return replace(
+        fetched,
         records=tuple(records),
-        upstream_truncated=fetched.upstream_truncated,
-        upstream_completeness_unverified=(
-            fetched.upstream_completeness_unverified
-        ),
-        payload_trimmed=fetched.payload_trimmed,
         discarded_rows=(
             fetched.discarded_rows
             + len(fetched.records)
             - len(records)
         ),
-        summary_window_partial=fetched.summary_window_partial,
-        conflicting_duplicate_rows=(
-            fetched.conflicting_duplicate_rows
-        ),
-        stream_attribution_unavailable=(
-            fetched.stream_attribution_unavailable
-        ),
-        granular_truncated=fetched.granular_truncated,
         package=(
             dict(fetched.package)
             if isinstance(fetched.package, Mapping)
@@ -1262,14 +1310,11 @@ def _wearable_fetch_with_current_retention(
         stream_attribution_verified=(
             not fetched.stream_attribution_unavailable
         ),
+        allow_missing_source_id=fetched.live_source_lineage_attested,
     )
-    return WearableSearchFetch(
+    return replace(
+        fetched,
         records=normalized.records,
-        upstream_truncated=fetched.upstream_truncated,
-        upstream_completeness_unverified=(
-            fetched.upstream_completeness_unverified
-        ),
-        payload_trimmed=fetched.payload_trimmed,
         discarded_rows=(
             fetched.discarded_rows + normalized.discarded_rows
         ),
@@ -3947,6 +3992,70 @@ class WearableContextProvider:
             return current
         return max(current, _as_utc(self._clock()))
 
+    @staticmethod
+    def _reader_accepts_provider_binding(reader: object) -> bool:
+        try:
+            signature = inspect.signature(reader)
+        except (TypeError, ValueError):
+            return False
+        parameter = signature.parameters.get("provider_binding")
+        if parameter is not None and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            return True
+        return any(
+            item.kind is inspect.Parameter.VAR_KEYWORD
+            for item in signature.parameters.values()
+        )
+
+    async def _commit_provider_bound_snapshot(
+        self,
+        *,
+        provider_binding: OpenWearablesExecutionBinding,
+        expected_source_policy: InputSourcePolicyBinding,
+        persist: Callable[
+            [Session],
+            WearableSnapshot | WearableQuerySnapshot,
+        ],
+    ) -> tuple[
+        WearableSnapshot | WearableQuerySnapshot | None,
+        str,
+    ]:
+        """Commit a provider-bound mirror only after final binding checks."""
+
+        factory = self._snapshot_session_factory
+        if factory is None:
+            return None, "wearable_snapshot_writer_unavailable"
+        try:
+            writer = factory()
+        except Exception:
+            return None, "wearable_snapshot_writer_unavailable"
+        with writer:
+            try:
+                if isinstance(writer.get_bind().pool, StaticPool):
+                    return None, "wearable_snapshot_writer_unavailable"
+                with activity_write_lock():
+                    lock_activity_write_plane(writer)
+                    snapshot = persist(writer)
+                    writer.flush()
+                    await provider_binding.revalidate()
+                    assert_input_source_policy_binding(
+                        writer,
+                        expected_source_policy,
+                    )
+                    writer.commit()
+            except OpenWearablesProviderBindingChangedError:
+                writer.rollback()
+                return None, OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+            except StaleInputSourcePolicyError:
+                writer.rollback()
+                return None, "wearable_source_policy_changed"
+            except Exception:
+                writer.rollback()
+                return None, "wearable_snapshot_persistence_failed"
+        return snapshot, ""
+
     def _current_retention_policy(
         self,
         session: Session,
@@ -4013,6 +4122,20 @@ class WearableContextProvider:
                 now=now,
                 source_policy=source_policy,
             )
+        provider_binding = current_open_wearables_execution_binding(
+            query.capability
+        )
+        execution_scope_digest = (
+            open_wearables_daily_execution_scope_digest(
+                capability=query.capability,
+                allowed_providers=provider_binding.allowed_providers,
+                provider_binding_digest=(
+                    provider_binding.provider_binding_digest
+                ),
+            )
+            if provider_binding is not None
+            else None
+        )
         day = _query_day(query, now=now)
         raw, snapshot, limitations = await self._snapshot_context(
             session,
@@ -4020,6 +4143,8 @@ class WearableContextProvider:
             timezone=query.timezone,
             now=now,
             source_policy=source_policy,
+            provider_binding=provider_binding,
+            execution_scope_digest=execution_scope_digest,
         )
         if raw is None or snapshot is None:
             return ContextResult(
@@ -4030,6 +4155,8 @@ class WearableContextProvider:
                     ContextStatus.FAILED
                     if {
                         "wearable_source_policy_changed",
+                        OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
+                        "open_wearables_source_lineage_unverified",
                         "wearable_snapshot_persistence_failed",
                         "wearable_snapshot_writer_unavailable",
                     }
@@ -4210,6 +4337,23 @@ class WearableContextProvider:
         now: datetime,
         source_policy: InputSourcePolicyBinding,
     ) -> ContextResult:
+        provider_binding = current_open_wearables_execution_binding(
+            query.capability
+        )
+        allowed_providers = (
+            provider_binding.allowed_providers
+            if provider_binding is not None
+            else None
+        )
+        provider_binding_digest = (
+            provider_binding.provider_binding_digest
+            if provider_binding is not None
+            else None
+        )
+        retained_only = (
+            provider_binding is not None
+            and provider_binding.retained_only
+        )
         start, end = self._detail_bounds(query, now=now)
         whoop_as_of = (
             _query_day(query, now=now)
@@ -4241,6 +4385,7 @@ class WearableContextProvider:
             privacy_level=query.privacy_level,
             retained_after=retained_after,
             as_of=whoop_as_of,
+            allowed_providers=allowed_providers,
         )
         validate_wearable_search_request(request)
 
@@ -4265,6 +4410,9 @@ class WearableContextProvider:
                 timezone=query.timezone,
                 parameters=snapshot_parameters,
                 now=now,
+                expected_provider_binding_digest=(
+                    provider_binding_digest
+                ),
             )
             if retained is None:
                 return ContextResult(
@@ -4288,6 +4436,7 @@ class WearableContextProvider:
                     retained,
                     provenance_mode="retained_related_record",
                     now=now,
+                    provider_binding=provider_binding,
                     expected_retention_policy=retention_policy,
                     allow_cursor=False,
                 )
@@ -4336,6 +4485,9 @@ class WearableContextProvider:
                         timezone=query.timezone,
                         parameters=snapshot_parameters,
                         now=now,
+                        expected_provider_binding_digest=(
+                            provider_binding_digest
+                        ),
                     )
                 )
                 if retained is None:
@@ -4343,12 +4495,13 @@ class WearableContextProvider:
                         "cursor is invalid or its wearable snapshot expired"
                     )
                 try:
-                    return self._detail_result(
+                    return self._detail_cursor_result(
                         query,
                         retained,
                         provenance_mode="retained_local_mirror",
                         now=now,
-                        expected_retention_policy=retention_policy,
+                        provider_binding=provider_binding,
+                        current_retention_policy=retention_policy,
                     )
                 except InvalidContextCursorError:
                     raise
@@ -4367,15 +4520,19 @@ class WearableContextProvider:
                 parameters=snapshot_parameters,
                 now=now,
                 candidate_limit=_LEGACY_WEARABLE_CURSOR_CANDIDATES,
+                expected_provider_binding_digest=(
+                    provider_binding_digest
+                ),
             )
             for retained in retained_snapshots:
                 try:
-                    return self._detail_result(
+                    return self._detail_cursor_result(
                         query,
                         retained,
                         provenance_mode="retained_local_mirror",
                         now=now,
-                        expected_retention_policy=retention_policy,
+                        provider_binding=provider_binding,
+                        current_retention_policy=retention_policy,
                     )
                 except (InvalidContextCursorError, ValueError):
                     continue
@@ -4405,7 +4562,7 @@ class WearableContextProvider:
                 limitations.add("wearable_retention_window_trimmed")
 
         fetched: WearableSearchFetch | None = None
-        if self._search_reader is not None:
+        if self._search_reader is not None and not retained_only:
             try:
                 async with asyncio.timeout(
                     self._upstream_timeout_seconds
@@ -4448,6 +4605,16 @@ class WearableContextProvider:
                 limitations.add("wearable_retention_window_trimmed")
 
         if fetched is not None:
+            fetched = _wearable_fetch_with_required_provider(fetched)
+            if (
+                provider_binding is not None
+                and not fetched.live_source_lineage_attested
+            ):
+                limitations.add(
+                    "open_wearables_source_lineage_unverified"
+                )
+                fetched = None
+        if fetched is not None:
             current_request = WearableSearchRequest(
                 capability=query.capability,
                 start=start,
@@ -4458,8 +4625,11 @@ class WearableContextProvider:
                 privacy_level=query.privacy_level,
                 retained_after=retained_after,
                 as_of=whoop_as_of,
+                allowed_providers=allowed_providers,
+                provider_source_lineage_verified=(
+                    fetched.provider_source_lineage_verified
+                ),
             )
-            fetched = _wearable_fetch_with_required_provider(fetched)
             fetched = _wearable_fetch_with_current_retention(
                 fetched,
                 request=current_request,
@@ -4488,7 +4658,7 @@ class WearableContextProvider:
                         )
                     )
                     snapshot, store_limitation = (
-                        self._store_detail_snapshot(
+                        await self._store_detail_snapshot(
                             session,
                             query=query,
                             start=start,
@@ -4501,6 +4671,7 @@ class WearableContextProvider:
                             collected_at=now,
                             now=now,
                             expected_source_policy=source_policy,
+                            provider_binding=provider_binding,
                         )
                     )
             else:
@@ -4530,7 +4701,7 @@ class WearableContextProvider:
                 if not incomplete_result:
                     stored_result["coverage"] = {"ratio": 1.0}
                 snapshot, store_limitation = (
-                    self._store_detail_snapshot(
+                    await self._store_detail_snapshot(
                         session,
                         query=query,
                         start=start,
@@ -4540,6 +4711,7 @@ class WearableContextProvider:
                         collected_at=now,
                         now=now,
                         expected_source_policy=source_policy,
+                        provider_binding=provider_binding,
                     )
                 )
             if snapshot is not None:
@@ -4550,6 +4722,7 @@ class WearableContextProvider:
                         snapshot,
                         provenance_mode="live_upstream_mirrored",
                         now=now,
+                        provider_binding=provider_binding,
                         extra_limitations=(
                             tuple(stored_limitations)
                             if query.capability
@@ -4563,7 +4736,10 @@ class WearableContextProvider:
                 )
             if store_limitation:
                 limitations.add(store_limitation)
-            if "wearable_source_policy_changed" in limitations:
+            if {
+                "wearable_source_policy_changed",
+                OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
+            } & limitations:
                 return ContextResult(
                     query_id=query.query_id,
                     provider_id=query.provider_id,
@@ -4591,116 +4767,53 @@ class WearableContextProvider:
             timezone=query.timezone,
             parameters=snapshot_parameters,
             now=now,
+            expected_provider_binding_digest=provider_binding_digest,
         )
         if retained is not None:
             limitations.add("wearable_query_snapshot_fallback_used")
             if query.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+                if (
+                    retained_after is not None
+                    and retained.retention_basis_at <= retained_after
+                ):
+                    retained = None
+            if (
+                retained is not None
+                and query.capability
+                == WHOOP_RECOVERY_PACKAGE_CAPABILITY
+            ):
                 try:
                     return self._detail_result(
                         query,
                         retained,
                         provenance_mode="retained_local_mirror",
                         now=now,
+                        provider_binding=provider_binding,
                         extra_limitations=tuple(limitations),
-                        expected_retention_policy=retention_policy,
+                        effective_retention_policy=retention_policy,
                         allow_cursor=False,
                     )
                 except ValueError:
-                    limitations.add(
-                        "wearable_snapshot_persistence_failed"
-                    )
                     retained = None
         if retained is not None:
-            fallback_result = dict(retained.result)
-            fallback_records = fallback_result.get("records")
-            fallback_fetch = _wearable_fetch_with_required_provider(
-                WearableSearchFetch(
-                    records=tuple(
-                        dict(record)
-                        for record in (
-                            fallback_records
-                            if isinstance(fallback_records, list)
-                            else []
-                        )
-                        if isinstance(record, Mapping)
-                    ),
-                    stream_attribution_unavailable=(
-                        query.capability == "wearable.timeseries"
-                        and fallback_result.get(
-                            "stream_attribution_status"
-                        )
-                        != "verified"
-                    ),
-                )
-            )
-            fallback_fetch = _wearable_fetch_with_current_retention(
-                fallback_fetch,
-                request=WearableSearchRequest(
-                    capability=query.capability,
-                    start=start,
-                    end=end,
-                    timezone=query.timezone,
-                    parameters=parameters,
-                    collected_at=retained.collected_at,
-                    privacy_level=query.privacy_level,
-                    retained_after=retained_after,
-                    as_of=whoop_as_of,
-                ),
-            )
-            fallback_result["status"] = "partial"
-            fallback_result["records"] = list(
-                fallback_fetch.records
-            )
-            fallback_result["coverage"] = {"status": "unknown"}
-            fallback_result["limitations"] = sorted(
-                {
-                    *_limitations(retained.result),
-                    *fallback_fetch.limitations,
-                    *limitations,
-                }
-            )
-            fallback_result["retention_window"] = (
-                _wearable_retention_window(
-                    start=start,
-                    end=end,
-                    effective_now=now,
-                    retention_policy=retention_policy,
-                )
-            )
-            fallback_snapshot, fallback_store_limitation = (
-                self._store_detail_snapshot(
-                    session,
-                    query=query,
-                    start=start,
-                    end=end,
-                    parameters=snapshot_parameters,
-                    result=fallback_result,
-                    collected_at=retained.collected_at,
+            try:
+                return self._detail_result(
+                    query,
+                    retained,
+                    provenance_mode="retained_local_mirror",
                     now=now,
-                    expected_source_policy=source_policy,
+                    provider_binding=provider_binding,
+                    extra_limitations=tuple(limitations),
+                    effective_retention_policy=retention_policy,
                 )
-            )
-            if fallback_snapshot is not None:
-                current_policy = self._current_retention_policy(
-                    session
-                )
-                if current_policy == retention_policy:
-                    return self._detail_result(
-                        query,
-                        fallback_snapshot,
-                        provenance_mode="retained_local_mirror",
-                        now=now,
-                        expected_retention_policy=current_policy,
-                    )
-                limitations.add(
-                    "wearable_snapshot_persistence_failed"
-                )
-            if fallback_store_limitation:
-                limitations.add(fallback_store_limitation)
+            except ValueError:
+                retained = None
 
         failed = bool(
             {
                 "wearable_source_policy_changed",
+                "open_wearables_source_lineage_unverified",
+                OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
                 "wearable_snapshot_persistence_failed",
                 "wearable_snapshot_writer_unavailable",
             }
@@ -4742,7 +4855,7 @@ class WearableContextProvider:
             raise ValueError("wearable detail window has not started")
         return start, end
 
-    def _store_detail_snapshot(
+    async def _store_detail_snapshot(
         self,
         session: Session,
         *,
@@ -4755,7 +4868,50 @@ class WearableContextProvider:
         collected_at: datetime,
         now: datetime,
         expected_source_policy: InputSourcePolicyBinding,
+        provider_binding: OpenWearablesExecutionBinding | None,
     ) -> tuple[WearableQuerySnapshot | None, str]:
+        provider_binding_digest = (
+            provider_binding.provider_binding_digest
+            if provider_binding is not None
+            else None
+        )
+        if provider_binding is not None:
+            try:
+                await provider_binding.revalidate()
+            except OpenWearablesProviderBindingChangedError:
+                return None, OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+            committed, limitation = (
+                await self._commit_provider_bound_snapshot(
+                    provider_binding=provider_binding,
+                    expected_source_policy=expected_source_policy,
+                    persist=lambda writer: (
+                        persist_open_wearables_query_snapshot(
+                            writer,
+                            capability=query.capability,
+                            start=start,
+                            end=end,
+                            timezone=query.timezone,
+                            parameters=parameters,
+                            result=result,
+                            private_provenance=private_provenance,
+                            collected_at=collected_at,
+                            now=now,
+                            expected_source_policy=(
+                                expected_source_policy
+                            ),
+                            provider_binding_digest=(
+                                provider_binding_digest
+                            ),
+                        )
+                    ),
+                )
+            )
+            if committed is None:
+                return None, limitation
+            if not isinstance(committed, WearableQuerySnapshot):
+                return None, "wearable_snapshot_persistence_failed"
+            return committed, ""
+
         factory = self._snapshot_session_factory
         if factory is not None:
             try:
@@ -4771,6 +4927,7 @@ class WearableContextProvider:
                     collected_at=collected_at,
                     now=now,
                     expected_source_policy=expected_source_policy,
+                    provider_binding_digest=provider_binding_digest,
                 )
             except StaleInputSourcePolicyError:
                 return None, "wearable_source_policy_changed"
@@ -4787,6 +4944,9 @@ class WearableContextProvider:
                     session,
                     event,
                     now=now,
+                    expected_provider_binding_digest=(
+                        provider_binding_digest
+                    ),
                 )
                 return (
                     (loaded, "")
@@ -4811,12 +4971,72 @@ class WearableContextProvider:
                 collected_at=collected_at,
                 now=now,
                 expected_source_policy=expected_source_policy,
+                provider_binding_digest=provider_binding_digest,
             )
         except StaleInputSourcePolicyError:
             return None, "wearable_source_policy_changed"
         except Exception:
             return None, "wearable_snapshot_persistence_failed"
         return snapshot, ""
+
+    def _detail_cursor_result(
+        self,
+        query: ContextQuery,
+        snapshot: WearableQuerySnapshot,
+        *,
+        provenance_mode: str,
+        now: datetime,
+        provider_binding: OpenWearablesExecutionBinding | None,
+        current_retention_policy: Mapping[str, Any],
+    ) -> ContextResult:
+        """Resume either a stored-policy or current-policy fallback cursor."""
+
+        failures: list[InvalidContextCursorError | ValueError] = []
+        candidates: list[
+            tuple[dict[str, Mapping[str, Any]], tuple[str, ...]]
+        ] = [
+            (
+                {
+                    "expected_retention_policy":
+                        current_retention_policy,
+                },
+                (),
+            )
+        ]
+        candidates.extend(
+            (
+                {
+                    "effective_retention_policy":
+                        current_retention_policy,
+                },
+                limitations,
+            )
+            for limitations in _fallback_cursor_limitation_candidates()
+        )
+        for retention_arguments, extra_limitations in candidates:
+            try:
+                return self._detail_result(
+                    query,
+                    snapshot,
+                    provenance_mode=provenance_mode,
+                    now=now,
+                    provider_binding=provider_binding,
+                    extra_limitations=extra_limitations,
+                    **retention_arguments,
+                )
+            except (InvalidContextCursorError, ValueError) as exc:
+                failures.append(exc)
+        invalid_cursor = next(
+            (
+                failure
+                for failure in failures
+                if isinstance(failure, InvalidContextCursorError)
+            ),
+            None,
+        )
+        if invalid_cursor is not None:
+            raise invalid_cursor
+        raise ValueError("wearable retention policy binding changed")
 
     def _detail_result(
         self,
@@ -4825,10 +5045,41 @@ class WearableContextProvider:
         *,
         provenance_mode: str,
         now: datetime,
+        provider_binding: OpenWearablesExecutionBinding | None = None,
         extra_limitations: Sequence[str] = (),
         expected_retention_policy: Mapping[str, Any] | None = None,
+        effective_retention_policy: Mapping[str, Any] | None = None,
         allow_cursor: bool = True,
     ) -> ContextResult:
+        provider_binding = (
+            provider_binding
+            if provider_binding is not None
+            else current_open_wearables_execution_binding(
+                query.capability
+            )
+        )
+        allowed_providers = (
+            provider_binding.allowed_providers
+            if provider_binding is not None
+            else None
+        )
+        lineage_mode = (
+            provider_binding.lineage_mode
+            if provider_binding is not None
+            else None
+        )
+        provider_source_allowlist = None
+        provider_source_identities = None
+        if provider_binding is not None:
+            provider_source_allowlist = (
+                provider_binding.provider_source_direct_allowlist
+                if lineage_mode
+                is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+                else provider_binding.provider_source_allowlist
+            )
+            provider_source_identities = (
+                provider_binding.provider_source_identities
+            )
         stored = dict(snapshot.result)
         retained_after, retention_window = (
             _stored_wearable_retention_window(
@@ -4837,6 +5088,17 @@ class WearableContextProvider:
                 expected_retention_policy=expected_retention_policy,
             )
         )
+        if effective_retention_policy is not None:
+            retention_window = _wearable_retention_window(
+                start=snapshot.start,
+                end=snapshot.end,
+                effective_now=now,
+                retention_policy=effective_retention_policy,
+            )
+            retained_after = _wearable_retention_cutoff(
+                effective_retention_policy,
+                effective_now=now,
+            )
         effective_start = _as_utc(
             datetime.fromisoformat(
                 str(retention_window["effective_start"])
@@ -4906,6 +5168,11 @@ class WearableContextProvider:
             if isinstance(record, Mapping)
         ]
         retained_limitations = set(_limitations(stored))
+        retained_source_lineage_attested = (
+            provider_binding is not None
+            and snapshot.provider_binding_digest
+            == provider_binding.provider_binding_digest
+        )
         normalized_fetch = normalize_retained_wearable_search(
             public_records,
             request=WearableSearchRequest(
@@ -4922,10 +5189,18 @@ class WearableContextProvider:
                 collected_at=snapshot.collected_at,
                 privacy_level=query.privacy_level,
                 retained_after=retained_after,
+                allowed_providers=allowed_providers,
+                provider_source_allowlist=provider_source_allowlist,
+                provider_source_identities=provider_source_identities,
+                lineage_mode=lineage_mode,
+                provider_source_lineage_verified=(
+                    retained_source_lineage_attested
+                ),
             ),
             stream_attribution_verified=(
                 stored.get("stream_attribution_status") == "verified"
             ),
+            allow_missing_source_id=retained_source_lineage_attested,
         )
         public_records = list(normalized_fetch.records)
         retained_limitations.update(normalized_fetch.limitations)
@@ -4950,6 +5225,7 @@ class WearableContextProvider:
             retention_window=retention_window,
             records=public_records,
             stored=stored,
+            response_limitations=extra_limitations,
         )
         selected_entries, next_cursor = _page_wearable_items(
             page_entries,
@@ -5073,6 +5349,8 @@ class WearableContextProvider:
         timezone: str,
         now: datetime,
         source_policy: InputSourcePolicyBinding,
+        provider_binding: OpenWearablesExecutionBinding | None,
+        execution_scope_digest: str | None,
     ) -> tuple[
         dict[str, Any] | None,
         WearableSnapshot | None,
@@ -5080,12 +5358,44 @@ class WearableContextProvider:
     ]:
         limitations: set[str] = set()
         normalized: dict[str, Any] | None = None
-        if self._reader is not None:
+        reader = self._reader
+        reader_supports_binding = (
+            reader is not None
+            and not (
+                provider_binding is not None
+                and provider_binding.retained_only
+            )
+            and (
+                provider_binding is None
+                or self._reader_accepts_provider_binding(reader)
+            )
+        )
+        if reader_supports_binding and reader is not None:
             try:
                 async with asyncio.timeout(
                     self._upstream_timeout_seconds
                 ):
-                    upstream = await self._reader(day)
+                    if provider_binding is None:
+                        upstream = await reader(day)
+                    else:
+                        bound_upstream = await reader(
+                            day,
+                            provider_binding=provider_binding,
+                        )
+                        if (
+                            not isinstance(
+                                bound_upstream,
+                                ProviderBoundWearableContext,
+                            )
+                            or not bound_upstream.lineage_attested
+                        ):
+                            limitations.add(
+                                "open_wearables_source_lineage_unverified"
+                            )
+                            raise LookupError(
+                                "provider-bound wearable context is unverified"
+                            )
+                        upstream = bound_upstream.context
                 normalized = _normalize_wearable_context(
                     upstream,
                     day=day,
@@ -5095,20 +5405,27 @@ class WearableContextProvider:
             except TimeoutError:
                 limitations.add("open_wearables_context_timeout")
             except Exception:
-                limitations.add("open_wearables_context_unavailable")
+                if (
+                    provider_binding is None
+                    or "open_wearables_source_lineage_unverified"
+                    not in limitations
+                ):
+                    limitations.add("open_wearables_context_unavailable")
 
         if (
             normalized is not None
             and _status(normalized)
             not in {ContextStatus.UNAVAILABLE, ContextStatus.FAILED}
         ):
-            snapshot, store_limitation = self._store_daily_snapshot(
+            snapshot, store_limitation = await self._store_daily_snapshot(
                 session,
                 normalized_context=normalized,
                 local_day=day,
                 timezone=timezone,
                 now=now,
                 expected_source_policy=source_policy,
+                provider_binding=provider_binding,
+                execution_scope_digest=execution_scope_digest,
             )
             if snapshot is not None:
                 return (
@@ -5117,7 +5434,10 @@ class WearableContextProvider:
                     limitations,
                 )
             limitations.add(store_limitation)
-            if store_limitation == "wearable_source_policy_changed":
+            if store_limitation in {
+                "wearable_source_policy_changed",
+                OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
+            }:
                 return None, None, limitations
         elif normalized is not None:
             limitations.add("open_wearables_context_unavailable")
@@ -5127,21 +5447,33 @@ class WearableContextProvider:
             local_day=day,
             timezone=timezone,
             now=now,
+            expected_provider_binding_digest=(
+                provider_binding.provider_binding_digest
+                if provider_binding is not None
+                else None
+            ),
+            expected_execution_scope_digest=execution_scope_digest,
         )
         if fallback is not None:
             limitations.add("wearable_snapshot_fallback_used")
-            if self._reader is None:
+            if not reader_supports_binding:
                 limitations.add("open_wearables_context_unavailable")
             return (
                 dict(fallback.normalized_context),
                 fallback,
                 limitations,
             )
-        if self._reader is None:
+        if (
+            provider_binding is not None
+            and not provider_binding.retained_only
+            and not reader_supports_binding
+        ):
+            limitations.add("open_wearables_source_lineage_unverified")
+        if not reader_supports_binding:
             limitations.add("open_wearables_context_unavailable")
         return None, None, limitations
 
-    def _store_daily_snapshot(
+    async def _store_daily_snapshot(
         self,
         session: Session,
         *,
@@ -5150,7 +5482,50 @@ class WearableContextProvider:
         timezone: str,
         now: datetime,
         expected_source_policy: InputSourcePolicyBinding,
+        provider_binding: OpenWearablesExecutionBinding | None,
+        execution_scope_digest: str | None,
     ) -> tuple[WearableSnapshot | None, str]:
+        provider_binding_digest = (
+            provider_binding.provider_binding_digest
+            if provider_binding is not None
+            else None
+        )
+        if provider_binding is not None:
+            try:
+                await provider_binding.revalidate()
+            except OpenWearablesProviderBindingChangedError:
+                return None, OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+            committed, limitation = (
+                await self._commit_provider_bound_snapshot(
+                    provider_binding=provider_binding,
+                    expected_source_policy=expected_source_policy,
+                    persist=lambda writer: (
+                        persist_open_wearables_observation(
+                            writer,
+                            normalized_context=normalized_context,
+                            local_day=local_day,
+                            timezone=timezone,
+                            collected_at=now,
+                            now=now,
+                            expected_source_policy=(
+                                expected_source_policy
+                            ),
+                            provider_binding_digest=(
+                                provider_binding_digest
+                            ),
+                            execution_scope_digest=(
+                                execution_scope_digest
+                            ),
+                        )
+                    ),
+                )
+            )
+            if committed is None:
+                return None, limitation
+            if not isinstance(committed, WearableSnapshot):
+                return None, "wearable_snapshot_persistence_failed"
+            return committed, ""
+
         factory = self._snapshot_session_factory
         if factory is not None:
             try:
@@ -5162,6 +5537,8 @@ class WearableContextProvider:
                     collected_at=now,
                     now=now,
                     expected_source_policy=expected_source_policy,
+                    provider_binding_digest=provider_binding_digest,
+                    execution_scope_digest=execution_scope_digest,
                 )
             except StaleInputSourcePolicyError:
                 return None, "wearable_source_policy_changed"
@@ -5178,6 +5555,12 @@ class WearableContextProvider:
                     session,
                     event,
                     now=now,
+                    expected_provider_binding_digest=(
+                        provider_binding_digest
+                    ),
+                    expected_execution_scope_digest=(
+                        execution_scope_digest
+                    ),
                 )
                 return (
                     (loaded, "")
@@ -5198,6 +5581,8 @@ class WearableContextProvider:
                 collected_at=now,
                 now=now,
                 expected_source_policy=expected_source_policy,
+                provider_binding_digest=provider_binding_digest,
+                execution_scope_digest=execution_scope_digest,
             )
         except StaleInputSourcePolicyError:
             return None, "wearable_source_policy_changed"

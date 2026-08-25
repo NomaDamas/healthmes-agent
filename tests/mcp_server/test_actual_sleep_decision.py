@@ -113,6 +113,108 @@ async def test_readiness_exposes_actual_sleep_without_changing_confidence(
     assert actual_sleep_refs[0]["record_id"] in result["evidence_ids"]
 
 
+async def test_provider_bound_readiness_keeps_matching_actual_sleep_mirror(
+    mcp_env,
+    store_factory,
+    pinned_tz,
+) -> None:
+    _seed_actual_sleep(store_factory, pinned_tz)
+
+    result = await server_module.build_daily_readiness_context(
+        LOCAL_DATE.isoformat(),
+        allowed_providers=frozenset({"oura"}),
+    )
+
+    assert result["actual_sleep"]["status"] == "ok"
+    assert result["actual_sleep"]["source"] == "oura"
+    assert any(
+        ref["resource_type"] == "actual_sleep"
+        and ref["upstream_provider"] == "oura"
+        for ref in result["source_refs"]
+    )
+
+
+async def test_provider_bound_readiness_rejects_mismatched_actual_sleep_mirror(
+    mcp_env,
+    store_factory,
+    pinned_tz,
+) -> None:
+    _seed_actual_sleep(store_factory, pinned_tz)
+
+    result = await server_module.build_daily_readiness_context(
+        LOCAL_DATE.isoformat(),
+        allowed_providers=frozenset({"whoop"}),
+    )
+
+    assert result["actual_sleep"] == {
+        "status": "insufficient_data",
+        "reason": "no_actual_sleep_observation",
+        "freshness": {
+            "recorded_at": None,
+            "status": "unavailable",
+        },
+    }
+    assert not any(
+        ref["resource_type"] == "actual_sleep"
+        for ref in result["source_refs"]
+    )
+
+
+async def test_strict_provider_bound_readiness_uses_exact_live_sleep_lineage(
+    mcp_env,
+    store_factory,
+    pinned_tz,
+) -> None:
+    _seed_actual_sleep(store_factory, pinned_tz)
+    mcp_env.add_sleep_summary(
+        LOCAL_DATE.isoformat(),
+        id="oura-live-sleep",
+        start_time="2026-07-07T23:30:00+09:00",
+        end_time="2026-07-08T07:00:00+09:00",
+        duration_minutes=420,
+        time_in_bed_minutes=450,
+        data_source_id="oura-source",
+    )
+
+    result = await server_module.build_daily_readiness_context(
+        LOCAL_DATE.isoformat(),
+        allowed_providers=frozenset({"oura"}),
+        provider_source_allowlist={"oura": frozenset({"oura-source"})},
+    )
+
+    assert result["actual_sleep"]["status"] == "ok"
+    assert result["actual_sleep"]["source"] == "oura"
+    assert not any(
+        ref["resource_type"] == "actual_sleep"
+        for ref in result["source_refs"]
+    )
+    assert [
+        ref["record_id"]
+        for ref in result["source_refs"]
+        if ref["resource_type"] == "sleep_summary"
+    ] == ["oura-live-sleep"]
+
+
+async def test_strict_provider_bound_readiness_does_not_trust_mirror_provider_name(
+    mcp_env,
+    store_factory,
+    pinned_tz,
+) -> None:
+    _seed_actual_sleep(store_factory, pinned_tz)
+
+    result = await server_module.build_daily_readiness_context(
+        LOCAL_DATE.isoformat(),
+        allowed_providers=frozenset({"oura"}),
+        provider_source_allowlist={"oura": frozenset({"oura-source"})},
+    )
+
+    assert result["actual_sleep"]["status"] == "insufficient_data"
+    assert not any(
+        ref["resource_type"] in {"actual_sleep", "sleep_summary"}
+        for ref in result["source_refs"]
+    )
+
+
 async def test_readiness_uses_fresh_oura_sleep_before_calendar_mirror_catches_up(
     mcp_client,
     mcp_env,

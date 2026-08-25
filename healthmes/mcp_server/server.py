@@ -199,6 +199,11 @@ from healthmes.store import (
 from healthmes.store import enums as store_enums
 from healthmes.timezones import parse_timezone
 from healthmes.trusted_session import verify_trusted_session_proof
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    current_open_wearables_execution_binding,
+)
+from healthmes.wearables.search import canonical_wearable_provider
 
 _NORMALIZED_INTAKE_ITEMS = TypeAdapter(tuple[NormalizedIntakeItem, ...])
 _REVIEWED_NUTRITION_ITEMS = TypeAdapter(tuple[ReviewedNutritionItem, ...])
@@ -958,16 +963,28 @@ def _open_wearables_source_ref(
             ),
         )
         record_id = f"synthetic:{resource_type}:{synthetic}"
+    lineage_provider = row.get("_healthmes_lineage_provider")
     return {
         "domain": "wearable",
         "record_id": record_id,
         "source_provider": "open-wearables",
-        "upstream_provider": _open_wearables_provider(row),
+        "upstream_provider": (
+            lineage_provider
+            if isinstance(lineage_provider, str) and lineage_provider
+            else _open_wearables_provider(row)
+        ),
         "resource_type": resource_type,
         "observed_at": observed_at,
         "schema_version": 1,
         "derived_by": "open-wearables.daily-readiness.v1",
     }
+
+
+def _reject_legacy_open_wearables_read_when_bound() -> None:
+    """Keep legacy direct reads from bypassing a frozen decision binding."""
+
+    if current_open_wearables_execution_binding() is not None:
+        raise ToolError("open_wearables_provider_binding_changed")
 
 
 def _score_row_point(
@@ -995,6 +1012,125 @@ def _sleep_summary_day(row: Mapping[str, Any]) -> dt.date | None:
         return None
 
 
+def _canonical_readiness_providers(
+    allowed_providers: frozenset[str] | tuple[str, ...] | None,
+) -> frozenset[str] | None:
+    if allowed_providers is None:
+        return None
+    if not isinstance(allowed_providers, frozenset | tuple):
+        raise TypeError(
+            "allowed_providers must be a frozenset, tuple, or None"
+        )
+    canonical: set[str] = set()
+    for value in allowed_providers:
+        provider = canonical_wearable_provider(value)
+        if provider is None:
+            raise ValueError("allowed provider is not recognized")
+        canonical.add(provider)
+    return frozenset(canonical)
+
+
+def _provider_bound_readiness_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    allowed_providers: frozenset[str] | None,
+    attribution: str,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+) -> list[dict[str, Any]]:
+    if allowed_providers is None:
+        if provider_source_allowlist is not None:
+            # A source allowlist without a provider catalog cannot establish
+            # lineage, so never silently downgrade to an unbounded query.
+            return []
+        return list(rows)
+    if attribution not in {"provider", "source"}:
+        raise ValueError("unsupported readiness provider attribution")
+
+    strict_lineage = provider_source_allowlist is not None
+
+    def row_data_source_id(row: Mapping[str, Any]) -> str | None:
+        value = row.get("data_source_id")
+        if value is None and isinstance(row.get("source"), Mapping):
+            value = row["source"].get("data_source_id")
+        return value if isinstance(value, str) and value else None
+
+    def source_owner(source_id: str) -> str | None:
+        owners = {
+            canonical_wearable_provider(raw_provider)
+            for raw_provider, source_ids in provider_source_allowlist.items()
+            if isinstance(source_ids, (set, frozenset, tuple, list))
+            and source_id in source_ids
+        }
+        owners.discard(None)
+        return next(iter(owners)) if len(owners) == 1 else None
+
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        declared_raw = row.get("provider")
+        declared = canonical_wearable_provider(declared_raw)
+        source = row.get("source")
+        source_raw = (
+            source.get("provider")
+            if isinstance(source, Mapping)
+            else None
+        )
+        source_provider = canonical_wearable_provider(source_raw)
+        if (
+            declared_raw is not None
+            and declared is None
+            or source_raw is not None
+            and source_provider is None
+            or declared is not None
+            and source_provider is not None
+            and declared != source_provider
+        ):
+            continue
+        provider = (
+            declared
+            if attribution == "provider"
+            else source_provider
+        )
+        if not strict_lineage:
+            if provider is None or provider not in allowed_providers:
+                # Preserve provider-only behavior for legacy callers that do
+                # not provide an exact source binding.
+                if not (
+                    attribution == "provider"
+                    and declared == "internal"
+                    and row.get("category") in {"sleep", "resilience"}
+                ):
+                    continue
+            filtered.append(row)
+            continue
+
+        # In a frozen session, a provider label is descriptive metadata, not
+        # proof of ownership. Every row must name one exact, currently
+        # allowed source, and that source must map to one provider.
+        data_source_id = row_data_source_id(row)
+        if data_source_id is None:
+            continue
+        owner = source_owner(data_source_id)
+        if owner is None or owner not in allowed_providers:
+            continue
+        if declared == "internal":
+            # Internal Open Wearables scores are usable only when their
+            # underlying source remains in the frozen binding. Keep the
+            # algorithm/category label, but carry real lineage for SourceRef.
+            if attribution != "provider" or (
+                source_provider is not None
+                and source_provider != owner
+            ):
+                continue
+        elif provider != owner or provider not in allowed_providers:
+            continue
+        bounded_row = dict(row)
+        bounded_row["_healthmes_lineage_provider"] = owner
+        filtered.append(bounded_row)
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Health tools (open-wearables + deterministic interpretation)
 # ---------------------------------------------------------------------------
@@ -1020,6 +1156,7 @@ async def get_health_scores(
     resilience score and `latest_hrv_cv` carries the raw coefficient of
     variation.
     """
+    _reject_legacy_open_wearables_read_when_bound()
     days = _parse_range_days(range)
     end_day = _parse_date(end_date, "end_date")
     start_day = end_day - dt.timedelta(days=days - 1)
@@ -1184,6 +1321,54 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     of guessing; overall confidence is the weakest confirmed block. `date` is
     ISO YYYY-MM-DD, default today in the user's timezone.
     """
+    binding = current_open_wearables_execution_binding()
+    if binding is None:
+        return await build_daily_readiness_context(date)
+    return await build_daily_readiness_context(
+        date,
+        allowed_providers=frozenset(binding.allowed_providers),
+        provider_source_allowlist=binding.provider_source_allowlist,
+        provider_binding=binding,
+    )
+
+
+async def build_daily_readiness_context(
+    date: str | None = None,
+    *,
+    allowed_providers: frozenset[str] | tuple[str, ...] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_binding: OpenWearablesExecutionBinding | None = None,
+) -> dict[str, Any]:
+    """Build readiness from rows attributable to the frozen provider set."""
+
+    if provider_binding is None:
+        provider_binding = current_open_wearables_execution_binding()
+    if provider_binding is not None:
+        bound_providers = frozenset(provider_binding.allowed_providers)
+        canonical_requested = _canonical_readiness_providers(
+            allowed_providers
+        )
+        if (
+            canonical_requested is not None
+            and canonical_requested != bound_providers
+        ):
+            raise ValueError("readiness provider binding does not match")
+        allowed_providers = bound_providers
+        bound_sources = provider_binding.provider_source_allowlist
+        if (
+            provider_source_allowlist is not None
+            and {
+                provider: frozenset(source_ids)
+                for provider, source_ids in provider_source_allowlist.items()
+            }
+            != bound_sources
+        ):
+            raise ValueError("readiness source binding does not match")
+        provider_source_allowlist = bound_sources
+
+    canonical_allowed = _canonical_readiness_providers(
+        allowed_providers
+    )
     tz = _local_timezone()
     as_of = _parse_date_local(date, "date", tz)
     fetch_start = as_of - dt.timedelta(days=interpret.BASELINE_WINDOW_DAYS + 7)
@@ -1198,6 +1383,24 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     workout_rows = await client.collect_workouts(
         user_id, (as_of - dt.timedelta(days=1)).isoformat(), as_of.isoformat()
     )
+    score_rows = _provider_bound_readiness_rows(
+        score_rows,
+        allowed_providers=canonical_allowed,
+        attribution="provider",
+        provider_source_allowlist=provider_source_allowlist,
+    )
+    sleep_rows = _provider_bound_readiness_rows(
+        sleep_rows,
+        allowed_providers=canonical_allowed,
+        attribution="source",
+        provider_source_allowlist=provider_source_allowlist,
+    )
+    workout_rows = _provider_bound_readiness_rows(
+        workout_rows,
+        allowed_providers=canonical_allowed,
+        attribution="source",
+        provider_source_allowlist=provider_source_allowlist,
+    )
     with _store_session() as session:
         (
             actual_sleep_block,
@@ -1208,6 +1411,26 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
             tz,
             account_generations=_calendar_account_generations(),
         )
+    if (
+        canonical_allowed is not None
+        and actual_sleep_source_ref is not None
+        and (
+            provider_source_allowlist is not None
+            or canonical_wearable_provider(
+                actual_sleep_source_ref.get("upstream_provider")
+            )
+            not in canonical_allowed
+        )
+    ):
+        # CalendarEventMirror predates Open Wearables data-source lineage and
+        # therefore cannot prove which exact source produced this observation.
+        # Legacy/provider-only callers may still use it; strict sessions must
+        # fall back to a live summary that carries an exact source ID.
+        actual_sleep_block = {
+            "status": interpret.STATUS_INSUFFICIENT,
+            "reason": "no_actual_sleep_observation",
+        }
+        actual_sleep_source_ref = None
     fresh_sleep: ActualSleepObservation | None = None
     fresh_sleep_source_row: Mapping[str, Any] | None = None
     if actual_sleep_block["status"] != interpret.STATUS_OK:
@@ -1621,6 +1844,7 @@ async def get_personal_baselines(
     sleep_efficiency_percent, resting_heart_rate_bpm, sleep_score, stress.
     `as_of` is ISO YYYY-MM-DD (default today in the user's timezone).
     """
+    _reject_legacy_open_wearables_read_when_bound()
     requested = tuple(metrics) if metrics else DEFAULT_BASELINE_METRICS
     unknown = sorted(set(requested) - set(_BASELINE_METRICS))
     if unknown:
@@ -2054,6 +2278,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
     arousal.py). `date` is ISO YYYY-MM-DD (default today, local). Honest
     `insufficient_data` when no stress signal exists at all.
     """
+    _reject_legacy_open_wearables_read_when_bound()
     tz = _local_timezone()
     day = _parse_date_local(date, "date", tz)
     start_utc, end_utc = _local_day_bounds_utc(day, tz)
@@ -2452,6 +2677,7 @@ async def compare_impact(
     Honest `insufficient_data` below 3 paired observations — never guess from
     less. Deltas are observational associations, not causation.
     """
+    _reject_legacy_open_wearables_read_when_bound()
     factor = factor.strip()
     if len(factor) < IMPACT_MIN_FACTOR_LENGTH:
         raise ToolError(

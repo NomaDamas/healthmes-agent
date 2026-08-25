@@ -101,6 +101,9 @@ from healthmes.store.models import (
     CognitiveEnergyEstimate,
 )
 from healthmes.store.session import session_scope
+from healthmes.wearables.binding import (
+    current_open_wearables_execution_binding,
+)
 
 __all__ = [
     "FACTOR_SPECS",
@@ -1547,6 +1550,11 @@ class OwEnergyReader:
         fetch_start = as_of - timedelta(days=OW_FETCH_DAYS)
         end_exclusive = as_of + timedelta(days=1)
         try:
+            if current_open_wearables_execution_binding() is not None:
+                raise RuntimeError(
+                    "legacy Open Wearables reader is blocked by an active "
+                    "provider binding"
+                )
             client = self._ensure_client()
             user_id = await self._resolve_user_id(client)
             score_rows = await client.collect_health_scores(

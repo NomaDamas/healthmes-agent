@@ -11,6 +11,9 @@
 > **Sake 기능 기준점:** recovery package `103b7269`, Open Wearables Cycle
 > `day_strain` 수집 `1726fd8a`.
 >
+> **Open Wearables capability 후속:** PR #199 / Issue #196, provider catalog
+> Issue #200.
+>
 > **목적:** Sake와 후속 리뷰어가 PR의 대목표, 실제 실행 경로, 저장 경계,
 > 핵심 불변조건과 검증 지점을 빠르게 확인하도록 한다.
 
@@ -39,6 +42,9 @@ REST / Channel / Proactive / Scheduled
       +-----------+-----------+-----------+
                   |
                   v
+    provider/value별 capability catalog
+                  |
+                  v
       source_refs 검증과 조건부 저장
 ```
 
@@ -58,6 +64,7 @@ Sake의 WHOOP 기능도 같은 경계를 따른다.
 WHOOP Skill
   -> search_wearable("wearable.whoop-recovery-package")
   -> WearableContextProvider
+  -> 현재 사용자에게 WHOOP binding이 있는지 확인
   -> Open Wearables Recovery + Cycle day_strain
   -> snapshot v2와 해당 WHOOP package의 SourceRef 정확히 하나
   -> Hermes LLM 종합
@@ -110,6 +117,7 @@ LLM 종합 -> DecisionFinalizer 검증 -> 필요한 경우만 compact 저장
 | 자료 선택 | Skill별 절차 또는 고정 `question_kind` | 하나의 LLM이 질문별로 자율 선택 |
 | 실제 조회 | 혼합 MCP와 전용 도구 | HealthMes MCP의 typed domain search |
 | Open Wearables | Hermes에 직접 노출 가능 | Wearable Provider 뒤 bounded reader |
+| Wearable capability 활성화 | source 전체 단위로 오인 가능 | provider/data-source/coverage/inventory 교집합 |
 | 판단 저장 | Skill이 범용 writer 호출을 기억해야 함 | `DecisionFinalizer`만 조건부 저장 |
 | 출처 검증 | 도구별로 상이 | canonical trace와 `source_refs` 공통 검증 |
 
@@ -296,6 +304,185 @@ HealthMes Personal Data Node
 상세 질문에서는 bounded Open Wearables reader를 호출한 뒤 필요한 결과와
 provenance만 HealthMes 계약으로 반환한다.
 
+### Open Wearables provider catalog
+
+PR #199와 Issue #200은 위 공통 wearable 경로에서 Open Wearables를 다음처럼
+제한한다.
+
+```text
+Settings Hub의 Open Wearables ON
+        |
+        v
+active connection + 실제 data source
+        |
+        v
+provider coverage + 사용자 inventory
+        |
+        v
+provider/capability/parameter value ownership
+        |
+        v
+세션별 frozen catalog
+        |
+        v
+search_wearable 실행 전후와 snapshot 저장 직전 재검증
+```
+
+WHOOP만 연결된 사용자에게 Garmin/Polar 전용 capability를 보여주지 않는다. 복수
+provider가 연결되면 검증된 capability의 합집합을 제공하되,
+`category=day_strain`, `series_type=garmin_stress_level`,
+`provider=polar`처럼 구체적인 parameter value에도 provider ownership을 적용한다.
+
+connection ID와 data-source ID는 LLM, MCP 결과와 public session handle에 노출하지
+않는다. 이 값들은 private binding digest에만 들어간다. source policy revision은
+같아도 실제 provider binding이 바뀌면 실행 결과, `source_refs`, cursor와 retained
+fallback을 폐기한다.
+
+#### Provider source-lineage 신뢰 경계
+
+`provider_source_lineage_verified=true`라는 필드만 보고 결과를 신뢰하면 안 된다.
+provider-bound runtime은 실제 bounded Open Wearables adapter가 발급한 내부
+live-lineage attestation까지 요구한다.
+
+#### Capability lineage와 query 결과의 차이
+
+리뷰 시 catalog에 capability가 보인다는 사실을 live 데이터가 바로 사용 가능하다는
+뜻으로 해석하면 안 된다.
+
+| Lineage mode | 대표 capability | strict 실행 규칙 |
+|---|---|---|
+| `EXPLICIT_ROW_SOURCE_ID` | health scores, WHOOP recovery package | 각 행의 exact `data_source_id`가 frozen source와 일치해야 함 |
+| `PROVIDER_ROUTE_AUTHORITATIVE` | provider workout/detail | provider 전용 route와 direct binding이 일치해야 함 |
+| `LINEAGE_UNAVAILABLE` | summary, sleep, body, timeseries | catalog에는 남을 수 있지만 exact source ID 없는 live 행은 거부 |
+
+`LINEAGE_UNAVAILABLE`은 catalog에서 무조건 제거하는 상태가 아니다. coverage와
+inventory가 capability를 설명할 수 있으면 모델에는 보이되, strict query에서
+source proof가 없는 행은 `open_wearables_source_lineage_unverified`로 fail-closed한다.
+따라서 catalog `available`, 요청 결과 `no_data`, lineage failure는 서로 다른
+상태다.
+
+metadata가 일시적으로 실패해 last-known-good catalog가 `degraded`로 복원되어도,
+실제 query는 동일 provider binding digest와 query scope를 가진 retained snapshot이
+있을 때만 수행할 수 있다. catalog가 있다고 해서 임의 기간의 retained data가
+존재한다고 가정하지 않는다.
+
+#### Imported-only/mixed binding
+
+선택된 provider 중 하나라도 imported-only이면 전체 query가 `retained_only`가 된다.
+direct provider와 imported-only provider를 섞은 query도 동일하게 live REST를
+호출하지 않고 HealthMes의 동일 binding/query scope snapshot만 사용한다. 이 규칙은
+direct provider를 통해 imported source의 보존 경계를 우회하거나 두 source의 행을
+검증 없이 섞는 것을 막는다.
+
+WHOOP 전용 recovery package는 예외적으로 direct WHOOP connection과 direct data
+source가 모두 필요하다. imported-only WHOOP은 일반 retained capability의 근거가
+될 수 있지만, Recovery와 Cycle `day_strain` package를 import inventory만으로
+재구성하거나 catalog에 노출하지 않는다.
+
+```text
+custom reader가 boolean만 true로 반환
+  -> attestation 없음
+  -> open_wearables_source_lineage_unverified
+  -> payload/source_refs/snapshot 저장 금지
+
+정상 bounded adapter의 빈 응답
+  -> exact source filter 완료
+  -> attestation 있음
+  -> status=no_data, coverage/source_ref 유지
+```
+
+retained row는 raw `data_source_id`를 public payload에 다시 넣지 않는다. 저장
+event의 private `provider_binding_digest`가 현재 frozen binding과 같을 때만
+sanitized row를 재사용하고, digest 누락 또는 변경이면 `no_data`로 완화하지 않고
+해당 retained 결과를 무효화한다.
+
+Live Open Wearables 응답에 source ID가 없는 summary/timeseries/workout 행은
+device/display label이 유일하더라도 source ownership을 증명하지 못한다. 따라서
+strict session에서는 해당 행을 제외하고 `open_wearables_source_lineage_unverified`
+경계로 처리한다. 인증된 source lookup 계약이 추가되기 전까지는 명시적
+`data_source_id`가 frozen allowlist에 exact 일치하는 행만 허용한다. 명시적 source
+ID가 있는 WHOOP HealthScore 경로는 exact allowlist 비교를 그대로 적용한다.
+
+#### Readiness mirror와 internal score의 strict 경계
+
+기존 calendar actual-sleep mirror에는 Open Wearables `data_source_id`가 없으므로
+공식 provider-bound 실행에서는 mirror의 provider 이름만 믿지 않는다. mirror를
+건너뛴 뒤 exact source ID를 가진 live sleep summary가 있으면 그 행을 선택하고,
+없으면 `insufficient_data`를 반환한다. provider-only legacy 호출은 기존 mirror
+동작을 유지한다.
+
+Open Wearables가 계산한 `internal` sleep/resilience score는 strict 세션에서도
+알고리즘을 바꾸지 않는다. 다만 정확한 `data_source_id`가 frozen source에
+매핑될 때만 입력으로 사용하며, SourceRef에는 계산 label과 별개로 실제
+contributing provider lineage를 기록한다. source ID가 없으면 해당 파생 score는
+fail-closed로 제외한다.
+
+```text
+provider 자체가 없거나 coverage가 없음
+  -> capability catalog에서 제거
+  -> 직접 호출도 upstream 전에 거부
+
+provider는 정상 연결됐지만 요청 기간에 행이 없음
+  -> capability 유지
+  -> 정상 no_data + coverage/freshness limitation
+```
+
+정상 빈 응답과 lineage failure는 반드시 구별한다. bounded adapter가 정상적으로
+빈 응답을 검증하면 `no_data`를 반환할 수 있지만, upstream 행이 있었고 모든 행이
+source 검증에서 탈락하면 빈 결과로 완화하지 않고 lineage failure를 반환하며
+payload, source_refs와 snapshot을 저장하지 않는다.
+
+#### Legacy direct-read 경계
+
+`get_health_scores`, `get_personal_baselines`, `get_stress_timeline`,
+`compare_impact`는 기존 standalone MCP 호환 도구다. trigger/energy의
+`OwHealthReader`와 `OwEnergyReader`도 같은 legacy direct-read 계열이다. 이
+경로들은 공식 six-tool Decision profile에 들어 있지 않으며, frozen provider
+binding이 활성화된 decision execution 안에서 호출되면 Open Wearables upstream
+호출 전에 거부하거나 빈/`unavailable` 결과로 종료한다.
+
+```text
+Decision Agent + frozen binding
+  -> legacy direct-read 경로
+  -> binding 전달 불가 감지
+  -> direct Open Wearables 호출 차단
+  -> search_wearable + BoundedOpenWearablesSearch만 허용
+```
+
+이것은 standalone 도구를 삭제하는 변경이 아니다. 일반 호환 호출은 유지하되,
+공식 판단 경로에서 HealthMes의 source/provider 검증을 우회하는 두 번째 데이터
+경로만 차단한다.
+
+Hermes에 Open Wearables MCP를 직접 등록하지 않는 이유는 하나의 질문이 direct
+Open Wearables 경로와 HealthMes 경로로 갈라지는 것을 막기 위해서다. LLM은 계속
+HealthMes의 `search_wearable`만 호출하고, 실제 Open Wearables REST route, 정확한
+행, pagination, dedup과 provenance는 Provider가 결정론적으로 선택한다.
+
+### Retained fallback과 write fence 검토 포인트
+
+```text
+frozen catalog = degraded + retained snapshot
+        |
+        +-- daily/detail live reader 호출 금지
+        +-- 같은 query scope의 immutable event 조회
+        `-- fallback/partial envelope로만 현재 실행 상태 표시
+```
+
+fallback은 snapshot을 다시 쓰거나 원본 행을 복제하지 않는다. 기존 event UUID와
+SourceRef coverage는 유지하고, `wearable_query_snapshot_fallback_used` 및
+upstream 장애 limitation만 새 응답에 추가한다. cursor 재개도 이 상태를 유지해야
+하며, 저장 event의 payload를 fallback용으로 수정하면 안 된다.
+
+provider-bound live 저장은 독립 writer에서만 허용한다. `persist -> flush ->
+provider binding revalidate -> source policy assert -> commit` 순서를 지키고
+마지막 검증과 commit 사이에 비동기 양보가 없어야 한다. writer가 없거나
+`StaticPool`이면 성공처럼 보이는 결과를 만들지 말고
+`wearable_snapshot_writer_unavailable`로 중단한다.
+
+daily snapshot은 capability, 허용 provider 집합, private binding digest를
+포함한 exact execution-scope digest로 분리된다. 그러므로 같은 날짜의 WHOOP
+조회와 Garmin 조회가 서로의 mirror를 읽지 않는다.
+
 ## 7. iPhone Screen Time과 입력 설정
 
 iPhone Screen Time은 별도 wellness domain이 아니라 Activity domain의 collector다.
@@ -477,6 +664,12 @@ related-record ID를 복구한다. 공개 REST도 `related_record_ids`를 응답
 공개 결과가 같더라도 private provenance의 원본 record ID, metric definition,
 Cycle/revision과 raw score가 누락되면 migration 통과가 아니다.
 
+Issue #200의 provider catalog도 이 계산 앞에 authorization fence로만 들어간다.
+WHOOP binding이 검증되면 기존 Sake 계산을 그대로 실행하며 Recovery/day strain
+행 선택, local day, Cycle linkage, latest revision, 등급과 action 계산은 바꾸지
+않는다. WHOOP binding이 없으면 계산을 다른 provider 값으로 흉내 내지 않고
+upstream 호출 전에 거부한다.
+
 이번 PR은 위 기준을 synthetic fixture, 경계값, 실패 조건, exact follow-up E2E로
 자동 검증했다. 실제 Sake 개인 WHOOP export나 production 계정에는 접근하지
 않았으므로 **실데이터 dogfood를 수행했다고 주장하지 않는다.** Sake 재리뷰에서는
@@ -588,6 +781,14 @@ Unicode, NUL, invalid 문자, collision과 raw/wellness provider 불일치의 �
 - Sake 계산 limitation은 public package에 보존하되 HealthMes runtime limitation은
   `ContextResult.limitations`에만 있어야 한다.
 - WHOOP 행·revision·Cycle·label·action 계산을 LLM 또는 Skill이 재구현하면 안 된다.
+- WHOOP-only catalog에 Garmin/Polar-only capability나 parameter value가 보이면
+  안 된다.
+- connection/data-source ID와 private provider binding digest가 LLM transcript,
+  public session handle 또는 MCP 결과에 노출되면 안 된다.
+- 실행 중 provider binding이 바뀌면 stale payload, `source_refs`, cursor와
+  retained fallback을 저장하거나 반환하면 안 된다.
+- 정상 연결된 provider에서 특정 기간의 행이 없다는 이유로 capability를 OFF하면
+  안 된다.
 - `source_provider`는 1..64자의 canonical portable ASCII identity여야 한다.
 - 과거 package follow-up의 `rr_` alias는 턴 전용이어야 하고 exact snapshot이
   없으면 최신 package로 대체하면 안 된다.
@@ -614,7 +815,7 @@ Unicode, NUL, invalid 문자, collision과 raw/wellness provider 불일치의 �
   `1 passed`
 - Ruff, compileall, `git diff --check`: 통과
 - Alembic:
-  - 단일 head `b7c8d9e0f1a2`
+  - 단일 head `c8d9e0f1a2b3`
   - PostgreSQL·SQLite offline SQL render 통과
   - 빈 SQLite 실제 `upgrade head`와 `current` 통과
   - provider 제약의 SQLite parser-stack 회귀, 정상화, invalid/collision 원자적

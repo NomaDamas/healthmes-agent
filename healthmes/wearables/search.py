@@ -8,7 +8,8 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from functools import partial
 from typing import Any
@@ -16,6 +17,11 @@ from typing import Any
 from healthmes.decision.contracts import PrivacyLevel
 from healthmes.mcp_server.ow_client import OWClient
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionDataSource,
+    current_open_wearables_execution_binding,
+)
+from healthmes.wearables.lineage import OpenWearablesLineageMode
 from healthmes.wearables.open_wearables_routes import (
     OPEN_WEARABLES_V1_EXPOSED_CAPABILITIES,
 )
@@ -166,7 +172,7 @@ _PROVIDER_ROW_ID_FIELDS = (
     "event_id",
 )
 _TRUSTED_PROVIDER_ATTRIBUTIONS = frozenset(
-    {"declared", "source_exact_alias"}
+    {"allowed_provider_binding", "declared", "source_exact_alias"}
 )
 _SAFE_PROVIDER_WORKOUT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,512}$")
 _ISO_DURATION = re.compile(
@@ -196,6 +202,7 @@ _SLEEP_STAGE_TYPES = frozenset(
 )
 
 WearableUserIdResolver = Callable[[], str | Awaitable[str]]
+_LIVE_SOURCE_LINEAGE_ATTESTATION = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +216,17 @@ class WearableSearchRequest:
     privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE
     retained_after: datetime | None = None
     as_of: date | None = None
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None
+    provider_source_identities: Mapping[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ] | None = None
+    lineage_mode: OpenWearablesLineageMode | None = None
+    # A retained snapshot is source-bound at the event level. Its public
+    # records intentionally omit raw data-source IDs, so the binding digest
+    # is the lineage proof for those already-verified records.
+    provider_source_lineage_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +249,22 @@ class WearableSearchFetch:
     granular_truncated: bool = False
     package: dict[str, Any] | None = None
     private_provenance: tuple[dict[str, Any], ...] = ()
+    provider_source_lineage_verified: bool = False
+    _live_source_lineage_attestation: object | None = dataclass_field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def live_source_lineage_attested(self) -> bool:
+        """Whether the bounded live adapter performed exact source filtering."""
+
+        return (
+            self.provider_source_lineage_verified
+            and self._live_source_lineage_attestation
+            is _LIVE_SOURCE_LINEAGE_ATTESTATION
+        )
 
     @property
     def limitations(self) -> tuple[str, ...]:
@@ -276,6 +310,11 @@ def normalize_retained_wearable_health_scores(
     start: datetime,
     end: datetime,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reapply the current window to retained health-score records."""
 
@@ -286,6 +325,7 @@ def normalize_retained_wearable_health_scores(
         raise ValueError("wearable health score category is not allowlisted")
     start_utc = start.astimezone(UTC)
     end_utc = end.astimezone(UTC)
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -310,11 +350,26 @@ def normalize_retained_wearable_health_scores(
         ):
             discarded += 1
             continue
-        normalized.append(dict(record))
+        clean = _filter_provider_attribution(
+            dict(record),
+            capability="wearable.health-scores",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
+        ),
     )
 
 
@@ -326,11 +381,17 @@ def normalize_retained_wearable_summaries(
     end: datetime,
     timezone: str,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Filter legacy mirrors against the exact retained summary window."""
 
     if kind not in WEARABLE_SUMMARY_KINDS:
         raise ValueError("wearable summary kind is not allowlisted")
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -354,7 +415,19 @@ def normalize_retained_wearable_summaries(
         ):
             discarded += 1
             continue
-        normalized.append(dict(record))
+        clean = _filter_provider_attribution(
+            dict(record),
+            capability="wearable.summaries",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
@@ -363,6 +436,9 @@ def normalize_retained_wearable_summaries(
             start=start,
             end=end,
             timezone=timezone,
+        ),
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
         ),
     )
 
@@ -376,6 +452,11 @@ def normalize_retained_wearable_timeseries(
     end: datetime,
     stream_attribution_verified: bool = False,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reapply current privacy rules to previously stored public records."""
 
@@ -386,6 +467,7 @@ def normalize_retained_wearable_timeseries(
 
     start_utc = start.astimezone(UTC)
     end_utc = end.astimezone(UTC)
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -443,13 +525,28 @@ def normalize_retained_wearable_timeseries(
             result["zone_offset"] = zone_offset
         if type(record.get("is_daily_total")) is bool:
             result["is_daily_total"] = record["is_daily_total"]
-        normalized.append(result)
+        clean = _filter_provider_attribution(
+            result,
+            capability="wearable.timeseries",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
         stream_attribution_unavailable=(
             bool(normalized) and not stream_attribution_verified
+        ),
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
         ),
     )
 
@@ -460,9 +557,15 @@ def normalize_retained_wearable_workouts(
     start: datetime,
     end: datetime,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reject retained workouts whose complete interval is no longer valid."""
 
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -477,11 +580,26 @@ def normalize_retained_wearable_workouts(
         ):
             discarded += 1
             continue
-        normalized.append(dict(record))
+        clean = _filter_provider_attribution(
+            dict(record),
+            capability="wearable.workouts",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
+        ),
     )
 
 
@@ -490,9 +608,11 @@ def normalize_retained_wearable_search(
     *,
     request: WearableSearchRequest,
     stream_attribution_verified: bool = False,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reapply current capability, privacy, and time rules to a local mirror."""
 
+    request = _request_with_execution_binding(request)
     validate_wearable_search_request(request)
     if request.capability == "wearable.health-scores":
         return normalize_retained_wearable_health_scores(
@@ -505,6 +625,13 @@ def normalize_retained_wearable_search(
             start=request.start,
             end=request.end,
             retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
         )
     if request.capability == "wearable.summaries":
         return normalize_retained_wearable_summaries(
@@ -514,6 +641,13 @@ def normalize_retained_wearable_search(
             end=request.end,
             timezone=request.timezone,
             retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
         )
     if request.capability == "wearable.workouts":
         return normalize_retained_wearable_workouts(
@@ -521,6 +655,13 @@ def normalize_retained_wearable_search(
             start=request.start,
             end=request.end,
             retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
         )
     if request.capability == "wearable.timeseries":
         return normalize_retained_wearable_timeseries(
@@ -531,6 +672,13 @@ def normalize_retained_wearable_search(
             end=request.end,
             stream_attribution_verified=stream_attribution_verified,
             retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
         )
 
     if request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
@@ -598,12 +746,30 @@ def normalize_retained_wearable_search(
 
     normalized: list[dict[str, Any]] = []
     discarded = 0
+    allowed_providers = _canonical_allowed_providers(
+        request.allowed_providers
+    )
     for record in records:
         clean = sanitizer(record)
         if clean is None:
             discarded += 1
             continue
-        normalized.append(clean)
+        filtered = _filter_provider_attribution(
+            clean,
+            capability=request.capability,
+            source_row=record,
+            allowed_providers=allowed_providers,
+            body_summary=(
+                request.capability == "wearable.body-summary"
+            ),
+            provider_source_allowlist=request.provider_source_allowlist,
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if filtered is None:
+            discarded += 1
+            continue
+        normalized.append(filtered)
     normalized, conflicting = _deduplicate_wearable_records(normalized)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
@@ -613,6 +779,9 @@ def normalize_retained_wearable_search(
         granular_truncated=any(
             record.get("granular_truncated") is True
             for record in normalized
+        ),
+        provider_source_lineage_verified=(
+            request.provider_source_lineage_verified
         ),
     )
 
@@ -652,6 +821,13 @@ def validate_wearable_search_request(
             raise ValueError("wearable retention cutoff must be timezone-aware")
     if type(request.privacy_level) is not PrivacyLevel:
         raise ValueError("wearable privacy level is invalid")
+    if type(request.provider_source_lineage_verified) is not bool:
+        raise ValueError(
+            "wearable provider source lineage state is invalid"
+        )
+    allowed_providers = _canonical_allowed_providers(
+        request.allowed_providers
+    )
     unexpected = (
         set(request.parameters)
         - _CAPABILITY_PARAMETERS[request.capability]
@@ -732,6 +908,13 @@ def validate_wearable_search_request(
                 )
     elif request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
         _whoop_as_of(request.as_of)
+        if (
+            allowed_providers is not None
+            and WHOOP_UPSTREAM_PROVIDER not in allowed_providers
+        ):
+            raise ValueError(
+                "WHOOP package requires an allowed WHOOP provider"
+            )
     elif request.as_of is not None:
         raise ValueError("as_of is only supported by the WHOOP package")
     if request.capability != "wearable.timeseries":
@@ -780,6 +963,17 @@ class BoundedOpenWearablesSearch:
         self,
         request: WearableSearchRequest,
     ) -> WearableSearchFetch:
+        binding = current_open_wearables_execution_binding(
+            request.capability
+        )
+        if binding is not None and binding.retained_only:
+            raise LookupError(
+                "retained-only Open Wearables binding cannot use live REST"
+            )
+        request = replace(
+            _request_with_execution_binding(request),
+            provider_source_lineage_verified=False,
+        )
         validate_wearable_search_request(request)
         user_id = self._user_id_resolver()
         if inspect.isawaitable(user_id):
@@ -937,12 +1131,52 @@ class BoundedOpenWearablesSearch:
             raise ValueError("unsupported wearable detail capability")
 
         sanitized: list[dict[str, Any]] = []
+        lineage_verified_rows = 0
+        lineage_rejected_rows = 0
+        allowed_providers = _canonical_allowed_providers(
+            request.allowed_providers
+        )
+        upstream_rows_present = bool(rows) or discarded > 0
         for row in rows:
-            clean = sanitizer(row)
+            source_row = _bind_provider_source_identity(
+                row,
+                capability=request.capability,
+                provider_source_allowlist=(
+                    request.provider_source_allowlist
+                ),
+                provider_source_identities=(
+                    request.provider_source_identities
+                ),
+                lineage_mode=request.lineage_mode,
+                authoritative_provider=_request_provider(request),
+            )
+            if source_row is None:
+                lineage_rejected_rows += 1
+                discarded += 1
+                continue
+            lineage_verified_rows += 1
+            clean = sanitizer(source_row)
             if clean is None or _contains_private_value(clean, user_id):
                 discarded += 1
                 continue
-            sanitized.append(clean)
+            filtered = _filter_provider_attribution(
+                clean,
+                capability=request.capability,
+                source_row=source_row,
+                allowed_providers=allowed_providers,
+                body_summary=(
+                    request.capability == "wearable.body-summary"
+                ),
+                provider_source_allowlist=(
+                    request.provider_source_allowlist
+                ),
+                lineage_mode=request.lineage_mode,
+                authoritative_provider=_request_provider(request),
+            )
+            if filtered is None:
+                discarded += 1
+                continue
+            sanitized.append(filtered)
         conflicting_duplicate_rows = False
         stream_attribution_unavailable = False
         sanitized, conflicting_duplicate_rows = (
@@ -986,6 +1220,24 @@ class BoundedOpenWearablesSearch:
                 record.get("granular_truncated") is True
                 for record in selected
             ),
+            provider_source_lineage_verified=(
+                _lineage_response_attested(
+                    request,
+                    upstream_rows_present=upstream_rows_present,
+                    lineage_verified_rows=lineage_verified_rows,
+                    lineage_rejected_rows=lineage_rejected_rows,
+                )
+            ),
+            _live_source_lineage_attestation=(
+                _LIVE_SOURCE_LINEAGE_ATTESTATION
+                if _lineage_response_attested(
+                    request,
+                    upstream_rows_present=upstream_rows_present,
+                    lineage_verified_rows=lineage_verified_rows,
+                    lineage_rejected_rows=lineage_rejected_rows,
+                )
+                else None
+            ),
         )
 
     async def _whoop_recovery_package(
@@ -1014,12 +1266,46 @@ class BoundedOpenWearablesSearch:
                 category="recovery",
             )
         )
+        recovery_upstream_rows_present = (
+            bool(recovery_rows) or recovery_discarded > 0
+        )
         day_strain_rows, day_strain_truncated, day_strain_discarded = (
             await self._whoop_health_scores(
                 user_id,
                 start=fetch_start,
                 end=fetch_end,
                 category="day_strain",
+            )
+        )
+        day_strain_upstream_rows_present = (
+            bool(day_strain_rows) or day_strain_discarded > 0
+        )
+        (
+            recovery_rows,
+            recovery_lineage_discarded,
+            recovery_lineage_verified,
+        ) = (
+            _filter_whoop_source_rows(
+                recovery_rows,
+                provider_source_allowlist=request.provider_source_allowlist,
+                provider_source_identities=(
+                    request.provider_source_identities
+                ),
+                lineage_mode=request.lineage_mode,
+            )
+        )
+        (
+            day_strain_rows,
+            day_strain_lineage_discarded,
+            day_strain_lineage_verified,
+        ) = (
+            _filter_whoop_source_rows(
+                day_strain_rows,
+                provider_source_allowlist=request.provider_source_allowlist,
+                provider_source_identities=(
+                    request.provider_source_identities
+                ),
+                lineage_mode=request.lineage_mode,
             )
         )
         calculation = calculate_whoop_recovery_package(
@@ -1046,10 +1332,81 @@ class BoundedOpenWearablesSearch:
                 recovery_truncated or day_strain_truncated
             ),
             discarded_rows=(
-                recovery_discarded + day_strain_discarded
+                recovery_discarded
+                + day_strain_discarded
+                + recovery_lineage_discarded
+                + day_strain_lineage_discarded
             ),
             conflicting_duplicate_rows=(
                 calculation.conflicting_duplicate_rows
+            ),
+            provider_source_lineage_verified=(
+                _lineage_response_attested(
+                    request,
+                    upstream_rows_present=(
+                        recovery_upstream_rows_present
+                        or day_strain_upstream_rows_present
+                    ),
+                    lineage_verified_rows=(
+                        recovery_lineage_verified
+                        + day_strain_lineage_verified
+                    ),
+                    lineage_rejected_rows=(
+                        recovery_lineage_discarded
+                        + day_strain_lineage_discarded
+                    ),
+                    component_attested=(
+                        (
+                            not recovery_upstream_rows_present
+                            or (
+                                recovery_lineage_verified > 0
+                                and recovery_lineage_discarded == 0
+                            )
+                        )
+                        and (
+                            not day_strain_upstream_rows_present
+                            or (
+                                day_strain_lineage_verified > 0
+                                and day_strain_lineage_discarded == 0
+                            )
+                        )
+                    ),
+                )
+            ),
+            _live_source_lineage_attestation=(
+                _LIVE_SOURCE_LINEAGE_ATTESTATION
+                if _lineage_response_attested(
+                    request,
+                    upstream_rows_present=(
+                        recovery_upstream_rows_present
+                        or day_strain_upstream_rows_present
+                    ),
+                    lineage_verified_rows=(
+                        recovery_lineage_verified
+                        + day_strain_lineage_verified
+                    ),
+                    lineage_rejected_rows=(
+                        recovery_lineage_discarded
+                        + day_strain_lineage_discarded
+                    ),
+                    component_attested=(
+                        (
+                            not recovery_upstream_rows_present
+                            or (
+                                recovery_lineage_verified > 0
+                                and recovery_lineage_discarded == 0
+                            )
+                        )
+                        and (
+                            not day_strain_upstream_rows_present
+                            or (
+                                day_strain_lineage_verified > 0
+                                and day_strain_lineage_discarded == 0
+                            )
+                        )
+                    ),
+                )
+                else None
             ),
         )
 
@@ -1517,6 +1874,131 @@ def _provider_family(value: Any) -> str | None:
     return _PROVIDER_FAMILY_ALIASES.get(_normalized_key(cleaned))
 
 
+def canonical_wearable_provider(value: Any) -> str | None:
+    """Return the canonical provider family used by wearable boundaries."""
+
+    return _provider_family(value)
+
+
+def _canonical_allowed_providers(
+    values: tuple[str, ...] | frozenset[str] | None,
+) -> frozenset[str] | None:
+    if values is None:
+        return None
+    if not isinstance(values, tuple | frozenset):
+        raise ValueError(
+            "wearable allowed providers must be a tuple or frozenset"
+        )
+    canonical: set[str] = set()
+    for value in values:
+        provider = _provider_family(value)
+        if provider is None:
+            raise ValueError(
+                "wearable allowed provider is not recognized"
+            )
+        canonical.add(provider)
+    return frozenset(canonical)
+
+
+def _request_with_execution_binding(
+    request: WearableSearchRequest,
+) -> WearableSearchRequest:
+    binding = current_open_wearables_execution_binding(request.capability)
+    if binding is None:
+        return request
+    lineage_mode = _effective_lineage_mode(
+        request.capability,
+        binding.lineage_mode,
+    )
+    source_allowlist = (
+        binding.provider_source_direct_allowlist
+        if lineage_mode
+        is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+        else binding.provider_source_allowlist
+    )
+    return replace(
+        request,
+        allowed_providers=binding.allowed_providers,
+        provider_source_allowlist=source_allowlist,
+        provider_source_identities=binding.provider_source_identities,
+        lineage_mode=lineage_mode,
+    )
+
+
+def _source_lineage_is_allowed(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    authoritative_provider: str | None = None,
+    require_source: bool = False,
+    allow_missing_source_id: bool = False,
+) -> bool:
+    if provider_source_allowlist is None:
+        return not require_source
+    data_source_id = _safe_text(
+        row.get("data_source_id"),
+        max_length=512,
+    )
+    allowed = provider_source_allowlist.get(provider)
+    if allowed is None or not allowed:
+        return False
+    if data_source_id is None:
+        if (
+            lineage_mode
+            is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+            and authoritative_provider == provider
+        ):
+            return True
+        return allow_missing_source_id is True
+    return data_source_id in allowed
+
+
+def _filter_whoop_source_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None,
+    provider_source_identities: Mapping[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ]
+    | None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    if provider_source_allowlist is None:
+        return [dict(row) for row in rows], 0, len(rows)
+    selected: list[dict[str, Any]] = []
+    discarded = 0
+    verified = 0
+    for row in rows:
+        provider, _attribution = _provider(row)
+        if provider != WHOOP_UPSTREAM_PROVIDER:
+            discarded += 1
+            continue
+        source_row = _bind_provider_source_identity(
+            row,
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            provider_source_allowlist=provider_source_allowlist,
+            provider_source_identities=provider_source_identities,
+            lineage_mode=lineage_mode,
+            authoritative_provider=WHOOP_UPSTREAM_PROVIDER,
+        )
+        if source_row is None or not _source_lineage_is_allowed(
+            source_row,
+            provider=WHOOP_UPSTREAM_PROVIDER,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            authoritative_provider=WHOOP_UPSTREAM_PROVIDER,
+            require_source=True,
+        ):
+            discarded += 1
+            continue
+        selected.append(source_row)
+        verified += 1
+    return selected, discarded, verified
+
+
 def _provider(row: Mapping[str, Any]) -> tuple[str, str]:
     declared = row.get("provider")
     if declared is not None:
@@ -1536,6 +2018,299 @@ def _provider(row: Mapping[str, Any]) -> tuple[str, str]:
         (family, "source_exact_alias")
         if family is not None
         else ("unknown", "source_unclassified")
+    )
+
+
+def _bind_provider_source_identity(
+    row: Mapping[str, Any],
+    *,
+    capability: str,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None,
+    provider_source_identities: Mapping[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ]
+    | None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    authoritative_provider: str | None = None,
+) -> dict[str, Any] | None:
+    """Bind one upstream row to the frozen provider/source contract.
+
+    Explicit-row capabilities require an exact ``data_source_id``.  Direct
+    provider-route capabilities may use the route itself as the authoritative
+    source when the upstream row omits that ID; an explicit ID is still
+    checked against the direct-source allowlist.
+    """
+
+    copied = dict(row)
+    if provider_source_allowlist is None:
+        return copied
+
+    mode = _effective_lineage_mode(
+        capability,
+        lineage_mode,
+    )
+    declared_provider = _provider_family(row.get("provider"))
+    source = row.get("source")
+    source_provider = _provider_family(
+        source.get("provider")
+        if isinstance(source, Mapping)
+        else None
+    )
+    if (
+        declared_provider is not None
+        and source_provider is not None
+        and declared_provider != source_provider
+    ):
+        return None
+    provider = declared_provider or source_provider
+    authoritative = _provider_family(authoritative_provider)
+    if mode is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE:
+        if authoritative is None:
+            return None
+        if authoritative not in provider_source_allowlist:
+            return None
+        if provider is not None and provider != authoritative:
+            return None
+        provider = authoritative
+        copied["provider"] = authoritative
+        copied["provider_attribution"] = "allowed_provider_binding"
+    elif provider is None:
+        return None
+    if provider is None:
+        return None
+    allowed = provider_source_allowlist.get(provider)
+    if allowed is None or not allowed:
+        return None
+
+    explicit_ids, malformed = _explicit_row_source_ids(row)
+    if malformed or len(explicit_ids) > 1:
+        return None
+    if explicit_ids:
+        source_id = next(iter(explicit_ids))
+        if source_id not in allowed:
+            return None
+        copied["data_source_id"] = source_id
+        return copied
+
+    if mode is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE:
+        return copied
+    return None
+
+
+def _explicit_row_source_ids(
+    row: Mapping[str, Any],
+) -> tuple[set[str], bool]:
+    """Read explicit IDs while rejecting conflicting or malformed values."""
+
+    containers: list[Mapping[str, Any]] = [row]
+    source = row.get("source")
+    if isinstance(source, Mapping):
+        containers.append(source)
+    values: set[str] = set()
+    malformed = False
+    for container in containers:
+        if "data_source_id" not in container:
+            continue
+        raw_value = container.get("data_source_id")
+        if raw_value is None:
+            continue
+        value = _safe_text(raw_value, max_length=512)
+        if value is None:
+            malformed = True
+            continue
+        values.add(value)
+    return values, malformed
+
+
+def _row_device_labels(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return exact device/source labels exposed by an upstream row."""
+
+    labels: set[str] = set()
+    fields = (
+        "device",
+        "device_model",
+        "device_name",
+        "display_name",
+        "original_source_name",
+    )
+    for container in (row, row.get("source")):
+        if not isinstance(container, Mapping):
+            continue
+        for field in fields:
+            value = _safe_text(container.get(field), max_length=128)
+            if value is not None:
+                labels.add(value)
+    return tuple(sorted(labels, key=lambda value: (value.casefold(), value)))
+
+
+def _source_label_key(value: str) -> str:
+    return " ".join(value.strip().casefold().split())
+
+
+def _filter_provider_attribution(
+    record: dict[str, Any],
+    *,
+    capability: str,
+    source_row: Mapping[str, Any],
+    allowed_providers: frozenset[str] | None,
+    body_summary: bool = False,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    authoritative_provider: str | None = None,
+    allow_missing_source_id: bool = False,
+) -> dict[str, Any] | None:
+    effective_lineage_mode = _effective_lineage_mode(
+        capability,
+        lineage_mode,
+    )
+    if allowed_providers is None:
+        return record
+    if body_summary:
+        if len(allowed_providers) != 1:
+            return None
+        allowed_provider = next(iter(allowed_providers))
+        declared_raw = source_row.get("provider")
+        if declared_raw == "unknown":
+            declared_raw = None
+        declared = _provider_family(declared_raw)
+        source = source_row.get("source")
+        source_raw = (
+            source.get("provider")
+            if isinstance(source, Mapping)
+            else None
+        )
+        if source_raw == "unknown":
+            source_raw = None
+        source_provider = _provider_family(source_raw)
+        if (
+            declared_raw is not None
+            and declared is None
+            or source_raw is not None
+            and source_provider is None
+            or declared is not None
+            and source_provider is not None
+            and declared != source_provider
+            or declared is not None
+            and declared != allowed_provider
+            or source_provider is not None
+            and source_provider != allowed_provider
+        ):
+            return None
+        if not _source_lineage_is_allowed(
+            source_row,
+            provider=allowed_provider,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=effective_lineage_mode,
+            authoritative_provider=authoritative_provider,
+            allow_missing_source_id=allow_missing_source_id,
+        ):
+            return None
+        record["provider"] = allowed_provider
+        record["provider_attribution"] = "allowed_provider_binding"
+        return record
+
+    provider = _provider_family(record.get("provider"))
+    attribution = _safe_text(
+        record.get("provider_attribution"),
+        max_length=32,
+    )
+    if (
+        provider is None
+        or attribution not in _TRUSTED_PROVIDER_ATTRIBUTIONS
+        or provider not in allowed_providers
+    ):
+        return None
+
+    declared = _provider_family(source_row.get("provider"))
+    source = source_row.get("source")
+    source_provider = _provider_family(
+        source.get("provider")
+        if isinstance(source, Mapping)
+        else None
+    )
+    if (
+        declared is not None
+        and source_provider is not None
+        and declared != source_provider
+    ):
+        return None
+    if not _source_lineage_is_allowed(
+        source_row,
+        provider=provider,
+        provider_source_allowlist=provider_source_allowlist,
+        lineage_mode=effective_lineage_mode,
+        authoritative_provider=authoritative_provider,
+        allow_missing_source_id=allow_missing_source_id,
+    ):
+        return None
+    record["provider"] = provider
+    return record
+
+
+def _effective_lineage_mode(
+    capability: str,
+    lineage_mode: OpenWearablesLineageMode | None,
+) -> OpenWearablesLineageMode | None:
+    """Resolve legacy requests while keeping the catalog contract strict."""
+
+    if lineage_mode is not None:
+        return lineage_mode
+    normalized = capability.strip().casefold()
+    if normalized in {
+        "wearable.health-scores",
+        WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    }:
+        return OpenWearablesLineageMode.EXPLICIT_ROW_SOURCE_ID
+    if normalized in {
+        "wearable.provider-workouts",
+        "wearable.provider-workout-detail",
+    }:
+        return OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+    return None
+
+
+def _request_provider(request: WearableSearchRequest) -> str | None:
+    """Return the single provider selected by a provider-owned request."""
+
+    raw = request.parameters.get("provider")
+    if raw is not None:
+        return _provider_family(raw)
+    allowed = _canonical_allowed_providers(request.allowed_providers)
+    if allowed is not None and len(allowed) == 1:
+        return next(iter(allowed))
+    return None
+
+
+def _lineage_response_attested(
+    request: WearableSearchRequest,
+    *,
+    upstream_rows_present: bool,
+    lineage_verified_rows: int,
+    lineage_rejected_rows: int = 0,
+    component_attested: bool = True,
+) -> bool:
+    """Return whether the bounded adapter proved its provider boundary.
+
+    An empty upstream response is an attested no-data result.  A non-empty
+    response requires at least one source-verified row.  If every row was
+    rejected, the adapter observed data but could not prove that any row
+    belonged to the frozen binding, so it must not attest normal no-data.
+    """
+
+    if request.provider_source_allowlist is None:
+        return False
+    if not component_attested:
+        return False
+    if not upstream_rows_present:
+        return True
+    # A response that mixes rows from the frozen source with rows that cannot
+    # be attributed is not a complete source-attested response.  Returning
+    # only the accepted subset would make coverage look stronger than the
+    # provider boundary actually proves.
+    return (
+        lineage_verified_rows > 0
+        and lineage_rejected_rows == 0
     )
 
 

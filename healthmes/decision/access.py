@@ -203,6 +203,7 @@ _AUDIT_REASON_CODES = frozenset(
         "future_context_unavailable",
         "future_range_trimmed",
         "open_wearables_disconnected",
+        "open_wearables_provider_binding_changed",
         "open_wearables_source_policy_changed",
         "open_wearables_source_setting_unavailable",
         "open_wearables_unconfigured",

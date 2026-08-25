@@ -11,7 +11,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from threading import Event
 
@@ -101,6 +101,10 @@ from healthmes.store.decision_receipts import (
     maintain_decision_receipt_results,
 )
 from healthmes.timing import steady_time
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    attest_provider_bound_wearable_context,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS = 30.0
@@ -727,10 +731,31 @@ def create_app(
             cleanup.callback(mcp_server.set_settings, None)
             await cleanup.enter_async_context(mcp_app.lifespan(mcp_app))
 
+            async def default_wearable_reader(
+                day: date,
+                *,
+                provider_binding: OpenWearablesExecutionBinding | None = None,
+            ) -> object:
+                if provider_binding is None:
+                    return await mcp_server.build_daily_readiness_context(
+                        day.isoformat()
+                    )
+                context = await mcp_server.build_daily_readiness_context(
+                    day.isoformat(),
+                    allowed_providers=frozenset(
+                        provider_binding.allowed_providers
+                    ),
+                    provider_source_allowlist=(
+                        provider_binding.provider_source_allowlist
+                    ),
+                    provider_binding=provider_binding,
+                )
+                return attest_provider_bound_wearable_context(context)
+
             wearable_reader = (
                 decision_wearable_reader
                 if decision_wearable_reader is not None
-                else lambda day: mcp_server.get_daily_readiness_context(day.isoformat())
+                else default_wearable_reader
             )
             decision_search_service = build_decision_context_search_session_service(
                 settings=settings,

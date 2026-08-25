@@ -83,6 +83,9 @@ from healthmes.store.models import (
     TriggerEvent,
 )
 from healthmes.store.session import session_scope
+from healthmes.wearables.binding import (
+    current_open_wearables_execution_binding,
+)
 
 __all__ = [
     "TRIGGER_INTERVAL_MINUTES",
@@ -352,6 +355,11 @@ class OwHealthReader:
 
     def read(self, now: datetime) -> HealthSignals:
         try:
+            if current_open_wearables_execution_binding() is not None:
+                raise RuntimeError(
+                    "legacy Open Wearables reader is blocked by an active "
+                    "provider binding"
+                )
             client = self._ensure_client()
             user_id = self._ensure_user_id(client)
             stress = self._read_stress(client, user_id, now)

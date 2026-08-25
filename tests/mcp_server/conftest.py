@@ -93,6 +93,7 @@ class FakeOW:
         *,
         qualifier: str | None = None,
         components: dict | None = None,
+        data_source_id: str | None = None,
     ) -> None:
         self.health_scores.append(
             {
@@ -104,7 +105,7 @@ class FakeOW:
                 "recorded_at": recorded_at,
                 "zone_offset": None,
                 "components": components,
-                "data_source_id": None,
+                "data_source_id": data_source_id,
             }
         )
 

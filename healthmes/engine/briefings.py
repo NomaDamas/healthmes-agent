@@ -114,6 +114,7 @@ def build_scheduled_briefing_job(
         session_factory=session_factory,
         alert_sender=alert_sender,
         rules=(),
+        now_provider=clock,
     )
 
     def run_scheduled_briefing() -> None:

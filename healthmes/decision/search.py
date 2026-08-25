@@ -51,9 +51,15 @@ from healthmes.decision.providers import (
 from healthmes.decision.validation import strict_model_validate
 from healthmes.wearables.availability import (
     OPEN_WEARABLES_BACKED_CAPABILITIES,
-    OPEN_WEARABLES_METADATA_UNAVAILABLE,
+    OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
     OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
     OpenWearablesAvailability,
+)
+from healthmes.wearables.binding import (
+    OpenWearablesBindingError,
+    OpenWearablesExecutionBinding,
+    open_wearables_execution_binding,
+    resolve_open_wearables_execution_binding,
 )
 
 DECISION_SEARCH_SESSION_ID_PATTERN = r"^dss_[A-Za-z0-9_-]{43}$"
@@ -75,6 +81,58 @@ def _utc(value: datetime) -> datetime:
         if value.tzinfo is None
         else value.astimezone(UTC)
     )
+
+
+def _open_wearables_runtime_fence_reason(
+    *,
+    frozen: OpenWearablesAvailability | None,
+    current: OpenWearablesAvailability | None,
+    binding: OpenWearablesExecutionBinding,
+) -> str | None:
+    """Return the stable denial code for a changed frozen OW binding."""
+
+    if frozen is None or current is None:
+        return OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+    if (
+        current.source_policy_revision
+        != frozen.source_policy_revision
+    ):
+        return OPEN_WEARABLES_SOURCE_POLICY_CHANGED
+    blocking_reason = current.blocking_reason_code
+    if blocking_reason is not None:
+        return blocking_reason
+    if (
+        frozen.provider_binding_digest is None
+        or current.provider_binding_digest is None
+        or frozen.provider_binding_digest
+        != binding.provider_binding_digest
+        or current.provider_binding_digest
+        != binding.provider_binding_digest
+        or current.provider_catalog_version
+        != frozen.provider_catalog_version
+        or current.state != frozen.state
+    ):
+        return OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+    try:
+        current_binding = resolve_open_wearables_execution_binding(
+            current,
+            capability=binding.capability,
+            parameters=dict(binding.provider_parameters),
+            availability_reader=None,
+        )
+    except OpenWearablesBindingError:
+        return OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+    if (
+        current_binding.allowed_providers
+        != binding.allowed_providers
+        or current_binding.provider_binding_digest
+        != binding.provider_binding_digest
+        or current_binding.retained_only != binding.retained_only
+    ):
+        return OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+    if not current.exposes_capabilities:
+        return OPEN_WEARABLES_PROVIDER_BINDING_CHANGED
+    return None
 
 
 class DecisionSearchSessionState(StrEnum):
@@ -421,7 +479,9 @@ class DecisionContextSearchSessionService:
         return self._begin(
             request,
             open_wearables_availability=None,
-            freeze_capability_catalog=False,
+            freeze_capability_catalog=(
+                self._open_wearables_availability is not None
+            ),
         )
 
     async def begin_available(
@@ -567,13 +627,18 @@ class DecisionContextSearchSessionService:
             ):
                 continue
             for item in descriptor.metadata.capabilities:
-                if (
-                    item.capability
-                    in OPEN_WEARABLES_BACKED_CAPABILITIES
-                    and open_wearables_availability is not None
-                    and not open_wearables_availability.exposes_capabilities
-                ):
-                    continue
+                if item.capability in OPEN_WEARABLES_BACKED_CAPABILITIES:
+                    if open_wearables_availability is None:
+                        continue
+                    try:
+                        resolve_open_wearables_execution_binding(
+                            open_wearables_availability,
+                            capability=item.capability,
+                            parameters={},
+                            availability_reader=None,
+                        )
+                    except OpenWearablesBindingError:
+                        continue
                 allowed.add(item.capability)
         return frozenset(allowed)
 
@@ -765,6 +830,29 @@ class DecisionContextSearchSessionService:
                 parameters=parameters,
             )
         )
+        open_wearables_binding: OpenWearablesExecutionBinding | None = None
+        if (
+            capability in OPEN_WEARABLES_BACKED_CAPABILITIES
+            and record.allowed_capabilities is not None
+        ):
+            frozen_availability = record.open_wearables_availability
+            if frozen_availability is None:
+                raise DecisionSearchPolicyError(
+                    "decision_search_capability_not_in_session_catalog"
+                )
+            try:
+                open_wearables_binding = (
+                    resolve_open_wearables_execution_binding(
+                        frozen_availability,
+                        capability=capability_spec.capability,
+                        parameters=effective_parameters,
+                        availability_reader=(
+                            self._open_wearables_availability
+                        ),
+                    )
+                )
+            except OpenWearablesBindingError as exc:
+                raise DecisionSearchQueryError() from exc
         try:
             query = ContextQuery(
                 provider_id=descriptor.metadata.provider_id,
@@ -796,22 +884,20 @@ class DecisionContextSearchSessionService:
             record.calls_started += 1
 
         availability_before: OpenWearablesAvailability | None = None
-        if (
-            capability in OPEN_WEARABLES_BACKED_CAPABILITIES
-            and self._open_wearables_availability is not None
-        ):
-            availability_before = (
-                await self._open_wearables_availability()
+        if open_wearables_binding is not None:
+            try:
+                availability_before = (
+                    await self._open_wearables_availability()
+                    if self._open_wearables_availability is not None
+                    else None
+                )
+            except Exception:
+                availability_before = None
+            reason_code = _open_wearables_runtime_fence_reason(
+                frozen=record.open_wearables_availability,
+                current=availability_before,
+                binding=open_wearables_binding,
             )
-            reason_code = availability_before.blocking_reason_code
-            frozen_availability = record.open_wearables_availability
-            if (
-                reason_code is None
-                and frozen_availability is not None
-                and availability_before.source_policy_revision
-                != frozen_availability.source_policy_revision
-            ):
-                reason_code = OPEN_WEARABLES_SOURCE_POLICY_CHANGED
             if reason_code is not None:
                 result = record.access_turn.deny(
                     provider_query,
@@ -860,11 +946,23 @@ class DecisionContextSearchSessionService:
         try:
             with _read_only_session(self._session_factory) as session:
                 async with asyncio.timeout(remaining):
-                    result = await record.access_turn.query(
-                        session,
-                        provider_query,
-                        ensure_active=lambda: self._ensure_active(record),
-                    )
+                    if open_wearables_binding is None:
+                        result = await record.access_turn.query(
+                            session,
+                            provider_query,
+                            ensure_active=lambda: self._ensure_active(record),
+                        )
+                    else:
+                        with open_wearables_execution_binding(
+                            open_wearables_binding
+                        ):
+                            result = await record.access_turn.query(
+                                session,
+                                provider_query,
+                                ensure_active=(
+                                    lambda: self._ensure_active(record)
+                                ),
+                            )
                     try:
                         policy_after = self._resolve_policy(
                             record.request
@@ -899,21 +997,23 @@ class DecisionContextSearchSessionService:
                                     )
                                 ),
                             )
-                    if (
-                        capability in OPEN_WEARABLES_BACKED_CAPABILITIES
-                        and self._open_wearables_availability is not None
-                    ):
+                    if open_wearables_binding is not None:
                         try:
                             availability_after = (
                                 await self._open_wearables_availability()
-                            )
-                            availability_reason = (
-                                availability_after.blocking_reason_code
+                                if self._open_wearables_availability
+                                is not None
+                                else None
                             )
                         except Exception:
-                            availability_reason = (
-                                OPEN_WEARABLES_METADATA_UNAVAILABLE
+                            availability_after = None
+                        availability_reason = (
+                            _open_wearables_runtime_fence_reason(
+                                frozen=record.open_wearables_availability,
+                                current=availability_after,
+                                binding=open_wearables_binding,
                             )
+                        )
                         if availability_reason is not None:
                             result = record.access_turn.deny(
                                 provider_query,
@@ -925,14 +1025,15 @@ class DecisionContextSearchSessionService:
                                 ),
                             )
                         elif (
-                            availability_before is not None
-                            and availability_after.source_policy_revision
-                            != availability_before.source_policy_revision
+                            availability_before is None
+                            or availability_after is None
+                            or availability_after.provider_binding_digest
+                            != availability_before.provider_binding_digest
                         ):
                             result = record.access_turn.deny(
                                 provider_query,
                                 reason_codes=(
-                                    OPEN_WEARABLES_SOURCE_POLICY_CHANGED,
+                                    OPEN_WEARABLES_PROVIDER_BINDING_CHANGED,
                                 ),
                                 effective_query=(
                                     record.access_turn.effective_query_for(

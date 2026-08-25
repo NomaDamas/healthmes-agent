@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -74,13 +75,20 @@ _MCP_INITIALIZE = {
 }
 _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_EXPECTED_ALEMBIC_HEAD = "b7c8d9e0f1a2"
 
 
 def _migration_config(database_url: str) -> Config:
     config = Config(str(_REPO_ROOT / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url)
     return config
+
+
+def _expected_alembic_head(database_url: str) -> str:
+    heads = ScriptDirectory.from_config(
+        _migration_config(database_url)
+    ).get_heads()
+    assert len(heads) == 1
+    return heads[0]
 
 
 def _completed_receipt(
@@ -139,6 +147,7 @@ class TestStoreWiring:
     ) -> None:
         database_url = f"sqlite+pysqlite:///{tmp_path / 'empty.db'}"
         configured = settings.model_copy(update={"database_url": database_url})
+        expected_head = _expected_alembic_head(database_url)
 
         with TestClient(create_app(configured)):
             engine = get_engine()
@@ -153,7 +162,7 @@ class TestStoreWiring:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.select(version_table.c.version_num)
-                ) == _EXPECTED_ALEMBIC_HEAD
+                ) == expected_head
                 connection.execute(sa.select(storage_object.c.id).limit(1))
 
     def test_direct_app_factory_rejects_existing_non_head_database(
@@ -171,13 +180,14 @@ class TestStoreWiring:
         )
         configured = settings.model_copy(update={"database_url": database_url})
         monkeypatch.setattr(app_module, "get_settings", lambda: configured)
+        expected_head = _expected_alembic_head(database_url)
 
         app = app_module.create_app()
         with pytest.raises(
             DatabaseSchemaError,
             match=(
                 rf"current: c3d4e5f6a7b8; expected: "
-                rf"{_EXPECTED_ALEMBIC_HEAD}.*"
+                rf"{expected_head}.*"
                 r"uv run alembic upgrade head"
             ),
         ):
@@ -204,6 +214,7 @@ class TestStoreWiring:
         )
         configured = settings.model_copy(update={"database_url": database_url})
         monkeypatch.setattr(cli_module, "get_settings", lambda: configured)
+        expected_head = _expected_alembic_head(database_url)
         monkeypatch.setattr(
             "uvicorn.run",
             lambda *_args, **_kwargs: pytest.fail(
@@ -214,7 +225,7 @@ class TestStoreWiring:
         assert cli_module.main([]) == 1
         error = capsys.readouterr().err
         assert "current: c3d4e5f6a7b8" in error
-        assert f"expected: {_EXPECTED_ALEMBIC_HEAD}" in error
+        assert f"expected: {expected_head}" in error
         assert "uv run alembic upgrade head" in error
 
     def test_lifespan_binds_engine_to_app_settings_and_serves_rest(self, settings) -> None:

@@ -22,6 +22,10 @@ from healthmes.store import (
     FoodLog,
     Task,
 )
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    open_wearables_execution_binding,
+)
 
 DAY = "2026-07-08"  # local (KST) test day = UTC [07-07 15:00, 07-08 15:00)
 CALENDAR_ACCOUNT_GENERATION = "e" * 32
@@ -96,6 +100,31 @@ def seed_usage(store_factory, bucket_start_utc: dt.datetime, **fields) -> None:
 
 
 class TestGetStressTimeline:
+    async def test_legacy_direct_reads_are_blocked_by_frozen_binding(self) -> None:
+        binding = OpenWearablesExecutionBinding(
+            capability="wearable.timeseries",
+            allowed_providers=("garmin",),
+            provider_binding_digest="sha256:" + ("c" * 64),
+            source_policy_revision=1,
+            provider_parameters=(),
+            provider_source_bindings=(),
+        )
+
+        with open_wearables_execution_binding(binding):
+            with pytest.raises(
+                ToolError,
+                match="open_wearables_provider_binding_changed",
+            ):
+                await server_module.get_stress_timeline(date=DAY)
+            with pytest.raises(
+                ToolError,
+                match="open_wearables_provider_binding_changed",
+            ):
+                await server_module.compare_impact(
+                    factor="coffee",
+                    metric="stress",
+                )
+
     async def test_hand_computed_timeseries_join(
         self, mcp_client, mcp_env, call_tool, store_factory
     ):

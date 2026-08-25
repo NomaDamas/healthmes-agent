@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
+from uuid import UUID
 
 import httpx
 
@@ -52,6 +53,39 @@ VENDOR_WORKOUTS_MAX_LIMIT = 100  # vendor_workouts.py: Query(le=100)
 MAX_RESPONSE_BYTES = 512_000
 
 Resolution = Literal["raw", "1min", "5min", "15min", "1hour"]
+
+_PROVIDERS = frozenset(
+    {
+        "apple",
+        "fitbit",
+        "garmin",
+        "google",
+        "internal",
+        "oura",
+        "polar",
+        "samsung",
+        "strava",
+        "suunto",
+        "ultrahuman",
+        "unknown",
+        "whoop",
+    }
+)
+_COVERAGE_PROVIDERS = _PROVIDERS - {"internal", "unknown"}
+_CONNECTION_STATUSES = frozenset({"active", "expired", "revoked"})
+_HEALTH_SCORE_CODES = frozenset(
+    {
+        "activity",
+        "body_battery",
+        "day_strain",
+        "readiness",
+        "recovery",
+        "resilience",
+        "sleep",
+        "strain",
+        "stress",
+    }
+)
 
 
 class OWClientError(Exception):
@@ -112,6 +146,105 @@ def _window_epoch_seconds(value: str) -> int:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=UTC)
     return int(parsed.timestamp())
+
+
+def _payload_error(resource: str) -> OWPayloadError:
+    return OWPayloadError(
+        f"open-wearables returned an invalid {resource} response"
+    )
+
+
+def _require_mapping(value: object, resource: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _payload_error(resource)
+    return value
+
+
+def _require_list(value: object, resource: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise _payload_error(resource)
+    return value
+
+
+def _require_nonempty_string(value: object, resource: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise _payload_error(resource)
+    return value
+
+
+def _require_canonical_uuid(value: object, resource: str) -> str:
+    text = _require_nonempty_string(value, resource)
+    try:
+        parsed = UUID(text)
+    except ValueError:
+        raise _payload_error(resource) from None
+    if str(parsed) != text:
+        raise _payload_error(resource)
+    return text
+
+
+def _require_optional_uuid(value: object, resource: str) -> None:
+    if value is not None:
+        _require_canonical_uuid(value, resource)
+
+
+def _require_provider(
+    value: object,
+    resource: str,
+    *,
+    coverage: bool = False,
+) -> str:
+    provider = _require_nonempty_string(value, resource)
+    allowed = _COVERAGE_PROVIDERS if coverage else _PROVIDERS
+    if provider not in allowed:
+        raise _payload_error(resource)
+    return provider
+
+
+def _require_count(value: object, resource: str) -> int:
+    if type(value) is not int or value < 0:
+        raise _payload_error(resource)
+    return value
+
+
+def _require_bool(value: object, resource: str) -> bool:
+    if type(value) is not bool:
+        raise _payload_error(resource)
+    return value
+
+
+def _require_unique_strings(
+    value: object,
+    resource: str,
+    *,
+    allowed: frozenset[str] | None = None,
+) -> list[str]:
+    items = _require_list(value, resource)
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = _require_nonempty_string(item, resource)
+        if text in seen or (allowed is not None and text not in allowed):
+            raise _payload_error(resource)
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _require_count_mapping(
+    value: object,
+    resource: str,
+    *,
+    allowed_codes: frozenset[str] | None = None,
+) -> dict[str, int]:
+    mapping = _require_mapping(value, resource)
+    result: dict[str, int] = {}
+    for raw_code, raw_count in mapping.items():
+        code = _require_nonempty_string(raw_code, resource)
+        if allowed_codes is not None and code not in allowed_codes:
+            raise _payload_error(resource)
+        result[code] = _require_count(raw_count, resource)
+    return result
 
 
 class OWClient:
@@ -241,11 +374,49 @@ class OWClient:
 
     async def get_connections(self, user_id: str) -> list[dict[str, Any]]:
         payload = await self._get(f"/api/v1/users/{user_id}/connections")
-        if not isinstance(payload, list) or any(
-            not isinstance(row, Mapping) for row in payload
-        ):
+        if not isinstance(payload, list):
             raise OWClientError("open-wearables returned an invalid connections response")
-        return [dict(row) for row in payload]
+        rows: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for value in payload:
+            row = _require_mapping(value, "connections")
+            provider = _require_provider(row.get("provider"), "connections")
+            status = _require_nonempty_string(row.get("status"), "connections")
+            if status not in _CONNECTION_STATUSES:
+                raise _payload_error("connections")
+            if "id" in row:
+                connection_id = _require_canonical_uuid(
+                    row.get("id"),
+                    "connections",
+                )
+                if connection_id in seen_ids:
+                    raise _payload_error("connections")
+                seen_ids.add(connection_id)
+            if "user_id" in row:
+                owner_id = _require_canonical_uuid(
+                    row.get("user_id"),
+                    "connections",
+                )
+                if owner_id != user_id:
+                    raise _payload_error("connections")
+            if "linked_user_ids" in row:
+                linked_ids = _require_list(
+                    row.get("linked_user_ids"),
+                    "connections",
+                )
+                seen_linked_ids: set[str] = set()
+                for linked_id in linked_ids:
+                    canonical_id = _require_canonical_uuid(
+                        linked_id,
+                        "connections",
+                    )
+                    if canonical_id in seen_linked_ids:
+                        raise _payload_error("connections")
+                    seen_linked_ids.add(canonical_id)
+            if provider in {"internal", "unknown"}:
+                raise _payload_error("connections")
+            rows.append(dict(row))
+        return rows
 
     async def get_user_data_sources(self, user_id: str) -> dict[str, Any]:
         """GET /api/v1/users/{user_id}/data-sources."""
@@ -256,18 +427,37 @@ class OWClient:
             )
         items = payload.get("items")
         total = payload.get("total")
-        if (
-            not isinstance(items, list)
-            or any(not isinstance(row, Mapping) for row in items)
-            or type(total) is not int
-            or total < 0
-        ):
-            raise OWClientError(
-                "open-wearables returned an invalid data sources response"
+        if not isinstance(items, list):
+            raise _payload_error("data sources")
+        parsed_total = _require_count(total, "data sources")
+        if parsed_total != len(items):
+            raise _payload_error("data sources")
+        rows: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for value in items:
+            row = _require_mapping(value, "data sources")
+            source_id = _require_canonical_uuid(
+                row.get("id"),
+                "data sources",
             )
+            if source_id in seen_ids:
+                raise _payload_error("data sources")
+            seen_ids.add(source_id)
+            owner_id = _require_canonical_uuid(
+                row.get("user_id"),
+                "data sources",
+            )
+            if owner_id != user_id:
+                raise _payload_error("data sources")
+            _require_provider(row.get("provider"), "data sources")
+            _require_optional_uuid(
+                row.get("user_connection_id"),
+                "data sources",
+            )
+            rows.append(dict(row))
         return {
-            "items": [dict(row) for row in items],
-            "total": total,
+            "items": rows,
+            "total": parsed_total,
         }
 
     # ------------------------------------------------------------------
@@ -276,7 +466,119 @@ class OWClient:
 
     async def get_provider_coverage(self) -> dict[str, Any]:
         """GET /api/v1/meta/coverage — static provider data coverage matrix."""
-        return await self._get("/api/v1/meta/coverage")
+        payload = _require_mapping(
+            await self._get("/api/v1/meta/coverage"),
+            "provider coverage",
+        )
+        providers = _require_unique_strings(
+            payload.get("providers"),
+            "provider coverage",
+            allowed=_COVERAGE_PROVIDERS,
+        )
+        provider_set = set(providers)
+
+        timeseries = _require_list(
+            payload.get("timeseries"),
+            "provider coverage",
+        )
+        seen_categories: set[str] = set()
+        seen_metrics: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for category_value in timeseries:
+            category = _require_mapping(
+                category_value,
+                "provider coverage",
+            )
+            category_name = _require_nonempty_string(
+                category.get("name"),
+                "provider coverage",
+            )
+            if category_name in seen_categories:
+                raise _payload_error("provider coverage")
+            seen_categories.add(category_name)
+            metrics = _require_list(
+                category.get("metrics"),
+                "provider coverage",
+            )
+            for metric_value in metrics:
+                metric = _require_mapping(
+                    metric_value,
+                    "provider coverage",
+                )
+                code = _require_nonempty_string(
+                    metric.get("code"),
+                    "provider coverage",
+                )
+                unit = metric.get("unit")
+                if not isinstance(unit, str):
+                    raise _payload_error("provider coverage")
+                metric_providers = _require_unique_strings(
+                    metric.get("providers"),
+                    "provider coverage",
+                    allowed=_COVERAGE_PROVIDERS,
+                )
+                if not metric_providers or not set(metric_providers) <= provider_set:
+                    raise _payload_error("provider coverage")
+                signature = (unit, tuple(sorted(metric_providers)))
+                if code in seen_metrics:
+                    raise _payload_error("provider coverage")
+                seen_metrics[code] = signature
+
+        for field_name in ("workout_fields", "sleep_fields"):
+            fields = _require_list(
+                payload.get(field_name),
+                "provider coverage",
+            )
+            seen_codes: set[str] = set()
+            for field_value in fields:
+                field = _require_mapping(
+                    field_value,
+                    "provider coverage",
+                )
+                code = _require_nonempty_string(
+                    field.get("code"),
+                    "provider coverage",
+                )
+                field_providers = _require_unique_strings(
+                    field.get("providers"),
+                    "provider coverage",
+                    allowed=_COVERAGE_PROVIDERS,
+                )
+                if (
+                    code in seen_codes
+                    or not field_providers
+                    or not set(field_providers) <= provider_set
+                ):
+                    raise _payload_error("provider coverage")
+                seen_codes.add(code)
+
+        health_scores = _require_list(
+            payload.get("health_scores"),
+            "provider coverage",
+        )
+        seen_score_codes: set[str] = set()
+        for score_value in health_scores:
+            score = _require_mapping(
+                score_value,
+                "provider coverage",
+            )
+            code = _require_nonempty_string(
+                score.get("code"),
+                "provider coverage",
+            )
+            score_providers = _require_unique_strings(
+                score.get("providers"),
+                "provider coverage",
+                allowed=_COVERAGE_PROVIDERS,
+            )
+            if (
+                code not in _HEALTH_SCORE_CODES
+                or code in seen_score_codes
+                or not score_providers
+                or not set(score_providers) <= provider_set
+            ):
+                raise _payload_error("provider coverage")
+            seen_score_codes.add(code)
+        return dict(payload)
 
     async def get_configured_providers(
         self,
@@ -424,10 +726,99 @@ class OWClient:
             params["start_date"] = start_date
         if end_date is not None:
             params["end_date"] = end_date
-        return await self._get(
-            f"/api/v1/users/{user_id}/summaries/data",
-            params=params,
+        payload = _require_mapping(
+            await self._get(
+                f"/api/v1/users/{user_id}/summaries/data",
+                params=params,
+            ),
+            "data summary",
         )
+        owner_id = _require_canonical_uuid(
+            payload.get("user_id"),
+            "data summary",
+        )
+        if owner_id != user_id:
+            raise _payload_error("data summary")
+
+        total_data_points = _require_count(
+            payload.get("total_data_points"),
+            "data summary",
+        )
+        total_workouts = _require_count(
+            payload.get("total_workouts"),
+            "data summary",
+        )
+        total_sleep_events = _require_count(
+            payload.get("total_sleep_events"),
+            "data summary",
+        )
+        series_type_counts = _require_count_mapping(
+            payload.get("series_type_counts"),
+            "data summary",
+        )
+        workout_type_counts = _require_count_mapping(
+            payload.get("workout_type_counts"),
+            "data summary",
+        )
+        _require_bool(
+            payload.get("has_womens_health_data", False),
+            "data summary",
+        )
+
+        provider_rows = _require_list(
+            payload.get("by_provider"),
+            "data summary",
+        )
+        seen_providers: set[str] = set()
+        provider_data_points = 0
+        provider_workouts = 0
+        provider_sleep_events = 0
+        aggregated_series_counts: dict[str, int] = {}
+        for value in provider_rows:
+            row = _require_mapping(value, "data summary")
+            provider = _require_provider(
+                row.get("provider"),
+                "data summary",
+            )
+            if provider in seen_providers:
+                raise _payload_error("data summary")
+            seen_providers.add(provider)
+            data_points = _require_count(
+                row.get("data_points"),
+                "data summary",
+            )
+            series_counts = _require_count_mapping(
+                row.get("series_counts"),
+                "data summary",
+            )
+            if data_points != sum(series_counts.values()):
+                raise _payload_error("data summary")
+            workout_count = _require_count(
+                row.get("workout_count"),
+                "data summary",
+            )
+            sleep_count = _require_count(
+                row.get("sleep_count"),
+                "data summary",
+            )
+            provider_data_points += data_points
+            provider_workouts += workout_count
+            provider_sleep_events += sleep_count
+            for code, count in series_counts.items():
+                aggregated_series_counts[code] = (
+                    aggregated_series_counts.get(code, 0) + count
+                )
+
+        if (
+            total_data_points != sum(series_type_counts.values())
+            or total_data_points != provider_data_points
+            or total_workouts != sum(workout_type_counts.values())
+            or total_workouts != provider_workouts
+            or total_sleep_events != provider_sleep_events
+            or series_type_counts != aggregated_series_counts
+        ):
+            raise _payload_error("data summary")
+        return dict(payload)
 
     async def get_sleep_summaries(
         self,
@@ -735,7 +1126,7 @@ class OWClient:
             f"/api/v1/providers/{normalized_provider}/users/{user_id}/workouts",
             params=params or None,
         )
-        if not isinstance(payload, (dict, list)):
+        if not isinstance(payload, dict | list):
             raise OWClientError(
                 "open-wearables returned an invalid vendor workouts response"
             )

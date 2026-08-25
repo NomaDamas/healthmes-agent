@@ -55,6 +55,10 @@ from healthmes.store.models import (
     Task,
     TriggerEvent,
 )
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    open_wearables_execution_binding,
+)
 
 
 def local_now() -> datetime:
@@ -2009,6 +2013,24 @@ def test_reader_degrades_to_empty_signals_on_failure(settings) -> None:
     # degrade the same way, never raise (and never require network).
     signals = OwHealthReader(settings).read(NOW_UTC)
     assert signals == HealthSignals()
+
+
+def test_reader_does_not_bypass_active_provider_binding(settings) -> None:
+    client = FakeOwClient({"stress": stress_history()})
+    binding = OpenWearablesExecutionBinding(
+        capability="wearable.stress",
+        allowed_providers=("garmin",),
+        provider_binding_digest="sha256:" + ("d" * 64),
+        source_policy_revision=1,
+        provider_parameters=(),
+        provider_source_bindings=(),
+    )
+
+    with open_wearables_execution_binding(binding):
+        signals = OwHealthReader(settings, client=client).read(NOW_UTC)
+
+    assert signals == HealthSignals()
+    assert client.calls == []
 
 
 def test_reader_honors_configured_ow_user_id(settings) -> None:

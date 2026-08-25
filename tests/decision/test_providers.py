@@ -44,8 +44,19 @@ from healthmes.decision import (
     build_context_provider_registry,
 )
 from healthmes.storage import update_retention_policy
-from healthmes.store import CalendarEventMirror, WellnessEvent
+from healthmes.store import (
+    Base,
+    CalendarEventMirror,
+    WellnessEvent,
+    create_db_engine,
+)
 from healthmes.store.enums import CalendarSource
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    OpenWearablesExecutionSourceBinding,
+    attest_provider_bound_wearable_context,
+    open_wearables_execution_binding,
+)
 
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 DAY_START = datetime(2026, 8, 10, tzinfo=UTC)
@@ -881,6 +892,235 @@ async def test_wearable_adapter_normalizes_upstream_source_reference(session):
     )
     assert result.source_refs[0].collected_at == NOW
     assert "wearable_source_refs_are_readiness_level" in result.limitations
+
+
+async def test_wearable_adapter_forwards_frozen_provider_binding(tmp_path):
+    calls: list[tuple[date, OpenWearablesExecutionBinding]] = []
+
+    async def reader(
+        day: date,
+        *,
+        provider_binding: OpenWearablesExecutionBinding,
+    ):
+        calls.append((day, provider_binding))
+        return attest_provider_bound_wearable_context(
+            {
+                "status": "ok",
+                "date": day.isoformat(),
+                "stress": {
+                    "status": "ok",
+                    "value": 42,
+                    "recorded_at": "2026-08-10T08:00:00+00:00",
+                },
+                "freshness": {
+                    "recorded_at": "2026-08-10T08:00:00+00:00",
+                    "status": "derived_from_readiness_blocks",
+                },
+                "coverage": {"status": "readiness_blocks", "ratio": 1.0},
+                "limitations": [],
+            }
+        )
+
+    binding = OpenWearablesExecutionBinding(
+        capability="wearable.stress",
+        allowed_providers=("garmin",),
+        provider_binding_digest="sha256:" + "a" * 64,
+        source_policy_revision=0,
+        provider_parameters=(),
+        provider_source_bindings=(
+            OpenWearablesExecutionSourceBinding(
+                provider="garmin",
+                active_connection_ids=("garmin-connection",),
+                direct_data_source_ids=("garmin-source",),
+                import_data_source_ids=(),
+            ),
+        ),
+    )
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'provider-binding.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    registry = ContextProviderRegistry(
+        (
+            WearableContextProvider(
+                reader,
+                snapshot_session_factory=factory,
+            ),
+        )
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.stress",
+        parameters={"date": "2026-08-10"},
+    )
+
+    try:
+        with factory() as session:
+            with open_wearables_execution_binding(binding):
+                result = await registry.execute(session, query, now=NOW)
+    finally:
+        engine.dispose()
+
+    assert result.status is ContextStatus.OK
+    assert calls == [(date(2026, 8, 10), binding)]
+
+
+async def test_provider_bound_daily_snapshot_requires_independent_writer(
+    session,
+):
+    async def reader(
+        day: date,
+        *,
+        provider_binding: OpenWearablesExecutionBinding,
+    ):
+        del provider_binding
+        return attest_provider_bound_wearable_context(
+            {
+                "status": "ok",
+                "date": day.isoformat(),
+                "stress": {
+                    "status": "ok",
+                    "value": 42,
+                    "recorded_at": "2026-08-10T08:00:00+00:00",
+                },
+                "freshness": {
+                    "recorded_at": "2026-08-10T08:00:00+00:00",
+                    "status": "derived_from_readiness_blocks",
+                },
+                "coverage": {"status": "readiness_blocks", "ratio": 1.0},
+                "limitations": [],
+            }
+        )
+
+    binding = OpenWearablesExecutionBinding(
+        capability="wearable.stress",
+        allowed_providers=("garmin",),
+        provider_binding_digest="sha256:" + "c" * 64,
+        source_policy_revision=0,
+        provider_parameters=(),
+        provider_source_bindings=(),
+    )
+    registry = ContextProviderRegistry((WearableContextProvider(reader),))
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.stress",
+        parameters={"date": "2026-08-10"},
+    )
+
+    with open_wearables_execution_binding(binding):
+        result = await registry.execute(session, query, now=NOW)
+
+    assert result.status is ContextStatus.FAILED
+    assert result.payload == {}
+    assert result.source_refs == []
+    assert result.limitations == ["wearable_snapshot_writer_unavailable"]
+
+
+async def test_wearable_adapter_does_not_call_legacy_reader_under_binding(
+    session,
+):
+    calls = 0
+
+    async def legacy_reader(day: date):
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"legacy reader called for {day}")
+
+    binding = OpenWearablesExecutionBinding(
+        capability="wearable.stress",
+        allowed_providers=("garmin",),
+        provider_binding_digest="sha256:" + "b" * 64,
+        source_policy_revision=0,
+        provider_parameters=(),
+        provider_source_bindings=(),
+    )
+    registry = ContextProviderRegistry(
+        (WearableContextProvider(legacy_reader),)
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.stress",
+        parameters={"date": "2026-08-10"},
+    )
+
+    with open_wearables_execution_binding(binding):
+        result = await registry.execute(session, query, now=NOW)
+
+    assert calls == 0
+    assert result.status is ContextStatus.FAILED
+    assert result.limitations == [
+        "open_wearables_context_unavailable",
+        "open_wearables_source_lineage_unverified",
+    ]
+
+
+async def test_provider_bound_reader_cannot_self_attest_with_plain_dict(
+    session,
+):
+    calls = 0
+
+    async def spoofed_reader(
+        day: date,
+        *,
+        provider_binding: OpenWearablesExecutionBinding,
+    ):
+        nonlocal calls
+        calls += 1
+        del provider_binding
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "stress": {
+                "status": "ok",
+                "value": 42,
+                "recorded_at": "2026-08-10T08:00:00+00:00",
+            },
+            "source_lineage_verified": True,
+        }
+
+    binding = OpenWearablesExecutionBinding(
+        capability="wearable.stress",
+        allowed_providers=("garmin",),
+        provider_binding_digest="sha256:" + "d" * 64,
+        source_policy_revision=0,
+        provider_parameters=(),
+        provider_source_bindings=(
+            OpenWearablesExecutionSourceBinding(
+                provider="garmin",
+                active_connection_ids=("garmin-connection",),
+                direct_data_source_ids=("garmin-source",),
+                import_data_source_ids=(),
+            ),
+        ),
+    )
+    registry = ContextProviderRegistry(
+        (WearableContextProvider(spoofed_reader),)
+    )
+
+    with open_wearables_execution_binding(binding):
+        result = await registry.execute(
+            session,
+            ContextQuery(
+                provider_id="wearable",
+                capability="wearable.stress",
+                parameters={"date": "2026-08-10"},
+            ),
+            now=NOW,
+        )
+
+    assert calls == 1
+    assert result.status is ContextStatus.FAILED
+    assert result.payload == {}
+    assert result.source_refs == []
+    assert result.limitations == [
+        "open_wearables_source_lineage_unverified"
+    ]
 
 
 async def test_wearable_metric_cursor_is_stable_and_filter_bound(session):
