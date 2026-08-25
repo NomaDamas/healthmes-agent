@@ -38,6 +38,13 @@ from healthmes.store import (
     WellnessEvent,
     create_db_engine,
 )
+from healthmes.wearables.availability import (
+    OpenWearablesAvailabilitySnapshot,
+    OpenWearablesAvailabilityState,
+    OpenWearablesCapabilityBinding,
+    OpenWearablesProviderBinding,
+    OpenWearablesProviderSourceBinding,
+)
 from healthmes.wearables.provenance import (
     open_wearables_retention_policy_binding,
     persist_open_wearables_query_snapshot,
@@ -52,6 +59,7 @@ LOCAL_DAY = date(2026, 8, 16)
 MODEL = "whoop-migration-e2e-model"
 PROVIDER = "whoop-migration-e2e-provider"
 FINGERPRINT_KEY = b"whoop-migration-e2e-fingerprint-key"
+WHOOP_PROVIDER_BINDING_DIGEST = "sha256:" + "a" * 64
 
 
 def _persist_whoop_snapshot(
@@ -128,6 +136,7 @@ def _persist_whoop_snapshot(
         private_provenance=calculation.provenance,
         collected_at=collected_at,
         now=NOW,
+        provider_binding_digest=WHOOP_PROVIDER_BINDING_DIGEST,
     )
 
 
@@ -430,11 +439,46 @@ async def test_exact_prior_whoop_package_survives_official_runtime_and_replay(
             owner_principal_id="owner",
             execution_scope=ExecutionScope.LOCAL,
         )
+
+        async def whoop_availability() -> OpenWearablesAvailabilitySnapshot:
+            return OpenWearablesAvailabilitySnapshot(
+                state=OpenWearablesAvailabilityState.AVAILABLE,
+                observed_at=NOW,
+                provider_catalog_version=1,
+                providers=("whoop",),
+                provider_bindings=(
+                    OpenWearablesProviderBinding(
+                        provider="whoop",
+                        direct_api=True,
+                        capabilities=(
+                            WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                        ),
+                    ),
+                ),
+                capability_catalog=(
+                    OpenWearablesCapabilityBinding(
+                        capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                        providers=("whoop",),
+                    ),
+                ),
+                provider_source_bindings=(
+                    OpenWearablesProviderSourceBinding(
+                        provider="whoop",
+                        active_connection_ids=("whoop-connection",),
+                        direct_data_source_ids=("whoop-data-source",),
+                    ),
+                ),
+                provider_binding_digest=(
+                    WHOOP_PROVIDER_BINDING_DIGEST
+                ),
+            )
+
         search_service = DecisionContextSearchSessionService(
             access_layer=access_layer,
             session_factory=factory,
             policy_resolver=policy_resolver,
             clock=lambda: NOW,
+            open_wearables_availability=whoop_availability,
         )
         transport = _WhoopMigrationHermesTransport(
             search_service=search_service,

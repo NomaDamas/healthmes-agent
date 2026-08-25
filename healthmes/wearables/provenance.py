@@ -7,7 +7,7 @@ import json
 import math
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
@@ -20,6 +20,10 @@ from sqlalchemy.pool import StaticPool
 from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
+)
+from healthmes.source_policy import (
+    InputSourcePolicyBinding,
+    assert_input_source_policy_binding,
 )
 from healthmes.storage.service import (
     DEFAULT_RETENTION,
@@ -53,6 +57,27 @@ _QUERY_SCHEMA = "healthmes.open-wearables-query.v1"
 _WHOOP_PACKAGE_QUERY_SCHEMA = "healthmes.open-wearables-query.v2"
 _WHOOP_PACKAGE_IDENTITY_SCHEMA = (
     "healthmes.open-wearables-query-identity.v3"
+)
+_PROVIDER_BOUND_SNAPSHOT_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-snapshot-identity.v2"
+)
+_PROVIDER_BOUND_OBSERVATION_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-observation-identity.v2"
+)
+_EXECUTION_SCOPED_SNAPSHOT_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-snapshot-identity.v3"
+)
+_EXECUTION_SCOPED_OBSERVATION_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-observation-identity.v3"
+)
+_DAILY_EXECUTION_SCOPE_SCHEMA = (
+    "healthmes.open-wearables-daily-execution-scope.v1"
+)
+_PROVIDER_BOUND_QUERY_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-query-identity.v2"
+)
+_PROVIDER_BOUND_WHOOP_PACKAGE_IDENTITY_SCHEMA = (
+    "healthmes.open-wearables-query-identity.v4"
 )
 _RETENTION_BINDING_SCHEMA = "healthmes.retention-policy-binding.v1"
 _MAX_CONTEXT_BYTES = 1_000_000
@@ -180,6 +205,8 @@ class WearableSnapshot:
     observed_end: datetime
     content_digest: str
     coverage: float | None
+    provider_binding_digest: str | None = None
+    execution_scope_digest: str | None = None
 
     def is_stale(self, *, now: datetime, max_age: timedelta) -> bool:
         """Return whether the last successful collection is older than ``max_age``."""
@@ -202,8 +229,10 @@ class WearableQuerySnapshot:
     collected_at: datetime
     retention_basis_at: datetime
     coverage: float | None
+    parameters: dict[str, Any] = field(default_factory=dict)
     schema_version: int = 1
     private_provenance_digest: str | None = None
+    provider_binding_digest: str | None = None
 
 
 def _aware_utc(value: datetime, *, field: str) -> datetime:
@@ -217,6 +246,113 @@ def _database_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _provider_binding_digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not str
+        or not value.startswith("sha256:")
+        or len(value) != 71
+        or any(
+            character not in "0123456789abcdef"
+            for character in value[7:]
+        )
+    ):
+        raise ValueError(
+            "provider_binding_digest must be sha256:<64 lowercase hex>"
+        )
+    return value
+
+
+def _execution_scope_digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not str
+        or not value.startswith("sha256:")
+        or len(value) != 71
+        or any(
+            character not in "0123456789abcdef"
+            for character in value[7:]
+        )
+    ):
+        raise ValueError(
+            "execution_scope_digest must be sha256:<64 lowercase hex>"
+        )
+    return value
+
+
+def _stored_provider_binding_digest(
+    payload: Mapping[str, Any],
+) -> str | None:
+    return _provider_binding_digest(
+        payload.get("provider_binding_digest")
+    )
+
+
+def _stored_execution_scope_digest(
+    payload: Mapping[str, Any],
+) -> str | None:
+    return _execution_scope_digest(
+        payload.get("execution_scope_digest")
+    )
+
+
+def _provider_binding_matches(
+    stored: str | None,
+    expected: str | None,
+) -> bool:
+    return expected is None or stored == expected
+
+
+def _execution_scope_matches(
+    stored: str | None,
+    expected: str | None,
+) -> bool:
+    return expected is None or stored == expected
+
+
+def open_wearables_daily_execution_scope_digest(
+    *,
+    capability: str,
+    allowed_providers: Sequence[str],
+    provider_binding_digest: str,
+) -> str:
+    """Return the canonical identity for one provider-bound daily execution."""
+
+    normalized_capability = capability.strip().casefold()
+    if (
+        not normalized_capability
+        or len(normalized_capability) > 128
+        or not normalized_capability.startswith("wearable.")
+    ):
+        raise ValueError("invalid wearable capability")
+    if isinstance(allowed_providers, str):
+        raise TypeError("allowed_providers must be a sequence of providers")
+    normalized_providers = sorted(
+        {
+            provider.strip().casefold()
+            for provider in allowed_providers
+            if isinstance(provider, str) and provider.strip()
+        }
+    )
+    if not normalized_providers:
+        raise ValueError("allowed_providers must not be empty")
+    binding_digest = _provider_binding_digest(provider_binding_digest)
+    assert binding_digest is not None
+    digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "allowed_providers": normalized_providers,
+                "capability": normalized_capability,
+                "provider_binding_digest": binding_digest,
+                "schema": _DAILY_EXECUTION_SCOPE_SCHEMA,
+            }
+        )
+    ).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _secret_key(value: str) -> bool:
@@ -519,7 +655,36 @@ def _source_record_id(
     *,
     local_day: date,
     content_digest: str,
+    provider_binding_digest: str | None,
+    execution_scope_digest: str | None,
 ) -> str:
+    if execution_scope_digest is not None:
+        identity_digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "content_digest": content_digest,
+                    "execution_scope_digest": execution_scope_digest,
+                    "local_day": local_day.isoformat(),
+                    "provider_binding_digest": provider_binding_digest,
+                    "schema": (
+                        _EXECUTION_SCOPED_SNAPSHOT_IDENTITY_SCHEMA
+                    ),
+                }
+            )
+        ).hexdigest()
+        return f"snapshot:{local_day.isoformat()}:{identity_digest}"
+    if provider_binding_digest is not None:
+        identity_digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "content_digest": content_digest,
+                    "local_day": local_day.isoformat(),
+                    "provider_binding_digest": provider_binding_digest,
+                    "schema": _PROVIDER_BOUND_SNAPSHOT_IDENTITY_SCHEMA,
+                }
+            )
+        ).hexdigest()
+        return f"snapshot:{local_day.isoformat()}:{identity_digest}"
     return f"snapshot:{local_day.isoformat()}:{content_digest}"
 
 
@@ -529,8 +694,49 @@ def _observation_source_record_id(
     timezone: str,
     collected_at: datetime,
     content_digest: str,
+    provider_binding_digest: str | None,
+    execution_scope_digest: str | None,
 ) -> str:
     timezone_digest = hashlib.sha256(timezone.encode("utf-8")).hexdigest()[:12]
+    if execution_scope_digest is not None:
+        observation_digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "collected_at": collected_at.isoformat(),
+                    "content_digest": content_digest,
+                    "execution_scope_digest": execution_scope_digest,
+                    "local_day": local_day.isoformat(),
+                    "provider_binding_digest": provider_binding_digest,
+                    "schema": (
+                        _EXECUTION_SCOPED_OBSERVATION_IDENTITY_SCHEMA
+                    ),
+                    "timezone": timezone,
+                }
+            )
+        ).hexdigest()
+        return (
+            f"observation:{local_day.isoformat()}:{timezone_digest}:"
+            f"{collected_at.isoformat()}:{observation_digest}"
+        )
+    if provider_binding_digest is not None:
+        observation_digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "collected_at": collected_at.isoformat(),
+                    "content_digest": content_digest,
+                    "local_day": local_day.isoformat(),
+                    "provider_binding_digest": provider_binding_digest,
+                    "schema": (
+                        _PROVIDER_BOUND_OBSERVATION_IDENTITY_SCHEMA
+                    ),
+                    "timezone": timezone,
+                }
+            )
+        ).hexdigest()
+        return (
+            f"observation:{local_day.isoformat()}:{timezone_digest}:"
+            f"{collected_at.isoformat()}:{observation_digest}"
+        )
     return (
         f"observation:{local_day.isoformat()}:{timezone_digest}:"
         f"{collected_at.isoformat()}:{content_digest}"
@@ -564,6 +770,8 @@ def _snapshot_payload(
     observed_start: datetime,
     observed_end: datetime,
     content_digest: str,
+    provider_binding_digest: str | None,
+    execution_scope_digest: str | None,
 ) -> dict[str, Any]:
     provenance = {
         key: normalized_context[key]
@@ -583,6 +791,10 @@ def _snapshot_payload(
         "normalized_context": normalized_context,
         "upstream_provenance": provenance,
     }
+    if provider_binding_digest is not None:
+        payload["provider_binding_digest"] = provider_binding_digest
+    if execution_scope_digest is not None:
+        payload["execution_scope_digest"] = execution_scope_digest
     return _normalize_json(
         payload,
         max_bytes=_MAX_PAYLOAD_BYTES,
@@ -598,20 +810,27 @@ def _observation_payload(
     observed_start: datetime,
     observed_end: datetime,
     content_digest: str,
+    provider_binding_digest: str | None,
+    execution_scope_digest: str | None,
 ) -> dict[str, Any]:
-    return _normalize_json(
-        {
-            "schema": _OBSERVATION_SCHEMA,
-            "snapshot_event_id": str(snapshot_event_id),
-            "local_day": local_day.isoformat(),
-            "timezone": timezone,
-            "collected_at": collected_at.isoformat(),
-            "window": {
-                "start": observed_start.isoformat(),
-                "end": observed_end.isoformat(),
-            },
-            "content_digest": content_digest,
+    payload = {
+        "schema": _OBSERVATION_SCHEMA,
+        "snapshot_event_id": str(snapshot_event_id),
+        "local_day": local_day.isoformat(),
+        "timezone": timezone,
+        "collected_at": collected_at.isoformat(),
+        "window": {
+            "start": observed_start.isoformat(),
+            "end": observed_end.isoformat(),
         },
+        "content_digest": content_digest,
+    }
+    if provider_binding_digest is not None:
+        payload["provider_binding_digest"] = provider_binding_digest
+    if execution_scope_digest is not None:
+        payload["execution_scope_digest"] = execution_scope_digest
+    return _normalize_json(
+        payload,
         max_bytes=_MAX_PAYLOAD_BYTES,
     )
 
@@ -624,6 +843,8 @@ def _validate_existing_snapshot(
     observed_start: datetime,
     content_digest: str,
     coverage: float | None,
+    provider_binding_digest: str | None,
+    execution_scope_digest: str | None,
     now: datetime,
 ) -> None:
     snapshot = _content_from_event(event)
@@ -634,6 +855,8 @@ def _validate_existing_snapshot(
         or snapshot.observed_start != observed_start
         or snapshot.content_digest != content_digest
         or snapshot.coverage != coverage
+        or snapshot.provider_binding_digest != provider_binding_digest
+        or snapshot.execution_scope_digest != execution_scope_digest
         or event.raw_object_id is not None
         or (
             event.expires_at is not None
@@ -651,10 +874,18 @@ def persist_open_wearables_observation(
     timezone: str,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
+    provider_binding_digest: str | None = None,
+    execution_scope_digest: str | None = None,
 ) -> WearableSnapshot:
     """Persist one observation under the shared wellness write fence."""
     with activity_write_lock():
         lock_activity_write_plane(session)
+        if expected_source_policy is not None:
+            assert_input_source_policy_binding(
+                session,
+                expected_source_policy,
+            )
         return _persist_open_wearables_observation(
             session,
             normalized_context=normalized_context,
@@ -662,6 +893,8 @@ def persist_open_wearables_observation(
             timezone=timezone,
             collected_at=collected_at,
             now=now,
+            provider_binding_digest=provider_binding_digest,
+            execution_scope_digest=execution_scope_digest,
         )
 
 
@@ -673,6 +906,8 @@ def _persist_open_wearables_observation(
     timezone: str,
     collected_at: datetime,
     now: datetime,
+    provider_binding_digest: str | None,
+    execution_scope_digest: str | None,
 ) -> WearableSnapshot:
     """Flush immutable content plus one collection observation.
 
@@ -684,6 +919,12 @@ def _persist_open_wearables_observation(
         raise TypeError("local_day must be a date")
     current = _aware_utc(now, field="now")
     collected = _aware_utc(collected_at, field="collected_at")
+    binding_digest = _provider_binding_digest(provider_binding_digest)
+    scope_digest = _execution_scope_digest(execution_scope_digest)
+    if scope_digest is not None and binding_digest is None:
+        raise ValueError(
+            "execution_scope_digest requires provider_binding_digest"
+        )
     if collected > current + _MAX_CLOCK_SKEW:
         raise ValueError("collected_at is too far in the future")
     parse_timezone(timezone)
@@ -701,6 +942,8 @@ def _persist_open_wearables_observation(
     source_record_id = _source_record_id(
         local_day=local_day,
         content_digest=content_digest,
+        provider_binding_digest=binding_digest,
+        execution_scope_digest=scope_digest,
     )
     payload = _snapshot_payload(
         normalized_context=context,
@@ -710,6 +953,8 @@ def _persist_open_wearables_observation(
         observed_start=observed_start,
         observed_end=observed_end,
         content_digest=content_digest,
+        provider_binding_digest=binding_digest,
+        execution_scope_digest=scope_digest,
     )
     coverage = _context_coverage(context)
 
@@ -728,6 +973,8 @@ def _persist_open_wearables_observation(
             observed_start=observed_start,
             content_digest=content_digest,
             coverage=coverage,
+            provider_binding_digest=binding_digest,
+            execution_scope_digest=scope_digest,
             now=current,
         )
     else:
@@ -761,6 +1008,20 @@ def _persist_open_wearables_observation(
                 "canonical_context_bytes": len(canonical_context),
             },
         )
+        if binding_digest is not None:
+            content_event.quality_flags[
+                "provider_binding_digest"
+            ] = binding_digest
+            content_event.derived_from[
+                "provider_binding_digest"
+            ] = binding_digest
+        if scope_digest is not None:
+            content_event.quality_flags[
+                "execution_scope_digest"
+            ] = scope_digest
+            content_event.derived_from[
+                "execution_scope_digest"
+            ] = scope_digest
         try:
             with session.begin_nested():
                 session.add(content_event)
@@ -784,6 +1045,8 @@ def _persist_open_wearables_observation(
                 observed_start=observed_start,
                 content_digest=content_digest,
                 coverage=coverage,
+                provider_binding_digest=binding_digest,
+                execution_scope_digest=scope_digest,
                 now=current,
             )
             content_event = concurrent
@@ -793,6 +1056,8 @@ def _persist_open_wearables_observation(
         timezone=timezone,
         collected_at=collected,
         content_digest=content_digest,
+        provider_binding_digest=binding_digest,
+        execution_scope_digest=scope_digest,
     )
     observation_payload = _observation_payload(
         snapshot_event_id=content_event.id,
@@ -802,6 +1067,8 @@ def _persist_open_wearables_observation(
         observed_start=observed_start,
         observed_end=observed_end,
         content_digest=content_digest,
+        provider_binding_digest=binding_digest,
+        execution_scope_digest=scope_digest,
     )
     observation = session.scalar(
         select(WellnessEvent).where(
@@ -845,6 +1112,20 @@ def _persist_open_wearables_observation(
                 "snapshot_event_id": str(content_event.id),
             },
         )
+        if binding_digest is not None:
+            observation.quality_flags[
+                "provider_binding_digest"
+            ] = binding_digest
+            observation.derived_from[
+                "provider_binding_digest"
+            ] = binding_digest
+        if scope_digest is not None:
+            observation.quality_flags[
+                "execution_scope_digest"
+            ] = scope_digest
+            observation.derived_from[
+                "execution_scope_digest"
+            ] = scope_digest
         try:
             with session.begin_nested():
                 session.add(observation)
@@ -868,6 +1149,8 @@ def _persist_open_wearables_observation(
         session,
         observation,
         now=current,
+        expected_provider_binding_digest=binding_digest,
+        expected_execution_scope_digest=scope_digest,
     )
     if snapshot is None:
         raise ValueError("stored wearable observation failed validation")
@@ -882,6 +1165,8 @@ def persist_open_wearables_snapshot(
     timezone: str,
     collected_at: datetime,
     now: datetime,
+    provider_binding_digest: str | None = None,
+    execution_scope_digest: str | None = None,
 ) -> WellnessEvent:
     """Compatibility wrapper returning the immutable content event.
 
@@ -896,14 +1181,16 @@ def persist_open_wearables_snapshot(
         timezone=timezone,
         collected_at=collected_at,
         now=now,
+        provider_binding_digest=provider_binding_digest,
+        execution_scope_digest=execution_scope_digest,
     )
     event = session.get(WellnessEvent, snapshot.content_event_id)
     if event is None:
         raise ValueError("persisted wearable content disappeared")
-    for field in ("observed_at", "recorded_at", "expires_at"):
-        value = getattr(event, field)
+    for event_field in ("observed_at", "recorded_at", "expires_at"):
+        value = getattr(event, event_field)
         if value is not None:
-            setattr(event, field, _database_utc(value))
+            setattr(event, event_field, _database_utc(value))
     return event
 
 
@@ -915,6 +1202,9 @@ def commit_open_wearables_snapshot(
     timezone: str,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
+    provider_binding_digest: str | None = None,
+    execution_scope_digest: str | None = None,
 ) -> WearableSnapshot:
     """Persist one immutable snapshot in its own commit-on-success transaction."""
     with session_scope(session_factory) as session:
@@ -931,6 +1221,9 @@ def commit_open_wearables_snapshot(
             timezone=timezone,
             collected_at=collected_at,
             now=now,
+            expected_source_policy=expected_source_policy,
+            provider_binding_digest=provider_binding_digest,
+            execution_scope_digest=execution_scope_digest,
         )
 
 
@@ -1449,15 +1742,22 @@ def _query_source_record_id(
     query_digest: str,
     collected_at: datetime,
     result_digest: str,
+    provider_binding_digest: str | None,
 ) -> str:
-    observation_digest = hashlib.sha256(
-        _canonical_json(
+    identity = {
+        "collected_at": collected_at.isoformat(),
+        "query_digest": query_digest,
+        "result_digest": result_digest,
+    }
+    if provider_binding_digest is not None:
+        identity.update(
             {
-                "collected_at": collected_at.isoformat(),
-                "query_digest": query_digest,
-                "result_digest": result_digest,
+                "provider_binding_digest": provider_binding_digest,
+                "schema": _PROVIDER_BOUND_QUERY_IDENTITY_SCHEMA,
             }
         )
+    observation_digest = hashlib.sha256(
+        _canonical_json(identity)
     ).hexdigest()
     return f"query:{query_digest}:{observation_digest}"
 
@@ -1468,23 +1768,271 @@ def _whoop_package_query_source_record_id(
     semantic_public_digest: str,
     private_provenance_digest: str,
     retention_policy_revision: str,
+    provider_binding_digest: str | None,
 ) -> str:
-    identity_digest = hashlib.sha256(
-        _canonical_json(
-            {
-                "schema": _WHOOP_PACKAGE_IDENTITY_SCHEMA,
-                "query_digest": query_digest,
-                "semantic_public_digest": semantic_public_digest,
-                "private_provenance_digest": (
-                    private_provenance_digest
-                ),
-                "retention_policy_revision": (
-                    retention_policy_revision
-                ),
-            }
+    schema = _WHOOP_PACKAGE_IDENTITY_SCHEMA
+    identity = {
+        "schema": schema,
+        "query_digest": query_digest,
+        "semantic_public_digest": semantic_public_digest,
+        "private_provenance_digest": private_provenance_digest,
+        "retention_policy_revision": retention_policy_revision,
+    }
+    if provider_binding_digest is not None:
+        identity["schema"] = (
+            _PROVIDER_BOUND_WHOOP_PACKAGE_IDENTITY_SCHEMA
         )
+        identity["provider_binding_digest"] = provider_binding_digest
+    identity_digest = hashlib.sha256(
+        _canonical_json(identity)
     ).hexdigest()
     return f"query:{query_digest}:{identity_digest}"
+
+
+def _query_timestamp(value: Any, *, field: str) -> datetime:
+    if type(value) is not str:
+        raise ValueError(f"{field} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} is invalid") from exc
+    return _aware_utc(parsed, field=field)
+
+
+def _query_interval(
+    record: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    label: str,
+    allow_future_end: bool = False,
+) -> tuple[datetime, datetime]:
+    interval_start = _query_timestamp(
+        record.get("start_time"),
+        field=f"{label} start_time",
+    )
+    interval_end = _query_timestamp(
+        record.get("end_time"),
+        field=f"{label} end_time",
+    )
+    if (
+        interval_end <= interval_start
+        or not start <= interval_start < end
+        or (not allow_future_end and interval_end > end)
+    ):
+        raise ValueError(f"{label} interval is invalid")
+    return interval_start, interval_end
+
+
+def _validate_nested_provider_timestamps(
+    record: Mapping[str, Any],
+    *,
+    interval_start: datetime,
+    interval_end: datetime,
+) -> None:
+    for collection_name in ("samples", "route"):
+        collection = record.get(collection_name)
+        if collection is None:
+            continue
+        if not isinstance(collection, list):
+            raise ValueError(
+                "wearable provider workout nested collection is invalid"
+            )
+        for item in collection:
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "wearable provider workout nested record is invalid"
+                )
+            if "timestamp" not in item:
+                continue
+            timestamp = _query_timestamp(
+                item.get("timestamp"),
+                field=(
+                    "wearable provider workout "
+                    f"{collection_name} timestamp"
+                ),
+            )
+            if not interval_start <= timestamp <= interval_end:
+                raise ValueError(
+                    "wearable provider workout nested timestamp is invalid"
+                )
+
+
+def _body_summary_observation(
+    record: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    parameters: Mapping[str, Any],
+    collected_at: datetime,
+) -> datetime:
+    observations: list[datetime] = []
+    slow = record.get("slow_changing")
+    averaged = record.get("averaged")
+    latest = record.get("latest")
+    for name, group in (
+        ("slow_changing", slow),
+        ("averaged", averaged),
+        ("latest", latest),
+    ):
+        if group is not None and not isinstance(group, Mapping):
+            raise ValueError(f"wearable body summary {name} is invalid")
+
+    if isinstance(slow, Mapping) and slow:
+        # Slow-changing values have no upstream measurement timestamp.
+        # This anchors the retained snapshot observation, not a measurement.
+        observations.append(collected_at)
+
+    if isinstance(averaged, Mapping) and averaged:
+        metric_keys = set(averaged) - {
+            "period_days",
+            "period_start",
+            "period_end",
+        }
+        period_days = averaged.get("period_days")
+        expected_period_days = parameters.get("average_period", 7)
+        period_start = _query_timestamp(
+            averaged.get("period_start"),
+            field="wearable body summary averaged period_start",
+        )
+        period_end = _query_timestamp(
+            averaged.get("period_end"),
+            field="wearable body summary averaged period_end",
+        )
+        if (
+            not metric_keys
+            or type(period_days) is not int
+            or period_days <= 0
+            or type(expected_period_days) is not int
+            or period_days != expected_period_days
+            or period_start >= period_end
+            or not start <= period_end < end
+        ):
+            raise ValueError(
+                "wearable body summary averaged period is invalid"
+            )
+        observations.append(period_start)
+
+    if isinstance(latest, Mapping) and latest:
+        latest_pairs = {
+            "body_temperature_celsius": "body_temperature_measured_at",
+            "skin_temperature_celsius": "skin_temperature_measured_at",
+            "blood_pressure": "blood_pressure_measured_at",
+        }
+        included_pairs = [
+            (value_field, measured_field)
+            for value_field, measured_field in latest_pairs.items()
+            if value_field in latest or measured_field in latest
+        ]
+        if not included_pairs or set(latest) != {
+            field
+            for pair in included_pairs
+            for field in pair
+        }:
+            raise ValueError("wearable body summary latest values are invalid")
+        for value_field, measured_field in included_pairs:
+            if (
+                latest.get(value_field) is None
+                or latest.get(measured_field) is None
+            ):
+                raise ValueError(
+                    "wearable body summary latest values are invalid"
+                )
+            measured_at = _query_timestamp(
+                latest[measured_field],
+                field=f"wearable body summary latest {measured_field}",
+            )
+            if not start <= measured_at < end:
+                raise ValueError(
+                    "wearable body summary latest observation is invalid"
+                )
+            observations.append(measured_at)
+
+    if not observations:
+        raise ValueError("wearable body summary observation is invalid")
+    return min(observations)
+
+
+def _query_record_observation(
+    record: Mapping[str, Any],
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    parameters: Mapping[str, Any],
+    collected_at: datetime,
+) -> datetime | None:
+    if capability == "wearable.body-summary":
+        return _body_summary_observation(
+            record,
+            start=start,
+            end=end,
+            parameters=parameters,
+            collected_at=collected_at,
+        )
+
+    if capability == "wearable.menstrual-cycles":
+        interval_start, _interval_end = _query_interval(
+            record,
+            start=start,
+            end=end,
+            label="wearable menstrual cycle",
+            allow_future_end=True,
+        )
+        if record.get("last_updated_at") is not None:
+            _query_timestamp(
+                record["last_updated_at"],
+                field="wearable menstrual cycle last_updated_at",
+            )
+        return interval_start
+
+    interval_capabilities = {
+        "wearable.sleep-sessions",
+        "wearable.workouts",
+        "wearable.provider-workout-detail",
+        "wearable.provider-workouts",
+    }
+    if capability not in interval_capabilities:
+        return None
+
+    label = (
+        "wearable sleep session"
+        if capability == "wearable.sleep-sessions"
+        else "wearable workout"
+    )
+    interval_start, interval_end = _query_interval(
+        record,
+        start=start,
+        end=end,
+        label=label,
+    )
+    if capability in {
+        "wearable.provider-workout-detail",
+        "wearable.provider-workouts",
+    }:
+        expected_provider = parameters.get("provider")
+        if (
+            type(expected_provider) is not str
+            or record.get("provider") != expected_provider
+        ):
+            raise ValueError(
+                "wearable provider workout provider is inconsistent"
+            )
+        _validate_nested_provider_timestamps(
+            record,
+            interval_start=interval_start,
+            interval_end=interval_end,
+        )
+    if capability == "wearable.provider-workout-detail":
+        expected_workout_id = parameters.get("workout_id")
+        if (
+            type(expected_workout_id) is not str
+            or record.get("provider_workout_id") != expected_workout_id
+        ):
+            raise ValueError(
+                "wearable provider workout detail identity is inconsistent"
+            )
+    return interval_start
 
 
 def _query_retention_basis(
@@ -1494,6 +2042,7 @@ def _query_retention_basis(
     start: datetime,
     end: datetime,
     timezone: str,
+    parameters: Mapping[str, Any],
     collected_at: datetime,
 ) -> datetime:
     """Use the oldest retained record, not the requested window, for expiry."""
@@ -1514,6 +2063,17 @@ def _query_retention_basis(
             raise ValueError(
                 "wearable query result record is invalid"
             )
+        capability_observation = _query_record_observation(
+            record,
+            capability=capability,
+            start=observed_start,
+            end=observed_end,
+            parameters=parameters,
+            collected_at=collected,
+        )
+        if capability_observation is not None:
+            observations.append(capability_observation)
+            continue
         observation: datetime | None = None
         raw_timestamp: Any = None
         if (
@@ -1573,28 +2133,6 @@ def _query_retention_basis(
             raise ValueError(
                 "wearable query result record observation is invalid"
             )
-        if capability == "wearable.workouts":
-            raw_end = record.get("end_time")
-            if not isinstance(raw_end, str):
-                raise ValueError(
-                    "wearable workout result interval is invalid"
-                )
-            try:
-                workout_end = datetime.fromisoformat(
-                    raw_end.replace("Z", "+00:00")
-                )
-            except ValueError:
-                workout_end = None
-            if (
-                workout_end is None
-                or workout_end.tzinfo is None
-                or not observation
-                < workout_end.astimezone(UTC)
-                <= observed_end
-            ):
-                raise ValueError(
-                    "wearable workout result interval is invalid"
-                )
         observations.append(observation)
     return min(observations)
 
@@ -1622,21 +2160,25 @@ def _query_payload(
     result_digest: str,
     collected_at: datetime,
     retention_basis_at: datetime,
+    provider_binding_digest: str | None,
 ) -> dict[str, Any]:
-    return _normalize_json(
-        {
-            "schema": _QUERY_SCHEMA,
-            "query": dict(scope),
-            "query_digest": query_digest,
-            "result": dict(result),
-            "result_digest": result_digest,
-            "collected_at": collected_at.isoformat(),
-            "retention_basis_at": retention_basis_at.isoformat(),
-            "window": {
-                "start": scope["start"],
-                "end": scope["end"],
-            },
+    payload = {
+        "schema": _QUERY_SCHEMA,
+        "query": dict(scope),
+        "query_digest": query_digest,
+        "result": dict(result),
+        "result_digest": result_digest,
+        "collected_at": collected_at.isoformat(),
+        "retention_basis_at": retention_basis_at.isoformat(),
+        "window": {
+            "start": scope["start"],
+            "end": scope["end"],
         },
+    }
+    if provider_binding_digest is not None:
+        payload["provider_binding_digest"] = provider_binding_digest
+    return _normalize_json(
+        payload,
         max_bytes=_MAX_PAYLOAD_BYTES,
     )
 
@@ -1653,28 +2195,32 @@ def _whoop_package_query_payload(
     retention_policy: Mapping[str, Any],
     collected_at: datetime,
     retention_basis_at: datetime,
+    provider_binding_digest: str | None,
 ) -> dict[str, Any]:
-    return _normalize_json(
-        {
-            "schema": _WHOOP_PACKAGE_QUERY_SCHEMA,
-            "schema_version": 2,
-            "query": dict(scope),
-            "query_digest": query_digest,
-            "public_result": dict(public_result),
-            "public_digest": public_digest,
-            "semantic_public_digest": semantic_public_digest,
-            "private_provenance": [
-                dict(row) for row in private_provenance
-            ],
-            "private_provenance_digest": private_provenance_digest,
-            "retention_policy": dict(retention_policy),
-            "collected_at": collected_at.isoformat(),
-            "retention_basis_at": retention_basis_at.isoformat(),
-            "window": {
-                "start": scope["start"],
-                "end": scope["end"],
-            },
+    payload = {
+        "schema": _WHOOP_PACKAGE_QUERY_SCHEMA,
+        "schema_version": 2,
+        "query": dict(scope),
+        "query_digest": query_digest,
+        "public_result": dict(public_result),
+        "public_digest": public_digest,
+        "semantic_public_digest": semantic_public_digest,
+        "private_provenance": [
+            dict(row) for row in private_provenance
+        ],
+        "private_provenance_digest": private_provenance_digest,
+        "retention_policy": dict(retention_policy),
+        "collected_at": collected_at.isoformat(),
+        "retention_basis_at": retention_basis_at.isoformat(),
+        "window": {
+            "start": scope["start"],
+            "end": scope["end"],
         },
+    }
+    if provider_binding_digest is not None:
+        payload["provider_binding_digest"] = provider_binding_digest
+    return _normalize_json(
+        payload,
         max_bytes=_MAX_PAYLOAD_BYTES,
     )
 
@@ -1691,13 +2237,23 @@ def persist_open_wearables_query_snapshot(
     private_provenance: Sequence[Mapping[str, Any]] | None = None,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
+    provider_binding_digest: str | None = None,
 ) -> WearableQuerySnapshot:
     """Persist one bounded sanitized query result under the wellness fence."""
 
     with activity_write_lock():
         lock_activity_write_plane(session)
+        if expected_source_policy is not None:
+            assert_input_source_policy_binding(
+                session,
+                expected_source_policy,
+            )
         current = _aware_utc(now, field="now")
         collected = _aware_utc(collected_at, field="collected_at")
+        binding_digest = _provider_binding_digest(
+            provider_binding_digest
+        )
         if collected > current + _MAX_CLOCK_SKEW:
             raise ValueError("collected_at is too far in the future")
         scope, query_digest = _normalize_query_scope(
@@ -1771,6 +2327,7 @@ def persist_open_wearables_query_snapshot(
                 retention_policy_revision=str(
                     expected_policy_binding["revision"]
                 ),
+                provider_binding_digest=binding_digest,
             )
             payload = _whoop_package_query_payload(
                 scope=scope,
@@ -1783,6 +2340,7 @@ def persist_open_wearables_query_snapshot(
                 retention_policy=expected_policy_binding,
                 collected_at=collected,
                 retention_basis_at=retention_basis_at,
+                provider_binding_digest=binding_digest,
             )
             quality_flags = {
                 "query_digest": query_digest,
@@ -1824,12 +2382,14 @@ def persist_open_wearables_query_snapshot(
                 start=datetime.fromisoformat(str(scope["start"])),
                 end=datetime.fromisoformat(str(scope["end"])),
                 timezone=timezone,
+                parameters=scope["parameters"],
                 collected_at=collected,
             )
             source_record_id = _query_source_record_id(
                 query_digest=query_digest,
                 collected_at=collected,
                 result_digest=public_digest,
+                provider_binding_digest=binding_digest,
             )
             payload = _query_payload(
                 scope=scope,
@@ -1838,6 +2398,7 @@ def persist_open_wearables_query_snapshot(
                 result_digest=public_digest,
                 collected_at=collected,
                 retention_basis_at=retention_basis_at,
+                provider_binding_digest=binding_digest,
             )
             quality_flags = {
                 "query_digest": query_digest,
@@ -1848,6 +2409,9 @@ def persist_open_wearables_query_snapshot(
                 "mode": "bounded-query-mirror",
                 "query_digest": query_digest,
             }
+        if binding_digest is not None:
+            quality_flags["provider_binding_digest"] = binding_digest
+            derived_from["provider_binding_digest"] = binding_digest
         coverage = _context_coverage(normalized_result)
         event = session.scalar(
             select(WellnessEvent).where(
@@ -1912,6 +2476,7 @@ def persist_open_wearables_query_snapshot(
             session,
             event,
             now=current,
+            expected_provider_binding_digest=binding_digest,
         )
         if snapshot is None:
             raise ValueError("stored wearable query snapshot failed validation")
@@ -1930,6 +2495,8 @@ def commit_open_wearables_query_snapshot(
     private_provenance: Sequence[Mapping[str, Any]] | None = None,
     collected_at: datetime,
     now: datetime,
+    expected_source_policy: InputSourcePolicyBinding | None = None,
+    provider_binding_digest: str | None = None,
 ) -> WearableQuerySnapshot:
     """Commit one query mirror independently from a read-only search session."""
 
@@ -1951,6 +2518,8 @@ def commit_open_wearables_query_snapshot(
             private_provenance=private_provenance,
             collected_at=collected_at,
             now=now,
+            expected_source_policy=expected_source_policy,
+            provider_binding_digest=provider_binding_digest,
         )
 
 
@@ -1959,10 +2528,14 @@ def wearable_query_snapshot_from_event(
     event: WellnessEvent,
     *,
     now: datetime,
+    expected_provider_binding_digest: str | None = None,
 ) -> WearableQuerySnapshot | None:
     """Validate and detach one retained bounded query event."""
 
     current = _aware_utc(now, field="now")
+    expected_binding_digest = _provider_binding_digest(
+        expected_provider_binding_digest
+    )
     payload = event.payload
     if not isinstance(payload, Mapping):
         return None
@@ -1974,6 +2547,7 @@ def wearable_query_snapshot_from_event(
             event,
             payload=payload,
             current=current,
+            expected_provider_binding_digest=expected_binding_digest,
         )
     if (
         event.schema_version == 2
@@ -1983,6 +2557,7 @@ def wearable_query_snapshot_from_event(
             event,
             payload=payload,
             current=current,
+            expected_provider_binding_digest=expected_binding_digest,
         )
     return None
 
@@ -1992,6 +2567,7 @@ def _wearable_query_snapshot_v1_from_event(
     *,
     payload: Mapping[str, Any],
     current: datetime,
+    expected_provider_binding_digest: str | None,
 ) -> WearableQuerySnapshot | None:
     try:
         scope = payload["query"]
@@ -2027,6 +2603,14 @@ def _wearable_query_snapshot_v1_from_event(
             result,
             capability=capability,
         )
+        provider_binding_digest = _stored_provider_binding_digest(
+            payload
+        )
+        if not _provider_binding_matches(
+            provider_binding_digest,
+            expected_provider_binding_digest,
+        ):
+            return None
         result_digest = hashlib.sha256(
             _canonical_json(normalized_result)
         ).hexdigest()
@@ -2040,12 +2624,14 @@ def _wearable_query_snapshot_v1_from_event(
             start=start,
             end=end,
             timezone=timezone,
+            parameters=expected_scope["parameters"],
             collected_at=collected_at,
         )
         expected_source_record_id = _query_source_record_id(
             query_digest=query_digest,
             collected_at=collected_at,
             result_digest=result_digest,
+            provider_binding_digest=provider_binding_digest,
         )
         expected_payload = _query_payload(
             scope=expected_scope,
@@ -2054,7 +2640,24 @@ def _wearable_query_snapshot_v1_from_event(
             result_digest=result_digest,
             collected_at=collected_at,
             retention_basis_at=retention_basis_at,
+            provider_binding_digest=provider_binding_digest,
         )
+        expected_quality_flags = {
+            "query_digest": query_digest,
+            "result_digest": result_digest,
+        }
+        expected_derived_from = {
+            "source": "open-wearables",
+            "mode": "bounded-query-mirror",
+            "query_digest": query_digest,
+        }
+        if provider_binding_digest is not None:
+            expected_quality_flags[
+                "provider_binding_digest"
+            ] = provider_binding_digest
+            expected_derived_from[
+                "provider_binding_digest"
+            ] = provider_binding_digest
         if (
             end <= start
             or event.event_type != OPEN_WEARABLES_QUERY_EVENT_TYPE
@@ -2071,17 +2674,8 @@ def _wearable_query_snapshot_v1_from_event(
             or _database_utc(event.observed_at) != retention_basis_at
             or _database_utc(event.recorded_at) != collected_at
             or event.coverage != _context_coverage(normalized_result)
-            or event.quality_flags
-            != {
-                "query_digest": query_digest,
-                "result_digest": result_digest,
-            }
-            or event.derived_from
-            != {
-                "source": "open-wearables",
-                "mode": "bounded-query-mirror",
-                "query_digest": query_digest,
-            }
+            or event.quality_flags != expected_quality_flags
+            or event.derived_from != expected_derived_from
             or payload.get("query_digest") != query_digest
             or payload.get("result_digest") != result_digest
             or payload.get("retention_basis_at")
@@ -2106,8 +2700,10 @@ def _wearable_query_snapshot_v1_from_event(
         collected_at=collected_at,
         retention_basis_at=retention_basis_at,
         coverage=event.coverage,
+        parameters=dict(expected_scope["parameters"]),
         schema_version=1,
         private_provenance_digest=None,
+        provider_binding_digest=provider_binding_digest,
     )
 
 
@@ -2116,6 +2712,7 @@ def _wearable_query_snapshot_v2_from_event(
     *,
     payload: Mapping[str, Any],
     current: datetime,
+    expected_provider_binding_digest: str | None,
 ) -> WearableQuerySnapshot | None:
     try:
         scope = payload["query"]
@@ -2153,6 +2750,14 @@ def _wearable_query_snapshot_v2_from_event(
             public_result,
             capability=capability,
         )
+        provider_binding_digest = _stored_provider_binding_digest(
+            payload
+        )
+        if not _provider_binding_matches(
+            provider_binding_digest,
+            expected_provider_binding_digest,
+        ):
+            return None
         as_of = _whoop_package_as_of(expected_scope)
         semantic_public_result = _semantic_whoop_public_result(
             normalized_result
@@ -2210,6 +2815,7 @@ def _wearable_query_snapshot_v2_from_event(
                 retention_policy_revision=str(
                     retention_policy["revision"]
                 ),
+                provider_binding_digest=provider_binding_digest,
             )
         )
         expected_payload = _whoop_package_query_payload(
@@ -2223,6 +2829,7 @@ def _wearable_query_snapshot_v2_from_event(
             retention_policy=retention_policy,
             collected_at=collected_at,
             retention_basis_at=retention_basis_at,
+            provider_binding_digest=provider_binding_digest,
         )
         expected_quality_flags = {
             "query_digest": query_digest,
@@ -2243,6 +2850,13 @@ def _wearable_query_snapshot_v2_from_event(
             "retention_policy_revision": retention_policy["revision"],
             "snapshot_schema_version": 2,
         }
+        if provider_binding_digest is not None:
+            expected_quality_flags[
+                "provider_binding_digest"
+            ] = provider_binding_digest
+            expected_derived_from[
+                "provider_binding_digest"
+            ] = provider_binding_digest
         if (
             end <= start
             or event.event_type != OPEN_WEARABLES_QUERY_EVENT_TYPE
@@ -2290,8 +2904,10 @@ def _wearable_query_snapshot_v2_from_event(
         collected_at=collected_at,
         retention_basis_at=retention_basis_at,
         coverage=event.coverage,
+        parameters=dict(expected_scope["parameters"]),
         schema_version=2,
         private_provenance_digest=private_provenance_digest,
+        provider_binding_digest=provider_binding_digest,
     )
 
 
@@ -2304,6 +2920,7 @@ def latest_retained_open_wearables_query_snapshot(
     timezone: str,
     parameters: Mapping[str, Any],
     now: datetime,
+    expected_provider_binding_digest: str | None = None,
 ) -> WearableQuerySnapshot | None:
     """Load the newest valid mirror for one exact bounded query."""
 
@@ -2315,6 +2932,9 @@ def latest_retained_open_wearables_query_snapshot(
         timezone=timezone,
         parameters=parameters,
         now=now,
+        expected_provider_binding_digest=(
+            expected_provider_binding_digest
+        ),
     )
     return snapshots[0] if snapshots else None
 
@@ -2329,6 +2949,7 @@ def retained_open_wearables_query_snapshots(
     parameters: Mapping[str, Any],
     now: datetime,
     candidate_limit: int = _MAX_RETAINED_QUERY_CANDIDATES,
+    expected_provider_binding_digest: str | None = None,
 ) -> tuple[WearableQuerySnapshot, ...]:
     """Load retained mirrors for one exact query, newest first."""
 
@@ -2348,6 +2969,9 @@ def retained_open_wearables_query_snapshots(
         parameters=parameters,
     )
     current = _aware_utc(now, field="now")
+    binding_digest = _provider_binding_digest(
+        expected_provider_binding_digest
+    )
     prefix = f"query:{query_digest}:%"
     statement = (
         select(WellnessEvent)
@@ -2361,13 +2985,19 @@ def retained_open_wearables_query_snapshots(
                 WellnessEvent.expires_at > current,
             ),
         )
-        .order_by(
-            WellnessEvent.recorded_at.desc(),
-            WellnessEvent.created_at.desc(),
-            WellnessEvent.id.desc(),
-        )
-        .limit(candidate_limit)
     )
+    if binding_digest is not None:
+        statement = statement.where(
+            WellnessEvent.payload[
+                "provider_binding_digest"
+            ].as_string()
+            == binding_digest
+        )
+    statement = statement.order_by(
+        WellnessEvent.recorded_at.desc(),
+        WellnessEvent.created_at.desc(),
+        WellnessEvent.id.desc(),
+    ).limit(candidate_limit)
     rows = session.scalars(statement)
     snapshots: list[WearableQuerySnapshot] = []
     for event in rows:
@@ -2375,6 +3005,7 @@ def retained_open_wearables_query_snapshots(
             session,
             event,
             now=current,
+            expected_provider_binding_digest=binding_digest,
         )
         if snapshot is not None and snapshot.query_digest == query_digest:
             snapshots.append(snapshot)
@@ -2391,6 +3022,7 @@ def retained_open_wearables_query_snapshot_by_event_id(
     timezone: str,
     parameters: Mapping[str, Any],
     now: datetime,
+    expected_provider_binding_digest: str | None = None,
 ) -> WearableQuerySnapshot | None:
     """Load one retained query mirror through its indexed primary key."""
 
@@ -2415,6 +3047,9 @@ def retained_open_wearables_query_snapshot_by_event_id(
         session,
         event,
         now=_aware_utc(now, field="now"),
+        expected_provider_binding_digest=(
+            expected_provider_binding_digest
+        ),
     )
     if (
         snapshot is None
@@ -2429,12 +3064,24 @@ def wearable_snapshot_from_event(
     event: WellnessEvent,
     *,
     now: datetime,
+    expected_provider_binding_digest: str | None = None,
+    expected_execution_scope_digest: str | None = None,
 ) -> WearableSnapshot | None:
     """Validate and detach one stored collection observation."""
     return _snapshot_from_observation(
         session,
         event,
         now=_aware_utc(now, field="now"),
+        expected_provider_binding_digest=(
+            _provider_binding_digest(
+                expected_provider_binding_digest
+            )
+        ),
+        expected_execution_scope_digest=(
+            _execution_scope_digest(
+                expected_execution_scope_digest
+            )
+        ),
     )
 
 
@@ -2468,6 +3115,15 @@ def _content_from_event(event: WellnessEvent) -> WearableSnapshot | None:
         )
         assert isinstance(normalized_context, dict)
         _reject_secret_keys(normalized_context)
+        provider_binding_digest = _stored_provider_binding_digest(
+            payload
+        )
+        execution_scope_digest = _stored_execution_scope_digest(payload)
+        if (
+            execution_scope_digest is not None
+            and provider_binding_digest is None
+        ):
+            return None
         content_digest = str(payload["content_digest"])
         expected_digest = _content_digest(
             normalized_context=normalized_context,
@@ -2477,6 +3133,8 @@ def _content_from_event(event: WellnessEvent) -> WearableSnapshot | None:
         expected_source_record_id = _source_record_id(
             local_day=local_day,
             content_digest=expected_digest,
+            provider_binding_digest=provider_binding_digest,
+            execution_scope_digest=execution_scope_digest,
         )
         expected_start, expected_end = _local_day_bounds(
             local_day,
@@ -2490,7 +3148,32 @@ def _content_from_event(event: WellnessEvent) -> WearableSnapshot | None:
             observed_start=expected_start,
             observed_end=expected_end,
             content_digest=expected_digest,
+            provider_binding_digest=provider_binding_digest,
+            execution_scope_digest=execution_scope_digest,
         )
+        expected_quality_flags = {
+            "content_digest": expected_digest,
+        }
+        expected_derived_from = {
+            "source": "open-wearables",
+            "canonical_context_bytes": len(
+                _canonical_json(normalized_context)
+            ),
+        }
+        if provider_binding_digest is not None:
+            expected_quality_flags[
+                "provider_binding_digest"
+            ] = provider_binding_digest
+            expected_derived_from[
+                "provider_binding_digest"
+            ] = provider_binding_digest
+        if execution_scope_digest is not None:
+            expected_quality_flags[
+                "execution_scope_digest"
+            ] = execution_scope_digest
+            expected_derived_from[
+                "execution_scope_digest"
+            ] = execution_scope_digest
         if (
             content_digest != expected_digest
             or event.event_type
@@ -2511,15 +3194,8 @@ def _content_from_event(event: WellnessEvent) -> WearableSnapshot | None:
             or _database_utc(event.recorded_at) != collected_at
             or event.coverage
             != _context_coverage(normalized_context)
-            or event.quality_flags
-            != {"content_digest": expected_digest}
-            or event.derived_from
-            != {
-                "source": "open-wearables",
-                "canonical_context_bytes": len(
-                    _canonical_json(normalized_context)
-                ),
-            }
+            or event.quality_flags != expected_quality_flags
+            or event.derived_from != expected_derived_from
             or _canonical_json(payload) != _canonical_json(expected_payload)
         ):
             return None
@@ -2536,6 +3212,8 @@ def _content_from_event(event: WellnessEvent) -> WearableSnapshot | None:
         observed_end=observed_end,
         content_digest=content_digest,
         coverage=event.coverage,
+        provider_binding_digest=provider_binding_digest,
+        execution_scope_digest=execution_scope_digest,
     )
 
 
@@ -2544,6 +3222,8 @@ def _snapshot_from_observation(
     event: WellnessEvent,
     *,
     now: datetime,
+    expected_provider_binding_digest: str | None = None,
+    expected_execution_scope_digest: str | None = None,
 ) -> WearableSnapshot | None:
     payload = event.payload
     try:
@@ -2566,6 +3246,25 @@ def _snapshot_from_observation(
             field="window.end",
         )
         content_digest = str(payload["content_digest"])
+        provider_binding_digest = _stored_provider_binding_digest(
+            payload
+        )
+        execution_scope_digest = _stored_execution_scope_digest(payload)
+        if (
+            execution_scope_digest is not None
+            and provider_binding_digest is None
+        ):
+            return None
+        if not _provider_binding_matches(
+            provider_binding_digest,
+            expected_provider_binding_digest,
+        ):
+            return None
+        if not _execution_scope_matches(
+            execution_scope_digest,
+            expected_execution_scope_digest,
+        ):
+            return None
         content_event_id = uuid.UUID(str(payload["snapshot_event_id"]))
         expected_start, expected_end = _local_day_bounds(
             local_day,
@@ -2576,6 +3275,8 @@ def _snapshot_from_observation(
             timezone=timezone,
             collected_at=collected_at,
             content_digest=content_digest,
+            provider_binding_digest=provider_binding_digest,
+            execution_scope_digest=execution_scope_digest,
         )
         expected_payload = _observation_payload(
             snapshot_event_id=content_event_id,
@@ -2585,7 +3286,31 @@ def _snapshot_from_observation(
             observed_start=expected_start,
             observed_end=expected_end,
             content_digest=content_digest,
+            provider_binding_digest=provider_binding_digest,
+            execution_scope_digest=execution_scope_digest,
         )
+        expected_quality_flags = {
+            "content_digest": content_digest,
+            "snapshot_event_id": str(content_event_id),
+        }
+        expected_derived_from = {
+            "source": "open-wearables",
+            "snapshot_event_id": str(content_event_id),
+        }
+        if provider_binding_digest is not None:
+            expected_quality_flags[
+                "provider_binding_digest"
+            ] = provider_binding_digest
+            expected_derived_from[
+                "provider_binding_digest"
+            ] = provider_binding_digest
+        if execution_scope_digest is not None:
+            expected_quality_flags[
+                "execution_scope_digest"
+            ] = execution_scope_digest
+            expected_derived_from[
+                "execution_scope_digest"
+            ] = execution_scope_digest
         if (
             event.event_type != OPEN_WEARABLES_OBSERVATION_EVENT_TYPE
             or event.source_provider
@@ -2602,16 +3327,8 @@ def _snapshot_from_observation(
             or observed_end != expected_end
             or _database_utc(event.observed_at) != expected_start
             or _database_utc(event.recorded_at) != collected_at
-            or event.quality_flags
-            != {
-                "content_digest": content_digest,
-                "snapshot_event_id": str(content_event_id),
-            }
-            or event.derived_from
-            != {
-                "source": "open-wearables",
-                "snapshot_event_id": str(content_event_id),
-            }
+            or event.quality_flags != expected_quality_flags
+            or event.derived_from != expected_derived_from
             or _canonical_json(payload) != _canonical_json(expected_payload)
             or (
                 event.expires_at is not None
@@ -2626,6 +3343,10 @@ def _snapshot_from_observation(
         if (
             content is None
             or content.content_digest != content_digest
+            or content.provider_binding_digest
+            != provider_binding_digest
+            or content.execution_scope_digest
+            != execution_scope_digest
             or content.local_day != local_day
             or content.timezone != timezone
             or content.observed_start != observed_start
@@ -2650,6 +3371,8 @@ def _snapshot_from_observation(
         observed_end=observed_end,
         content_digest=content_digest,
         coverage=event.coverage,
+        provider_binding_digest=provider_binding_digest,
+        execution_scope_digest=execution_scope_digest,
     )
 
 
@@ -2659,27 +3382,39 @@ def latest_retained_open_wearables_snapshot(
     local_day: date,
     timezone: str,
     now: datetime,
+    expected_provider_binding_digest: str | None = None,
+    expected_execution_scope_digest: str | None = None,
 ) -> WearableSnapshot | None:
     """Return the newest non-expired snapshot for one exact local-day scope."""
     current = _aware_utc(now, field="now")
+    binding_digest = _provider_binding_digest(
+        expected_provider_binding_digest
+    )
+    scope_digest = _execution_scope_digest(
+        expected_execution_scope_digest
+    )
     parse_timezone(timezone)
     observed_start, observed_end = _local_day_bounds(local_day, timezone)
-    rows = session.scalars(
-        select(WellnessEvent)
-        .where(
-            WellnessEvent.event_type
-            == OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
-            WellnessEvent.source_provider
-            == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
-            WellnessEvent.timezone == timezone,
-            WellnessEvent.observed_at >= observed_start,
-            WellnessEvent.observed_at < observed_end,
-            or_(
-                WellnessEvent.expires_at.is_(None),
-                WellnessEvent.expires_at > current,
-            ),
+    statement = select(WellnessEvent).where(
+        WellnessEvent.event_type
+        == OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+        WellnessEvent.source_provider
+        == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+        WellnessEvent.timezone == timezone,
+        WellnessEvent.observed_at >= observed_start,
+        WellnessEvent.observed_at < observed_end,
+        or_(
+            WellnessEvent.expires_at.is_(None),
+            WellnessEvent.expires_at > current,
+        ),
+    )
+    if scope_digest is not None:
+        statement = statement.where(
+            WellnessEvent.payload["execution_scope_digest"].as_string()
+            == scope_digest
         )
-        .order_by(
+    rows = session.scalars(
+        statement.order_by(
             WellnessEvent.recorded_at.desc(),
             WellnessEvent.created_at.desc(),
         )
@@ -2689,6 +3424,8 @@ def latest_retained_open_wearables_snapshot(
             session,
             row,
             now=current,
+            expected_provider_binding_digest=binding_digest,
+            expected_execution_scope_digest=scope_digest,
         )
         if (
             snapshot is not None

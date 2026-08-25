@@ -20,6 +20,7 @@ from healthmes.inputs import (
 from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
+    InputSourcePolicy,
     RawIngestEvent,
     RetentionPolicy,
     WellnessEvent,
@@ -238,6 +239,104 @@ def test_unified_inputs_returns_one_source_and_404s_unknown(client) -> None:
     missing = client.get("/v1/inputs/not-a-source")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "input_source_not_found"
+
+
+def test_open_wearables_source_switch_is_persistent_and_independent(
+    client,
+    session,
+) -> None:
+    before = client.get("/v1/inputs/wearable.open-wearables").json()
+    healthkit_before = client.get(
+        "/v1/inputs/wearable.healthkit-bridge"
+    ).json()
+
+    assert before["source_enabled"] is True
+    assert {
+        setting["key"]: setting["scope"]
+        for setting in before["settings"]
+    } == {
+        "source_enabled": "source",
+        "decision_access_enabled": "domain",
+        "retention": "data_class",
+    }
+
+    disabled = _put_settings(
+        client,
+        "wearable.open-wearables",
+        {"source_enabled": False},
+        revision=before["revision"],
+    )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["source_enabled"] is False
+    assert disabled.json()["decision_access_enabled"] == (
+        before["decision_access_enabled"]
+    )
+    assert disabled.json()["revision"] != before["revision"]
+    assert disabled.headers["ETag"] == (
+        f'"{disabled.json()["revision"]}"'
+    )
+    assert client.get(
+        "/v1/inputs/wearable.healthkit-bridge"
+    ).json() == healthkit_before
+
+    session.expire_all()
+    row = session.scalar(
+        select(InputSourcePolicy).where(
+            InputSourcePolicy.source_id == "wearable.open-wearables"
+        )
+    )
+    assert row is not None
+    assert row.enabled is False
+    assert row.revision == 1
+
+    persisted = client.get(
+        "/v1/inputs/wearable.open-wearables"
+    ).json()
+    assert persisted == disabled.json()
+
+
+def test_open_wearables_source_switch_participates_in_cas(client) -> None:
+    before = client.get("/v1/inputs/wearable.open-wearables").json()
+    disabled = _put_settings(
+        client,
+        "wearable.open-wearables",
+        {"source_enabled": False},
+        revision=before["revision"],
+    )
+    stale = _put_settings(
+        client,
+        "wearable.open-wearables",
+        {"source_enabled": True},
+        revision=before["revision"],
+    )
+    noop = _put_settings(
+        client,
+        "wearable.open-wearables",
+        {"source_enabled": False},
+        revision=disabled.json()["revision"],
+    )
+
+    assert disabled.status_code == 200
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == (
+        "input_settings_revision_conflict"
+    )
+    assert noop.status_code == 200
+    assert noop.json()["revision"] == disabled.json()["revision"]
+
+
+def test_source_switch_is_rejected_for_sources_without_one(client) -> None:
+    response = _put_settings(
+        client,
+        "wearable.healthkit-bridge",
+        {"source_enabled": False},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == (
+        "input_source_setting_unsupported"
+    )
 
 
 def test_input_settings_requires_a_well_formed_if_match(client) -> None:
@@ -609,6 +708,7 @@ def test_unified_inputs_rejects_empty_or_null_only_updates(client) -> None:
         {"retention": {}},
         {"instance_id": "iphone-noop"},
         {"enabled": None},
+        {"source_enabled": None},
         {"decision_access_enabled": None},
     ):
         response = _put_settings(

@@ -66,6 +66,13 @@ HERMES_DECISION_SEARCH_PARAMETER_MAP: Mapping[
         "summary_kind": "summary_kind",
         "series_type": "series_type",
         "resolution": "resolution",
+        "average_period": "average_period",
+        "latest_window_hours": "latest_window_hours",
+        "provider": "provider",
+        "workout_id": "workout_id",
+        "samples": "samples",
+        "zones": "zones",
+        "route": "route",
     },
 }
 HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY: Mapping[str, str] = {
@@ -73,6 +80,11 @@ HERMES_DECISION_WEARABLE_DEFAULT_GRANULARITY: Mapping[str, str] = {
     "wearable.health-scores": "record",
     "wearable.workouts": "record",
     "wearable.timeseries": "series",
+    "wearable.body-summary": "summary",
+    "wearable.sleep-sessions": "record",
+    "wearable.menstrual-cycles": "record",
+    "wearable.provider-workouts": "record",
+    "wearable.provider-workout-detail": "record",
 }
 
 # These hashes bind the exact FastMCP inputSchema exposed to Hermes. A contract
@@ -94,7 +106,7 @@ HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256 = {
         "989c29458d67f6e9089749b7eb41c3ac8d68843fa0ed0a8327857cfb0a3631a8"
     ),
     "search_wearable": (
-        "7ef2a322f5f11452cc4968ffd11e001caf947edb4a27098eeb81736f11f78d28"
+        "be563936bb219a81d60a147ad7e13696e4d27e09b8282794e61ef118d0d1461f"
     ),
 }
 

@@ -31,6 +31,10 @@ from healthmes.engine.cognitive_energy import (
     OwEnergyReader,
     OwRows,
 )
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    open_wearables_execution_binding,
+)
 
 UTC = dt.UTC
 AS_OF = dt.date(2026, 7, 9)
@@ -276,6 +280,23 @@ def _run(awaitable):
 
 
 class TestOwEnergyReaderV2:
+    def test_reader_does_not_bypass_active_provider_binding(self, settings) -> None:
+        binding = OpenWearablesExecutionBinding(
+            capability="wearable.timeseries",
+            allowed_providers=("garmin",),
+            provider_binding_digest="sha256:" + ("e" * 64),
+            source_policy_revision=1,
+            provider_parameters=(),
+            provider_source_bindings=(),
+        )
+
+        with open_wearables_execution_binding(binding):
+            rows = _run(OwEnergyReader(settings, client=object()).read(AS_OF))
+
+        assert rows.status == "unavailable"
+        assert rows.detail is not None
+        assert "legacy Open Wearables reader is blocked" in rows.detail
+
     def test_fetches_series_and_cycles_with_documented_windows(
         self, settings, v2_series_rows, v2_cycle_rows
     ) -> None:

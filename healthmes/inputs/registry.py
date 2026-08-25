@@ -54,6 +54,7 @@ from healthmes.storage import (
     update_retention_policy,
 )
 from healthmes.store import (
+    InputSourcePolicy,
     RawIngestEvent,
     RetentionPolicy,
     WellnessEvent,
@@ -78,6 +79,7 @@ class _SourceSpec:
     privacy: InputPrivacyProfile
     activity_platforms: tuple[ActivityPlatform, ...] = ()
     supports_collection_settings: bool = False
+    supports_source_setting: bool = False
     supports_exclusions: bool = False
     actions: tuple[InputActionDescriptor, ...] = ()
     limitations: tuple[str, ...] = ()
@@ -90,6 +92,15 @@ _DECISION_SETTING = InputSettingDefinition(
     description=(
         "Allow the HealthMes Decision Agent to query this domain through "
         "the Context Access Layer."
+    ),
+)
+_SOURCE_ENABLED_SETTING = InputSettingDefinition(
+    key="source_enabled",
+    value_type="boolean",
+    scope="source",
+    description=(
+        "Enable or disable this input source without changing its domain "
+        "decision-access consent or any other source."
     ),
 )
 _RETENTION_SETTING = InputSettingDefinition(
@@ -375,6 +386,7 @@ _SOURCES = (
             "workouts",
         ),
         retention_classes=(OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,),
+        supports_source_setting=True,
         actions=(
             InputActionDescriptor(
                 action="connect",
@@ -522,6 +534,15 @@ class InputSourceRegistry:
                 self._settings.decision_owner_principal_id,
             )
         }
+        source_rows = {
+            row.source_id: row
+            for row in session.scalars(
+                select(InputSourcePolicy).where(
+                    InputSourcePolicy.owner_principal_id
+                    == self._settings.decision_owner_principal_id
+                )
+            )
+        }
         activity = self._activity_instances(session)
         raw_ingest_sources = set(
             session.scalars(select(RawIngestEvent.source).distinct())
@@ -532,6 +553,7 @@ class InputSourceRegistry:
                 activity=activity,
                 policies=policies,
                 decision_rows=decision_rows,
+                source_rows=source_rows,
                 raw_ingest_sources=raw_ingest_sources,
             )
             for source in _SOURCES
@@ -590,6 +612,14 @@ class InputSourceRegistry:
             raise InputSourceRegistryError(
                 "input_instance_required",
                 "instance_id is required for collection settings",
+            )
+        if (
+            update.source_enabled is not None
+            and not source.supports_source_setting
+        ):
+            raise InputSourceRegistryError(
+                "input_source_setting_unsupported",
+                f"{source.source_id} does not expose a source-level switch",
             )
         invalid_retention = sorted(
             set(update.retention) - set(source.retention_classes)
@@ -676,12 +706,48 @@ class InputSourceRegistry:
                         source.domain,
                         enabled=update.decision_access_enabled,
                     )
+                if update.source_enabled is not None:
+                    self._update_source_policy(
+                        session,
+                        source.source_id,
+                        enabled=update.source_enabled,
+                    )
                 updated = self._get_in_transaction(session, source)
                 session.commit()
             except BaseException:
                 session.rollback()
                 raise
         return updated
+
+    def _update_source_policy(
+        self,
+        session: Session,
+        source_id: str,
+        *,
+        enabled: bool,
+    ) -> InputSourcePolicy:
+        owner = self._settings.decision_owner_principal_id
+        row = session.scalar(
+            select(InputSourcePolicy)
+            .where(
+                InputSourcePolicy.owner_principal_id == owner,
+                InputSourcePolicy.source_id == source_id,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            row = InputSourcePolicy(
+                owner_principal_id=owner,
+                source_id=source_id,
+                enabled=enabled,
+                revision=1,
+            )
+            session.add(row)
+        elif row.enabled != enabled:
+            row.enabled = enabled
+            row.revision += 1
+        session.flush()
+        return row
 
     def _source(self, source_id: str) -> _SourceSpec:
         normalized = source_id.strip().casefold()
@@ -860,6 +926,7 @@ class InputSourceRegistry:
         activity: dict[ActivityPlatform, list[InputInstance]],
         policies: dict[str, RetentionPolicy],
         decision_rows: dict[str, Any],
+        source_rows: dict[str, InputSourcePolicy],
         raw_ingest_sources: set[str],
     ) -> InputSourceDescriptor:
         instances = [
@@ -874,6 +941,8 @@ class InputSourceRegistry:
         )
         decision = decision_rows.get(source.domain)
         settings = [_DECISION_SETTING]
+        if source.supports_source_setting:
+            settings.insert(0, _SOURCE_ENABLED_SETTING)
         if source.retention_classes:
             settings.append(_RETENTION_SETTING)
         if source.supports_collection_settings:
@@ -908,6 +977,9 @@ class InputSourceRegistry:
             capabilities=list(source.capabilities),
             connection_state=connection,
             collection_state=collection,
+            source_enabled=bool(
+                getattr(source_rows.get(source.source_id), "enabled", True)
+            ),
             decision_access_enabled=bool(
                 getattr(decision, "enabled", False)
             ),

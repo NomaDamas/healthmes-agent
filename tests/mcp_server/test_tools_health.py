@@ -11,6 +11,10 @@ from fastmcp.exceptions import ToolError
 
 from healthmes.calendars.adjustments import evaluate_health_evidence
 from healthmes.mcp_server import server as server_module
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionBinding,
+    open_wearables_execution_binding,
+)
 
 AS_OF = "2026-07-08"
 D = dt.date(2026, 7, 8)
@@ -64,6 +68,47 @@ def _seed_readiness_fixture(fake_ow) -> None:
 
 
 class TestGetHealthScores:
+    async def test_legacy_direct_read_is_blocked_by_frozen_binding(
+        self,
+    ) -> None:
+        binding = OpenWearablesExecutionBinding(
+            capability="wearable.health-scores",
+            allowed_providers=("garmin",),
+            provider_binding_digest="sha256:" + ("a" * 64),
+            source_policy_revision=1,
+            provider_parameters=(),
+            provider_source_bindings=(),
+        )
+
+        with open_wearables_execution_binding(binding):
+            with pytest.raises(
+                ToolError,
+                match="open_wearables_provider_binding_changed",
+            ):
+                await server_module.get_health_scores(
+                    range="7d",
+                    end_date=AS_OF,
+                )
+
+    async def test_legacy_baseline_read_is_blocked_by_frozen_binding(
+        self,
+    ) -> None:
+        binding = OpenWearablesExecutionBinding(
+            capability="wearable.health-scores",
+            allowed_providers=("garmin",),
+            provider_binding_digest="sha256:" + ("b" * 64),
+            source_policy_revision=1,
+            provider_parameters=(),
+            provider_source_bindings=(),
+        )
+
+        with open_wearables_execution_binding(binding):
+            with pytest.raises(
+                ToolError,
+                match="open_wearables_provider_binding_changed",
+            ):
+                await server_module.get_personal_baselines(as_of=AS_OF)
+
     async def test_groups_and_interprets_by_category_provider(
         self, mcp_client, mcp_env, call_tool
     ):
@@ -198,6 +243,90 @@ class TestDailyReadinessContext:
 
         # Weakest confirmed block (sleep debt / hrv are low-coverage) wins.
         assert result["confidence"] == "low"
+
+    async def test_provider_bound_readiness_keeps_internal_derived_scores(
+        self,
+        mcp_env,
+    ):
+        _seed_readiness_fixture(mcp_env)
+
+        result = await server_module.build_daily_readiness_context(
+            AS_OF,
+            allowed_providers=frozenset({"whoop"}),
+        )
+
+        assert result["sleep_debt"]["source"] == "internal_sleep_score"
+        assert result["sleep_debt"]["status"] == "ok"
+        assert result["stress"]["source"] == "internal_resilience_proxy"
+        assert result["stress"]["value"] == 35.0
+        assert result["charge"]["status"] == "insufficient_data"
+        assert result["hrv"]["status"] == "insufficient_data"
+        assert result["yesterday_load"]["workouts"] == 0
+        assert {
+            ref["upstream_provider"] for ref in result["source_refs"]
+        } == {"internal"}
+
+    async def test_strict_provider_bound_readiness_rejects_unattributed_internal_scores(
+        self,
+        mcp_env,
+    ):
+        _seed_readiness_fixture(mcp_env)
+
+        result = await server_module.build_daily_readiness_context(
+            AS_OF,
+            allowed_providers=frozenset({"garmin"}),
+            provider_source_allowlist={
+                "garmin": frozenset({"garmin-source"})
+            },
+        )
+
+        assert result["sleep_debt"]["status"] == "insufficient_data"
+        assert result["stress"]["status"] == "insufficient_data"
+        assert result["hrv"]["status"] == "insufficient_data"
+        assert result["charge"]["status"] == "insufficient_data"
+        assert result["yesterday_load"]["workouts"] == 0
+        assert {
+            ref["upstream_provider"] for ref in result["source_refs"]
+        } == set()
+
+    async def test_strict_provider_bound_internal_scores_keep_source_lineage(
+        self,
+        mcp_env,
+    ):
+        for day, score in [
+            ("2026-07-06", 90),
+            ("2026-07-07", 80),
+            ("2026-07-08", 70),
+        ]:
+            mcp_env.add_score(
+                "sleep",
+                "internal",
+                f"{day}T07:00:00Z",
+                score,
+                data_source_id="garmin-source",
+            )
+        mcp_env.add_score(
+            "resilience",
+            "internal",
+            "2026-07-08T00:00:00Z",
+            0.12,
+            components={"resilience_score": {"value": 65}},
+            data_source_id="garmin-source",
+        )
+
+        result = await server_module.build_daily_readiness_context(
+            AS_OF,
+            allowed_providers=frozenset({"garmin"}),
+            provider_source_allowlist={
+                "garmin": frozenset({"garmin-source"})
+            },
+        )
+
+        assert result["sleep_debt"]["status"] == "ok"
+        assert result["stress"]["source"] == "internal_resilience_proxy"
+        assert {
+            ref["upstream_provider"] for ref in result["source_refs"]
+        } == {"garmin"}
 
     async def test_source_refs_are_stable_and_only_cover_used_rows(
         self,

@@ -55,6 +55,9 @@ from healthmes.mcp_server.ow_client import (
     resolve_single_user_id,
 )
 from healthmes.store.enums import CalendarSource
+from healthmes.wearables.availability import (
+    OpenWearablesAvailabilityResolver,
+)
 from healthmes.wearables.search import (
     BoundedOpenWearablesSearch,
     WearableSearchReader,
@@ -258,9 +261,8 @@ def build_decision_context_search_session_service(
 
     sync_health_store = FileSyncHealthStore.for_data_dir(settings.data_dir)
     selected_wearable_search_reader = wearable_search_reader
+    open_wearables = OWClient.from_settings(settings)
     if selected_wearable_search_reader is None:
-        open_wearables = OWClient.from_settings(settings)
-
         async def resolve_open_wearables_user() -> str:
             return await resolve_single_user_id(
                 open_wearables,
@@ -311,6 +313,12 @@ def build_decision_context_search_session_service(
         owner_principal_id=settings.decision_owner_principal_id,
         execution_scope=execution_scope,
     )
+    open_wearables_availability = OpenWearablesAvailabilityResolver(
+        settings=settings,
+        client=open_wearables,
+        session_factory=session_factory,
+        clock=clock,
+    )
     return DecisionContextSearchSessionService(
         access_layer=access_layer,
         session_factory=session_factory,
@@ -319,6 +327,7 @@ def build_decision_context_search_session_service(
         max_active_sessions=settings.decision_max_pending_requests,
         clock=clock,
         monotonic_clock=monotonic_clock,
+        open_wearables_availability=open_wearables_availability,
     )
 
 

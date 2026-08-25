@@ -6,12 +6,16 @@ from typing import Any
 
 import pytest
 
+from healthmes.decision.contracts import PrivacyLevel
+from healthmes.mcp_server.ow_client import VendorWorkoutCollection
+from healthmes.wearables.binding import OpenWearablesExecutionDataSource
 from healthmes.wearables.search import (
     MAX_WEARABLE_SEARCH_PAGES,
     MAX_WEARABLE_SEARCH_PAYLOAD_BYTES,
     MAX_WEARABLE_SEARCH_ROWS,
     BoundedOpenWearablesSearch,
     WearableSearchRequest,
+    normalize_retained_wearable_search,
     normalize_retained_wearable_timeseries,
     normalize_retained_wearable_workouts,
     validate_wearable_search_request,
@@ -22,6 +26,7 @@ from healthmes.wearables.whoop_recovery import (
 
 START = datetime(2026, 8, 10, tzinfo=UTC)
 END = START + timedelta(days=1)
+COLLECTED_AT = START + timedelta(hours=12)
 WHOOP_AS_OF = date(2026, 8, 22)
 
 
@@ -98,16 +103,35 @@ def _request(
     end: datetime = END,
     retained_after: datetime | None = None,
     as_of: date | None = None,
-    **parameters: str,
+    collected_at: datetime = COLLECTED_AT,
+    timezone: str = "UTC",
+    privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: dict[str, frozenset[str]] | None = None,
+    provider_source_identities: dict[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ]
+    | None = None,
+    provider_source_lineage_verified: bool = False,
+    **parameters: Any,
 ) -> WearableSearchRequest:
     return WearableSearchRequest(
         capability=capability,
         start=start,
         end=end,
-        timezone="UTC",
+        timezone=timezone,
         parameters=parameters,
+        collected_at=collected_at,
+        privacy_level=privacy_level,
         retained_after=retained_after,
         as_of=as_of,
+        allowed_providers=allowed_providers,
+        provider_source_allowlist=provider_source_allowlist,
+        provider_source_identities=provider_source_identities,
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
+        ),
     )
 
 
@@ -168,6 +192,7 @@ async def test_whoop_package_fetches_exact_local_window_and_raw_signals() -> Non
             end=datetime(2026, 8, 22, 15, tzinfo=UTC),
             timezone="Asia/Seoul",
             parameters={},
+            collected_at=datetime(2026, 8, 22, 12, tzinfo=UTC),
             as_of=WHOOP_AS_OF,
         )
     )
@@ -257,6 +282,31 @@ async def test_whoop_package_tracks_each_signal_truncation_independently() -> No
     ]
 
 
+async def test_whoop_package_requires_whoop_when_providers_are_restricted() -> None:
+    resolver_calls = 0
+
+    def resolve_user() -> str:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return "private-user-id"
+
+    search = BoundedOpenWearablesSearch(
+        WhoopPackageClient(),  # type: ignore[arg-type]
+        resolve_user,
+    )
+
+    with pytest.raises(ValueError, match="requires an allowed WHOOP"):
+        await search(
+            _request(
+                WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+                as_of=WHOOP_AS_OF,
+                allowed_providers=("garmin",),
+            )
+        )
+
+    assert resolver_calls == 0
+
+
 @pytest.mark.parametrize(
     ("as_of", "parameters"),
     (
@@ -292,6 +342,7 @@ async def test_whoop_package_rejects_non_exact_or_extra_parameters(
                 end=END,
                 timezone="UTC",
                 parameters=parameters,
+                collected_at=COLLECTED_AT,
                 as_of=as_of,  # type: ignore[arg-type]
             )
         )
@@ -1027,12 +1078,14 @@ class RepeatingCursorTimeseriesClient:
         **_kwargs,
     ):
         self.calls.append(cursor)
+        minute = 20 if cursor == "repeated-page" else 10
+        value = 20 if cursor == "repeated-page" else 10
         return {
             "data": [
                 {
-                    "timestamp": "2026-08-10T10:10:00Z",
+                    "timestamp": f"2026-08-10T10:{minute:02d}:00Z",
                     "type": "steps",
-                    "value": 10,
+                    "value": value,
                     "unit": "count",
                     "provider": "apple",
                     "data_source_id": "trusted-sensor",
@@ -1063,7 +1116,7 @@ async def test_cursor_cycle_does_not_aggregate_repeated_page() -> None:
     )
 
     assert client.calls == [None, "repeated-page"]
-    assert [record["value"] for record in fetched.records] == [10]
+    assert [record["value"] for record in fetched.records] == [30]
     assert fetched.upstream_truncated is True
     assert fetched.limitations == (
         "wearable_upstream_page_limit_reached",
@@ -2292,6 +2345,584 @@ async def test_search_uses_declared_provider_and_exact_legacy_aliases() -> None:
     ]
 
 
+class ProviderRestrictedTimeseriesClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 70,
+                    "unit": "bpm",
+                    "provider": "apple",
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 71,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                },
+                {
+                    "timestamp": "2026-08-10T10:03:00Z",
+                    "type": "heart_rate",
+                    "value": 73,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                    "source": {"provider": "apple"},
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_live_search_filters_unknown_mixed_and_disallowed_providers() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        ProviderRestrictedTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+            allowed_providers=("apple_health_sdk",),
+        )
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T10:00:00+00:00",
+            "series_type": "heart_rate",
+            "value": 70,
+            "unit": "bpm",
+            "provider": "apple_health",
+            "provider_attribution": "declared",
+        },
+    )
+    assert fetched.discarded_rows == 3
+    assert fetched.provider_source_lineage_verified is False
+    assert fetched.limitations == (
+        "wearable_rows_discarded",
+        "wearable_stream_attribution_unavailable",
+    )
+
+
+class SourceBoundTimeseriesClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 70,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                    "data_source_id": "source-old",
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 71,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                    "data_source_id": "source-current",
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                },
+                {
+                    "timestamp": "2026-08-10T10:03:00Z",
+                    "type": "heart_rate",
+                    "value": 73,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                    "data_source_id": "source-new-unbound",
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_live_search_requires_exact_frozen_data_source() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        SourceBoundTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+            allowed_providers=("garmin",),
+            provider_source_allowlist={
+                "garmin": frozenset({"source-current"})
+            },
+        )
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T10:01:00+00:00",
+            "series_type": "heart_rate",
+            "value": 71,
+            "unit": "bpm",
+            "provider": "garmin",
+            "provider_attribution": "declared",
+        },
+    )
+    assert fetched.discarded_rows == 3
+    assert fetched.provider_source_lineage_verified is False
+    assert fetched.live_source_lineage_attested is False
+
+
+class SourceIdentityTimeseriesClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 70,
+                    "unit": "bpm",
+                    "source": {
+                        "provider": "garmin",
+                        "device": "Forerunner 955",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 71,
+                    "unit": "bpm",
+                    "source": {
+                        "provider": "garmin",
+                        "device_model": "Venu 3",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "source": {"provider": "garmin"},
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_live_search_rejects_missing_source_id_even_with_unique_device() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        SourceIdentityTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+            allowed_providers=("garmin",),
+            provider_source_allowlist={
+                "garmin": frozenset({"source-forerunner", "source-venu"})
+            },
+            provider_source_identities={
+                "garmin": (
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="source-forerunner",
+                        device_labels=("Forerunner 955",),
+                    ),
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="source-venu",
+                        device_labels=("Venu 3",),
+                    ),
+                )
+            },
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.discarded_rows == 3
+    assert fetched.provider_source_lineage_verified is False
+    assert fetched.live_source_lineage_attested is False
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "data_source_id" not in encoded
+    assert "Forerunner 955" not in encoded
+    assert "Venu 3" not in encoded
+
+
+async def test_live_search_fails_closed_for_ambiguous_device_identity() -> None:
+    class AmbiguousClient(SourceIdentityTimeseriesClient):
+        async def get_timeseries(self, _user_id, *_args, **_kwargs):
+            return {
+                "data": [
+                    {
+                        "timestamp": "2026-08-10T10:00:00Z",
+                        "type": "heart_rate",
+                        "value": 70,
+                        "unit": "bpm",
+                        "source": {
+                            "provider": "garmin",
+                            "device": "same-device",
+                        },
+                    }
+                ],
+                "pagination": {"next_cursor": None, "has_more": False},
+            }
+
+    fetched = await BoundedOpenWearablesSearch(
+        AmbiguousClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+            allowed_providers=("garmin",),
+            provider_source_allowlist={
+                "garmin": frozenset({"source-a", "source-b"})
+            },
+            provider_source_identities={
+                "garmin": (
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="source-a",
+                        device_labels=("same-device",),
+                    ),
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="source-b",
+                        device_labels=("same-device",),
+                    ),
+                )
+            },
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.discarded_rows == 1
+    assert fetched.provider_source_lineage_verified is False
+    assert fetched.live_source_lineage_attested is False
+
+
+async def test_live_search_rejects_missing_source_id_when_device_is_missing() -> None:
+    class MissingDeviceClient:
+        async def get_timeseries(self, _user_id, *_args, **_kwargs):
+            return {
+                "data": [
+                    {
+                        "timestamp": "2026-08-10T10:00:00Z",
+                        "type": "heart_rate",
+                        "value": 70,
+                        "unit": "bpm",
+                        "source": {"provider": "garmin"},
+                    }
+                ],
+                "pagination": {"next_cursor": None, "has_more": False},
+            }
+
+    fetched = await BoundedOpenWearablesSearch(
+        MissingDeviceClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+            allowed_providers=("garmin",),
+            provider_source_allowlist={
+                "garmin": frozenset({"only-source"})
+            },
+            provider_source_identities={
+                "garmin": (
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="only-source",
+                    ),
+                )
+            },
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.discarded_rows == 1
+    assert fetched.provider_source_lineage_verified is False
+    assert fetched.live_source_lineage_attested is False
+
+
+class ExplicitWhoopSourceClient(WhoopPackageClient):
+    async def get_health_scores(
+        self,
+        user_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        payload = await super().get_health_scores(user_id, **kwargs)
+        payload["data"][0]["data_source_id"] = "whoop-source"
+        return payload
+
+
+class MixedWhoopSourceClient(WhoopPackageClient):
+    def __init__(self, mixed_category: str) -> None:
+        super().__init__()
+        self.mixed_category = mixed_category
+
+    async def get_health_scores(
+        self,
+        user_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        payload = await super().get_health_scores(user_id, **kwargs)
+        if kwargs["category"] != self.mixed_category:
+            payload["data"][0]["data_source_id"] = "whoop-source"
+            return payload
+        accepted = dict(payload["data"][0])
+        accepted["data_source_id"] = "whoop-source"
+        rejected = dict(payload["data"][0])
+        rejected["id"] = f"{kwargs['category']}-unbound-row"
+        rejected["data_source_id"] = "other-whoop-source"
+        payload["data"] = [accepted, rejected]
+        return payload
+
+
+async def test_whoop_package_preserves_explicit_source_lineage_without_leaking_id() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        ExplicitWhoopSourceClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            as_of=WHOOP_AS_OF,
+            timezone="Asia/Seoul",
+            provider_source_allowlist={
+                "whoop": frozenset({"whoop-source"})
+            },
+            provider_source_identities={
+                "whoop": (
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="whoop-source",
+                    ),
+                )
+            },
+        )
+    )
+
+    assert fetched.package is not None
+    assert fetched.package["status"] == "ok"
+    encoded = json.dumps(
+        {"package": fetched.package, "provenance": fetched.private_provenance},
+        sort_keys=True,
+    )
+    assert "whoop-source" not in encoded
+
+
+@pytest.mark.parametrize("mixed_category", ("recovery", "day_strain"))
+async def test_whoop_package_rejects_mixed_source_lineage(
+    mixed_category: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        MixedWhoopSourceClient(mixed_category),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            as_of=WHOOP_AS_OF,
+            timezone="Asia/Seoul",
+            provider_source_allowlist={
+                "whoop": frozenset({"whoop-source"})
+            },
+            provider_source_identities={
+                "whoop": (
+                    OpenWearablesExecutionDataSource(
+                        data_source_id="whoop-source",
+                    ),
+                )
+            },
+        )
+    )
+
+    assert fetched.package is not None
+    assert fetched.package["status"] == "ok"
+    assert fetched.discarded_rows == 1
+    assert fetched.provider_source_lineage_verified is False
+    assert fetched.live_source_lineage_attested is False
+
+
+def test_retained_search_accepts_sanitized_source_bound_rows() -> None:
+    fetched = normalize_retained_wearable_search(
+        (
+            {
+                "timestamp": "2026-08-10T08:01:00+00:00",
+                "series_type": "steps",
+                "value": 20,
+                "unit": "count",
+                "provider": "garmin",
+                "provider_attribution": "declared",
+            },
+        ),
+        request=_request(
+            "wearable.timeseries",
+            series_type="steps",
+            resolution="1hour",
+            allowed_providers=("garmin",),
+            provider_source_allowlist={
+                "garmin": frozenset({"source-current"})
+            },
+            provider_source_lineage_verified=True,
+        ),
+        stream_attribution_verified=True,
+        allow_missing_source_id=True,
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T08:00:00+00:00",
+            "series_type": "steps",
+            "value": 20,
+            "unit": "count",
+            "provider": "garmin",
+            "provider_attribution": "declared",
+        },
+    )
+    assert fetched.provider_source_lineage_verified is True
+
+
+def test_retained_search_filters_unknown_mixed_and_disallowed_providers() -> None:
+    fetched = normalize_retained_wearable_search(
+        (
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 10,
+                "unit": "count",
+                "provider": "apple",
+                "provider_attribution": "source_exact_alias",
+            },
+            {
+                "timestamp": "2026-08-10T08:01:00+00:00",
+                "series_type": "steps",
+                "value": 20,
+                "unit": "count",
+                "provider": "garmin",
+                "provider_attribution": "declared",
+            },
+            {
+                "timestamp": "2026-08-10T08:02:00+00:00",
+                "series_type": "steps",
+                "value": 30,
+                "unit": "count",
+                "provider": "unknown",
+                "provider_attribution": "missing",
+            },
+            {
+                "timestamp": "2026-08-10T08:03:00+00:00",
+                "series_type": "steps",
+                "value": 40,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "mixed",
+            },
+        ),
+        request=_request(
+            "wearable.timeseries",
+            series_type="steps",
+            resolution="1hour",
+            allowed_providers=frozenset({"apple"}),
+        ),
+        stream_attribution_verified=True,
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T08:00:00+00:00",
+            "series_type": "steps",
+            "value": 10,
+            "unit": "count",
+            "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
+        },
+    )
+    assert fetched.discarded_rows == 3
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+def test_retained_search_requires_exact_frozen_data_source() -> None:
+    fetched = normalize_retained_wearable_search(
+        (
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 10,
+                "unit": "count",
+                "provider": "garmin",
+                "provider_attribution": "declared",
+                "data_source_id": "source-old",
+            },
+            {
+                "timestamp": "2026-08-10T08:01:00+00:00",
+                "series_type": "steps",
+                "value": 20,
+                "unit": "count",
+                "provider": "garmin",
+                "provider_attribution": "declared",
+                "data_source_id": "source-current",
+            },
+            {
+                "timestamp": "2026-08-10T08:02:00+00:00",
+                "series_type": "steps",
+                "value": 30,
+                "unit": "count",
+                "provider": "garmin",
+                "provider_attribution": "declared",
+            },
+            {
+                "timestamp": "2026-08-10T08:03:00+00:00",
+                "series_type": "steps",
+                "value": 40,
+                "unit": "count",
+                "provider": "garmin",
+                "provider_attribution": "declared",
+                "data_source_id": "source-new-unbound",
+            },
+        ),
+        request=_request(
+            "wearable.timeseries",
+            series_type="steps",
+            resolution="1hour",
+            allowed_providers=("garmin",),
+            provider_source_allowlist={
+                "garmin": frozenset({"source-current"})
+            },
+        ),
+        stream_attribution_verified=True,
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T08:00:00+00:00",
+            "series_type": "steps",
+            "value": 20,
+            "unit": "count",
+            "provider": "garmin",
+            "provider_attribution": "declared",
+        },
+    )
+    assert fetched.discarded_rows == 3
+
+
 class RealOpenWearablesTimeseriesClient:
     async def get_timeseries(
         self,
@@ -2590,3 +3221,737 @@ async def test_search_retains_rows_without_provider_as_unknown(
             "wearable_stream_attribution_unavailable"
         )
     assert set(fetched.limitations) == expected_limitations
+
+
+class BodySummaryClient:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls: list[tuple[int, int]] = []
+
+    async def get_body_summary(
+        self,
+        user_id: str,
+        *,
+        average_period: int,
+        latest_window_hours: int,
+    ) -> dict[str, Any]:
+        assert user_id == "private-user-id"
+        self.calls.append((average_period, latest_window_hours))
+        return self.payload
+
+
+async def test_body_summary_normalizes_temporal_groups_independently() -> None:
+    measured_at = COLLECTED_AT - timedelta(hours=1)
+    client = BodySummaryClient(
+        {
+            "source": {
+                "provider": "garmin",
+                "device": "private-device",
+            },
+            "slow_changing": {
+                "weight_kg": 72.5,
+                "height_cm": 175,
+                "private_note": "do not expose",
+            },
+            "averaged": "malformed-group",
+            "latest": {
+                "body_temperature_celsius": 36.6,
+                "body_temperature_measured_at": measured_at.isoformat(),
+            },
+        }
+    )
+
+    fetched = await BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.body-summary",
+            average_period=7,
+            latest_window_hours=4,
+        )
+    )
+
+    assert client.calls == [(7, 4)]
+    assert fetched.records == (
+        {
+            "record_kind": "body_summary",
+            "summary_collected_at": COLLECTED_AT.isoformat(),
+            "provider": "garmin",
+            "provider_attribution": "source_exact_alias",
+            "slow_changing": {
+                "weight_kg": 72.5,
+                "height_cm": 175,
+            },
+            "latest": {
+                "body_temperature_celsius": 36.6,
+                "body_temperature_measured_at": measured_at.isoformat(),
+            },
+        },
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-device" not in encoded
+    assert "private_note" not in encoded
+
+
+async def test_body_summary_uses_single_allowed_provider_binding() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        BodySummaryClient(
+            {
+                "slow_changing": {"weight_kg": 72.5},
+                "averaged": {},
+                "latest": {},
+            }
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.body-summary",
+            allowed_providers=("apple_health_sdk",),
+        )
+    )
+
+    assert fetched.records == (
+        {
+            "record_kind": "body_summary",
+            "summary_collected_at": COLLECTED_AT.isoformat(),
+            "provider": "apple_health",
+            "provider_attribution": "allowed_provider_binding",
+            "slow_changing": {"weight_kg": 72.5},
+        },
+    )
+    assert fetched.limitations == ()
+
+
+@pytest.mark.parametrize(
+    ("payload", "allowed_provider"),
+    (
+        ({"provider": "garmin"}, "apple"),
+        ({"source": {"provider": "garmin"}}, "apple"),
+        (
+            {
+                "provider": "garmin",
+                "source": {"provider": "apple"},
+            },
+            "garmin",
+        ),
+        ({"provider": "unrecognized-provider"}, "garmin"),
+    ),
+)
+async def test_body_summary_rejects_conflicting_provider_attribution(
+    payload: dict[str, Any],
+    allowed_provider: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        BodySummaryClient(
+            {
+                **payload,
+                "slow_changing": {"weight_kg": 72.5},
+                "averaged": {},
+                "latest": {},
+            }
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.body-summary",
+            allowed_providers=(allowed_provider,),
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.discarded_rows == 1
+
+
+@pytest.mark.parametrize(
+    "allowed_providers",
+    ((), ("apple", "garmin")),
+)
+async def test_body_summary_rejects_ambiguous_provider_binding(
+    allowed_providers: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        BodySummaryClient(
+            {
+                "slow_changing": {"weight_kg": 72.5},
+                "averaged": {},
+                "latest": {},
+            }
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.body-summary",
+            allowed_providers=allowed_providers,
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.discarded_rows == 1
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+def test_retained_body_summary_uses_single_allowed_provider_binding() -> None:
+    fetched = normalize_retained_wearable_search(
+        (
+            {
+                "record_kind": "body_summary",
+                "summary_collected_at": COLLECTED_AT.isoformat(),
+                "slow_changing": {"weight_kg": 72.5},
+            },
+        ),
+        request=_request(
+            "wearable.body-summary",
+            allowed_providers=("garmin_connect",),
+        ),
+    )
+
+    assert fetched.records == (
+        {
+            "record_kind": "body_summary",
+            "summary_collected_at": COLLECTED_AT.isoformat(),
+            "provider": "garmin",
+            "provider_attribution": "allowed_provider_binding",
+            "slow_changing": {"weight_kg": 72.5},
+        },
+    )
+    assert fetched.limitations == ()
+
+
+async def test_body_summary_retention_uses_full_averaging_period() -> None:
+    period_start = START - timedelta(days=7)
+    client = BodySummaryClient(
+        {
+            "source": {"provider": "oura"},
+            "slow_changing": {},
+            "averaged": {
+                "period_days": 7,
+                "period_start": period_start.isoformat(),
+                "period_end": COLLECTED_AT.isoformat(),
+                "resting_heart_rate_bpm": 58,
+            },
+            "latest": {},
+        }
+    )
+
+    fetched = await BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.body-summary",
+            start=period_start,
+            retained_after=period_start,
+            average_period=7,
+            latest_window_hours=4,
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+class SleepSessionsClient:
+    async def get_sleep_sessions(
+        self,
+        user_id: str,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        assert user_id == "private-user-id"
+        first_start = START + timedelta(hours=1)
+        first_end = START + timedelta(hours=4)
+        second_start = START + timedelta(hours=6)
+        second_end = START + timedelta(hours=7)
+        return {
+            "data": [
+                {
+                    "id": "private-sleep-row-1",
+                    "start_time": first_start.isoformat(),
+                    "end_time": first_end.isoformat(),
+                    "duration_seconds": 10_800,
+                    "provider": "oura",
+                    "stages": {
+                        "deep_minutes": 60,
+                        "rem_minutes": 45,
+                    },
+                    "sleep_stage_intervals": [
+                        {
+                            "stage": "deep",
+                            "start_time": first_start.isoformat(),
+                            "end_time": (
+                                first_start + timedelta(hours=1)
+                            ).isoformat(),
+                            "private_signal": "omit",
+                        },
+                        {
+                            "stage": "light",
+                            "start_time": (
+                                first_start + timedelta(minutes=30)
+                            ).isoformat(),
+                            "end_time": (
+                                first_start + timedelta(hours=1, minutes=30)
+                            ).isoformat(),
+                        },
+                        {
+                            "stage": "rem",
+                            "start_time": (
+                                first_start + timedelta(hours=1)
+                            ).isoformat(),
+                            "end_time": (
+                                first_start + timedelta(hours=2)
+                            ).isoformat(),
+                        },
+                    ],
+                },
+                {
+                    "id": "private-sleep-row-2",
+                    "start_time": second_start.isoformat(),
+                    "end_time": second_end.isoformat(),
+                    "duration_seconds": 3_600,
+                    "provider": "oura",
+                    "is_nap": True,
+                },
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+            },
+        }
+
+
+async def test_sleep_intervals_require_identity_and_sessions_stay_distinct() -> None:
+    search = BoundedOpenWearablesSearch(
+        SleepSessionsClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    aggregate = await search(_request("wearable.sleep-sessions"))
+    identity = await search(
+        _request(
+            "wearable.sleep-sessions",
+            privacy_level=PrivacyLevel.IDENTITY,
+        )
+    )
+
+    assert len(aggregate.records) == 2
+    assert all(
+        "sleep_stage_intervals" not in record
+        and "sleep_stage_intervals_truncated" not in record
+        for record in aggregate.records
+    )
+    assert len(identity.records) == 2
+    assert identity.records[0]["sleep_stage_intervals"] == [
+        {
+            "stage": "deep",
+            "start_time": "2026-08-10T01:00:00+00:00",
+            "end_time": "2026-08-10T02:00:00+00:00",
+        },
+        {
+            "stage": "rem",
+            "start_time": "2026-08-10T02:00:00+00:00",
+            "end_time": "2026-08-10T03:00:00+00:00",
+        },
+    ]
+    assert identity.records[0]["sleep_stage_intervals_truncated"] is True
+    encoded = json.dumps(identity.records, sort_keys=True)
+    assert "private-sleep-row" not in encoded
+    assert "private_signal" not in encoded
+
+
+def test_retained_sleep_reapplies_the_requested_privacy_level() -> None:
+    retained = (
+        {
+            "record_kind": "sleep_session",
+            "start_time": "2026-08-10T01:00:00+00:00",
+            "end_time": "2026-08-10T04:00:00+00:00",
+            "provider": "oura",
+            "provider_attribution": "declared",
+            "duration_seconds": 10_800,
+            "sleep_stage_intervals": [
+                {
+                    "stage": "deep",
+                    "start_time": "2026-08-10T01:00:00+00:00",
+                    "end_time": "2026-08-10T02:00:00+00:00",
+                    "secret": "must disappear",
+                }
+            ],
+            "sleep_stage_intervals_truncated": True,
+        },
+    )
+
+    aggregate = normalize_retained_wearable_search(
+        retained,
+        request=_request("wearable.sleep-sessions"),
+    )
+    identity = normalize_retained_wearable_search(
+        retained,
+        request=_request(
+            "wearable.sleep-sessions",
+            privacy_level=PrivacyLevel.IDENTITY,
+        ),
+    )
+
+    assert "sleep_stage_intervals" not in aggregate.records[0]
+    assert "sleep_stage_intervals_truncated" not in aggregate.records[0]
+    assert identity.records[0]["sleep_stage_intervals"] == [
+        {
+            "stage": "deep",
+            "start_time": "2026-08-10T01:00:00+00:00",
+            "end_time": "2026-08-10T02:00:00+00:00",
+        }
+    ]
+    assert identity.records[0]["sleep_stage_intervals_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "option"),
+    (
+        ("garmin", "samples"),
+        ("garmin", "route"),
+        ("suunto", "zones"),
+    ),
+)
+async def test_non_polar_granular_options_fail_before_user_resolution(
+    provider: str,
+    option: str,
+) -> None:
+    resolver_calls = 0
+
+    def resolve_user() -> str:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return "private-user-id"
+
+    parameters: dict[str, Any] = {
+        "provider": provider,
+        option: True,
+    }
+    search = BoundedOpenWearablesSearch(
+        object(),  # type: ignore[arg-type]
+        resolve_user,
+    )
+
+    with pytest.raises(ValueError, match="only for polar"):
+        await search(
+            _request(
+                "wearable.provider-workouts",
+                privacy_level=PrivacyLevel.IDENTITY,
+                **parameters,
+            )
+        )
+
+    assert resolver_calls == 0
+
+
+def test_retained_polar_granular_data_is_allowlisted_again() -> None:
+    retained = (
+        {
+            "record_kind": "provider_workout",
+            "provider": "polar",
+            "provider_attribution": "declared",
+            "provider_workout_id": "polar-workout-1",
+            "workout_type": "running",
+            "start_time": "2026-08-10T01:00:00+00:00",
+            "end_time": "2026-08-10T02:00:00+00:00",
+            "samples": [
+                {
+                    "recording_rate_seconds": 1,
+                    "sample_type": "heart_rate",
+                    "data": "70,71,72",
+                    "secret": "omit",
+                },
+                {"sample_type": "invalid"},
+            ],
+            "heart_rate_zones": [
+                {
+                    "index": 1,
+                    "lower_bpm": 100,
+                    "upper_bpm": 120,
+                    "duration_seconds": 300,
+                    "secret": "omit",
+                }
+            ],
+            "route": [
+                {
+                    "latitude": 37.5,
+                    "longitude": 127.0,
+                    "timestamp": "2026-08-10T01:30:00+00:00",
+                    "secret": "omit",
+                }
+            ],
+        },
+    )
+
+    fetched = normalize_retained_wearable_search(
+        retained,
+        request=_request(
+            "wearable.provider-workouts",
+            privacy_level=PrivacyLevel.IDENTITY,
+            provider="polar",
+            samples=True,
+            zones=True,
+            route=True,
+        ),
+    )
+
+    assert fetched.records[0]["samples"] == [
+        {
+            "recording_rate_seconds": 1,
+            "sample_type": "heart_rate",
+            "data": "70,71,72",
+        }
+    ]
+    assert fetched.records[0]["heart_rate_zones"] == [
+        {
+            "index": 1,
+            "lower_bpm": 100,
+            "upper_bpm": 120,
+            "duration_seconds": 300,
+        }
+    ]
+    assert fetched.records[0]["route"] == [
+        {
+            "latitude": 37.5,
+            "longitude": 127.0,
+            "timestamp": "2026-08-10T01:30:00+00:00",
+        }
+    ]
+    assert fetched.records[0]["granular_truncated"] is True
+    assert "secret" not in json.dumps(fetched.records, sort_keys=True)
+
+
+def test_request_rejects_naive_collection_timestamp() -> None:
+    request = _request(
+        "wearable.health-scores",
+        collected_at=datetime(2026, 8, 10, 12),
+    )
+
+    with pytest.raises(ValueError, match="collection timestamp"):
+        validate_wearable_search_request(request)
+
+
+class MenstrualCyclesClient:
+    async def get_menstrual_cycles(
+        self,
+        user_id: str,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        assert user_id == "private-user-id"
+        return {
+            "data": [
+                {
+                    "id": "private-cycle-id",
+                    "start_time": "2026-08-10T00:00:00+00:00",
+                    "end_time": "2026-09-07T00:00:00+00:00",
+                    "provider": "garmin",
+                    "current_phase": 2,
+                    "current_phase_type": "follicular",
+                    "day_in_cycle": 1,
+                    "cycle_length": 28,
+                    "period_length": 5,
+                    "is_predicted_cycle": False,
+                    "last_updated_at": "2026-08-10T08:00:00+00:00",
+                    "pregnancy_snapshot": [
+                        {"private_vendor_payload": "omit"}
+                    ],
+                }
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+            },
+        }
+
+
+async def test_menstrual_cycle_allows_future_end_and_sanitizes_payload() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        MenstrualCyclesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_request("wearable.menstrual-cycles"))
+
+    assert fetched.records == (
+        {
+            "record_kind": "menstrual_cycle",
+            "start_time": "2026-08-10T00:00:00+00:00",
+            "end_time": "2026-09-07T00:00:00+00:00",
+            "provider": "garmin",
+            "provider_attribution": "declared",
+            "current_phase": 2,
+            "day_in_cycle": 1,
+            "cycle_length": 28,
+            "period_length": 5,
+            "current_phase_type": "follicular",
+            "is_predicted_cycle": False,
+            "last_updated_at": "2026-08-10T08:00:00+00:00",
+        },
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-cycle-id" not in encoded
+    assert "private_vendor_payload" not in encoded
+
+
+class PolarWorkoutClient:
+    async def collect_vendor_workouts_tracked(
+        self,
+        provider: str,
+        user_id: str,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> VendorWorkoutCollection:
+        assert provider == "polar"
+        assert user_id == "private-user-id"
+        assert kwargs == {
+            "samples": True,
+            "zones": True,
+            "route": True,
+            "max_pages": MAX_WEARABLE_SEARCH_PAGES,
+        }
+        return VendorWorkoutCollection(
+            rows=(
+                {
+                    "id": "polar-workout-1",
+                    "start_time": "2026-08-10T01:00:00",
+                    "start_time_utc_offset": 0,
+                    "duration": "PT1H",
+                    "sport": "RUNNING",
+                    "distance": 10_000,
+                    "calories": 600,
+                    "heart_rate": {
+                        "average": 145,
+                        "maximum": 175,
+                    },
+                    "samples": [
+                        {
+                            "recording-rate": 1,
+                            "sample-type": "heart_rate",
+                            "data": "140,145,150",
+                        }
+                    ],
+                    "heart_rate_zones": [
+                        {
+                            "index": 1,
+                            "lower-limit": 100,
+                            "upper-limit": 120,
+                            "in-zone": "PT5M",
+                        }
+                    ],
+                    "route": [
+                        {
+                            "latitude": 37.5,
+                            "longitude": 127.0,
+                            "time": "2026-08-10T01:30:00+00:00",
+                        }
+                    ],
+                },
+            ),
+        )
+
+
+class GarminCompletenessClient:
+    async def collect_vendor_workouts_tracked(
+        self,
+        provider: str,
+        user_id: str,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> VendorWorkoutCollection:
+        assert provider == "garmin"
+        assert user_id == "private-user-id"
+        assert kwargs == {
+            "samples": False,
+            "zones": False,
+            "route": False,
+            "max_pages": MAX_WEARABLE_SEARCH_PAGES,
+        }
+        return VendorWorkoutCollection(
+            rows=(
+                {
+                    "activityId": 7,
+                    "activityType": "RUNNING",
+                    "startTimeInSeconds": int(
+                        (START + timedelta(hours=1)).timestamp()
+                    ),
+                    "durationInSeconds": 3600,
+                },
+            ),
+            completeness_unverified=True,
+        )
+
+
+async def test_long_garmin_window_is_unverified_not_page_truncated() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        GarminCompletenessClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.provider-workouts",
+            end=START + timedelta(days=2),
+            provider="garmin",
+        )
+    )
+
+    assert len(fetched.records) == 1
+    assert fetched.upstream_truncated is False
+    assert fetched.upstream_completeness_unverified is True
+    assert fetched.limitations == (
+        "wearable_upstream_completeness_unverified",
+    )
+
+
+async def test_polar_provider_workout_preserves_bounded_native_detail() -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        PolarWorkoutClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.provider-workouts",
+            privacy_level=PrivacyLevel.IDENTITY,
+            provider="polar",
+            samples=True,
+            zones=True,
+            route=True,
+        )
+    )
+
+    assert fetched.records == (
+        {
+            "record_kind": "provider_workout",
+            "provider": "polar",
+            "provider_attribution": "declared",
+            "workout_type": "running",
+            "start_time": "2026-08-10T01:00:00+00:00",
+            "end_time": "2026-08-10T02:00:00+00:00",
+            "provider_workout_id": "polar-workout-1",
+            "provider_workout_type_code": "RUNNING",
+            "duration_seconds": 3600,
+            "zone_offset": "+00:00",
+            "distance_meters": 10_000,
+            "calories_kcal": 600,
+            "avg_heart_rate_bpm": 145,
+            "max_heart_rate_bpm": 175,
+            "samples": [
+                {
+                    "recording_rate_seconds": 1,
+                    "sample_type": "heart_rate",
+                    "data": "140,145,150",
+                }
+            ],
+            "heart_rate_zones": [
+                {
+                    "index": 1,
+                    "lower_bpm": 100,
+                    "upper_bpm": 120,
+                    "duration_seconds": 300,
+                }
+            ],
+            "route": [
+                {
+                    "latitude": 37.5,
+                    "longitude": 127.0,
+                    "timestamp": "2026-08-10T01:30:00+00:00",
+                }
+            ],
+        },
+    )

@@ -202,6 +202,11 @@ _AUDIT_REASON_CODES = frozenset(
         "freshness_unknown",
         "future_context_unavailable",
         "future_range_trimmed",
+        "open_wearables_disconnected",
+        "open_wearables_provider_binding_changed",
+        "open_wearables_source_policy_changed",
+        "open_wearables_source_setting_unavailable",
+        "open_wearables_unconfigured",
         "privacy_fields_redacted",
         "privacy_implicit_escalation_denied",
         "provider_access_changed",
@@ -252,6 +257,7 @@ _AUDIT_REASON_CODES = frozenset(
         "turn_context_byte_budget_exhausted",
         "turn_source_ref_budget_exhausted",
         "turn_tool_call_budget_exhausted",
+        "wearable_input_disabled",
     }
 )
 _PROVIDER_GENERIC_LIMITATION_CODES = frozenset(

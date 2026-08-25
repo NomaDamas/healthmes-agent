@@ -6,29 +6,32 @@ import hashlib
 import inspect
 import json
 import math
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from functools import partial
 from typing import Any
 
+from healthmes.decision.contracts import PrivacyLevel
 from healthmes.mcp_server.ow_client import OWClient
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.binding import (
+    OpenWearablesExecutionDataSource,
+    current_open_wearables_execution_binding,
+)
+from healthmes.wearables.lineage import OpenWearablesLineageMode
+from healthmes.wearables.open_wearables_routes import (
+    OPEN_WEARABLES_V1_EXPOSED_CAPABILITIES,
+)
 from healthmes.wearables.whoop_recovery import (
     WHOOP_RECOVERY_PACKAGE_CAPABILITY,
     WHOOP_UPSTREAM_PROVIDER,
     calculate_whoop_recovery_package,
 )
 
-WEARABLE_DETAIL_CAPABILITIES = frozenset(
-    {
-        "wearable.health-scores",
-        "wearable.summaries",
-        "wearable.workouts",
-        "wearable.timeseries",
-        WHOOP_RECOVERY_PACKAGE_CAPABILITY,
-    }
-)
+WEARABLE_DETAIL_CAPABILITIES = OPEN_WEARABLES_V1_EXPOSED_CAPABILITIES
 WEARABLE_HEALTH_SCORE_CATEGORIES = (
     "activity",
     "body_battery",
@@ -41,6 +44,11 @@ WEARABLE_HEALTH_SCORE_CATEGORIES = (
     "stress",
 )
 WEARABLE_SUMMARY_KINDS = ("activity", "recovery", "sleep")
+WEARABLE_PROVIDER_WORKOUT_PROVIDERS = (
+    "garmin",
+    "polar",
+    "suunto",
+)
 WEARABLE_TIMESERIES_RESOLUTIONS = ("1min", "5min", "15min", "1hour")
 WEARABLE_TIMESERIES_TYPES = (
     "active_time",
@@ -91,7 +99,18 @@ _SUM_TIMESERIES_TYPES = frozenset(
     }
 )
 _CAPABILITY_PARAMETERS = {
+    "wearable.body-summary": frozenset(
+        {"average_period", "latest_window_hours"}
+    ),
     "wearable.health-scores": frozenset({"category"}),
+    "wearable.menstrual-cycles": frozenset(),
+    "wearable.provider-workout-detail": frozenset(
+        {"provider", "route", "samples", "workout_id", "zones"}
+    ),
+    "wearable.provider-workouts": frozenset(
+        {"provider", "route", "samples", "zones"}
+    ),
+    "wearable.sleep-sessions": frozenset(),
     "wearable.summaries": frozenset({"summary_kind"}),
     "wearable.workouts": frozenset(),
     "wearable.timeseries": frozenset({"resolution", "series_type"}),
@@ -143,6 +162,8 @@ _INTERNAL_ROW_IDENTITY = "_healthmes_row_identity"
 _INTERNAL_STABLE_ROW_ID = "_healthmes_stable_row_id"
 _INTERNAL_STREAM_KEY = "_healthmes_stream_key"
 _PROVIDER_ROW_ID_FIELDS = (
+    "provider_workout_id",
+    "provider_numeric_workout_id",
     "id",
     "record_id",
     "summary_id",
@@ -151,10 +172,37 @@ _PROVIDER_ROW_ID_FIELDS = (
     "event_id",
 )
 _TRUSTED_PROVIDER_ATTRIBUTIONS = frozenset(
-    {"declared", "source_exact_alias"}
+    {"allowed_provider_binding", "declared", "source_exact_alias"}
+)
+_SAFE_PROVIDER_WORKOUT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,512}$")
+_ISO_DURATION = re.compile(
+    r"^P"
+    r"(?:(?P<days>\d+(?:\.\d+)?)D)?"
+    r"(?:T"
+    r"(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?"
+    r")?$",
+    re.IGNORECASE,
+)
+_MAX_GRANULAR_WORKOUT_ROWS = 250
+_MAX_GRANULAR_WORKOUT_TEXT = 4_096
+_MAX_SLEEP_STAGE_INTERVALS = 250
+_MAX_COLLECTION_CLOCK_SKEW = timedelta(minutes=5)
+_SLEEP_STAGE_TYPES = frozenset(
+    {
+        "awake",
+        "deep",
+        "in_bed",
+        "light",
+        "rem",
+        "sleeping",
+        "unknown",
+    }
 )
 
 WearableUserIdResolver = Callable[[], str | Awaitable[str]]
+_LIVE_SOURCE_LINEAGE_ATTESTATION = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,8 +212,21 @@ class WearableSearchRequest:
     end: datetime
     timezone: str
     parameters: Mapping[str, Any]
+    collected_at: datetime
+    privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE
     retained_after: datetime | None = None
     as_of: date | None = None
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None
+    provider_source_identities: Mapping[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ] | None = None
+    lineage_mode: OpenWearablesLineageMode | None = None
+    # A retained snapshot is source-bound at the event level. Its public
+    # records intentionally omit raw data-source IDs, so the binding digest
+    # is the lineage proof for those already-verified records.
+    provider_source_lineage_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,19 +240,41 @@ class _ProviderPage:
 class WearableSearchFetch:
     records: tuple[dict[str, Any], ...]
     upstream_truncated: bool = False
+    upstream_completeness_unverified: bool = False
     payload_trimmed: bool = False
     discarded_rows: int = 0
     summary_window_partial: bool = False
     conflicting_duplicate_rows: bool = False
     stream_attribution_unavailable: bool = False
+    granular_truncated: bool = False
     package: dict[str, Any] | None = None
     private_provenance: tuple[dict[str, Any], ...] = ()
+    provider_source_lineage_verified: bool = False
+    _live_source_lineage_attestation: object | None = dataclass_field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def live_source_lineage_attested(self) -> bool:
+        """Whether the bounded live adapter performed exact source filtering."""
+
+        return (
+            self.provider_source_lineage_verified
+            and self._live_source_lineage_attestation
+            is _LIVE_SOURCE_LINEAGE_ATTESTATION
+        )
 
     @property
     def limitations(self) -> tuple[str, ...]:
         values: list[str] = []
         if self.upstream_truncated:
             values.append("wearable_upstream_page_limit_reached")
+        if self.upstream_completeness_unverified:
+            values.append(
+                "wearable_upstream_completeness_unverified"
+            )
         if self.payload_trimmed:
             values.append("wearable_payload_limit_reached")
         if self.discarded_rows:
@@ -202,6 +285,8 @@ class WearableSearchFetch:
             values.append("wearable_conflicting_duplicate_rows")
         if self.stream_attribution_unavailable:
             values.append("wearable_stream_attribution_unavailable")
+        if self.granular_truncated:
+            values.append("wearable_granular_data_truncated")
         if any(
             record.get("provider") == "unknown"
             or record.get("provider_attribution")
@@ -225,6 +310,11 @@ def normalize_retained_wearable_health_scores(
     start: datetime,
     end: datetime,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reapply the current window to retained health-score records."""
 
@@ -235,6 +325,7 @@ def normalize_retained_wearable_health_scores(
         raise ValueError("wearable health score category is not allowlisted")
     start_utc = start.astimezone(UTC)
     end_utc = end.astimezone(UTC)
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -259,11 +350,26 @@ def normalize_retained_wearable_health_scores(
         ):
             discarded += 1
             continue
-        normalized.append(dict(record))
+        clean = _filter_provider_attribution(
+            dict(record),
+            capability="wearable.health-scores",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
+        ),
     )
 
 
@@ -275,11 +381,17 @@ def normalize_retained_wearable_summaries(
     end: datetime,
     timezone: str,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Filter legacy mirrors against the exact retained summary window."""
 
     if kind not in WEARABLE_SUMMARY_KINDS:
         raise ValueError("wearable summary kind is not allowlisted")
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -303,7 +415,19 @@ def normalize_retained_wearable_summaries(
         ):
             discarded += 1
             continue
-        normalized.append(dict(record))
+        clean = _filter_provider_attribution(
+            dict(record),
+            capability="wearable.summaries",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
@@ -312,6 +436,9 @@ def normalize_retained_wearable_summaries(
             start=start,
             end=end,
             timezone=timezone,
+        ),
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
         ),
     )
 
@@ -325,6 +452,11 @@ def normalize_retained_wearable_timeseries(
     end: datetime,
     stream_attribution_verified: bool = False,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reapply current privacy rules to previously stored public records."""
 
@@ -335,6 +467,7 @@ def normalize_retained_wearable_timeseries(
 
     start_utc = start.astimezone(UTC)
     end_utc = end.astimezone(UTC)
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -392,13 +525,28 @@ def normalize_retained_wearable_timeseries(
             result["zone_offset"] = zone_offset
         if type(record.get("is_daily_total")) is bool:
             result["is_daily_total"] = record["is_daily_total"]
-        normalized.append(result)
+        clean = _filter_provider_attribution(
+            result,
+            capability="wearable.timeseries",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
         stream_attribution_unavailable=(
             bool(normalized) and not stream_attribution_verified
+        ),
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
         ),
     )
 
@@ -409,9 +557,15 @@ def normalize_retained_wearable_workouts(
     start: datetime,
     end: datetime,
     retained_after: datetime | None = None,
+    allowed_providers: tuple[str, ...] | frozenset[str] | None = None,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    provider_source_lineage_verified: bool = False,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    allow_missing_source_id: bool = False,
 ) -> WearableSearchFetch:
     """Reject retained workouts whose complete interval is no longer valid."""
 
+    canonical_allowed = _canonical_allowed_providers(allowed_providers)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -426,11 +580,209 @@ def normalize_retained_wearable_workouts(
         ):
             discarded += 1
             continue
-        normalized.append(dict(record))
+        clean = _filter_provider_attribution(
+            dict(record),
+            capability="wearable.workouts",
+            source_row=record,
+            allowed_providers=canonical_allowed,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if clean is None:
+            discarded += 1
+            continue
+        normalized.append(clean)
     normalized.sort(key=_row_sort_key)
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
+        provider_source_lineage_verified=(
+            provider_source_lineage_verified
+        ),
+    )
+
+
+def normalize_retained_wearable_search(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    request: WearableSearchRequest,
+    stream_attribution_verified: bool = False,
+    allow_missing_source_id: bool = False,
+) -> WearableSearchFetch:
+    """Reapply current capability, privacy, and time rules to a local mirror."""
+
+    request = _request_with_execution_binding(request)
+    validate_wearable_search_request(request)
+    if request.capability == "wearable.health-scores":
+        return normalize_retained_wearable_health_scores(
+            records,
+            category=(
+                str(request.parameters["category"])
+                if request.parameters.get("category") is not None
+                else None
+            ),
+            start=request.start,
+            end=request.end,
+            retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+    if request.capability == "wearable.summaries":
+        return normalize_retained_wearable_summaries(
+            records,
+            kind=str(request.parameters["summary_kind"]),
+            start=request.start,
+            end=request.end,
+            timezone=request.timezone,
+            retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+    if request.capability == "wearable.workouts":
+        return normalize_retained_wearable_workouts(
+            records,
+            start=request.start,
+            end=request.end,
+            retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+    if request.capability == "wearable.timeseries":
+        return normalize_retained_wearable_timeseries(
+            records,
+            series_type=str(request.parameters["series_type"]),
+            resolution=str(request.parameters["resolution"]),
+            start=request.start,
+            end=request.end,
+            stream_attribution_verified=stream_attribution_verified,
+            retained_after=request.retained_after,
+            allowed_providers=request.allowed_providers,
+            provider_source_allowlist=request.provider_source_allowlist,
+            provider_source_lineage_verified=(
+                request.provider_source_lineage_verified
+            ),
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+
+    if request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
+        raise ValueError("WHOOP package mirrors use their dedicated normalizer")
+
+    if request.capability == "wearable.body-summary":
+        sanitizer = partial(
+            _sanitize_body_summary,
+            start=request.start,
+            end=request.end,
+            retained_after=request.retained_after,
+            collected_at=request.collected_at,
+            average_period=_bounded_request_integer(
+                request.parameters,
+                "average_period",
+                default=7,
+                minimum=1,
+                maximum=7,
+            ),
+            latest_window_hours=_bounded_request_integer(
+                request.parameters,
+                "latest_window_hours",
+                default=4,
+                minimum=1,
+                maximum=24,
+            ),
+        )
+    elif request.capability == "wearable.sleep-sessions":
+        sanitizer = partial(
+            _sanitize_sleep_session,
+            start=request.start,
+            end=request.end,
+            retained_after=request.retained_after,
+            privacy_level=request.privacy_level,
+        )
+    elif request.capability == "wearable.menstrual-cycles":
+        sanitizer = partial(
+            _sanitize_menstrual_cycle,
+            start=request.start,
+            end=request.end,
+            retained_after=request.retained_after,
+        )
+    elif request.capability in {
+        "wearable.provider-workout-detail",
+        "wearable.provider-workouts",
+    }:
+        sanitizer = partial(
+            _sanitize_retained_provider_workout,
+            provider=str(request.parameters["provider"]),
+            expected_workout_id=(
+                str(request.parameters["workout_id"])
+                if request.capability
+                == "wearable.provider-workout-detail"
+                else None
+            ),
+            start=request.start,
+            end=request.end,
+            retained_after=request.retained_after,
+            samples=request.parameters.get("samples", False) is True,
+            zones=request.parameters.get("zones", False) is True,
+            route=request.parameters.get("route", False) is True,
+        )
+    else:
+        raise ValueError("unsupported wearable detail capability")
+
+    normalized: list[dict[str, Any]] = []
+    discarded = 0
+    allowed_providers = _canonical_allowed_providers(
+        request.allowed_providers
+    )
+    for record in records:
+        clean = sanitizer(record)
+        if clean is None:
+            discarded += 1
+            continue
+        filtered = _filter_provider_attribution(
+            clean,
+            capability=request.capability,
+            source_row=record,
+            allowed_providers=allowed_providers,
+            body_summary=(
+                request.capability == "wearable.body-summary"
+            ),
+            provider_source_allowlist=request.provider_source_allowlist,
+            lineage_mode=request.lineage_mode,
+            allow_missing_source_id=allow_missing_source_id,
+        )
+        if filtered is None:
+            discarded += 1
+            continue
+        normalized.append(filtered)
+    normalized, conflicting = _deduplicate_wearable_records(normalized)
+    normalized.sort(key=_row_sort_key)
+    return WearableSearchFetch(
+        records=tuple(normalized),
+        discarded_rows=discarded,
+        conflicting_duplicate_rows=conflicting,
+        granular_truncated=any(
+            record.get("granular_truncated") is True
+            for record in normalized
+        ),
+        provider_source_lineage_verified=(
+            request.provider_source_lineage_verified
+        ),
     )
 
 
@@ -452,6 +804,13 @@ def validate_wearable_search_request(
     end = request.end.astimezone(UTC)
     if end <= start:
         raise ValueError("wearable query end must be after start")
+    if (
+        request.collected_at.tzinfo is None
+        or request.collected_at.utcoffset() is None
+    ):
+        raise ValueError(
+            "wearable collection timestamp must be timezone-aware"
+        )
     parse_timezone(request.timezone)
     if request.retained_after is not None:
         retained_after = request.retained_after
@@ -460,13 +819,37 @@ def validate_wearable_search_request(
             or retained_after.utcoffset() is None
         ):
             raise ValueError("wearable retention cutoff must be timezone-aware")
+    if type(request.privacy_level) is not PrivacyLevel:
+        raise ValueError("wearable privacy level is invalid")
+    if type(request.provider_source_lineage_verified) is not bool:
+        raise ValueError(
+            "wearable provider source lineage state is invalid"
+        )
+    allowed_providers = _canonical_allowed_providers(
+        request.allowed_providers
+    )
     unexpected = (
         set(request.parameters)
         - _CAPABILITY_PARAMETERS[request.capability]
     )
     if unexpected:
         raise ValueError("wearable query contains unsupported parameters")
-    if request.capability == "wearable.health-scores":
+    if request.capability == "wearable.body-summary":
+        _bounded_request_integer(
+            request.parameters,
+            "average_period",
+            default=7,
+            minimum=1,
+            maximum=7,
+        )
+        _bounded_request_integer(
+            request.parameters,
+            "latest_window_hours",
+            default=4,
+            minimum=1,
+            maximum=24,
+        )
+    elif request.capability == "wearable.health-scores":
         category = request.parameters.get("category")
         if (
             category is not None
@@ -479,8 +862,59 @@ def validate_wearable_search_request(
             not in WEARABLE_SUMMARY_KINDS
         ):
             raise ValueError("wearable summary kind is not allowlisted")
+    elif request.capability in {
+        "wearable.provider-workout-detail",
+        "wearable.provider-workouts",
+    }:
+        provider = request.parameters.get("provider")
+        if (
+            type(provider) is not str
+            or provider not in WEARABLE_PROVIDER_WORKOUT_PROVIDERS
+        ):
+            raise ValueError(
+                "wearable provider workout provider is not allowlisted"
+            )
+        for field in ("samples", "zones", "route"):
+            value = request.parameters.get(field, False)
+            if type(value) is not bool:
+                raise ValueError(
+                    f"wearable provider workout {field} must be boolean"
+                )
+        if (
+            any(
+                request.parameters.get(field, False) is True
+                for field in ("samples", "zones", "route")
+            )
+            and request.privacy_level is not PrivacyLevel.IDENTITY
+        ):
+            raise ValueError(
+                "granular provider workout data requires identity privacy"
+            )
+        if provider != "polar" and any(
+            request.parameters.get(field, False) is True
+            for field in ("samples", "zones", "route")
+        ):
+            raise ValueError(
+                "granular provider workout options are supported only for polar"
+            )
+        if request.capability == "wearable.provider-workout-detail":
+            workout_id = request.parameters.get("workout_id")
+            if (
+                type(workout_id) is not str
+                or _SAFE_PROVIDER_WORKOUT_ID.fullmatch(workout_id) is None
+            ):
+                raise ValueError(
+                    "wearable provider workout_id is invalid"
+                )
     elif request.capability == WHOOP_RECOVERY_PACKAGE_CAPABILITY:
         _whoop_as_of(request.as_of)
+        if (
+            allowed_providers is not None
+            and WHOOP_UPSTREAM_PROVIDER not in allowed_providers
+        ):
+            raise ValueError(
+                "WHOOP package requires an allowed WHOOP provider"
+            )
     elif request.as_of is not None:
         raise ValueError("as_of is only supported by the WHOOP package")
     if request.capability != "wearable.timeseries":
@@ -498,6 +932,22 @@ def validate_wearable_search_request(
         raise ValueError("wearable timeseries window exceeds resolution limit")
 
 
+def _bounded_request_integer(
+    parameters: Mapping[str, Any],
+    field: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = parameters.get(field, default)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(
+            f"wearable {field} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
 class BoundedOpenWearablesSearch:
     """Read a narrow Open Wearables slice without exposing its raw database."""
 
@@ -513,6 +963,17 @@ class BoundedOpenWearablesSearch:
         self,
         request: WearableSearchRequest,
     ) -> WearableSearchFetch:
+        binding = current_open_wearables_execution_binding(
+            request.capability
+        )
+        if binding is not None and binding.retained_only:
+            raise LookupError(
+                "retained-only Open Wearables binding cannot use live REST"
+            )
+        request = replace(
+            _request_with_execution_binding(request),
+            provider_source_lineage_verified=False,
+        )
         validate_wearable_search_request(request)
         user_id = self._user_id_resolver()
         if inspect.isawaitable(user_id):
@@ -524,7 +985,34 @@ class BoundedOpenWearablesSearch:
             return await self._whoop_recovery_package(user_id, request)
 
         summary_window_partial = False
-        if request.capability == "wearable.health-scores":
+        upstream_completeness_unverified = False
+        if request.capability == "wearable.body-summary":
+            rows, truncated, discarded = await self._body_summary(
+                user_id,
+                request,
+            )
+            sanitizer = partial(
+                _sanitize_body_summary,
+                start=request.start,
+                end=request.end,
+                retained_after=request.retained_after,
+                collected_at=request.collected_at,
+                average_period=_bounded_request_integer(
+                    request.parameters,
+                    "average_period",
+                    default=7,
+                    minimum=1,
+                    maximum=7,
+                ),
+                latest_window_hours=_bounded_request_integer(
+                    request.parameters,
+                    "latest_window_hours",
+                    default=4,
+                    minimum=1,
+                    maximum=24,
+                ),
+            )
+        elif request.capability == "wearable.health-scores":
             rows, truncated, discarded = await self._health_scores(
                 user_id,
                 request,
@@ -554,6 +1042,67 @@ class BoundedOpenWearablesSearch:
                 timezone=request.timezone,
                 retained_after=request.retained_after,
             )
+        elif request.capability == "wearable.sleep-sessions":
+            rows, truncated, discarded = await self._sleep_sessions(
+                user_id,
+                request,
+            )
+            sanitizer = partial(
+                _sanitize_sleep_session,
+                start=request.start,
+                end=request.end,
+                retained_after=request.retained_after,
+                privacy_level=request.privacy_level,
+            )
+        elif request.capability == "wearable.menstrual-cycles":
+            rows, truncated, discarded = await self._menstrual_cycles(
+                user_id,
+                request,
+            )
+            sanitizer = partial(
+                _sanitize_menstrual_cycle,
+                start=request.start,
+                end=request.end,
+                retained_after=request.retained_after,
+            )
+        elif request.capability == "wearable.provider-workouts":
+            (
+                rows,
+                truncated,
+                discarded,
+                upstream_completeness_unverified,
+            ) = await self._provider_workouts(user_id, request)
+            sanitizer = partial(
+                _sanitize_provider_workout,
+                provider=str(request.parameters["provider"]),
+                expected_workout_id=None,
+                start=request.start,
+                end=request.end,
+                retained_after=request.retained_after,
+                samples=request.parameters.get("samples", False) is True,
+                zones=request.parameters.get("zones", False) is True,
+                route=request.parameters.get("route", False) is True,
+            )
+        elif request.capability == "wearable.provider-workout-detail":
+            rows, truncated, discarded = (
+                await self._provider_workout_detail(
+                    user_id,
+                    request,
+                )
+            )
+            sanitizer = partial(
+                _sanitize_provider_workout,
+                provider=str(request.parameters["provider"]),
+                expected_workout_id=str(
+                    request.parameters["workout_id"]
+                ),
+                start=request.start,
+                end=request.end,
+                retained_after=request.retained_after,
+                samples=request.parameters.get("samples", False) is True,
+                zones=request.parameters.get("zones", False) is True,
+                route=request.parameters.get("route", False) is True,
+            )
         elif request.capability == "wearable.workouts":
             rows, truncated, discarded = await self._workouts(
                 user_id,
@@ -565,7 +1114,7 @@ class BoundedOpenWearablesSearch:
                 end=request.end,
                 retained_after=request.retained_after,
             )
-        else:
+        elif request.capability == "wearable.timeseries":
             rows, truncated, discarded = await self._timeseries(
                 user_id,
                 request,
@@ -578,14 +1127,56 @@ class BoundedOpenWearablesSearch:
                 end=request.end,
                 retained_after=request.retained_after,
             )
+        else:
+            raise ValueError("unsupported wearable detail capability")
 
         sanitized: list[dict[str, Any]] = []
+        lineage_verified_rows = 0
+        lineage_rejected_rows = 0
+        allowed_providers = _canonical_allowed_providers(
+            request.allowed_providers
+        )
+        upstream_rows_present = bool(rows) or discarded > 0
         for row in rows:
-            clean = sanitizer(row)
+            source_row = _bind_provider_source_identity(
+                row,
+                capability=request.capability,
+                provider_source_allowlist=(
+                    request.provider_source_allowlist
+                ),
+                provider_source_identities=(
+                    request.provider_source_identities
+                ),
+                lineage_mode=request.lineage_mode,
+                authoritative_provider=_request_provider(request),
+            )
+            if source_row is None:
+                lineage_rejected_rows += 1
+                discarded += 1
+                continue
+            lineage_verified_rows += 1
+            clean = sanitizer(source_row)
             if clean is None or _contains_private_value(clean, user_id):
                 discarded += 1
                 continue
-            sanitized.append(clean)
+            filtered = _filter_provider_attribution(
+                clean,
+                capability=request.capability,
+                source_row=source_row,
+                allowed_providers=allowed_providers,
+                body_summary=(
+                    request.capability == "wearable.body-summary"
+                ),
+                provider_source_allowlist=(
+                    request.provider_source_allowlist
+                ),
+                lineage_mode=request.lineage_mode,
+                authoritative_provider=_request_provider(request),
+            )
+            if filtered is None:
+                discarded += 1
+                continue
+            sanitized.append(filtered)
         conflicting_duplicate_rows = False
         stream_attribution_unavailable = False
         sanitized, conflicting_duplicate_rows = (
@@ -615,12 +1206,37 @@ class BoundedOpenWearablesSearch:
         return WearableSearchFetch(
             records=tuple(selected),
             upstream_truncated=truncated or row_trimmed,
+            upstream_completeness_unverified=(
+                upstream_completeness_unverified
+            ),
             payload_trimmed=payload_trimmed,
             discarded_rows=discarded,
             summary_window_partial=summary_window_partial,
             conflicting_duplicate_rows=conflicting_duplicate_rows,
             stream_attribution_unavailable=(
                 stream_attribution_unavailable
+            ),
+            granular_truncated=any(
+                record.get("granular_truncated") is True
+                for record in selected
+            ),
+            provider_source_lineage_verified=(
+                _lineage_response_attested(
+                    request,
+                    upstream_rows_present=upstream_rows_present,
+                    lineage_verified_rows=lineage_verified_rows,
+                    lineage_rejected_rows=lineage_rejected_rows,
+                )
+            ),
+            _live_source_lineage_attestation=(
+                _LIVE_SOURCE_LINEAGE_ATTESTATION
+                if _lineage_response_attested(
+                    request,
+                    upstream_rows_present=upstream_rows_present,
+                    lineage_verified_rows=lineage_verified_rows,
+                    lineage_rejected_rows=lineage_rejected_rows,
+                )
+                else None
             ),
         )
 
@@ -650,12 +1266,46 @@ class BoundedOpenWearablesSearch:
                 category="recovery",
             )
         )
+        recovery_upstream_rows_present = (
+            bool(recovery_rows) or recovery_discarded > 0
+        )
         day_strain_rows, day_strain_truncated, day_strain_discarded = (
             await self._whoop_health_scores(
                 user_id,
                 start=fetch_start,
                 end=fetch_end,
                 category="day_strain",
+            )
+        )
+        day_strain_upstream_rows_present = (
+            bool(day_strain_rows) or day_strain_discarded > 0
+        )
+        (
+            recovery_rows,
+            recovery_lineage_discarded,
+            recovery_lineage_verified,
+        ) = (
+            _filter_whoop_source_rows(
+                recovery_rows,
+                provider_source_allowlist=request.provider_source_allowlist,
+                provider_source_identities=(
+                    request.provider_source_identities
+                ),
+                lineage_mode=request.lineage_mode,
+            )
+        )
+        (
+            day_strain_rows,
+            day_strain_lineage_discarded,
+            day_strain_lineage_verified,
+        ) = (
+            _filter_whoop_source_rows(
+                day_strain_rows,
+                provider_source_allowlist=request.provider_source_allowlist,
+                provider_source_identities=(
+                    request.provider_source_identities
+                ),
+                lineage_mode=request.lineage_mode,
             )
         )
         calculation = calculate_whoop_recovery_package(
@@ -682,10 +1332,81 @@ class BoundedOpenWearablesSearch:
                 recovery_truncated or day_strain_truncated
             ),
             discarded_rows=(
-                recovery_discarded + day_strain_discarded
+                recovery_discarded
+                + day_strain_discarded
+                + recovery_lineage_discarded
+                + day_strain_lineage_discarded
             ),
             conflicting_duplicate_rows=(
                 calculation.conflicting_duplicate_rows
+            ),
+            provider_source_lineage_verified=(
+                _lineage_response_attested(
+                    request,
+                    upstream_rows_present=(
+                        recovery_upstream_rows_present
+                        or day_strain_upstream_rows_present
+                    ),
+                    lineage_verified_rows=(
+                        recovery_lineage_verified
+                        + day_strain_lineage_verified
+                    ),
+                    lineage_rejected_rows=(
+                        recovery_lineage_discarded
+                        + day_strain_lineage_discarded
+                    ),
+                    component_attested=(
+                        (
+                            not recovery_upstream_rows_present
+                            or (
+                                recovery_lineage_verified > 0
+                                and recovery_lineage_discarded == 0
+                            )
+                        )
+                        and (
+                            not day_strain_upstream_rows_present
+                            or (
+                                day_strain_lineage_verified > 0
+                                and day_strain_lineage_discarded == 0
+                            )
+                        )
+                    ),
+                )
+            ),
+            _live_source_lineage_attestation=(
+                _LIVE_SOURCE_LINEAGE_ATTESTATION
+                if _lineage_response_attested(
+                    request,
+                    upstream_rows_present=(
+                        recovery_upstream_rows_present
+                        or day_strain_upstream_rows_present
+                    ),
+                    lineage_verified_rows=(
+                        recovery_lineage_verified
+                        + day_strain_lineage_verified
+                    ),
+                    lineage_rejected_rows=(
+                        recovery_lineage_discarded
+                        + day_strain_lineage_discarded
+                    ),
+                    component_attested=(
+                        (
+                            not recovery_upstream_rows_present
+                            or (
+                                recovery_lineage_verified > 0
+                                and recovery_lineage_discarded == 0
+                            )
+                        )
+                        and (
+                            not day_strain_upstream_rows_present
+                            or (
+                                day_strain_lineage_verified > 0
+                                and day_strain_lineage_discarded == 0
+                            )
+                        )
+                    ),
+                )
+                else None
             ),
         )
 
@@ -728,6 +1449,30 @@ class BoundedOpenWearablesSearch:
             )
 
         return await _collect_offset_pages(fetch)
+
+    async def _body_summary(
+        self,
+        user_id: str,
+        request: WearableSearchRequest,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        payload = await self._client.get_body_summary(
+            user_id,
+            average_period=_bounded_request_integer(
+                request.parameters,
+                "average_period",
+                default=7,
+                minimum=1,
+                maximum=7,
+            ),
+            latest_window_hours=_bounded_request_integer(
+                request.parameters,
+                "latest_window_hours",
+                default=4,
+                minimum=1,
+                maximum=24,
+            ),
+        )
+        return ([] if payload is None else [dict(payload)]), False, 0
 
     async def _summaries(
         self,
@@ -786,6 +1531,85 @@ class BoundedOpenWearablesSearch:
             )
 
         return await _collect_cursor_pages(fetch)
+
+    async def _sleep_sessions(
+        self,
+        user_id: str,
+        request: WearableSearchRequest,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        async def fetch(
+            limit: int,
+            cursor: str | None,
+        ) -> Mapping[str, Any]:
+            return await self._client.get_sleep_sessions(
+                user_id,
+                request.start.astimezone(UTC).isoformat(),
+                request.end.astimezone(UTC).isoformat(),
+                cursor=cursor,
+                limit=limit,
+                filter_by_priority=True,
+            )
+
+        return await _collect_cursor_pages(fetch)
+
+    async def _menstrual_cycles(
+        self,
+        user_id: str,
+        request: WearableSearchRequest,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        async def fetch(
+            limit: int,
+            cursor: str | None,
+        ) -> Mapping[str, Any]:
+            return await self._client.get_menstrual_cycles(
+                user_id,
+                request.start.astimezone(UTC).isoformat(),
+                request.end.astimezone(UTC).isoformat(),
+                cursor=cursor,
+                limit=limit,
+            )
+
+        return await _collect_cursor_pages(fetch)
+
+    async def _provider_workouts(
+        self,
+        user_id: str,
+        request: WearableSearchRequest,
+    ) -> tuple[list[dict[str, Any]], bool, int, bool]:
+        collection = await self._client.collect_vendor_workouts_tracked(
+            str(request.parameters["provider"]),
+            user_id,
+            request.start.astimezone(UTC).isoformat(),
+            request.end.astimezone(UTC).isoformat(),
+            samples=request.parameters.get("samples", False) is True,
+            zones=request.parameters.get("zones", False) is True,
+            route=request.parameters.get("route", False) is True,
+            max_pages=MAX_WEARABLE_SEARCH_PAGES,
+        )
+        return (
+            _rows_with_page_provenance(
+                collection.rows,
+                page_index=0,
+            ),
+            collection.truncated,
+            0,
+            collection.completeness_unverified,
+        )
+
+    async def _provider_workout_detail(
+        self,
+        user_id: str,
+        request: WearableSearchRequest,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        row = await self._client.get_vendor_workout_detail(
+            str(request.parameters["provider"]),
+            user_id,
+            str(request.parameters["workout_id"]),
+            samples=request.parameters.get("samples", False) is True,
+            zones=request.parameters.get("zones", False) is True,
+            route=request.parameters.get("route", False) is True,
+        )
+        return _rows_with_page_provenance([row], page_index=0), False, 0
 
     async def _timeseries(
         self,
@@ -898,13 +1722,6 @@ async def _collect_cursor_pages(
             raise ValueError(
                 "open-wearables returned contradictory cursor pagination"
             )
-        has_more = raw_has_more
-        if has_more and (
-            next_cursor is None
-            or next_cursor == cursor
-            or next_cursor in seen_cursors
-        ):
-            return rows, True, discarded_rows
         rows.extend(
             _rows_with_page_provenance(
                 page.rows,
@@ -914,6 +1731,13 @@ async def _collect_cursor_pages(
         raw_rows += page.raw_count
         discarded_rows += page.discarded_rows
         if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
+            return rows, True, discarded_rows
+        has_more = raw_has_more
+        if has_more and (
+            next_cursor is None
+            or next_cursor == cursor
+            or next_cursor in seen_cursors
+        ):
             return rows, True, discarded_rows
         if not has_more:
             return rows, False, discarded_rows
@@ -1050,6 +1874,131 @@ def _provider_family(value: Any) -> str | None:
     return _PROVIDER_FAMILY_ALIASES.get(_normalized_key(cleaned))
 
 
+def canonical_wearable_provider(value: Any) -> str | None:
+    """Return the canonical provider family used by wearable boundaries."""
+
+    return _provider_family(value)
+
+
+def _canonical_allowed_providers(
+    values: tuple[str, ...] | frozenset[str] | None,
+) -> frozenset[str] | None:
+    if values is None:
+        return None
+    if not isinstance(values, tuple | frozenset):
+        raise ValueError(
+            "wearable allowed providers must be a tuple or frozenset"
+        )
+    canonical: set[str] = set()
+    for value in values:
+        provider = _provider_family(value)
+        if provider is None:
+            raise ValueError(
+                "wearable allowed provider is not recognized"
+            )
+        canonical.add(provider)
+    return frozenset(canonical)
+
+
+def _request_with_execution_binding(
+    request: WearableSearchRequest,
+) -> WearableSearchRequest:
+    binding = current_open_wearables_execution_binding(request.capability)
+    if binding is None:
+        return request
+    lineage_mode = _effective_lineage_mode(
+        request.capability,
+        binding.lineage_mode,
+    )
+    source_allowlist = (
+        binding.provider_source_direct_allowlist
+        if lineage_mode
+        is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+        else binding.provider_source_allowlist
+    )
+    return replace(
+        request,
+        allowed_providers=binding.allowed_providers,
+        provider_source_allowlist=source_allowlist,
+        provider_source_identities=binding.provider_source_identities,
+        lineage_mode=lineage_mode,
+    )
+
+
+def _source_lineage_is_allowed(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    authoritative_provider: str | None = None,
+    require_source: bool = False,
+    allow_missing_source_id: bool = False,
+) -> bool:
+    if provider_source_allowlist is None:
+        return not require_source
+    data_source_id = _safe_text(
+        row.get("data_source_id"),
+        max_length=512,
+    )
+    allowed = provider_source_allowlist.get(provider)
+    if allowed is None or not allowed:
+        return False
+    if data_source_id is None:
+        if (
+            lineage_mode
+            is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+            and authoritative_provider == provider
+        ):
+            return True
+        return allow_missing_source_id is True
+    return data_source_id in allowed
+
+
+def _filter_whoop_source_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None,
+    provider_source_identities: Mapping[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ]
+    | None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    if provider_source_allowlist is None:
+        return [dict(row) for row in rows], 0, len(rows)
+    selected: list[dict[str, Any]] = []
+    discarded = 0
+    verified = 0
+    for row in rows:
+        provider, _attribution = _provider(row)
+        if provider != WHOOP_UPSTREAM_PROVIDER:
+            discarded += 1
+            continue
+        source_row = _bind_provider_source_identity(
+            row,
+            capability=WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+            provider_source_allowlist=provider_source_allowlist,
+            provider_source_identities=provider_source_identities,
+            lineage_mode=lineage_mode,
+            authoritative_provider=WHOOP_UPSTREAM_PROVIDER,
+        )
+        if source_row is None or not _source_lineage_is_allowed(
+            source_row,
+            provider=WHOOP_UPSTREAM_PROVIDER,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=lineage_mode,
+            authoritative_provider=WHOOP_UPSTREAM_PROVIDER,
+            require_source=True,
+        ):
+            discarded += 1
+            continue
+        selected.append(source_row)
+        verified += 1
+    return selected, discarded, verified
+
+
 def _provider(row: Mapping[str, Any]) -> tuple[str, str]:
     declared = row.get("provider")
     if declared is not None:
@@ -1069,6 +2018,299 @@ def _provider(row: Mapping[str, Any]) -> tuple[str, str]:
         (family, "source_exact_alias")
         if family is not None
         else ("unknown", "source_unclassified")
+    )
+
+
+def _bind_provider_source_identity(
+    row: Mapping[str, Any],
+    *,
+    capability: str,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None,
+    provider_source_identities: Mapping[
+        str,
+        tuple[OpenWearablesExecutionDataSource, ...],
+    ]
+    | None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    authoritative_provider: str | None = None,
+) -> dict[str, Any] | None:
+    """Bind one upstream row to the frozen provider/source contract.
+
+    Explicit-row capabilities require an exact ``data_source_id``.  Direct
+    provider-route capabilities may use the route itself as the authoritative
+    source when the upstream row omits that ID; an explicit ID is still
+    checked against the direct-source allowlist.
+    """
+
+    copied = dict(row)
+    if provider_source_allowlist is None:
+        return copied
+
+    mode = _effective_lineage_mode(
+        capability,
+        lineage_mode,
+    )
+    declared_provider = _provider_family(row.get("provider"))
+    source = row.get("source")
+    source_provider = _provider_family(
+        source.get("provider")
+        if isinstance(source, Mapping)
+        else None
+    )
+    if (
+        declared_provider is not None
+        and source_provider is not None
+        and declared_provider != source_provider
+    ):
+        return None
+    provider = declared_provider or source_provider
+    authoritative = _provider_family(authoritative_provider)
+    if mode is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE:
+        if authoritative is None:
+            return None
+        if authoritative not in provider_source_allowlist:
+            return None
+        if provider is not None and provider != authoritative:
+            return None
+        provider = authoritative
+        copied["provider"] = authoritative
+        copied["provider_attribution"] = "allowed_provider_binding"
+    elif provider is None:
+        return None
+    if provider is None:
+        return None
+    allowed = provider_source_allowlist.get(provider)
+    if allowed is None or not allowed:
+        return None
+
+    explicit_ids, malformed = _explicit_row_source_ids(row)
+    if malformed or len(explicit_ids) > 1:
+        return None
+    if explicit_ids:
+        source_id = next(iter(explicit_ids))
+        if source_id not in allowed:
+            return None
+        copied["data_source_id"] = source_id
+        return copied
+
+    if mode is OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE:
+        return copied
+    return None
+
+
+def _explicit_row_source_ids(
+    row: Mapping[str, Any],
+) -> tuple[set[str], bool]:
+    """Read explicit IDs while rejecting conflicting or malformed values."""
+
+    containers: list[Mapping[str, Any]] = [row]
+    source = row.get("source")
+    if isinstance(source, Mapping):
+        containers.append(source)
+    values: set[str] = set()
+    malformed = False
+    for container in containers:
+        if "data_source_id" not in container:
+            continue
+        raw_value = container.get("data_source_id")
+        if raw_value is None:
+            continue
+        value = _safe_text(raw_value, max_length=512)
+        if value is None:
+            malformed = True
+            continue
+        values.add(value)
+    return values, malformed
+
+
+def _row_device_labels(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return exact device/source labels exposed by an upstream row."""
+
+    labels: set[str] = set()
+    fields = (
+        "device",
+        "device_model",
+        "device_name",
+        "display_name",
+        "original_source_name",
+    )
+    for container in (row, row.get("source")):
+        if not isinstance(container, Mapping):
+            continue
+        for field in fields:
+            value = _safe_text(container.get(field), max_length=128)
+            if value is not None:
+                labels.add(value)
+    return tuple(sorted(labels, key=lambda value: (value.casefold(), value)))
+
+
+def _source_label_key(value: str) -> str:
+    return " ".join(value.strip().casefold().split())
+
+
+def _filter_provider_attribution(
+    record: dict[str, Any],
+    *,
+    capability: str,
+    source_row: Mapping[str, Any],
+    allowed_providers: frozenset[str] | None,
+    body_summary: bool = False,
+    provider_source_allowlist: Mapping[str, frozenset[str]] | None = None,
+    lineage_mode: OpenWearablesLineageMode | None = None,
+    authoritative_provider: str | None = None,
+    allow_missing_source_id: bool = False,
+) -> dict[str, Any] | None:
+    effective_lineage_mode = _effective_lineage_mode(
+        capability,
+        lineage_mode,
+    )
+    if allowed_providers is None:
+        return record
+    if body_summary:
+        if len(allowed_providers) != 1:
+            return None
+        allowed_provider = next(iter(allowed_providers))
+        declared_raw = source_row.get("provider")
+        if declared_raw == "unknown":
+            declared_raw = None
+        declared = _provider_family(declared_raw)
+        source = source_row.get("source")
+        source_raw = (
+            source.get("provider")
+            if isinstance(source, Mapping)
+            else None
+        )
+        if source_raw == "unknown":
+            source_raw = None
+        source_provider = _provider_family(source_raw)
+        if (
+            declared_raw is not None
+            and declared is None
+            or source_raw is not None
+            and source_provider is None
+            or declared is not None
+            and source_provider is not None
+            and declared != source_provider
+            or declared is not None
+            and declared != allowed_provider
+            or source_provider is not None
+            and source_provider != allowed_provider
+        ):
+            return None
+        if not _source_lineage_is_allowed(
+            source_row,
+            provider=allowed_provider,
+            provider_source_allowlist=provider_source_allowlist,
+            lineage_mode=effective_lineage_mode,
+            authoritative_provider=authoritative_provider,
+            allow_missing_source_id=allow_missing_source_id,
+        ):
+            return None
+        record["provider"] = allowed_provider
+        record["provider_attribution"] = "allowed_provider_binding"
+        return record
+
+    provider = _provider_family(record.get("provider"))
+    attribution = _safe_text(
+        record.get("provider_attribution"),
+        max_length=32,
+    )
+    if (
+        provider is None
+        or attribution not in _TRUSTED_PROVIDER_ATTRIBUTIONS
+        or provider not in allowed_providers
+    ):
+        return None
+
+    declared = _provider_family(source_row.get("provider"))
+    source = source_row.get("source")
+    source_provider = _provider_family(
+        source.get("provider")
+        if isinstance(source, Mapping)
+        else None
+    )
+    if (
+        declared is not None
+        and source_provider is not None
+        and declared != source_provider
+    ):
+        return None
+    if not _source_lineage_is_allowed(
+        source_row,
+        provider=provider,
+        provider_source_allowlist=provider_source_allowlist,
+        lineage_mode=effective_lineage_mode,
+        authoritative_provider=authoritative_provider,
+        allow_missing_source_id=allow_missing_source_id,
+    ):
+        return None
+    record["provider"] = provider
+    return record
+
+
+def _effective_lineage_mode(
+    capability: str,
+    lineage_mode: OpenWearablesLineageMode | None,
+) -> OpenWearablesLineageMode | None:
+    """Resolve legacy requests while keeping the catalog contract strict."""
+
+    if lineage_mode is not None:
+        return lineage_mode
+    normalized = capability.strip().casefold()
+    if normalized in {
+        "wearable.health-scores",
+        WHOOP_RECOVERY_PACKAGE_CAPABILITY,
+    }:
+        return OpenWearablesLineageMode.EXPLICIT_ROW_SOURCE_ID
+    if normalized in {
+        "wearable.provider-workouts",
+        "wearable.provider-workout-detail",
+    }:
+        return OpenWearablesLineageMode.PROVIDER_ROUTE_AUTHORITATIVE
+    return None
+
+
+def _request_provider(request: WearableSearchRequest) -> str | None:
+    """Return the single provider selected by a provider-owned request."""
+
+    raw = request.parameters.get("provider")
+    if raw is not None:
+        return _provider_family(raw)
+    allowed = _canonical_allowed_providers(request.allowed_providers)
+    if allowed is not None and len(allowed) == 1:
+        return next(iter(allowed))
+    return None
+
+
+def _lineage_response_attested(
+    request: WearableSearchRequest,
+    *,
+    upstream_rows_present: bool,
+    lineage_verified_rows: int,
+    lineage_rejected_rows: int = 0,
+    component_attested: bool = True,
+) -> bool:
+    """Return whether the bounded adapter proved its provider boundary.
+
+    An empty upstream response is an attested no-data result.  A non-empty
+    response requires at least one source-verified row.  If every row was
+    rejected, the adapter observed data but could not prove that any row
+    belonged to the frozen binding, so it must not attest normal no-data.
+    """
+
+    if request.provider_source_allowlist is None:
+        return False
+    if not component_attested:
+        return False
+    if not upstream_rows_present:
+        return True
+    # A response that mixes rows from the frozen source with rows that cannot
+    # be attributed is not a complete source-attested response.  Returning
+    # only the accepted subset would make coverage look stronger than the
+    # provider boundary actually proves.
+    return (
+        lineage_verified_rows > 0
+        and lineage_rejected_rows == 0
     )
 
 
@@ -1153,9 +2395,20 @@ def _structural_row_locator(
             "summary_kind": record.get("summary_kind"),
             "date": record.get("date"),
         }
+    if record.get("record_kind") == "body_summary":
+        return {
+            "record_kind": "body_summary",
+            "summary_collected_at": record.get("summary_collected_at"),
+        }
     if "workout_type" in record:
         return {
             "workout_type": record.get("workout_type"),
+            "start_time": record.get("start_time"),
+            "end_time": record.get("end_time"),
+        }
+    if "start_time" in record or "end_time" in record:
+        return {
+            "record_kind": record.get("record_kind"),
             "start_time": record.get("start_time"),
             "end_time": record.get("end_time"),
         }
@@ -1241,6 +2494,1227 @@ def _put_number(
     value = _number(source.get(field), integer=integer)
     if value is not None:
         target[field] = value
+
+
+def _nonnegative_number(
+    value: Any,
+    *,
+    integer: bool = False,
+) -> int | float | None:
+    number = _number(value, integer=integer)
+    return number if number is not None and number >= 0 else None
+
+
+def _put_nonnegative_number(
+    target: dict[str, Any],
+    source: Mapping[str, Any],
+    field: str,
+    *,
+    integer: bool = False,
+) -> None:
+    value = _nonnegative_number(source.get(field), integer=integer)
+    if value is not None:
+        target[field] = value
+
+
+def _normalized_label(value: Any, *, max_length: int = 64) -> str | None:
+    cleaned = _safe_text(value, max_length=max_length)
+    if cleaned is None:
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "_", cleaned.casefold()).strip("_")
+    return normalized or None
+
+
+def _safe_identifier(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    return (
+        value
+        if isinstance(value, str)
+        and _SAFE_PROVIDER_WORKOUT_ID.fullmatch(value) is not None
+        else None
+    )
+
+
+def _epoch_timestamp(
+    value: Any,
+    *,
+    milliseconds: bool,
+) -> datetime | None:
+    number = _number(value)
+    if number is None:
+        return None
+    seconds = float(number) / (1_000 if milliseconds else 1)
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _iso_duration_seconds(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    matched = _ISO_DURATION.fullmatch(value.strip())
+    if matched is None or not any(matched.groupdict().values()):
+        return None
+    seconds = sum(
+        float(matched.group(name) or 0) * multiplier
+        for name, multiplier in (
+            ("days", 86_400),
+            ("hours", 3_600),
+            ("minutes", 60),
+            ("seconds", 1),
+        )
+    )
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _offset_string(total_minutes: Any) -> str | None:
+    minutes = _number(total_minutes, integer=True)
+    if minutes is None or not -1_439 <= minutes <= 1_439:
+        return None
+    sign = "+" if minutes >= 0 else "-"
+    absolute = abs(minutes)
+    return f"{sign}{absolute // 60:02d}:{absolute % 60:02d}"
+
+
+def _polar_start_time(
+    value: Any,
+    *,
+    offset_minutes: Any,
+) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+        return parsed.astimezone(UTC)
+    minutes = _number(offset_minutes, integer=True)
+    if minutes is None or not -1_439 <= minutes <= 1_439:
+        return None
+    return parsed.replace(
+        tzinfo=timezone(timedelta(minutes=minutes))
+    ).astimezone(UTC)
+
+
+def _sanitize_body_summary(
+    row: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+    collected_at: datetime,
+    average_period: int,
+    latest_window_hours: int,
+) -> dict[str, Any] | None:
+    slow = row.get("slow_changing")
+    averaged = row.get("averaged")
+    latest = row.get("latest")
+    query_start = start.astimezone(UTC)
+    query_end = end.astimezone(UTC)
+    collected = collected_at.astimezone(UTC)
+    if (
+        not query_start <= collected < query_end
+        or not _observation_is_retained(
+            collected,
+            retained_after=retained_after,
+        )
+    ):
+        return None
+    stored_collected_at = row.get("summary_collected_at")
+    if stored_collected_at is not None:
+        if _timestamp(stored_collected_at) != collected:
+            return None
+
+    provider, attribution = _provider(row)
+    result: dict[str, Any] = {
+        "record_kind": "body_summary",
+        "summary_collected_at": collected.isoformat(),
+        "provider": provider,
+        "provider_attribution": attribution,
+    }
+
+    clean_slow: dict[str, Any] = {}
+    if (
+        isinstance(slow, Mapping)
+    ):
+        for field in (
+            "weight_kg",
+            "height_cm",
+            "body_fat_percent",
+            "muscle_mass_kg",
+            "bmi",
+        ):
+            _put_nonnegative_number(clean_slow, slow, field)
+        _put_nonnegative_number(clean_slow, slow, "age", integer=True)
+    if clean_slow:
+        result["slow_changing"] = clean_slow
+
+    clean_averaged: dict[str, Any] = {}
+    period_start = (
+        _timestamp(averaged.get("period_start"))
+        if isinstance(averaged, Mapping)
+        else None
+    )
+    period_end = (
+        _timestamp(averaged.get("period_end"))
+        if isinstance(averaged, Mapping)
+        else None
+    )
+    period_days = (
+        _number(averaged.get("period_days"), integer=True)
+        if isinstance(averaged, Mapping)
+        else None
+    )
+    if (
+        isinstance(averaged, Mapping)
+        and period_start is not None
+        and period_end is not None
+        and period_start < period_end
+        and period_days == average_period
+        and query_start <= period_end < query_end
+        and period_end <= collected + _MAX_COLLECTION_CLOCK_SKEW
+        and _observation_is_retained(
+            period_start,
+            retained_after=retained_after,
+        )
+    ):
+        _put_nonnegative_number(
+            clean_averaged,
+            averaged,
+            "resting_heart_rate_bpm",
+            integer=True,
+        )
+        for field in ("avg_hrv_sdnn_ms", "avg_hrv_rmssd_ms"):
+            _put_nonnegative_number(clean_averaged, averaged, field)
+    if clean_averaged:
+        assert period_start is not None
+        assert period_end is not None
+        clean_averaged.update(
+            {
+                "period_days": period_days,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+            }
+        )
+        result["averaged"] = clean_averaged
+
+    clean_latest: dict[str, Any] = {}
+    if isinstance(latest, Mapping):
+        for value_field, measured_field in (
+            (
+                "body_temperature_celsius",
+                "body_temperature_measured_at",
+            ),
+            (
+                "skin_temperature_celsius",
+                "skin_temperature_measured_at",
+            ),
+        ):
+            value = _number(latest.get(value_field))
+            measured_at = _timestamp(latest.get(measured_field))
+            if (
+                value is not None
+                and measured_at is not None
+                and query_start <= measured_at < query_end
+                and collected - timedelta(
+                    hours=latest_window_hours
+                )
+                <= measured_at
+                <= collected + _MAX_COLLECTION_CLOCK_SKEW
+                and _observation_is_retained(
+                    measured_at,
+                    retained_after=retained_after,
+                )
+            ):
+                clean_latest[value_field] = value
+                clean_latest[measured_field] = measured_at.isoformat()
+
+    pressure = (
+        latest.get("blood_pressure")
+        if isinstance(latest, Mapping)
+        else None
+    )
+    pressure_at = (
+        _timestamp(latest.get("blood_pressure_measured_at"))
+        if isinstance(latest, Mapping)
+        else None
+    )
+    if (
+        isinstance(pressure, Mapping)
+        and pressure_at is not None
+        and query_start <= pressure_at < query_end
+        and collected - timedelta(hours=latest_window_hours)
+        <= pressure_at
+        <= collected + _MAX_COLLECTION_CLOCK_SKEW
+        and _observation_is_retained(
+            pressure_at,
+            retained_after=retained_after,
+        )
+    ):
+        clean_pressure: dict[str, Any] = {}
+        for field in (
+            "avg_systolic_mmhg",
+            "avg_diastolic_mmhg",
+            "max_systolic_mmhg",
+            "max_diastolic_mmhg",
+            "min_systolic_mmhg",
+            "min_diastolic_mmhg",
+            "reading_count",
+        ):
+            _put_nonnegative_number(
+                clean_pressure,
+                pressure,
+                field,
+                integer=True,
+            )
+        if clean_pressure:
+            clean_latest["blood_pressure"] = clean_pressure
+            clean_latest["blood_pressure_measured_at"] = (
+                pressure_at.isoformat()
+            )
+    if clean_latest:
+        result["latest"] = clean_latest
+
+    if not any(
+        key in result for key in ("slow_changing", "averaged", "latest")
+    ):
+        return None
+    return _with_row_identity(result, row=row)
+
+
+def _sanitize_sleep_stage_intervals(
+    value: Any,
+    *,
+    session_start: datetime,
+    session_end: datetime,
+) -> tuple[list[dict[str, Any]], bool]:
+    if value is None:
+        return [], False
+    if not isinstance(value, list):
+        return [], True
+
+    candidates: list[dict[str, Any]] = []
+    truncated = len(value) > _MAX_SLEEP_STAGE_INTERVALS
+    for raw in value[:_MAX_SLEEP_STAGE_INTERVALS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        stage = _safe_text(raw.get("stage"), max_length=16)
+        interval_start = _timestamp(raw.get("start_time"))
+        interval_end = _timestamp(raw.get("end_time"))
+        if (
+            stage not in _SLEEP_STAGE_TYPES
+            or interval_start is None
+            or interval_end is None
+            or not session_start <= interval_start < interval_end <= session_end
+        ):
+            truncated = True
+            continue
+        candidates.append(
+            {
+                "stage": stage,
+                "start_time": interval_start.isoformat(),
+                "end_time": interval_end.isoformat(),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (item["start_time"], item["end_time"], item["stage"])
+    )
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    last_end: datetime | None = None
+    for item in candidates:
+        identity = (
+            str(item["stage"]),
+            str(item["start_time"]),
+            str(item["end_time"]),
+        )
+        if identity in seen:
+            continue
+        interval_start = _timestamp(item["start_time"])
+        interval_end = _timestamp(item["end_time"])
+        assert interval_start is not None
+        assert interval_end is not None
+        if last_end is not None and interval_start < last_end:
+            truncated = True
+            continue
+        seen.add(identity)
+        selected.append(item)
+        last_end = interval_end
+    return selected, truncated
+
+
+def _sanitize_sleep_session(
+    row: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+    privacy_level: PrivacyLevel,
+) -> dict[str, Any] | None:
+    start_time = _timestamp(row.get("start_time"))
+    end_time = _timestamp(row.get("end_time"))
+    if not _workout_interval_is_allowed(
+        start_time,
+        end_time,
+        start=start,
+        end=end,
+        retained_after=retained_after,
+    ):
+        return None
+    assert start_time is not None
+    assert end_time is not None
+    provider, attribution = _provider(row)
+    result: dict[str, Any] = {
+        "record_kind": "sleep_session",
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "provider": provider,
+        "provider_attribution": attribution,
+    }
+    for field in ("duration_seconds", "sleep_duration_seconds"):
+        _put_nonnegative_number(result, row, field, integer=True)
+    efficiency = _number(row.get("efficiency_percent"))
+    if efficiency is not None and 0 <= efficiency <= 100:
+        result["efficiency_percent"] = efficiency
+    if type(row.get("is_nap")) is bool:
+        result["is_nap"] = row["is_nap"]
+    zone_offset = _safe_text(row.get("zone_offset"), max_length=16)
+    if zone_offset is not None:
+        result["zone_offset"] = zone_offset
+    stages = row.get("stages")
+    if isinstance(stages, Mapping):
+        clean_stages: dict[str, Any] = {}
+        for field in (
+            "awake_minutes",
+            "light_minutes",
+            "deep_minutes",
+            "rem_minutes",
+        ):
+            _put_nonnegative_number(
+                clean_stages,
+                stages,
+                field,
+                integer=True,
+            )
+        if clean_stages:
+            result["stages"] = clean_stages
+    if privacy_level is PrivacyLevel.IDENTITY:
+        intervals, intervals_truncated = _sanitize_sleep_stage_intervals(
+            row.get("sleep_stage_intervals"),
+            session_start=start_time,
+            session_end=end_time,
+        )
+        if intervals:
+            result["sleep_stage_intervals"] = intervals
+        if (
+            intervals_truncated
+            or row.get("sleep_stage_intervals_truncated") is True
+        ):
+            result["sleep_stage_intervals_truncated"] = True
+    return _with_row_identity(result, row=row)
+
+
+def _sanitize_menstrual_cycle(
+    row: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+) -> dict[str, Any] | None:
+    start_time = _timestamp(row.get("start_time"))
+    end_time = _timestamp(row.get("end_time"))
+    if (
+        start_time is None
+        or end_time is None
+        or end_time <= start_time
+        or not start.astimezone(UTC)
+        <= start_time
+        < end.astimezone(UTC)
+        or not _observation_is_retained(
+            start_time,
+            retained_after=retained_after,
+        )
+    ):
+        return None
+    provider, attribution = _provider(row)
+    result: dict[str, Any] = {
+        "record_kind": "menstrual_cycle",
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "provider": provider,
+        "provider_attribution": attribution,
+    }
+    zone_offset = _safe_text(row.get("zone_offset"), max_length=16)
+    if zone_offset is not None:
+        result["zone_offset"] = zone_offset
+    for field in (
+        "current_phase",
+        "day_in_cycle",
+        "cycle_length",
+        "predicted_cycle_length",
+        "period_length",
+        "length_of_current_phase",
+        "days_until_next_phase",
+        "fertile_window_start",
+        "length_of_fertile_window",
+    ):
+        _put_nonnegative_number(result, row, field, integer=True)
+    phase_type = _safe_text(
+        row.get("current_phase_type"),
+        max_length=64,
+    )
+    if phase_type is not None:
+        result["current_phase_type"] = phase_type
+    for field in (
+        "is_predicted_cycle",
+        "has_specified_cycle_length",
+        "has_specified_period_length",
+    ):
+        if type(row.get(field)) is bool:
+            result[field] = row[field]
+    last_updated_at = _timestamp(row.get("last_updated_at"))
+    if last_updated_at is not None:
+        result["last_updated_at"] = last_updated_at.isoformat()
+    return _with_row_identity(result, row=row)
+
+
+def _provider_workout_source(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+) -> Mapping[str, Any]:
+    if provider == "suunto":
+        payload = row.get("payload")
+        if isinstance(payload, Mapping):
+            return payload
+    if provider == "garmin":
+        summary = row.get("summary")
+        if isinstance(summary, Mapping):
+            return {**row, **summary}
+    return row
+
+
+def _provider_workout_interval(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+) -> tuple[datetime | None, datetime | None, int | float | None]:
+    if provider == "garmin":
+        start_time = _epoch_timestamp(
+            row.get("startTimeInSeconds"),
+            milliseconds=False,
+        )
+        duration = _nonnegative_number(
+            row.get("durationInSeconds"),
+            integer=True,
+        )
+    elif provider == "polar":
+        start_time = _polar_start_time(
+            row.get("start_time"),
+            offset_minutes=row.get("start_time_utc_offset"),
+        )
+        duration = _iso_duration_seconds(row.get("duration"))
+    else:
+        start_time = _epoch_timestamp(
+            row.get("startTime"),
+            milliseconds=True,
+        )
+        duration = _nonnegative_number(row.get("totalTime"))
+
+    end_time: datetime | None = None
+    if provider == "suunto":
+        end_time = _epoch_timestamp(
+            row.get("stopTime"),
+            milliseconds=True,
+        )
+    if end_time is None and start_time is not None and duration is not None:
+        end_time = start_time + timedelta(seconds=float(duration))
+    return start_time, end_time, duration
+
+
+def _provider_workout_ids(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+) -> tuple[str | None, str | None]:
+    if provider == "garmin":
+        return _safe_identifier(row.get("activityId")), None
+    if provider == "polar":
+        return _safe_identifier(row.get("id")), None
+    return (
+        _safe_identifier(row.get("workoutKey")),
+        _safe_identifier(row.get("workoutId")),
+    )
+
+
+def _provider_workout_type(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+) -> tuple[str | None, int | str | None]:
+    if provider == "garmin":
+        raw = row.get("activityType")
+        return _normalized_label(raw), _safe_text(raw, max_length=64)
+    if provider == "polar":
+        raw = row.get("detailed_sport_info") or row.get("sport")
+        return _normalized_label(raw), _safe_text(raw, max_length=64)
+    code = _nonnegative_number(row.get("activityId"), integer=True)
+    return (
+        f"suunto_activity_{code}" if code is not None else None,
+        code,
+    )
+
+
+def _provider_workout_zone_offset(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+) -> str | None:
+    if provider == "garmin":
+        seconds = _number(
+            row.get("startTimeOffsetInSeconds"),
+            integer=True,
+        )
+        return (
+            _offset_string(seconds // 60)
+            if seconds is not None and seconds % 60 == 0
+            else None
+        )
+    if provider == "polar":
+        return _offset_string(row.get("start_time_utc_offset"))
+    return _offset_string(row.get("timeOffsetInMinutes"))
+
+
+def _first_number(
+    *values: Any,
+    integer: bool = False,
+    nonnegative: bool = True,
+) -> int | float | None:
+    for value in values:
+        number = (
+            _nonnegative_number(value, integer=integer)
+            if nonnegative
+            else _number(value, integer=integer)
+        )
+        if number is not None:
+            return number
+    return None
+
+
+def _sanitize_garmin_samples(
+    row: Mapping[str, Any],
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    include_location: bool,
+) -> tuple[list[dict[str, Any]], bool]:
+    raw_samples = row.get("samples")
+    if not isinstance(raw_samples, list):
+        return [], False
+    selected: list[dict[str, Any]] = []
+    truncated = len(raw_samples) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in raw_samples[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        timestamp = _epoch_timestamp(
+            raw.get("startTimeInSeconds"),
+            milliseconds=False,
+        )
+        if timestamp is None or not start_time <= timestamp <= end_time:
+            truncated = True
+            continue
+        sample: dict[str, Any] = {"timestamp": timestamp.isoformat()}
+        for source_field, public_field in (
+            ("heartRate", "heart_rate_bpm"),
+            ("speedMetersPerSecond", "speed_meters_per_second"),
+            ("stepsPerMinute", "cadence_steps_per_minute"),
+            ("powerInWatts", "power_watts"),
+            ("elevationInMeters", "elevation_meters"),
+            ("airTemperatureCelcius", "air_temperature_celsius"),
+        ):
+            value = _number(raw.get(source_field))
+            if value is not None:
+                sample[public_field] = value
+        if include_location:
+            latitude = _number(raw.get("latitudeInDegree"))
+            longitude = _number(raw.get("longitudeInDegree"))
+            if (
+                latitude is not None
+                and longitude is not None
+                and -90 <= latitude <= 90
+                and -180 <= longitude <= 180
+            ):
+                sample["latitude"] = latitude
+                sample["longitude"] = longitude
+        if len(sample) > 1:
+            selected.append(sample)
+    return selected, truncated
+
+
+def _sanitize_polar_samples(
+    row: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    raw_samples = row.get("samples")
+    if not isinstance(raw_samples, list):
+        return [], False
+    selected: list[dict[str, Any]] = []
+    truncated = len(raw_samples) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in raw_samples[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        recording_rate = _nonnegative_number(
+            raw.get("recording-rate"),
+            integer=True,
+        )
+        sample_type = _safe_text(
+            raw.get("sample-type"),
+            max_length=64,
+        )
+        data = _safe_text(
+            raw.get("data"),
+            max_length=_MAX_GRANULAR_WORKOUT_TEXT,
+        )
+        if recording_rate is None or sample_type is None or data is None:
+            truncated = True
+            continue
+        selected.append(
+            {
+                "recording_rate_seconds": recording_rate,
+                "sample_type": sample_type,
+                "data": data,
+            }
+        )
+    return selected, truncated
+
+
+def _sanitize_polar_zones(
+    row: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    raw_zones = row.get("heart_rate_zones")
+    if not isinstance(raw_zones, list):
+        return [], False
+    selected: list[dict[str, Any]] = []
+    truncated = len(raw_zones) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in raw_zones[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        index = _nonnegative_number(raw.get("index"), integer=True)
+        lower = _nonnegative_number(
+            raw.get("lower-limit"),
+            integer=True,
+        )
+        upper = _nonnegative_number(
+            raw.get("upper-limit"),
+            integer=True,
+        )
+        duration = _iso_duration_seconds(raw.get("in-zone"))
+        if (
+            index is None
+            or lower is None
+            or upper is None
+            or lower > upper
+            or duration is None
+        ):
+            truncated = True
+            continue
+        selected.append(
+            {
+                "index": index,
+                "lower_bpm": lower,
+                "upper_bpm": upper,
+                "duration_seconds": duration,
+            }
+        )
+    return selected, truncated
+
+
+def _sanitize_polar_route(
+    row: Mapping[str, Any],
+    *,
+    start_time: datetime,
+    end_time: datetime,
+) -> tuple[list[dict[str, Any]], bool]:
+    raw_route = row.get("route")
+    if not isinstance(raw_route, list):
+        return [], False
+    selected: list[dict[str, Any]] = []
+    truncated = len(raw_route) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in raw_route[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        latitude = _number(raw.get("latitude"))
+        longitude = _number(raw.get("longitude"))
+        timestamp = _timestamp(raw.get("time"))
+        if (
+            latitude is None
+            or longitude is None
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+            or (
+                timestamp is not None
+                and not start_time <= timestamp <= end_time
+            )
+        ):
+            truncated = True
+            continue
+        point: dict[str, Any] = {
+            "latitude": latitude,
+            "longitude": longitude,
+        }
+        if timestamp is not None:
+            point["timestamp"] = timestamp.isoformat()
+        for field in ("satellites", "fix"):
+            value = _nonnegative_number(raw.get(field), integer=True)
+            if value is not None:
+                point[field] = value
+        selected.append(point)
+    return selected, truncated
+
+
+def _sanitize_provider_workout(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+    expected_workout_id: str | None,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+    samples: bool,
+    zones: bool,
+    route: bool,
+) -> dict[str, Any] | None:
+    source = _provider_workout_source(row, provider=provider)
+    workout_id, numeric_workout_id = _provider_workout_ids(
+        source,
+        provider=provider,
+    )
+    if expected_workout_id is not None and workout_id != expected_workout_id:
+        return None
+    if provider != "suunto" and workout_id is None:
+        return None
+    if provider == "suunto" and workout_id is None and numeric_workout_id is None:
+        return None
+
+    start_time, end_time, duration = _provider_workout_interval(
+        source,
+        provider=provider,
+    )
+    if not _workout_interval_is_allowed(
+        start_time,
+        end_time,
+        start=start,
+        end=end,
+        retained_after=retained_after,
+    ):
+        return None
+    assert start_time is not None
+    assert end_time is not None
+    workout_type, workout_type_code = _provider_workout_type(
+        source,
+        provider=provider,
+    )
+    if workout_type is None:
+        return None
+
+    result: dict[str, Any] = {
+        "record_kind": "provider_workout",
+        "provider": provider,
+        "provider_attribution": "declared",
+        "workout_type": workout_type,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+    }
+    if workout_id is not None:
+        result["provider_workout_id"] = workout_id
+    if numeric_workout_id is not None:
+        result["provider_numeric_workout_id"] = numeric_workout_id
+    if workout_type_code is not None:
+        result["provider_workout_type_code"] = workout_type_code
+    if duration is not None:
+        result["duration_seconds"] = (
+            int(duration)
+            if float(duration).is_integer()
+            else duration
+        )
+    zone_offset = _provider_workout_zone_offset(
+        source,
+        provider=provider,
+    )
+    if zone_offset is not None:
+        result["zone_offset"] = zone_offset
+
+    heart_rate = source.get("heart_rate")
+    heart_rate = heart_rate if isinstance(heart_rate, Mapping) else {}
+    hrdata = source.get("hrdata")
+    hrdata = hrdata if isinstance(hrdata, Mapping) else {}
+    metric_values = {
+        "distance_meters": _first_number(
+            source.get(
+                "distanceInMeters"
+                if provider == "garmin"
+                else "distance"
+                if provider == "polar"
+                else "totalDistance"
+            )
+        ),
+        "calories_kcal": _first_number(
+            source.get(
+                "activeKilocalories"
+                if provider == "garmin"
+                else "calories"
+                if provider == "polar"
+                else "energyConsumption"
+            )
+        ),
+        "steps": _first_number(
+            source.get("steps" if provider == "garmin" else "stepCount"),
+            integer=True,
+        ),
+        "avg_heart_rate_bpm": _first_number(
+            source.get("averageHeartRateInBeatsPerMinute"),
+            heart_rate.get("average"),
+            hrdata.get("avg"),
+            hrdata.get("workoutAvgHR"),
+        ),
+        "max_heart_rate_bpm": _first_number(
+            source.get("maxHeartRateInBeatsPerMinute"),
+            heart_rate.get("maximum"),
+            hrdata.get("hrmax"),
+            hrdata.get("workoutMaxHR"),
+        ),
+        "min_heart_rate_bpm": _first_number(hrdata.get("min")),
+        "avg_speed_meters_per_second": _first_number(
+            source.get("averageSpeedInMetersPerSecond"),
+            source.get("avgSpeed"),
+        ),
+        "max_speed_meters_per_second": _first_number(
+            source.get("maxSpeed")
+        ),
+        "avg_power_watts": _first_number(source.get("avgPower")),
+        "max_power_watts": _first_number(source.get("maxPower")),
+        "avg_cadence": _first_number(
+            source.get("averageRunCadenceInStepsPerMinute"),
+            source.get("averageBikingCadenceInRevPerMinute"),
+            source.get("averageSwimCadenceInStrokesPerMinute"),
+            source.get("averageCadence"),
+            source.get("avgCadence"),
+        ),
+        "max_cadence": _first_number(source.get("maxCadence")),
+        "elevation_gain_meters": _first_number(
+            source.get("elevationGainInMeters"),
+            source.get("totalAscent"),
+        ),
+        "elevation_loss_meters": _first_number(
+            source.get("totalDescent")
+        ),
+        "max_altitude_meters": _first_number(
+            source.get("maxAltitude")
+        ),
+        "min_altitude_meters": _first_number(
+            source.get("minAltitude")
+        ),
+        "training_load": _first_number(source.get("training_load")),
+    }
+    for field, value in metric_values.items():
+        if value is not None:
+            result[field] = value
+    if type(source.get("has_route")) is bool:
+        result["route_available"] = source["has_route"]
+
+    granular_truncated = False
+    if samples:
+        clean_samples, was_truncated = (
+            _sanitize_garmin_samples(
+                source,
+                start_time=start_time,
+                end_time=end_time,
+                include_location=route,
+            )
+            if provider == "garmin"
+            else _sanitize_polar_samples(source)
+            if provider == "polar"
+            else ([], False)
+        )
+        if clean_samples:
+            result["samples"] = clean_samples
+        granular_truncated |= was_truncated
+    if zones and provider == "polar":
+        clean_zones, was_truncated = _sanitize_polar_zones(source)
+        if clean_zones:
+            result["heart_rate_zones"] = clean_zones
+        granular_truncated |= was_truncated
+    if route and provider == "polar":
+        clean_route, was_truncated = _sanitize_polar_route(
+            source,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        if clean_route:
+            result["route"] = clean_route
+        granular_truncated |= was_truncated
+    if granular_truncated:
+        result["granular_truncated"] = True
+
+    identity_row = {
+        **source,
+        "provider": provider,
+    }
+    if workout_id is not None:
+        identity_row["provider_workout_id"] = workout_id
+    if numeric_workout_id is not None:
+        identity_row["provider_numeric_workout_id"] = numeric_workout_id
+    return _with_row_identity(result, row=identity_row)
+
+
+def _sanitize_retained_provider_workout(
+    row: Mapping[str, Any],
+    *,
+    provider: str,
+    expected_workout_id: str | None,
+    start: datetime,
+    end: datetime,
+    retained_after: datetime | None,
+    samples: bool,
+    zones: bool,
+    route: bool,
+) -> dict[str, Any] | None:
+    if (
+        row.get("record_kind") != "provider_workout"
+        or row.get("provider") != provider
+    ):
+        return None
+    workout_id = _safe_identifier(row.get("provider_workout_id"))
+    numeric_workout_id = _safe_identifier(
+        row.get("provider_numeric_workout_id")
+    )
+    if expected_workout_id is not None and workout_id != expected_workout_id:
+        return None
+    start_time = _timestamp(row.get("start_time"))
+    end_time = _timestamp(row.get("end_time"))
+    if not _workout_interval_is_allowed(
+        start_time,
+        end_time,
+        start=start,
+        end=end,
+        retained_after=retained_after,
+    ):
+        return None
+    workout_type = _safe_text(row.get("workout_type"), max_length=64)
+    if workout_type is None:
+        return None
+
+    allowed = {
+        "record_kind",
+        "provider",
+        "provider_attribution",
+        "provider_workout_id",
+        "provider_numeric_workout_id",
+        "provider_workout_type_code",
+        "workout_type",
+        "start_time",
+        "end_time",
+        "duration_seconds",
+        "zone_offset",
+        "distance_meters",
+        "calories_kcal",
+        "steps",
+        "avg_heart_rate_bpm",
+        "max_heart_rate_bpm",
+        "min_heart_rate_bpm",
+        "avg_speed_meters_per_second",
+        "max_speed_meters_per_second",
+        "avg_power_watts",
+        "max_power_watts",
+        "avg_cadence",
+        "max_cadence",
+        "elevation_gain_meters",
+        "elevation_loss_meters",
+        "max_altitude_meters",
+        "min_altitude_meters",
+        "training_load",
+        "route_available",
+        "granular_truncated",
+    }
+    if samples:
+        allowed.add("samples")
+    if zones:
+        allowed.add("heart_rate_zones")
+    if route:
+        allowed.add("route")
+    result = {
+        key: value
+        for key, value in row.items()
+        if key in allowed
+    }
+    if samples:
+        clean_samples, samples_truncated = (
+            _sanitize_retained_polar_samples(row.get("samples"))
+        )
+        result.pop("samples", None)
+        if clean_samples:
+            result["samples"] = clean_samples
+        if samples_truncated:
+            result["granular_truncated"] = True
+    if zones:
+        clean_zones, zones_truncated = (
+            _sanitize_retained_polar_zones(
+                row.get("heart_rate_zones")
+            )
+        )
+        result.pop("heart_rate_zones", None)
+        if clean_zones:
+            result["heart_rate_zones"] = clean_zones
+        if zones_truncated:
+            result["granular_truncated"] = True
+    if route:
+        assert start_time is not None
+        assert end_time is not None
+        clean_route, route_truncated = (
+            _sanitize_retained_polar_route(
+                row.get("route"),
+                start_time=start_time,
+                end_time=end_time,
+            )
+        )
+        result.pop("route", None)
+        if clean_route:
+            result["route"] = clean_route
+        if route_truncated:
+            result["granular_truncated"] = True
+    identity_row = {
+        "provider": provider,
+        "provider_workout_id": workout_id,
+        "provider_numeric_workout_id": numeric_workout_id,
+    }
+    return _with_row_identity(result, row=identity_row)
+
+
+def _sanitize_retained_polar_samples(
+    value: Any,
+) -> tuple[list[dict[str, Any]], bool]:
+    if value is None:
+        return [], False
+    if not isinstance(value, list):
+        return [], True
+    selected: list[dict[str, Any]] = []
+    truncated = len(value) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in value[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        recording_rate = _nonnegative_number(
+            raw.get("recording_rate_seconds"),
+            integer=True,
+        )
+        sample_type = _safe_text(raw.get("sample_type"), max_length=64)
+        data = _safe_text(
+            raw.get("data"),
+            max_length=_MAX_GRANULAR_WORKOUT_TEXT,
+        )
+        if recording_rate is None or sample_type is None or data is None:
+            truncated = True
+            continue
+        selected.append(
+            {
+                "recording_rate_seconds": recording_rate,
+                "sample_type": sample_type,
+                "data": data,
+            }
+        )
+    return selected, truncated
+
+
+def _sanitize_retained_polar_zones(
+    value: Any,
+) -> tuple[list[dict[str, Any]], bool]:
+    if value is None:
+        return [], False
+    if not isinstance(value, list):
+        return [], True
+    selected: list[dict[str, Any]] = []
+    truncated = len(value) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in value[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        index = _nonnegative_number(raw.get("index"), integer=True)
+        lower = _nonnegative_number(raw.get("lower_bpm"), integer=True)
+        upper = _nonnegative_number(raw.get("upper_bpm"), integer=True)
+        duration = _nonnegative_number(raw.get("duration_seconds"))
+        if (
+            index is None
+            or lower is None
+            or upper is None
+            or lower > upper
+            or duration is None
+        ):
+            truncated = True
+            continue
+        selected.append(
+            {
+                "index": index,
+                "lower_bpm": lower,
+                "upper_bpm": upper,
+                "duration_seconds": duration,
+            }
+        )
+    return selected, truncated
+
+
+def _sanitize_retained_polar_route(
+    value: Any,
+    *,
+    start_time: datetime,
+    end_time: datetime,
+) -> tuple[list[dict[str, Any]], bool]:
+    if value is None:
+        return [], False
+    if not isinstance(value, list):
+        return [], True
+    selected: list[dict[str, Any]] = []
+    truncated = len(value) > _MAX_GRANULAR_WORKOUT_ROWS
+    for raw in value[:_MAX_GRANULAR_WORKOUT_ROWS]:
+        if not isinstance(raw, Mapping):
+            truncated = True
+            continue
+        latitude = _number(raw.get("latitude"))
+        longitude = _number(raw.get("longitude"))
+        timestamp = _timestamp(raw.get("timestamp"))
+        if (
+            latitude is None
+            or longitude is None
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+            or (
+                timestamp is not None
+                and not start_time <= timestamp <= end_time
+            )
+        ):
+            truncated = True
+            continue
+        point: dict[str, Any] = {
+            "latitude": latitude,
+            "longitude": longitude,
+        }
+        if timestamp is not None:
+            point["timestamp"] = timestamp.isoformat()
+        for field in ("satellites", "fix"):
+            number = _nonnegative_number(raw.get(field), integer=True)
+            if number is not None:
+                point[field] = number
+        selected.append(point)
+    return selected, truncated
 
 
 def _sanitize_health_score(

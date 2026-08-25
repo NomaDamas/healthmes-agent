@@ -18,11 +18,13 @@ from healthmes.wearables.provenance import (
     commit_open_wearables_snapshot,
     latest_retained_open_wearables_query_snapshot,
     latest_retained_open_wearables_snapshot,
+    open_wearables_daily_execution_scope_digest,
     open_wearables_retention_policy_binding,
     persist_open_wearables_observation,
     persist_open_wearables_query_snapshot,
     persist_open_wearables_snapshot,
     wearable_query_snapshot_from_event,
+    wearable_snapshot_from_event,
 )
 from healthmes.wearables.whoop_recovery import (
     WHOOP_RECOVERY_ALGORITHM,
@@ -34,6 +36,9 @@ NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 WHOOP_START = datetime(2026, 8, 10, tzinfo=UTC)
 WHOOP_END = datetime(2026, 8, 11, tzinfo=UTC)
 WHOOP_PARAMETERS = {"as_of": "2026-08-10"}
+PROVIDER_BINDING_A = "sha256:" + ("a" * 64)
+PROVIDER_BINDING_B = "sha256:" + ("b" * 64)
+PROVIDER_BINDING_C = "sha256:" + ("c" * 64)
 
 
 def _whoop_public_result(
@@ -131,6 +136,7 @@ def _persist_whoop_package(
     result: dict | None = None,
     private_provenance: list[dict] | None = None,
     now: datetime = NOW,
+    provider_binding_digest: str | None = None,
 ):
     return persist_open_wearables_query_snapshot(
         session,
@@ -147,6 +153,7 @@ def _persist_whoop_package(
         ),
         collected_at=now,
         now=now,
+        provider_binding_digest=provider_binding_digest,
     )
 
 
@@ -1098,6 +1105,70 @@ def test_summary_retention_uses_summary_day_not_previous_bedtime(
     assert snapshot.retention_basis_at == start
 
 
+def test_body_summary_averaged_retention_uses_full_period_start(
+    session,
+) -> None:
+    period_start = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    period_end = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.body-summary",
+        start=WHOOP_START,
+        end=WHOOP_END,
+        timezone="UTC",
+        parameters={"average_period": 7},
+        result={
+            "status": "ok",
+            "records": [
+                {
+                    "record_kind": "body_summary",
+                    "summary_as_of": period_end.isoformat(),
+                    "averaged": {
+                        "resting_heart_rate_bpm": 58,
+                        "period_days": 7,
+                        "period_start": period_start.isoformat(),
+                        "period_end": period_end.isoformat(),
+                    },
+                }
+            ],
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    assert snapshot.retention_basis_at == period_start
+
+
+def test_body_summary_slow_only_uses_snapshot_collection_observation(
+    session,
+) -> None:
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.body-summary",
+        start=WHOOP_START,
+        end=WHOOP_END,
+        timezone="UTC",
+        parameters={"average_period": 7},
+        result={
+            "status": "ok",
+            "records": [
+                {
+                    "record_kind": "body_summary",
+                    "summary_as_of": "2000-01-01T00:00:00+00:00",
+                    "slow_changing": {"weight_kg": 70},
+                }
+            ],
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    assert snapshot.retention_basis_at == NOW
+
+
 def test_whoop_package_v2_separates_public_result_and_private_provenance(
     session,
 ) -> None:
@@ -1921,3 +1992,454 @@ def test_generic_v1_query_rejects_private_provenance(session) -> None:
         )
 
     assert _query_count(session) == 0
+
+
+def test_provider_binding_digest_must_be_prefixed_lowercase_sha256(
+    session,
+) -> None:
+    invalid = (
+        "a" * 64,
+        "sha256:" + ("A" * 64),
+        "sha256:" + ("a" * 63),
+        "sha512:" + ("a" * 64),
+    )
+
+    for value in invalid:
+        with pytest.raises(ValueError, match="provider_binding_digest"):
+            persist_open_wearables_observation(
+                session,
+                normalized_context=_context(),
+                local_day=DAY,
+                timezone="UTC",
+                collected_at=NOW,
+                now=NOW,
+                provider_binding_digest=value,
+            )
+
+    assert _count(session) == 0
+    assert _observation_count(session) == 0
+
+
+def test_daily_snapshot_provider_binding_is_private_and_identity_bound(
+    session,
+) -> None:
+    legacy = persist_open_wearables_observation(
+        session,
+        normalized_context=_context(),
+        local_day=DAY,
+        timezone="UTC",
+        collected_at=NOW,
+        now=NOW,
+    )
+    bound_a = persist_open_wearables_observation(
+        session,
+        normalized_context=_context(),
+        local_day=DAY,
+        timezone="UTC",
+        collected_at=NOW,
+        now=NOW,
+        provider_binding_digest=PROVIDER_BINDING_A,
+    )
+    bound_b = persist_open_wearables_observation(
+        session,
+        normalized_context=_context(),
+        local_day=DAY,
+        timezone="UTC",
+        collected_at=NOW,
+        now=NOW,
+        provider_binding_digest=PROVIDER_BINDING_B,
+    )
+
+    assert _count(session) == 3
+    assert _observation_count(session) == 3
+    assert len(
+        {
+            legacy.content_event_id,
+            bound_a.content_event_id,
+            bound_b.content_event_id,
+        }
+    ) == 3
+    assert len({legacy.event_id, bound_a.event_id, bound_b.event_id}) == 3
+    assert legacy.content_digest == bound_a.content_digest
+    assert bound_a.content_digest == bound_b.content_digest
+    assert legacy.provider_binding_digest is None
+    assert bound_a.provider_binding_digest == PROVIDER_BINDING_A
+    assert bound_b.provider_binding_digest == PROVIDER_BINDING_B
+
+    observation = session.get(WellnessEvent, bound_a.event_id)
+    content = session.get(WellnessEvent, bound_a.content_event_id)
+    assert observation is not None
+    assert content is not None
+    for event in (observation, content):
+        assert event.payload["provider_binding_digest"] == (
+            PROVIDER_BINDING_A
+        )
+        assert event.quality_flags["provider_binding_digest"] == (
+            PROVIDER_BINDING_A
+        )
+        assert event.derived_from["provider_binding_digest"] == (
+            PROVIDER_BINDING_A
+        )
+        assert PROVIDER_BINDING_A not in json.dumps(
+            event.payload.get("normalized_context", {}),
+            sort_keys=True,
+        )
+
+    assert wearable_snapshot_from_event(
+        session,
+        observation,
+        now=NOW,
+    ) == bound_a
+    assert wearable_snapshot_from_event(
+        session,
+        observation,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) == bound_a
+    assert wearable_snapshot_from_event(
+        session,
+        observation,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_B,
+    ) is None
+
+    legacy_event = session.get(WellnessEvent, legacy.event_id)
+    assert legacy_event is not None
+    assert wearable_snapshot_from_event(
+        session,
+        legacy_event,
+        now=NOW,
+    ) == legacy
+    assert wearable_snapshot_from_event(
+        session,
+        legacy_event,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) is None
+    assert latest_retained_open_wearables_snapshot(
+        session,
+        local_day=DAY,
+        timezone="UTC",
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) == bound_a
+    assert latest_retained_open_wearables_snapshot(
+        session,
+        local_day=DAY,
+        timezone="UTC",
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_C,
+    ) is None
+
+
+def test_daily_snapshot_isolated_by_exact_execution_scope_digest(
+    session,
+) -> None:
+    stress_scope = open_wearables_daily_execution_scope_digest(
+        capability="wearable.stress",
+        allowed_providers=("garmin",),
+        provider_binding_digest=PROVIDER_BINDING_A,
+    )
+    recovery_scope = open_wearables_daily_execution_scope_digest(
+        capability="wearable.recovery",
+        allowed_providers=("garmin",),
+        provider_binding_digest=PROVIDER_BINDING_A,
+    )
+
+    stress = persist_open_wearables_observation(
+        session,
+        normalized_context=_context(),
+        local_day=DAY,
+        timezone="UTC",
+        collected_at=NOW,
+        now=NOW,
+        provider_binding_digest=PROVIDER_BINDING_A,
+        execution_scope_digest=stress_scope,
+    )
+    recovery = persist_open_wearables_observation(
+        session,
+        normalized_context=_context(),
+        local_day=DAY,
+        timezone="UTC",
+        collected_at=NOW,
+        now=NOW,
+        provider_binding_digest=PROVIDER_BINDING_A,
+        execution_scope_digest=recovery_scope,
+    )
+
+    assert stress.content_digest == recovery.content_digest
+    assert stress.content_event_id != recovery.content_event_id
+    assert stress.event_id != recovery.event_id
+    assert _count(session) == 2
+    assert _observation_count(session) == 2
+    assert latest_retained_open_wearables_snapshot(
+        session,
+        local_day=DAY,
+        timezone="UTC",
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+        expected_execution_scope_digest=stress_scope,
+    ) == stress
+    assert latest_retained_open_wearables_snapshot(
+        session,
+        local_day=DAY,
+        timezone="UTC",
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+        expected_execution_scope_digest=recovery_scope,
+    ) == recovery
+    assert (
+        latest_retained_open_wearables_snapshot(
+            session,
+            local_day=DAY,
+            timezone="UTC",
+            now=NOW,
+            expected_provider_binding_digest=PROVIDER_BINDING_A,
+            expected_execution_scope_digest="sha256:" + ("f" * 64),
+        )
+        is None
+    )
+
+
+def test_generic_query_provider_binding_is_private_and_identity_bound(
+    session,
+) -> None:
+    start = datetime(2026, 8, 10, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    parameters = {
+        "series_type": "heart_rate",
+        "resolution": "1min",
+    }
+    result = {
+        "status": "ok",
+        "records": [
+            {
+                "timestamp": start.isoformat(),
+                "series_type": "heart_rate",
+                "value": 72,
+                "unit": "bpm",
+            }
+        ],
+        "limitations": [],
+    }
+
+    legacy = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters=parameters,
+        result=result,
+        collected_at=NOW,
+        now=NOW,
+    )
+    bound_a = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters=parameters,
+        result=result,
+        collected_at=NOW,
+        now=NOW,
+        provider_binding_digest=PROVIDER_BINDING_A,
+    )
+    bound_b = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters=parameters,
+        result=result,
+        collected_at=NOW,
+        now=NOW,
+        provider_binding_digest=PROVIDER_BINDING_B,
+    )
+
+    assert _query_count(session) == 3
+    assert len({legacy.event_id, bound_a.event_id, bound_b.event_id}) == 3
+    assert legacy.query_digest == bound_a.query_digest
+    assert bound_a.query_digest == bound_b.query_digest
+    assert legacy.provider_binding_digest is None
+    assert bound_a.provider_binding_digest == PROVIDER_BINDING_A
+    assert bound_b.provider_binding_digest == PROVIDER_BINDING_B
+
+    event = session.get(WellnessEvent, bound_a.event_id)
+    assert event is not None
+    assert event.payload["provider_binding_digest"] == PROVIDER_BINDING_A
+    assert event.quality_flags["provider_binding_digest"] == (
+        PROVIDER_BINDING_A
+    )
+    assert event.derived_from["provider_binding_digest"] == (
+        PROVIDER_BINDING_A
+    )
+    assert "provider_binding_digest" not in event.payload["query"]
+    assert PROVIDER_BINDING_A not in json.dumps(
+        event.payload["result"],
+        sort_keys=True,
+    )
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+    ) == bound_a
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) == bound_a
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_B,
+    ) is None
+
+    legacy_event = session.get(WellnessEvent, legacy.event_id)
+    assert legacy_event is not None
+    assert wearable_query_snapshot_from_event(
+        session,
+        legacy_event,
+        now=NOW,
+    ) == legacy
+    assert wearable_query_snapshot_from_event(
+        session,
+        legacy_event,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) is None
+    assert latest_retained_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters=parameters,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) == bound_a
+    assert latest_retained_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters=parameters,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_C,
+    ) is None
+
+
+def test_whoop_binding_digest_is_independent_from_private_provenance(
+    session,
+) -> None:
+    first = _persist_whoop_package(
+        session,
+        provider_binding_digest=PROVIDER_BINDING_A,
+    )
+    second = _persist_whoop_package(
+        session,
+        provider_binding_digest=PROVIDER_BINDING_B,
+    )
+
+    assert first.event_id != second.event_id
+    assert first.query_digest == second.query_digest
+    assert (
+        first.private_provenance_digest
+        == second.private_provenance_digest
+    )
+    assert first.provider_binding_digest == PROVIDER_BINDING_A
+    assert second.provider_binding_digest == PROVIDER_BINDING_B
+    assert (
+        first.provider_binding_digest
+        != first.private_provenance_digest
+    )
+
+    event = session.get(WellnessEvent, first.event_id)
+    assert event is not None
+    assert event.payload["provider_binding_digest"] == PROVIDER_BINDING_A
+    assert event.payload["private_provenance_digest"] == (
+        first.private_provenance_digest
+    )
+    assert event.quality_flags["provider_binding_digest"] == (
+        PROVIDER_BINDING_A
+    )
+    assert event.derived_from["provider_binding_digest"] == (
+        PROVIDER_BINDING_A
+    )
+    assert "provider_binding_digest" not in event.payload["query"]
+    assert PROVIDER_BINDING_A not in json.dumps(
+        first.result,
+        sort_keys=True,
+    )
+    assert PROVIDER_BINDING_A not in json.dumps(
+        event.payload["private_provenance"],
+        sort_keys=True,
+    )
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) == first
+    assert latest_retained_open_wearables_query_snapshot(
+        session,
+        capability="wearable.whoop-recovery-package",
+        start=WHOOP_START,
+        end=WHOOP_END,
+        timezone="UTC",
+        parameters=WHOOP_PARAMETERS,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) == first
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "payload",
+        "quality_flags",
+        "derived_from",
+        "source_record_id",
+    ),
+)
+def test_bound_query_rejects_provider_binding_tampering(
+    session,
+    tamper: str,
+) -> None:
+    snapshot = _persist_whoop_package(
+        session,
+        provider_binding_digest=PROVIDER_BINDING_A,
+    )
+    event = session.get(WellnessEvent, snapshot.event_id)
+    assert event is not None
+
+    if tamper == "payload":
+        event.payload = {
+            **event.payload,
+            "provider_binding_digest": PROVIDER_BINDING_B,
+        }
+    elif tamper == "quality_flags":
+        event.quality_flags = {
+            **event.quality_flags,
+            "provider_binding_digest": PROVIDER_BINDING_B,
+        }
+    elif tamper == "derived_from":
+        event.derived_from = {
+            **event.derived_from,
+            "provider_binding_digest": PROVIDER_BINDING_B,
+        }
+    else:
+        event.source_record_id = f"{event.source_record_id}-tampered"
+    session.flush([event])
+
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+        expected_provider_binding_digest=PROVIDER_BINDING_A,
+    ) is None

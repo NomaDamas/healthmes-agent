@@ -3216,6 +3216,18 @@ def test_usage_measurement_bounds_external_sqlite_writer_and_restores_timeout(
             original_timeout_ms,
         )
         measurement_connection.rollback()
+        timeout_updates: list[int] = []
+        set_timeout = storage_service.set_sqlite_busy_timeout_ms
+
+        def record_timeout(connection, timeout_ms):
+            timeout_updates.append(timeout_ms)
+            set_timeout(connection, timeout_ms)
+
+        monkeypatch.setattr(
+            storage_service,
+            "set_sqlite_busy_timeout_ms",
+            record_timeout,
+        )
         with sqlite3.connect(database_path, timeout=30) as blocker:
             blocker.execute("BEGIN IMMEDIATE")
             with Session(bind=measurement_connection) as session:
@@ -3224,13 +3236,20 @@ def test_usage_measurement_bounds_external_sqlite_writer_and_restores_timeout(
                     storage_service.measure_usage(session, settings)
                 elapsed = time.monotonic() - started
 
-            assert 0.08 <= elapsed < 1
+            assert 0.08 <= elapsed < 5.0
+            bounded_updates = timeout_updates[:-1]
+            assert bounded_updates
+            assert all(
+                0 < timeout_ms <= 150
+                for timeout_ms in bounded_updates
+            )
+            assert timeout_updates[-1] == original_timeout_ms
             assert (
                 storage_service.sqlite_busy_timeout_ms(
                     measurement_connection
                 )
                 == original_timeout_ms
-        )
+            )
 
 
 def test_usage_measurement_leaves_caller_connection_transaction_clean(

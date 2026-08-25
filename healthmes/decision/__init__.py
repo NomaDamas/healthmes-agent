@@ -1,28 +1,16 @@
-"""HealthMes-owned contracts and orchestration for wellness decisions."""
+"""HealthMes-owned contracts and orchestration for wellness decisions.
 
-from healthmes.decision.access import (
-    AccessAuditEntry,
-    AccessOutcome,
-    ContextAccessLayer,
-    ContextAccessPolicy,
-    ContextAccessTurn,
-    DomainAccessGrant,
-)
-from healthmes.decision.agent import (
-    DecisionAgentRun,
-)
-from healthmes.decision.compatibility import (
-    decision_request_from_activity_context,
-)
-from healthmes.decision.composition import (
-    build_configured_decision_engine,
-    build_context_provider_registry,
-    build_decision_context_search_session_service,
-    build_decision_recovery_finalizer,
-    build_healthmes_responses_decision_engine,
-    local_owner_access_policy,
-    resolve_decision_execution_scope,
-)
+The contract module is intentionally imported eagerly, while heavier
+orchestration modules are exposed lazily.  Low-level modules such as
+``healthmes.wearables.search`` import the contracts package and must not
+initialize every decision provider as a side effect.
+"""
+
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
+
 from healthmes.decision.contracts import (
     CompatibilityPreset,
     ContextCoverage,
@@ -55,124 +43,23 @@ from healthmes.decision.contracts import (
     decision_record_summary,
     source_ref_id,
 )
-from healthmes.decision.domain_providers import (
-    ActivityContextProvider,
-    CalendarContextProvider,
-    NutritionContextProvider,
-    WearableContextProvider,
-)
-from healthmes.decision.engine import (
-    DecisionEngineBusyError,
-    DecisionEngineClosedError,
-    HealthMesDecisionEngine,
-)
-from healthmes.decision.execution import DecisionExecutionControl
-from healthmes.decision.finalizer import (
-    DECISION_PAYLOAD_SCHEMA,
-    DECISION_RECORD_SCHEMA,
-    DecisionFinalizer,
-    decision_request_fingerprint,
-    decision_request_timezone_from_record,
-    decision_result_from_record,
-)
-from healthmes.decision.hermes_profile import (
-    HERMES_DECISION_MCP_SERVER,
-    HERMES_DECISION_MCP_TOOL_NAMES,
-    HERMES_DECISION_NATIVE_TOOLSET_DENYLIST,
-    HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
-    HERMES_DECISION_TOOL_ALLOWLIST,
-    HermesDecisionProfileAssertion,
-    HermesDecisionProfileError,
-)
-from healthmes.decision.policy import (
-    DECISION_DOMAINS,
-    DatabaseDecisionPolicyResolver,
-    decision_access_policy,
-    ensure_decision_domain_policies,
-    list_decision_domain_policies,
-    update_decision_domain_policy,
-)
-from healthmes.decision.providers import (
-    ContextCapability,
-    ContextParameterFormat,
-    ContextParameterSpec,
-    ContextParameterType,
-    ContextProvider,
-    ContextProviderDescriptor,
-    ContextProviderMetadata,
-    ContextProviderRegistry,
-    ContextProviderRegistryError,
-    DisabledProviderError,
-    DuplicateCapabilityError,
-    DuplicateProviderError,
-    ProvenanceSupport,
-    UnknownCapabilityError,
-    UnknownProviderError,
-    validate_context_parameters,
-)
-from healthmes.decision.responses import (
-    HERMES_DECISION_DRAFT_SCHEMA,
-    HERMES_RESPONSES_PATH,
-    HERMES_RESPONSES_POLICY_VERSION,
-    HERMES_TOOLSETS_PATH,
-    HermesHttpResponsesTransport,
-    HermesResponsesContractError,
-    HermesResponsesDecisionAgent,
-    HermesResponsesError,
-    HermesResponsesHttpResult,
-    HermesResponsesTransport,
-    HermesResponsesTransportError,
-    HermesRuntimeAttestationAssertion,
-)
-from healthmes.decision.runtime import (
-    ContextToolCall,
-    DecisionRuntime,
-    DecisionRuntimeContractError,
-    DecisionRuntimeError,
-    DecisionRuntimeTurn,
-    DecisionRuntimeUnavailableError,
-    DecisionToolCallError,
-    DecisionToolSpec,
-    RuntimeContextResult,
-    RuntimeDecisionContextHints,
-    RuntimeDecisionRequest,
-    RuntimeRelatedRecord,
-    RuntimeResourceBudget,
-    RuntimeStepOutput,
-    RuntimeToolExchange,
-)
-from healthmes.decision.search import (
-    AbortedDecisionSearchSessionError,
-    BusyDecisionSearchSessionError,
-    ContextSearchAccessAudit,
-    ContextSearchResult,
-    DecisionContextSearchSessionService,
-    DecisionSearchBudgetError,
-    DecisionSearchBudgetUsage,
-    DecisionSearchPolicyError,
-    DecisionSearchQueryError,
-    DecisionSearchRelatedRecord,
-    DecisionSearchSessionCapacityError,
-    DecisionSearchSessionError,
-    DecisionSearchSessionHandle,
-    DecisionSearchSessionSnapshot,
-    DecisionSearchSessionState,
-    ExpiredDecisionSearchSessionError,
-    FinishedDecisionSearchSessionError,
-    UnknownDecisionSearchSessionError,
-)
-from healthmes.decision.service import (
-    DecisionChannelAdapter,
-    DecisionChannelRequest,
-    DecisionIdempotencyConflictError,
-    DecisionIdempotencyExpiredError,
-    DecisionIdempotencyUnavailableError,
-    DecisionIngress,
-    DecisionRecoveryNotFoundError,
-    DecisionRuntimeNotConfiguredError,
-    DecisionServiceRequest,
-    HealthMesDecisionService,
-    decision_rest_request_id,
+
+_LAZY_MODULES = (
+    "healthmes.decision.access",
+    "healthmes.decision.agent",
+    "healthmes.decision.compatibility",
+    "healthmes.decision.composition",
+    "healthmes.decision.domain_providers",
+    "healthmes.decision.engine",
+    "healthmes.decision.execution",
+    "healthmes.decision.finalizer",
+    "healthmes.decision.hermes_profile",
+    "healthmes.decision.policy",
+    "healthmes.decision.providers",
+    "healthmes.decision.responses",
+    "healthmes.decision.runtime",
+    "healthmes.decision.search",
+    "healthmes.decision.service",
 )
 
 __all__ = [
@@ -204,6 +91,7 @@ __all__ = [
     "ContextStatus",
     "ContextToolCall",
     "CoverageStatus",
+    "DatabaseDecisionPolicyResolver",
     "DecisionAgentRun",
     "DecisionAction",
     "DecisionActionKind",
@@ -212,31 +100,28 @@ __all__ = [
     "DecisionCaller",
     "DecisionChannelAdapter",
     "DecisionChannelRequest",
-    "DecisionIdempotencyConflictError",
-    "DecisionIdempotencyExpiredError",
-    "DecisionIdempotencyUnavailableError",
     "DecisionContextHints",
     "DecisionContextSearchSessionService",
     "DecisionDraft",
-    "DecisionPersistenceIntent",
-    "DecisionRecordSummaryCode",
     "DecisionEngineBusyError",
     "DecisionEngineClosedError",
     "DecisionExecutionControl",
     "DecisionFinalizer",
+    "DecisionIdempotencyConflictError",
+    "DecisionIdempotencyExpiredError",
+    "DecisionIdempotencyUnavailableError",
     "DecisionIngress",
-    "DecisionRequest",
+    "DecisionPersistenceIntent",
+    "DecisionRecordSummaryCode",
     "DecisionRecoveryNotFoundError",
-    "DECISION_PAYLOAD_SCHEMA",
-    "DECISION_RECORD_SCHEMA",
     "DecisionResult",
+    "DecisionRequest",
     "DecisionRuntime",
     "DecisionRuntimeContractError",
     "DecisionRuntimeError",
+    "DecisionRuntimeNotConfiguredError",
     "DecisionRuntimeTurn",
     "DecisionRuntimeUnavailableError",
-    "DecisionRuntimeNotConfiguredError",
-    "DecisionServiceRequest",
     "DecisionSearchBudgetError",
     "DecisionSearchBudgetUsage",
     "DecisionSearchPolicyError",
@@ -247,11 +132,13 @@ __all__ = [
     "DecisionSearchSessionHandle",
     "DecisionSearchSessionSnapshot",
     "DecisionSearchSessionState",
+    "DecisionServiceRequest",
     "DecisionStatus",
     "DecisionToolCallError",
     "DecisionToolSpec",
-    "DatabaseDecisionPolicyResolver",
     "DECISION_DOMAINS",
+    "DECISION_PAYLOAD_SCHEMA",
+    "DECISION_RECORD_SCHEMA",
     "DisabledProviderError",
     "DomainAccessGrant",
     "DuplicateCapabilityError",
@@ -260,6 +147,15 @@ __all__ = [
     "ExpiredDecisionSearchSessionError",
     "FinishedDecisionSearchSessionError",
     "FreshnessStatus",
+    "HERMES_DECISION_DRAFT_SCHEMA",
+    "HERMES_DECISION_MCP_SERVER",
+    "HERMES_DECISION_MCP_TOOL_NAMES",
+    "HERMES_DECISION_NATIVE_TOOLSET_DENYLIST",
+    "HERMES_DECISION_SKILL_MCP_TOOL_NAMES",
+    "HERMES_DECISION_TOOL_ALLOWLIST",
+    "HERMES_RESPONSES_PATH",
+    "HERMES_RESPONSES_POLICY_VERSION",
+    "HERMES_TOOLSETS_PATH",
     "HealthMesDecisionEngine",
     "HealthMesDecisionService",
     "decision_rest_request_id",
@@ -273,28 +169,19 @@ __all__ = [
     "HermesResponsesTransport",
     "HermesResponsesTransportError",
     "HermesRuntimeAttestationAssertion",
-    "HERMES_DECISION_DRAFT_SCHEMA",
-    "HERMES_DECISION_MCP_SERVER",
-    "HERMES_DECISION_MCP_TOOL_NAMES",
-    "HERMES_DECISION_NATIVE_TOOLSET_DENYLIST",
-    "HERMES_DECISION_SKILL_MCP_TOOL_NAMES",
-    "HERMES_DECISION_TOOL_ALLOWLIST",
-    "HERMES_RESPONSES_PATH",
-    "HERMES_RESPONSES_POLICY_VERSION",
-    "HERMES_TOOLSETS_PATH",
     "NutritionContextProvider",
     "PersistenceStatus",
     "PrivacyLevel",
     "ProvenanceSupport",
     "RawSourceHandle",
-    "RuntimeStepOutput",
     "RuntimeContextResult",
-    "RuntimeToolExchange",
-    "RuntimeMetadata",
     "RuntimeDecisionContextHints",
     "RuntimeDecisionRequest",
+    "RuntimeMetadata",
     "RuntimeRelatedRecord",
     "RuntimeResourceBudget",
+    "RuntimeStepOutput",
+    "RuntimeToolExchange",
     "SourceRef",
     "ToolCallRecord",
     "ToolCallStatus",
@@ -302,22 +189,46 @@ __all__ = [
     "UnknownDecisionSearchSessionError",
     "UnknownProviderError",
     "WearableContextProvider",
+    "build_configured_decision_engine",
     "build_context_provider_registry",
     "build_decision_context_search_session_service",
     "build_decision_recovery_finalizer",
-    "build_configured_decision_engine",
     "build_healthmes_responses_decision_engine",
-    "decision_request_from_activity_context",
-    "decision_request_fingerprint",
-    "decision_request_timezone_from_record",
-    "decision_record_summary",
-    "decision_result_from_record",
     "decision_access_policy",
+    "decision_record_summary",
+    "decision_request_fingerprint",
+    "decision_request_from_activity_context",
+    "decision_request_timezone_from_record",
+    "decision_result_from_record",
     "ensure_decision_domain_policies",
     "list_decision_domain_policies",
+    "local_owner_access_policy",
     "resolve_decision_execution_scope",
     "source_ref_id",
-    "local_owner_access_policy",
     "update_decision_domain_policy",
     "validate_context_parameters",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public orchestration symbol on first use."""
+
+    if name not in __all__:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+    for module_name in _LAZY_MODULES:
+        module = import_module(module_name)
+        if hasattr(module, name):
+            value = getattr(module, name)
+            globals()[name] = value
+            return value
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
+    )
+
+
+def __dir__() -> list[str]:
+    """Include lazy exports in introspection and IDE completion."""
+
+    return sorted(set(globals()) | set(__all__))
