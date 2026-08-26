@@ -122,22 +122,23 @@ struct WeeklyReportView: View {
     // MARK: Schedule adherence
 
     private func adherenceSection(_ report: WeeklyReport) -> some View {
-        Section {
+        let breakdown = report.schedule.displayBreakdown
+        return Section {
             HStack(spacing: 0) {
                 statCell(
-                    value: report.schedule.acceptancePct.map { "\($0)%" } ?? "--",
-                    label: String(localized: "acceptance")
+                    value: String(breakdown.syncPending),
+                    label: String(localized: "sync pending")
                 )
                 statCell(
-                    value: String(report.schedule.accepted + report.schedule.pushed),
+                    value: String(breakdown.applied),
                     label: String(localized: "applied")
                 )
                 statCell(
-                    value: String(report.schedule.declined),
+                    value: String(breakdown.declined),
                     label: String(localized: "declined")
                 )
                 statCell(
-                    value: String(report.schedule.proposed),
+                    value: String(breakdown.pending),
                     label: String(localized: "pending")
                 )
             }
@@ -145,7 +146,10 @@ struct WeeklyReportView: View {
         } header: {
             Text("Schedule adherence")
         } footer: {
-            Text("Of \(report.schedule.decided) decided proposals this week.")
+            let acceptance = report.schedule.acceptancePct.map { "\($0)%" } ?? "--"
+            Text(
+                "\(acceptance) accepted overall · \(report.schedule.decided) decided proposals this week."
+            )
         }
     }
 

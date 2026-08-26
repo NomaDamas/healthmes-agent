@@ -14,7 +14,11 @@ final class BackgroundRefreshManager {
     static let shared = BackgroundRefreshManager()
 
     /// Must match BGTaskSchedulerPermittedIdentifiers in project.yml.
-    static let taskIdentifier = "com.healthmes.companion.refresh"
+    static var taskIdentifier: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "HealthMesBackgroundRefreshIdentifier"
+        ) as? String ?? "com.healthmes.companion.refresh"
+    }
     /// The endpoint caches for 5 minutes; 15 minutes matches the WidgetKit
     /// floor used across the companions (never sooner, per the glance
     /// budget policy).
@@ -54,13 +58,23 @@ final class BackgroundRefreshManager {
         // Always keep the chain alive first — even if this run fails.
         schedule()
 
-        let work = Task {
-            let success = await RefreshCoordinator.shared.sync(isForeground: false)
-            task.setTaskCompleted(success: success)
-        }
+        let runner = HealthKitBackgroundTaskRunner(
+            operation: {
+                async let productRefresh =
+                    RefreshCoordinator.shared.sync(isForeground: false)
+                async let healthKitRefresh =
+                    HealthKitSyncManager.shared.backgroundSync()
+                let productSuccess = await productRefresh
+                let healthKitSuccess = await healthKitRefresh
+                return productSuccess || healthKitSuccess
+            },
+            completion: { success in
+                task.setTaskCompleted(success: success)
+            }
+        )
         task.expirationHandler = {
-            work.cancel()
-            task.setTaskCompleted(success: false)
+            runner.expire()
         }
+        runner.start()
     }
 }

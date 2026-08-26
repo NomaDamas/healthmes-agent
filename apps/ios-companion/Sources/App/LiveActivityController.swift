@@ -55,4 +55,15 @@ final class LiveActivityController {
             }
         #endif
     }
+
+    func endAll() async {
+        #if canImport(ActivityKit)
+            for activity in Activity<FocusBlockActivityAttributes>.activities {
+                await activity.end(
+                    activity.content,
+                    dismissalPolicy: .immediate
+                )
+            }
+        #endif
+    }
 }

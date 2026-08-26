@@ -18,7 +18,7 @@ struct PairingSettingsView: View {
     var body: some View {
         Form {
             Section {
-                TextField(text: $baseURLText, prompt: Text(verbatim: "http://192.168.1.20:8100")) {
+                TextField(text: $baseURLText, prompt: Text(verbatim: "https://healthmes.example.com")) {
                     Text("settings.baseURL")
                 }
                 .textFieldStyle(.roundedBorder)
@@ -43,8 +43,15 @@ struct PairingSettingsView: View {
 
                     if store.isPaired {
                         Button(role: .destructive) {
-                            store.unpair()
-                            testResultKey = nil
+                            Task {
+                                do {
+                                    try await store.unpair()
+                                    testResultKey = nil
+                                } catch {
+                                    testSucceeded = false
+                                    testResultKey = "error.unreachable"
+                                }
+                            }
                         } label: {
                             Text("settings.unpair")
                         }
@@ -99,8 +106,7 @@ struct PairingSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(minWidth: 420, idealWidth: 560, maxWidth: 720)
         .onAppear {
             if let pairing = PairingStore.shared.load() {
                 baseURLText = pairing.baseURL.absoluteString

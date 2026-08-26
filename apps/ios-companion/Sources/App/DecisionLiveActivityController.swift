@@ -11,13 +11,25 @@ final class DecisionLiveActivityController {
 
     private init() {}
 
-    func sync(alerts: [AlertItem], isForeground: Bool, now: Date = Date()) async {
+    func sync(
+        alerts: [AlertItem],
+        pairing: Pairing,
+        isForeground: Bool,
+        now: Date = Date()
+    ) async {
         #if canImport(ActivityKit)
             guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+            guard
+                let pairingIdentity =
+                    PairingStore.shared.cacheIdentity(for: pairing)
+            else {
+                return
+            }
 
             let candidate = alerts.first {
                 $0.proposalId != nil
                     && $0.decisionCard != nil
+                    && ProposalActionPresentation.exactPrompt(alert: $0) != nil
                     && ($0.decisionCard?.expiresAt ?? .distantPast) > now
             }
             let running = Activity<DecisionActivityAttributes>.activities
@@ -25,7 +37,8 @@ final class DecisionLiveActivityController {
             guard
                 let alert = candidate,
                 let proposalID = alert.proposalId,
-                let card = alert.decisionCard
+                let card = alert.decisionCard,
+                let prompt = ProposalActionPresentation.exactPrompt(alert: alert)
             else {
                 for activity in running {
                     await activity.end(activity.content, dismissalPolicy: .immediate)
@@ -34,7 +47,7 @@ final class DecisionLiveActivityController {
             }
 
             let state = DecisionActivityAttributes.ContentState(
-                title: AlertNotificationContent.decisionPrompt(for: card),
+                title: prompt,
                 reason: AlertNotificationContent.compactLine(card.observationShort, limit: 34),
                 target: AlertNotificationContent.targetLine(after: card.after),
                 expiresAt: card.expiresAt
@@ -44,6 +57,10 @@ final class DecisionLiveActivityController {
 
             if let matching = running.first(where: {
                 $0.attributes.proposalID == proposalText
+                    && $0.attributes.pairingFingerprint
+                        == pairingIdentity.fingerprint
+                    && $0.attributes.pairingGeneration
+                        == pairingIdentity.generation
             }) {
                 await matching.update(content)
                 for stray in running where stray.id != matching.id {
@@ -55,10 +72,27 @@ final class DecisionLiveActivityController {
                 }
                 if isForeground {
                     _ = try? Activity.request(
-                        attributes: DecisionActivityAttributes(proposalID: proposalText),
+                        attributes: DecisionActivityAttributes(
+                            proposalID: proposalText,
+                            pairingFingerprint:
+                                pairingIdentity.fingerprint,
+                            pairingGeneration:
+                                pairingIdentity.generation
+                        ),
                         content: content
                     )
                 }
+            }
+        #endif
+    }
+
+    func endAll() async {
+        #if canImport(ActivityKit)
+            for activity in Activity<DecisionActivityAttributes>.activities {
+                await activity.end(
+                    activity.content,
+                    dismissalPolicy: .immediate
+                )
             }
         #endif
     }

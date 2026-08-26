@@ -7,6 +7,9 @@
 > **범위:** 입력 탐색, 연결 상태, 수집 제어, Decision Agent 접근 동의,
 > 데이터 클래스별 보존 정책과 UI action metadata. 실제 화면 구현은 포함하지
 > 않는다.
+>
+> Apple UI와 Main의 전체 연결 경계는
+> [`APPLE-MAIN-INTEGRATION.ko.md`](APPLE-MAIN-INTEGRATION.ko.md)를 따른다.
 
 ## TLDR
 
@@ -49,7 +52,7 @@ Wearable과 Calendar는 실제 adapter가 제공하는 connect/disconnect/sync a
 | `activity.activitywatch` | activity | macOS/Windows/Linux foreground·idle·시간별 집계 |
 | `activity.ios-screentime` | activity | 조건부 iPhone Screen Time 시간별 집계 계약; 일반 빌드는 unavailable |
 | `nutrition.capture` | nutrition | 사진 VLM, 텍스트, 음성 transcript, 영양소, 카페인 |
-| `wearable.healthkit-bridge` | wearable | 외부 HealthKit exporter의 raw-first 수신과 Open Wearables 전달 |
+| `wearable.healthkit-bridge` | wearable | HealthMes iPhone first-party collector의 native 수신, legacy exporter 호환과 Open Wearables 전달 |
 | `wearable.open-wearables` | wearable | 수면, 회복, HRV, 스트레스, 운동 |
 | `calendar.google` | calendar | 일정 mirror, 가용 시간, 일정 밀도 |
 | `calendar.icloud` | calendar | 일정 mirror, 가용 시간, 일정 밀도 |
@@ -102,11 +105,41 @@ PUT /v1/inputs/{source_id}/settings
   UI는 모든 설정 PUT에 그 `ETag`를 `If-Match`로 전송해야 한다.
 
 `actions`는 UI 명세이지 모든 동작을 대신 실행하는 범용 RPC가 아니다. iPhone
-authorize/sync action은 향후 gate-enabled·entitled 기기 빌드가 수행할 계약이며
-일반 저장소 빌드에서는 사용할 수 없다. HealthKit bridge의 sync action은 외부
-exporter가 기존 `POST /v1/ingest/healthkit` endpoint를 호출한다는 뜻이며,
-HealthMes가 iOS 백그라운드 실행을 대신 예약한다는 뜻이 아니다. Google Calendar
-connect는 기존 브라우저 OAuth endpoint를 사용한다.
+authorize/sync action은 지원되는 기기 빌드가 수행하고, HealthKit bridge의 기본
+connect action은 HealthMes iPhone 앱이 Apple Health 권한을 받은 뒤 first-party
+collector를 시작한다는 뜻이다. `POST /v1/ingest/healthkit`은 native collector와
+기존 외부 exporter가 함께 사용하는 수신 endpoint이며, 서버가 iOS 백그라운드
+실행을 대신 예약한다는 뜻은 아니다. 외부 exporter는 optional legacy 경로이지
+필수 의존성이 아니다. Google Calendar connect는 기존 브라우저 OAuth endpoint를
+사용한다.
+
+### Apple one-page setup과 서버 정본 동기화
+
+iPhone과 macOS는 각각 하나의 Settings 진입점에서 다음을 함께 표시한다.
+
+```text
+GET /v1/setup/readiness
+        +
+GET /v1/inputs
+        +
+GET /v1/inputs/{source_id} -> If-Match PUT
+```
+
+Mac 설정을 iPhone에 직접 복제하지 않는다. 두 앱이 같은 Main의 descriptor를
+읽고 쓰기 때문에 동기화된다. API token, Open Wearables key, Hermes provider
+key와 calendar credential은 서버에 남고 앱은 readiness와 configured 상태만
+받는다.
+
+Apple Health 권한은 iPhone의 local device action이다. 그러나 수집 상태,
+retention과 Decision 접근 동의는 같은 one-page Settings에서 서버 source 상태와
+함께 보여 준다. provider/device inventory는 Main이 `instances`로 반환한 항목만
+표시하며, Main에 없는 CRUD를 UI가 만들어 내지 않는다.
+
+first-party HealthKit upload는 pairing fingerprint별 encrypted outbox를 거친다.
+각 outbox item은 exact request bytes, stable `Idempotency-Key`와 candidate
+anchors를 함께 보존한다. 서버가 `202`, `durable=true`, 일치하는 `sha256`와
+`size_bytes`, 그리고 accepted forward status를 반환한 뒤에만 해당 pairing
+namespace의 anchor를 확정한다.
 
 ### 설정 변경
 
@@ -623,10 +656,13 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 
 `wearable.healthkit-bridge`는 정규화 전 원문을 `raw_payload` 정책으로 먼저
 저장한다. 첫 `healthkit-bridge` raw event가 도착하기 전에는 `configured`,
-도착한 뒤에는 `connected`로 표시한다. 이 상태는 exporter가 현재도 주기적으로
-실행 중이라는 보장이 아니므로 collection state는 `idle`로 유지하고 freshness를
-과장하지 않는다. raw payload의 기본 LLM 노출은 `none`이며, 판단에는 별도로
-정규화된 wearable context만 사용한다.
+도착한 뒤에는 `connected`로 표시한다. 이 상태는 first-party collector 또는
+optional legacy exporter가 현재도 주기적으로 실행 중이라는 보장이 아니므로
+collection state는 `idle`로 유지하고 freshness를 과장하지 않는다. raw payload의
+기본 LLM 노출은 `none`이며, 판단에는 별도로 정규화된 wearable context만 사용한다.
+raw-first는 정상 payload에만 적용되는 설명이 아니라 모든 수신 bytes의 durability
+계약이다. native/legacy 감지 parser가 excessive nesting 등으로 실패해도 raw 저장
+전에 요청을 잃어서는 안 되며 focused API test로 고정한다.
 
 ## 7. UI 구현자가 지켜야 할 계약
 
@@ -655,11 +691,17 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 10. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
    합치지 않는다.
 11. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
+12. iPhone과 macOS는 one-page Settings에서 같은 `/v1/inputs` 서버 정본을
+    렌더링한다. 한 앱의 local copy를 다른 앱의 정본으로 사용하지 않는다.
+13. HealthKit outbox와 anchor는 pairing fingerprint별로 격리하고, durable ACK,
+    hash/size와 accepted forward status 확인 전에는 anchor를 이동하지 않는다.
+14. Health Auto Export를 설치 필수 단계로 안내하지 않는다. 외부 exporter는
+    기존 사용자를 위한 optional legacy adapter로만 표시한다.
 
 ## 8. 비범위와 후속
 
-- iOS/Android/desktop 실제 설정 화면
-- iPhone 권한 설명·설정 UI
+- Android 실제 설정 화면
+- Apple 설정 화면의 제품 polish, 배포 signing과 실기기 접근성 QA
 - Apple entitlement 신청과 실제 기기 dogfood
 - App ID capability, signed provisioning profile과 distribution 검증
 - hosted/mobile-only Personal Data Node

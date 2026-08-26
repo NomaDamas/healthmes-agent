@@ -52,16 +52,34 @@ public enum HealthMesAPIError: Error {
     }
 }
 
+public enum HealthKitUploadRequestError: Error, Equatable, LocalizedError {
+    case emptyBody
+    case invalidIdempotencyKey
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyBody:
+            return "The HealthKit upload body is empty."
+        case .invalidIdempotencyKey:
+            return "The HealthKit Idempotency-Key is invalid."
+        }
+    }
+}
+
 public final class HealthMesAPI {
     public let pairingStore: PairingStore
     private let session: URLSession
+    private let wellnessDecisionTransport: WellnessDecisionTransporting
 
     public init(
         session: URLSession = GlanceClient.makeSession(),
-        pairingStore: PairingStore = .shared
+        pairingStore: PairingStore = .shared,
+        wellnessDecisionTransport: WellnessDecisionTransporting? = nil
     ) {
         self.session = session
         self.pairingStore = pairingStore
+        self.wellnessDecisionTransport =
+            wellnessDecisionTransport ?? WellnessDecisionURLSessionTransport()
     }
 
     // MARK: - Request builders (pure, unit-tested)
@@ -115,6 +133,179 @@ public final class HealthMesAPI {
         return request
     }
 
+    /// `GET /v1/goals` for the current product plan.
+    public static func goalsRequest(
+        pairing: Pairing,
+        weekStart: String? = nil,
+        status: String? = nil,
+        limit: Int = 50
+    ) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/goals", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let weekStart {
+            query.append(URLQueryItem(name: "week_start", value: weekStart))
+        }
+        if let status {
+            query.append(URLQueryItem(name: "status", value: status))
+        }
+        components.queryItems = query
+        request.url = components.url
+        return request
+    }
+
+    /// `GET /v1/tasks`, ordered by the server by deadline.
+    public static func tasksRequest(pairing: Pairing, limit: Int = 100) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/tasks", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        request.url = components.url
+        return request
+    }
+
+    public static func decisionsRequest(pairing: Pairing, limit: Int = 100) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/decisions", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "offset", value: "0"),
+        ]
+        request.url = components.url
+        return request
+    }
+
+    public static func setupReadinessRequest(pairing: Pairing) -> URLRequest {
+        baseRequest(
+            pairing: pairing,
+            path: "v1/setup/readiness",
+            method: "GET"
+        )
+    }
+
+    public static func healthKitUploadRequest(
+        pairing: Pairing,
+        payload: HealthKitIngestPayload
+    ) throws -> URLRequest {
+        let body = try healthKitUploadBody(payload)
+        return try healthKitUploadRequest(
+            pairing: pairing,
+            body: body,
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(for: body)
+        )
+    }
+
+    public static func healthKitUploadBody(
+        _ payload: HealthKitIngestPayload
+    ) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(payload)
+    }
+
+    public static func healthKitUploadRequest(
+        pairing: Pairing,
+        body: Data,
+        idempotencyKey: String
+    ) throws -> URLRequest {
+        guard !body.isEmpty else {
+            throw HealthKitUploadRequestError.emptyBody
+        }
+        guard
+            1...255 ~= idempotencyKey.count,
+            idempotencyKey == idempotencyKey.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ),
+            idempotencyKey.utf8.allSatisfy({
+                $0 >= 0x20 && $0 <= 0x7e
+            })
+        else {
+            throw HealthKitUploadRequestError.invalidIdempotencyKey
+        }
+
+        var request = baseRequest(
+            pairing: pairing,
+            path: "v1/ingest/healthkit",
+            method: "POST"
+        )
+        request.setValue(
+            "application/json",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.setValue(
+            idempotencyKey,
+            forHTTPHeaderField: "Idempotency-Key"
+        )
+        request.httpBody = body
+        return request
+    }
+
+    /// `GET /v1/schedule/events?start=…&end=…`.
+    public static func scheduleEventsRequest(
+        pairing: Pairing,
+        start: Date,
+        end: Date,
+        limit: Int = 100
+    ) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/schedule/events", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        components.queryItems = [
+            URLQueryItem(name: "start", value: formatter.string(from: start)),
+            URLQueryItem(name: "end", value: formatter.string(from: end)),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        request.url = components.url
+        return request
+    }
+
+    public static func wellnessDecisionSubmission(
+        question: String,
+        persistenceRequested: Bool = false,
+        hints: WellnessDecisionHints = WellnessDecisionHints(),
+        idempotencyKey: String
+    ) throws -> WellnessDecisionSubmission {
+        try WellnessDecisionSubmission(
+            input: WellnessDecisionInput(
+                question: question,
+                persistenceRequested: persistenceRequested,
+                hints: hints
+            ),
+            idempotencyKey: idempotencyKey
+        )
+    }
+
+    public static func wellnessDecisionRequest(
+        pairing: Pairing,
+        question: String,
+        persistenceRequested: Bool = false,
+        hints: WellnessDecisionHints = WellnessDecisionHints(),
+        idempotencyKey: String
+    ) throws -> URLRequest {
+        try wellnessDecisionSubmission(
+            question: question,
+            persistenceRequested: persistenceRequested,
+            hints: hints,
+            idempotencyKey: idempotencyKey
+        ).request(pairing: pairing)
+    }
+
+    public static func createGoalRequest(
+        pairing: Pairing,
+        body: WeeklyGoalCreateBody
+    ) throws -> URLRequest {
+        try jsonRequest(pairing: pairing, path: "v1/goals", body: body)
+    }
+
+    public static func createTaskRequest(
+        pairing: Pairing,
+        body: TaskCreateBody
+    ) throws -> URLRequest {
+        try jsonRequest(pairing: pairing, path: "v1/tasks", body: body)
+    }
+
     /// `GET /v1/schedule/proposals/{id}` — direct notification/deep-link lookup.
     public static func proposalRequest(pairing: Pairing, proposalID: UUID) -> URLRequest {
         baseRequest(
@@ -166,11 +357,63 @@ public final class HealthMesAPI {
         return request
     }
 
-    /// `POST /v1/food-logs`.
-    public static func foodLogRequest(
-        pairing: Pairing, body: FoodLogCreateBody
+    public static func nutritionPhotoAnalysisRequest(
+        pairing: Pairing,
+        body: NutritionPhotoAnalysisBody
     ) throws -> URLRequest {
-        try jsonRequest(pairing: pairing, path: "v1/food-logs", body: body)
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/nutrition-observations/analyze",
+            body: body
+        )
+    }
+
+    public static func nutritionObservationReviewRequest(
+        pairing: Pairing,
+        observationID: UUID,
+        body: NutritionObservationReviewBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path:
+                "v1/nutrition-observations/\(observationID.uuidString.lowercased())/review",
+            body: body
+        )
+    }
+
+    public static func intakeAnalysisRequest(
+        pairing: Pairing,
+        body: IntakeInteractionAnalysisBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/intake-interactions/analyze",
+            body: body
+        )
+    }
+
+    public static func photoIntakeRequest(
+        pairing: Pairing,
+        body: PhotoIntakeInteractionBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/intake-interactions",
+            body: body
+        )
+    }
+
+    public static func intakeOutcomeRequest(
+        pairing: Pairing,
+        interactionID: UUID,
+        body: IntakeOutcomeBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path:
+                "v1/intake-interactions/\(interactionID.uuidString.lowercased())/outcomes",
+            body: body
+        )
     }
 
     /// `POST /v1/medical-records` — REST twin of the create_medical_record
@@ -181,12 +424,64 @@ public final class HealthMesAPI {
         try jsonRequest(pairing: pairing, path: "v1/medical-records", body: body)
     }
 
+    public static func storageSettingsRequest(pairing: Pairing) -> URLRequest {
+        baseRequest(pairing: pairing, path: "v1/storage/settings", method: "GET")
+    }
+
+    public static func storageRetentionRequest(
+        pairing: Pairing,
+        dataClass: String,
+        preset: String
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/storage/settings/\(dataClass)",
+            method: "PUT",
+            body: StorageRetentionUpdate(preset: preset)
+        )
+    }
+
+    public static func storageMaintenanceRequest(
+        pairing: Pairing,
+        dryRun: Bool
+    ) -> URLRequest {
+        var request = baseRequest(
+            pairing: pairing,
+            path: "v1/storage/maintenance",
+            method: "POST"
+        )
+        var components = URLComponents(
+            url: request.url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "dry_run", value: dryRun ? "true" : "false")
+        ]
+        request.url = components.url
+        return request
+    }
+
     static func jsonRequest<Body: Encodable>(
         pairing: Pairing, path: String, body: Body
     ) throws -> URLRequest {
-        var request = baseRequest(pairing: pairing, path: path, method: "POST")
+        try jsonRequest(
+            pairing: pairing,
+            path: path,
+            method: "POST",
+            body: body
+        )
+    }
+
+    static func jsonRequest<Body: Encodable>(
+        pairing: Pairing,
+        path: String,
+        method: String,
+        body: Body
+    ) throws -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: path, method: method)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
         request.httpBody = try encoder.encode(body)
         return request
@@ -211,28 +506,256 @@ public final class HealthMesAPI {
     public func listAlerts(hours: Int = 24, limit: Int = 50, offset: Int = 0)
         async throws -> AlertsPage
     {
+        try await listAlerts(
+            pairing: try pairing(),
+            hours: hours,
+            limit: limit,
+            offset: offset
+        )
+    }
+
+    public func listAlerts(
+        pairing: Pairing,
+        hours: Int = 24,
+        limit: Int = 50,
+        offset: Int = 0
+    ) async throws -> AlertsPage {
         let request = Self.alertsRequest(
-            pairing: try pairing(), hours: hours, limit: limit, offset: offset
+            pairing: pairing, hours: hours, limit: limit, offset: offset
         )
         return try await perform(request, expecting: AlertsPage.self)
     }
 
     public func weeklyReport() async throws -> WeeklyReport {
+        try await weeklyReport(pairing: try pairing())
+    }
+
+    public func weeklyReport(pairing: Pairing) async throws -> WeeklyReport {
         try await perform(
-            Self.weeklyReportRequest(pairing: try pairing()), expecting: WeeklyReport.self
+            Self.weeklyReportRequest(pairing: pairing), expecting: WeeklyReport.self
         )
     }
 
     public func listProposals(status: ProposalStatus? = nil) async throws -> ProposalsPage {
+        try await listProposals(pairing: try pairing(), status: status)
+    }
+
+    public func listProposals(
+        pairing: Pairing,
+        status: ProposalStatus? = nil
+    ) async throws -> ProposalsPage {
         try await perform(
-            Self.proposalsRequest(pairing: try pairing(), status: status),
+            Self.proposalsRequest(pairing: pairing, status: status),
             expecting: ProposalsPage.self
         )
     }
 
-    public func getProposal(_ proposalID: UUID) async throws -> ProposalItem {
+    public func listGoals(
+        weekStart: String? = nil,
+        status: String? = nil
+    ) async throws -> WeeklyGoalsPage {
+        try await listGoals(
+            pairing: try pairing(),
+            weekStart: weekStart,
+            status: status
+        )
+    }
+
+    public func listGoals(
+        pairing: Pairing,
+        weekStart: String? = nil,
+        status: String? = nil
+    ) async throws -> WeeklyGoalsPage {
         try await perform(
-            Self.proposalRequest(pairing: try pairing(), proposalID: proposalID),
+            Self.goalsRequest(
+                pairing: pairing,
+                weekStart: weekStart,
+                status: status
+            ),
+            expecting: WeeklyGoalsPage.self
+        )
+    }
+
+    public func listTasks() async throws -> TasksPage {
+        try await listTasks(pairing: try pairing())
+    }
+
+    public func listTasks(pairing: Pairing) async throws -> TasksPage {
+        try await perform(
+            Self.tasksRequest(pairing: pairing),
+            expecting: TasksPage.self
+        )
+    }
+
+    public func listDecisionRecords() async throws -> ProductDecisionsPage {
+        try await listDecisionRecords(pairing: try pairing())
+    }
+
+    public func listDecisionRecords(pairing: Pairing) async throws -> ProductDecisionsPage {
+        try await perform(
+            Self.decisionsRequest(pairing: pairing),
+            expecting: ProductDecisionsPage.self
+        )
+    }
+
+    public func setupReadiness() async throws -> SetupReadiness {
+        try await setupReadiness(pairing: try pairing())
+    }
+
+    public func setupReadiness(pairing: Pairing) async throws -> SetupReadiness {
+        try await perform(
+            Self.setupReadinessRequest(pairing: pairing),
+            expecting: SetupReadiness.self
+        )
+    }
+
+    public func uploadHealthKit(
+        _ payload: HealthKitIngestPayload
+    ) async throws -> HealthKitIngestAck {
+        try await uploadHealthKit(payload, pairing: try pairing())
+    }
+
+    public func uploadHealthKit(
+        _ payload: HealthKitIngestPayload,
+        pairing: Pairing
+    ) async throws -> HealthKitIngestAck {
+        let body = try Self.healthKitUploadBody(payload)
+        return try await uploadHealthKit(
+            body: body,
+            idempotencyKey:
+                HealthKitSyncOutboxIdentity.idempotencyKey(for: body),
+            pairing: pairing
+        )
+    }
+
+    public func uploadHealthKit(
+        body: Data,
+        idempotencyKey: String,
+        pairing: Pairing
+    ) async throws -> HealthKitIngestAck {
+        let ack = try await perform(
+            Self.healthKitUploadRequest(
+                pairing: pairing,
+                body: body,
+                idempotencyKey: idempotencyKey
+            ),
+            expecting: HealthKitIngestAck.self,
+            expectedStatusCode: 202
+        )
+        try ack.validate(exactBody: body)
+        return ack
+    }
+
+    public func listScheduleEvents(start: Date, end: Date) async throws -> CalendarEventsPage {
+        try await listScheduleEvents(
+            pairing: try pairing(),
+            start: start,
+            end: end
+        )
+    }
+
+    public func listScheduleEvents(
+        pairing: Pairing,
+        start: Date,
+        end: Date
+    ) async throws -> CalendarEventsPage {
+        try await perform(
+            Self.scheduleEventsRequest(pairing: pairing, start: start, end: end),
+            expecting: CalendarEventsPage.self
+        )
+    }
+
+    public func createWellnessDecision(
+        question: String,
+        persistenceRequested: Bool = false,
+        hints: WellnessDecisionHints = WellnessDecisionHints(),
+        idempotencyKey: String = WellnessDecisionIdempotencyKey.make(),
+        lens: WellnessLens = .now,
+        timezone: String = TimeZone.current.identifier
+    ) async throws -> WellnessDecisionPresentation {
+        try await createWellnessDecision(
+            question: question,
+            persistenceRequested: persistenceRequested,
+            hints: hints,
+            idempotencyKey: idempotencyKey,
+            lens: lens,
+            timezone: timezone,
+            pairing: try pairing()
+        )
+    }
+
+    public func createWellnessDecision(
+        question: String,
+        persistenceRequested: Bool = false,
+        hints: WellnessDecisionHints = WellnessDecisionHints(),
+        idempotencyKey: String = WellnessDecisionIdempotencyKey.make(),
+        lens: WellnessLens = .now,
+        timezone: String = TimeZone.current.identifier,
+        pairing: Pairing
+    ) async throws -> WellnessDecisionPresentation {
+        let submission = try Self.wellnessDecisionSubmission(
+            question: question,
+            persistenceRequested: persistenceRequested,
+            hints: hints,
+            idempotencyKey: idempotencyKey
+        )
+        let output = try await WellnessDecisionCoordinator(
+            transport: wellnessDecisionTransport
+        ).submit(submission, pairing: pairing)
+        let scene = WellnessDecisionProjector.project(
+            output,
+            lens: lens,
+            timezone: timezone
+        )
+        try WellnessSceneValidator.validate(
+            scene,
+            pairedBaseURL: pairing.baseURL,
+            expectedProposalID: nil
+        )
+        return WellnessDecisionPresentation(
+            output: output,
+            scene: scene
+        )
+    }
+
+    public func createGoal(_ body: WeeklyGoalCreateBody) async throws -> WeeklyGoalItem {
+        try await createGoal(body, pairing: try pairing())
+    }
+
+    public func createGoal(
+        _ body: WeeklyGoalCreateBody,
+        pairing: Pairing
+    ) async throws -> WeeklyGoalItem {
+        try await perform(
+            Self.createGoalRequest(pairing: pairing, body: body),
+            expecting: WeeklyGoalItem.self
+        )
+    }
+
+    public func createTask(_ body: TaskCreateBody) async throws -> TaskItem {
+        try await createTask(body, pairing: try pairing())
+    }
+
+    public func createTask(
+        _ body: TaskCreateBody,
+        pairing: Pairing
+    ) async throws -> TaskItem {
+        try await perform(
+            Self.createTaskRequest(pairing: pairing, body: body),
+            expecting: TaskItem.self
+        )
+    }
+
+    public func getProposal(_ proposalID: UUID) async throws -> ProposalItem {
+        try await getProposal(proposalID, pairing: try pairing())
+    }
+
+    public func getProposal(
+        _ proposalID: UUID,
+        pairing: Pairing
+    ) async throws -> ProposalItem {
+        try await perform(
+            Self.proposalRequest(pairing: pairing, proposalID: proposalID),
             expecting: ProposalItem.self
         )
     }
@@ -242,19 +765,52 @@ public final class HealthMesAPI {
         action: ProposalAction,
         surface: String = "ios_app"
     ) async throws -> ProposalItem {
+        try await resolveProposal(
+            proposal,
+            action: action,
+            surface: surface,
+            pairing: try pairing()
+        )
+    }
+
+    public func resolveProposal(
+        _ proposal: ProposalItem,
+        action: ProposalAction,
+        surface: String = "ios_app",
+        pairing: Pairing
+    ) async throws -> ProposalItem {
         guard let resolutionToken = proposal.resolutionToken(for: action) else {
             throw HealthMesAPIError.httpStatus(422)
         }
-        return try await perform(
-            Self.proposalActionRequest(
-                pairing: try pairing(),
-                proposalID: proposal.id,
-                action: action,
-                resolutionToken: resolutionToken,
-                surface: surface
-            ),
-            expecting: ProposalItem.self
-        )
+        guard
+            let relayLease = PairingRelayGate.shared.begin(
+                pairing: pairing,
+                store: pairingStore
+            )
+        else {
+            throw HealthMesAPIError.notPaired
+        }
+        defer {
+            PairingRelayGate.shared.end(relayLease)
+        }
+        do {
+            return try await pairingStore.withPairingLease(
+                for: pairing
+            ) {
+                try await perform(
+                    Self.proposalActionRequest(
+                        pairing: pairing,
+                        proposalID: proposal.id,
+                        action: action,
+                        resolutionToken: resolutionToken,
+                        surface: surface
+                    ),
+                    expecting: ProposalItem.self
+                )
+            }
+        } catch is PairingError {
+            throw HealthMesAPIError.notPaired
+        }
     }
 
     public func uploadMedia(data: Data, mediaType: CaptureMediaType) async throws -> MediaUpload {
@@ -264,10 +820,61 @@ public final class HealthMesAPI {
         )
     }
 
-    public func createFoodLog(_ body: FoodLogCreateBody) async throws -> FoodLogItem {
+    public func analyzeNutritionPhoto(
+        _ body: NutritionPhotoAnalysisBody
+    ) async throws -> NutritionObservationResult {
         try await perform(
-            Self.foodLogRequest(pairing: try pairing(), body: body),
-            expecting: FoodLogItem.self
+            Self.nutritionPhotoAnalysisRequest(
+                pairing: try pairing(),
+                body: body
+            ),
+            expecting: NutritionObservationResult.self
+        )
+    }
+
+    public func reviewNutritionObservation(
+        observationID: UUID,
+        body: NutritionObservationReviewBody
+    ) async throws -> NutritionObservationReviewResult {
+        try await perform(
+            Self.nutritionObservationReviewRequest(
+                pairing: try pairing(),
+                observationID: observationID,
+                body: body
+            ),
+            expecting: NutritionObservationReviewResult.self
+        )
+    }
+
+    public func analyzeIntake(
+        _ body: IntakeInteractionAnalysisBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.intakeAnalysisRequest(pairing: try pairing(), body: body),
+            expecting: IntakeInteractionResult.self
+        )
+    }
+
+    public func createPhotoIntake(
+        _ body: PhotoIntakeInteractionBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.photoIntakeRequest(pairing: try pairing(), body: body),
+            expecting: IntakeInteractionResult.self
+        )
+    }
+
+    public func confirmIntake(
+        interactionID: UUID,
+        body: IntakeOutcomeBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.intakeOutcomeRequest(
+                pairing: try pairing(),
+                interactionID: interactionID,
+                body: body
+            ),
+            expecting: IntakeInteractionResult.self
         )
     }
 
@@ -280,10 +887,43 @@ public final class HealthMesAPI {
         )
     }
 
+    public func storageSettings() async throws -> StorageSettingsSnapshot {
+        try await perform(
+            Self.storageSettingsRequest(pairing: try pairing()),
+            expecting: StorageSettingsSnapshot.self
+        )
+    }
+
+    public func updateStorageRetention(
+        dataClass: String,
+        preset: String
+    ) async throws -> StorageRetentionPolicy {
+        try await perform(
+            Self.storageRetentionRequest(
+                pairing: try pairing(),
+                dataClass: dataClass,
+                preset: preset
+            ),
+            expecting: StorageRetentionPolicy.self
+        )
+    }
+
+    public func maintainStorage(dryRun: Bool) async throws -> StorageMaintenanceReport {
+        try await perform(
+            Self.storageMaintenanceRequest(
+                pairing: try pairing(),
+                dryRun: dryRun
+            ),
+            expecting: StorageMaintenanceReport.self
+        )
+    }
+
     // MARK: - Transport + envelope mapping
 
     private func perform<Response: Decodable>(
-        _ request: URLRequest, expecting: Response.Type
+        _ request: URLRequest,
+        expecting: Response.Type,
+        expectedStatusCode: Int? = nil
     ) async throws -> Response {
         let data: Data
         let response: URLResponse
@@ -294,6 +934,17 @@ public final class HealthMesAPI {
         }
         guard let http = response as? HTTPURLResponse else {
             throw HealthMesAPIError.httpStatus(-1)
+        }
+        if let expectedStatusCode, http.statusCode != expectedStatusCode {
+            if http.statusCode == 401 {
+                throw HealthMesAPIError.unauthorized(
+                    statusCode: http.statusCode
+                )
+            }
+            throw Self.responseError(
+                statusCode: http.statusCode,
+                data: data
+            )
         }
         switch http.statusCode {
         case 200...299:

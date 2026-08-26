@@ -712,18 +712,16 @@ def _cmd_connect_qr(_args: argparse.Namespace) -> int:
     settings = _cli_settings()
     from healthmes.pairing import build_pairing_url, render_terminal_qr
 
-    payload = build_pairing_url(settings)
+    try:
+        payload = build_pairing_url(settings)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(render_terminal_qr(payload))
     print(f"payload: {payload}")
-    if not settings.api_token.get_secret_value().strip():
-        print(
-            "note: no HEALTHMES_API_TOKEN configured — the QR pairs URL only "
-            "(fine for a loopback-only instance)."
-        )
     print(
-        "Scan with the HealthMes companion app, or copy the url/token into "
-        "a bridge app (e.g. Health Auto Export → REST API target "
-        f"{settings.public_base_url.rstrip('/')}/v1/ingest/healthkit)."
+        "Scan with the HealthMes companion app within five minutes. The QR "
+        "contains a one-time code, never the long-lived API token."
     )
     return 0
 

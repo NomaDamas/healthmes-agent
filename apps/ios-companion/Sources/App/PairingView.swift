@@ -12,11 +12,12 @@ struct PairingView: View {
     @State private var token: String = ""
     @State private var status: String = ""
     @State private var busy = false
+    @State private var showUnpairConfirmation = false
 
     var body: some View {
         Form {
             Section {
-                TextField(text: $baseURL, prompt: Text(verbatim: "http://192.168.1.20:8100")) {
+                TextField(text: $baseURL, prompt: Text(verbatim: "https://healthmes.example.com")) {
                     Text("Base URL")
                 }
                 .keyboardType(.URL)
@@ -28,10 +29,10 @@ struct PairingView: View {
                 }
                 .accessibilityLabel(Text("API token"))
             } header: {
-                Text("Your HealthMes instance")
+                Text("Manual connection")
             } footer: {
                 Text(
-                    "The URL of your own healthmes service (HEALTHMES_API_TOKEN from its .env). This is the only server this app ever contacts."
+                    "Advanced fallback only. The normal setup uses Tailscale and a one-time QR, so no URL or API token is typed."
                 )
             }
 
@@ -49,7 +50,7 @@ struct PairingView: View {
                 }
                 .disabled(busy)
                 Button(role: .destructive) {
-                    unpair()
+                    showUnpairConfirmation = true
                 } label: {
                     Text("Unpair")
                 }
@@ -73,6 +74,20 @@ struct PairingView: View {
             }
         }
         .onAppear(perform: loadExisting)
+        .confirmationDialog(
+            "Disconnect HealthMes?",
+            isPresented: $showUnpairConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Unpair and delete queued uploads", role: .destructive) {
+                unpair()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Unsent Apple Health batches and sync cursors for this pairing are deleted from this iPhone. If the encrypted queue is unreadable, HealthMes may delete the entire local Apple Health upload queue, including queued batches for other pairings, so corrupted encrypted data cannot remain. Data already stored on the server is unchanged."
+            )
+        }
     }
 
     private var statusPlaceholder: String {
@@ -87,31 +102,48 @@ struct PairingView: View {
     }
 
     private func save() {
-        do {
-            let pairing = try PairingStore.shared.save(baseURLString: baseURL, token: token)
-            PhoneWatchSync.shared.pushPairing(
-                baseURL: pairing.baseURL.absoluteString,
-                token: pairing.token ?? ""
-            )
-            WidgetCenter.shared.reloadAllTimelines()
-            status = String(
-                localized: "Paired with \(pairing.baseURL.absoluteString). Widgets will refresh."
-            )
-            NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
-            Task {
+        busy = true
+        Task { @MainActor in
+            do {
+                let candidate = try PairingStore.validatedPairing(
+                    baseURLString: baseURL,
+                    token: token
+                )
+                let pairing = try await HealthKitSyncManager.shared.replacePairing(
+                    with: candidate
+                )
+                PhoneWatchSync.shared.pushPairing(
+                    baseURL: pairing.baseURL.absoluteString,
+                    token: pairing.token ?? ""
+                )
+                WidgetCenter.shared.reloadAllTimelines()
+                status = String(
+                    localized: "Paired with \(pairing.baseURL.absoluteString). Widgets will refresh."
+                )
+                NotificationCenter.default.post(
+                    name: .healthmesPairingChanged,
+                    object: nil
+                )
                 // Ask for notification permission now that alerts can exist,
                 // and mark the current history as seen so enabling
                 // notifications never replays old alerts as new ones.
                 _ = await NotificationManager.shared.requestAuthorization()
-                if let page = try? await HealthMesAPI().listAlerts(hours: 24) {
-                    SeenAlertsStore.shared.primeWithoutNotifying(page.data)
-                } else {
-                    SeenAlertsStore.shared.deferPrimingUntilNextFeed()
-                }
+                let page = try? await HealthMesAPI().listAlerts(
+                    pairing: pairing,
+                    hours: 24
+                )
+                SeenAlertsStore.shared.applyPairingScopedBaseline(
+                    page?.data,
+                    for: pairing
+                )
                 BackgroundRefreshManager.shared.schedule()
+                await HealthKitSyncManager.shared.requestAuthorizationAndSync()
+                busy = false
+            } catch {
+                await HealthKitSyncManager.shared.pairingDidChange()
+                busy = false
+                status = error.localizedDescription
             }
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -144,7 +176,22 @@ struct PairingView: View {
     }
 
     private func unpair() {
-        PairingStore.shared.clear()
+        busy = true
+        Task { @MainActor in
+            do {
+                try await HealthKitSyncManager.shared.unpair()
+                finishUnpair()
+            } catch {
+                busy = false
+                status = String(
+                    localized:
+                        "Could not safely unpair because the encrypted Apple Health queue could not be removed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func finishUnpair() {
         GlanceSnapshotCache.shared.clear()
         SeenAlertsStore.shared.clear()
         PhoneWatchSync.shared.pushUnpair()
@@ -152,6 +199,7 @@ struct PairingView: View {
         token = ""
         baseURL = ""
         status = String(localized: "Not paired")
+        busy = false
         NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
     }
 }

@@ -117,6 +117,26 @@ public struct ReportScheduleAdherence: Codable, Equatable {
     }
 }
 
+public struct ReportScheduleBreakdown: Equatable {
+    public let syncPending: Int
+    public let applied: Int
+    public let declined: Int
+    public let pending: Int
+}
+
+public extension ReportScheduleAdherence {
+    /// UI-facing counts preserve the server's accepted/pushed distinction:
+    /// accepted is approved but awaiting sync; pushed is on the calendar.
+    var displayBreakdown: ReportScheduleBreakdown {
+        ReportScheduleBreakdown(
+            syncPending: accepted,
+            applied: pushed,
+            declined: declined,
+            pending: proposed
+        )
+    }
+}
+
 public struct ReportAlertDigest: Codable, Equatable {
     public let fired: Int
     public let delivered: Int

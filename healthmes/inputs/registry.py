@@ -339,10 +339,11 @@ _SOURCES = (
         actions=(
             InputActionDescriptor(
                 action="connect",
-                execution="external",
+                execution="device",
                 description=(
-                    "Configure a HealthKit auto-export app to send data to "
-                    "the HealthMes receiver."
+                    "Authorize Apple Health in the paired HealthMes iPhone "
+                    "app. No separate exporter app or provider API key is "
+                    "required."
                 ),
             ),
             InputActionDescriptor(
@@ -351,8 +352,9 @@ _SOURCES = (
                 method="POST",
                 endpoint="/v1/ingest/healthkit",
                 description=(
-                    "External exporters POST HealthKit payloads to this "
-                    "raw-first receiver."
+                    "The first-party HealthMes iPhone collector uploads "
+                    "encrypted HealthKit batches to this raw-first receiver; "
+                    "legacy external exporters may use the same endpoint."
                 ),
             ),
         ),
@@ -369,7 +371,7 @@ _SOURCES = (
             ),
         ),
         limitations=(
-            "healthkit_exporter_configuration_is_external",
+            "healthkit_collection_requires_healthmes_ios_companion",
             "healthkit_delivery_freshness_is_not_observed",
         ),
     ),
@@ -391,14 +393,26 @@ _SOURCES = (
             InputActionDescriptor(
                 action="connect",
                 execution="external",
+                method="GET",
+                endpoint="/v1/wearables/{provider}/authorize",
                 description=(
-                    "Connect wearable providers in the Open Wearables service."
+                    "Open the server-managed OAuth flow for one supported "
+                    "wearable provider."
                 ),
             ),
             InputActionDescriptor(
                 action="sync",
                 execution="external",
+                method="POST",
+                endpoint="/v1/wearables/{provider}/sync",
                 description="Run provider synchronization in Open Wearables.",
+            ),
+            InputActionDescriptor(
+                action="disconnect",
+                execution="external",
+                method="POST",
+                endpoint="/v1/wearables/{provider}/disconnect",
+                description="Disconnect one wearable provider.",
             ),
         ),
         privacy=InputPrivacyProfile(
@@ -410,6 +424,10 @@ _SOURCES = (
                 "HealthMes stores normalized provenance snapshots, not provider "
                 "credentials.",
             ),
+        ),
+        limitations=(
+            "open_wearables_configuration_is_server_managed",
+            "wearable_provider_details_in_management_hub",
         ),
     ),
     _SourceSpec(

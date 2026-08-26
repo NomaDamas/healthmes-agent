@@ -145,7 +145,7 @@
     stroke: var(--brand); stroke-width: 2.4;
     filter: drop-shadow(0 1px 4px rgba(18, 128, 108, 0.35));
   }
-  g.fnode.chosen .ntype { fill: #0b5c4d; }
+  g.fnode.chosen .ntype { fill: var(--brand-deep); }
   g.fnode.rejected { opacity: 0.45; }
   g.fnode.selected .ncard { stroke: #22312a; stroke-width: 2; }
   .bud { fill: var(--ink-3); font-size: 10px; text-anchor: middle; font-weight: 700; }
@@ -451,7 +451,7 @@
 
       {% if graph.truncated %}
       <p class="muted">트리가 커서 앞쪽 {{ graph.node_index | length }}개 노드만 표시했습니다 —
-        전체 트리는 <a href="/decisions/{{ record.id }}.json{{ token_qs }}">JSON 보기</a>에 있습니다.</p>
+        전체 트리는 <a href="{{ app_path('/decisions/' ~ record.id ~ '.json') }}{{ token_qs }}">JSON 보기</a>에 있습니다.</p>
       {% endif %}
     </div>
 
@@ -506,8 +506,8 @@
 </section>
 
 <p class="muted foot-links">
-  <a href="/decisions/{{ record.id }}.json{{ token_qs }}">JSON 보기</a> ·
-  <a href="/decisions{{ token_qs }}">전체 결정 기록</a>
+  <a href="{{ app_path('/decisions/' ~ record.id ~ '.json') }}{{ token_qs }}">JSON 보기</a> ·
+  <a href="{{ app_path('/decisions') }}{{ token_qs }}">전체 결정 기록</a>
 </p>
 {% endblock %}
 
@@ -515,7 +515,7 @@
 {% if graph.root %}
 <script type="application/json" id="node-data">{{ graph.node_index | tojson }}</script>
 <script type="application/json" id="type-labels">{{ node_type_labels | tojson }}</script>
-<script src="/static/mermaid.min.js"></script>
+<script src="{{ app_path('/static/mermaid.min.js') }}{{ token_qs }}"></script>
 <script>
 (function () {
   "use strict";

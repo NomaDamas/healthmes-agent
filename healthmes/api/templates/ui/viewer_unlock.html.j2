@@ -1,0 +1,51 @@
+{% extends "ui/_base.html.j2" %}
+
+{% block title %}잠금 해제 — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ Unlock</span>{% endblock %}
+
+{% block head %}
+<style>
+  .unlock-wrap { max-width: 29rem; margin: clamp(2rem, 10vh, 6rem) auto; }
+  .unlock-wrap .card { padding: clamp(1.2rem, 5vw, 2rem); }
+  .unlock-form { display: grid; gap: 0.7rem; margin-top: 1.2rem; }
+  .unlock-form label { font-size: 0.82rem; font-weight: 700; }
+  .unlock-form input {
+    width: 100%; border: 1px solid var(--line); border-radius: 12px;
+    background: var(--glass-solid); color: var(--ink);
+    padding: 0.75rem 0.85rem; font: inherit;
+  }
+  .unlock-form button {
+    border: 0; border-radius: 12px; background: var(--brand);
+    color: white; padding: 0.75rem 1rem; font: inherit; font-weight: 750;
+    cursor: pointer;
+  }
+  .requested-path {
+    display: block; margin-top: 0.8rem; padding: 0.55rem 0.7rem;
+    border-radius: 10px; background: var(--surface-2);
+    color: var(--ink-2); overflow-wrap: anywhere;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="unlock-wrap">
+  <section class="card">
+    <p class="eyebrow">Private health dashboard</p>
+    <h1>HealthMes를 잠금 해제하세요</h1>
+    <p class="muted">건강·일정 데이터는 보호되어 있습니다. 가장 쉬운 방법은 연결된 HealthMes 앱에서 “웹 대시보드 열기”를 누르는 것입니다.</p>
+    <code class="requested-path">{{ next_path }}</code>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <form class="unlock-form" method="post" action="{{ app_path('/unlock') }}">
+      <input type="hidden" name="next" value="{{ next_path }}">
+      <label for="viewer-token">읽기 전용 viewer key</label>
+      <input id="viewer-token" type="password" name="viewer_token"
+        autocomplete="off" required>
+      <button type="submit">읽기 전용으로 열기</button>
+    </form>
+    <details class="progressive">
+      <summary>고급: viewer key는 무엇인가요?</summary>
+      <p class="muted">API 쓰기 권한이 없는 읽기 전용 키입니다. 일반 사용자는 이 값을 직접 다루지 않고, 연결된 앱이 안전한 URL을 만들어 엽니다.</p>
+    </details>
+  </section>
+</div>
+{% endblock %}

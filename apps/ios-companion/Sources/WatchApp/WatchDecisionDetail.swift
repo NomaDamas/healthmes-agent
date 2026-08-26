@@ -11,6 +11,7 @@ struct WatchDecisionDetail: Identifiable {
     let before: Date?
     let after: Date?
     let endsAt: Date?
+    let expiresAt: Date?
 }
 
 @MainActor
@@ -21,6 +22,20 @@ final class WatchDecisionInbox: ObservableObject {
 
     func present(content: UNNotificationContent) {
         let info = content.userInfo
+        guard
+            PairingContextCoordinator.matchingSourcePairing(
+                fingerprint: info[
+                    AlertNotificationContent.userInfoPairingFingerprint
+                ] as? String,
+                generation: PairingScope.generation(
+                    from: info[
+                        AlertNotificationContent.userInfoPairingGeneration
+                    ]
+                )
+            ) != nil
+        else {
+            return
+        }
         let formatter = ISO8601DateFormatter()
         detail = WatchDecisionDetail(
             prompt: content.title,
@@ -33,8 +48,14 @@ final class WatchDecisionInbox: ObservableObject {
             after: (info[AlertNotificationContent.userInfoDecisionAfter] as? String)
                 .flatMap(formatter.date(from:)),
             endsAt: (info[AlertNotificationContent.userInfoDecisionEndsAt] as? String)
+                .flatMap(formatter.date(from:)),
+            expiresAt: (info[AlertNotificationContent.userInfoDecisionExpiresAt] as? String)
                 .flatMap(formatter.date(from:))
         )
+    }
+
+    func clear() {
+        detail = nil
     }
 }
 
@@ -84,6 +105,11 @@ struct WatchDecisionDetailView: View {
                     Text(action)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+                if let expiresAt = detail.expiresAt {
+                    Text("Available until \(expiresAt, style: .time)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

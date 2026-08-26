@@ -1,29 +1,94 @@
 # HealthMes iOS/watchOS Companion
 
-Full native companion app for HealthMes Agent (GitHub issue #10, building on
-the #7 glance plumbing): live the whole daily loop on the phone — see the
-briefing, act on an alert, capture food/medication, check "why?" — with
-Telegram optional rather than required. Plus the #7 surfaces: WidgetKit
-home/lock-screen widgets and the watchOS app + complications.
+Full native companion app for HealthMes Agent (issues #7, #10, #91, and
+#108). The iPhone presents one bounded wellness control canvas with a
+persistent voice/editable-text dock, real calendar blocks, and one primary
+decision. Apple Watch remains a deliberately smaller three-second Yes/No
+decision remote.
 
 Local-first, like `apps/android-usage`: the paired base URL is the **only**
 network destination in the whole project — no third-party endpoint, no
 analytics, no push relay. The watch receives the pairing from the phone over
 WatchConnectivity and then talks to the instance directly.
 
+The paired instance is expected to run continuously on the user's Mac or
+Linux machine. A physical iPhone cannot reach that machine through
+`localhost`; production pairing requires a trusted HTTPS
+`HEALTHMES_PUBLIC_BASE_URL`.
+
+## Main 통합 책임 경계
+
+Apple 앱은 Main runtime을 복제하지 않는 client layer다. 세 경로를 분리한다.
+
+```text
+일반 데이터/설정
+iPhone · macOS · Watch -> Main REST API + /v1/inputs
+
+자연어 wellness 판단
+iPhone · macOS voice/text -> POST /v1/wellness-decisions
+                            -> Decision Service -> Hermes -> HealthMes MCP
+
+Apple Health 수집
+Apple Watch -> iPhone HealthKit -> pairing별 encrypted outbox
+            -> POST /v1/ingest/healthkit
+            -> durable ACK + accepted forward status -> anchor 확정
+```
+
+Dashboard, alert, task, schedule와 settings는 Main REST 응답이 정본이다. 앱은
+Hermes, HealthMes MCP 또는 Open Wearables를 직접 호출하지 않는다. 자유 형식
+질문만 `/v1/wellness-decisions`를 사용한다.
+
+iPhone과 macOS는 각각 하나의 Settings 화면에서
+`GET /v1/setup/readiness`와 `GET /v1/inputs`를 함께 렌더링한다. source 변경은
+상세 GET의 strong `ETag`를 `If-Match`로 보내며, 두 앱은 같은 서버 정본을 다시
+읽어 동기화한다. Mac 설정 blob을 iPhone에 복사하지 않고 Open Wearables,
+Hermes와 calendar credential도 서버 밖으로 내보내지 않는다.
+
+HealthKit 통합의 완료 조건은 collector가 exact request bytes와 stable
+`Idempotency-Key`, candidate anchors를 encrypted outbox에 먼저 저장하는 것이다.
+outbox와 anchor는 `Pairing.cacheFingerprint`별로 격리한다. HTTP `202`,
+`durable=true`, 일치하는 `sha256`와 `size_bytes`, 그리고 accepted forward
+status를 받은 뒤에만 anchor를 확정하고 queue item을 삭제한다.
+`forward_failed` 또는 `skipped_no_user`이거나 응답이 유실되면 같은 key와 같은
+bytes로 재시도한다.
+
+외부 Health Auto Export 계열 앱은 optional legacy adapter다. 별도 exporter를
+설치하지 않아도 first-party iPhone collector가 동기화하는 것이 기본이며, 서버는
+기존 headerless payload 자동화를 깨뜨리지 않기 위해 같은 ingest endpoint의
+legacy parsing을 유지한다.
+
+현재 `HealthKitSyncManager`는 exact bytes와 candidate anchors를 AES-GCM
+outbox에 먼저 저장하고, stable `Idempotency-Key`로 재전송하며, 서버의 durable
+hash/size ACK와 accepted forward status를 검증한 뒤 anchor를 확정한다. queue,
+pause와 last-upload 상태는 pairing fingerprint별로 격리되고 Settings에서 retry,
+pause/resume와 현재 pairing의 queue 삭제를 제어한다. simulator contract/outbox test와 unsigned build는
+저장소 검증 범위이며, 실제 권한 prompt, Watch-origin sample과 background cadence는
+signed hardware QA가 필요하다. 상세 계약은
+[`APPLE-MAIN-INTEGRATION.ko.md`](../../docs/APPLE-MAIN-INTEGRATION.ko.md)를
+따른다.
+
 ## What the app does
 
-- **Briefing home** — energy score + hand-drawn 24 h curve (honest gaps for
-  `null` hours, current-hour marker), next blocks, pending schedule
-  proposals with a real §8.5 button row, unresolved-alert list, latest
-  decision link. Pull-to-refresh; the glance leg stays ETag-cheap (304).
+- **Issue #108 core IA** — one current wellness conclusion, at most one
+  useful visualization, Apple/Google calendar blocks, one primary decision,
+  and progressive Web detail. Explore/Settings keeps history, diagnostics,
+  pairing, and storage out of the daily path.
+- **Bounded command canvas** — voice and editable text share one dock.
+  Commands return a bounded generated scene rather than an infinite chat
+  transcript. Read-only questions cannot leak mutation controls; supported
+  writes still require an exact proposal and explicit confirmation.
+- **Today** — one Now energy state, one Next calendar block, and one
+  explicit decision question. Yes/No calls the real schedule endpoint;
+  reasoning and the exact web decision remain progressively disclosed.
+  Pull-to-refresh keeps the glance leg ETag-cheap (304).
 - **Alert list in §8.5 grammar** (`GET /v1/alerts`) — observation line
   (`summary`), evidence line rendered from the `evidence` facts, proposal
   line, relative fired-time, "Why this?" → in-app decision viewer. Lines the
   payload does not carry are dropped, never invented.
-- **Real alert actions** — ✅ Apply → `POST /v1/schedule/proposals/{id}/accept`,
-  ❌ Keep as is → `…/decline`, ✏️ Adjust → proposal detail sheet. A second
-  tap elsewhere (or in Telegram) surfaces as the server's 409
+- **Real decision actions** — Yes →
+  `POST /v1/schedule/proposals/{id}/accept`, No → `…/decline`; the in-app
+  detail sheet retains the longer Apply/Keep wording where context is
+  visible. A second tap elsewhere (or in Telegram) surfaces as the server's 409
   `invalid_transition` → rendered "Already resolved (accepted/declined)".
   App actions return the action-scoped `resolution_token` from the authenticated
   pending-proposal response.
@@ -36,27 +101,37 @@ WatchConnectivity and then talks to the instance directly.
   viewer links (native Done/share come free). Links always come from the
   paired instance's own payloads; `healthmes://decision?url=…` deep links
   are additionally host-checked against the pairing.
-- **Capture** — camera (device only) / photo picker / voice memo →
-  `POST /v1/media` (multipart, field `file`; photos re-encoded to JPEG,
-  memos AAC-in-m4a = `audio/mp4`) → `POST /v1/food-logs` or
-  `POST /v1/medical-records` with a description the user edits first.
-  Offline-friendly: a failed step keeps text + attachment + any already-
-  uploaded `media_path`, so Retry never re-uploads or loses data. Medical
-  captures send capture metadata only (`context.capture`); the server
-  attaches its own health snapshot (`context.health`).
-- **Native notifications** (parity with Android's `AlertNotifier`) —
+- **Capture** — camera (device only) / photo picker / text / voice memo.
+  Nutrition follows analyze → user review → interaction → explicit outcome:
+  photos use `POST /v1/nutrition-observations/analyze` and
+  `POST /v1/nutrition-observations/{id}/review`; text/voice use
+  `POST /v1/intake-interactions/analyze`; only a separate
+  `POST /v1/intake-interactions/{id}/outcomes` records consumed,
+  not-consumed, or cancelled. Analysis and `log_consumed` intent are not
+  consumption proof. Medication/symptom capture keeps
+  `POST /v1/medical-records`. Offline retry must retain the same operation
+  IDs, timestamp, media token, and stage so it cannot duplicate a meal or
+  silently skip review.
+- **Native notifications** (issue #91, parity with Android's `AlertNotifier`) —
   BGAppRefreshTask + foreground sync poll `GET /v1/alerts`, diff against a
   seen-store (exactly-once per alert), and post local notifications in the
   §8.5 grammar: observation title, evidence+proposal body, per-rule thread.
-  ✅/✏️/❌ actions are attached **only when exactly one pending proposal
-  exists** (no alert→proposal FK exists yet, so that is the only case where
-  "Apply" is unambiguous) and call the real endpoints from the action
+  No/Yes actions are attached only to the exact `proposal_id` correlated by
+  the server and call the real endpoints from the action
   handler, confirming with an outcome notification. Tap-through opens the
   decision viewer. Badge = unresolved count.
 - **Live Activity** — current focus block (from glance `next_blocks`) on
   the lock screen / Dynamic Island with timer progress; started on
   foreground refresh, updated by the background task, `staleDate = block
   end` so iOS dims it when no budget arrives. Polling only — no push token.
+- **Apple Health sync** — the iPhone requests read access for supported
+  heart, HRV, respiratory, oxygen, activity, distance, wrist-temperature,
+  sleep-stage, and workout samples. Incremental anchored queries produce the
+  native `healthmes.healthkit.v1` contract. The integration contract queues
+  exact bytes in a pairing-scoped encrypted outbox and advances anchors only
+  after a durable, hash-matched server ACK. Observer queries, hourly
+  background delivery, app activation, and first pairing all request a sync.
+  Apple Watch samples are read once through the phone's HealthKit store.
 - **Localization & accessibility** — all app strings ko+en via
   `Resources/Localizable.xcstrings` (server-provided text renders
   verbatim); Dynamic Type throughout (verified at accessibility-large);
@@ -84,12 +159,42 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 
 | Endpoint | Used by |
 |---|---|
+| `GET /v1/setup/readiness` | one-page iPhone/macOS setup readiness |
+| `GET /v1/inputs`, `GET /v1/inputs/{source_id}`, `PUT …/settings` | server-owned input settings shared by iPhone and Mac |
 | `GET /v1/briefing/glance` (ETag/304, max-age 300) | home, widgets, watch, Live Activity |
 | `GET /v1/alerts?hours=24` (§8.5 grammar items) | home alert list, notifications |
 | `GET /v1/schedule/proposals?status=proposed` + `POST …/{id}/accept\|decline` | proposal cards, notification actions |
+| `GET /v1/goals`, `POST /v1/goals` | Plan goals, spoken weekly goals |
+| `GET /v1/tasks`, `POST /v1/tasks` | Plan tasks, spoken tasks |
+| `GET /v1/schedule/events?start=…&end=…` | Plan calendar timeline |
 | `GET /reports/weekly.json` | report tab |
 | `POST /v1/media` (multipart `file`) + `GET /v1/media/{path}` | capture upload / preview URL |
-| `POST /v1/food-logs`, `POST /v1/medical-records` | capture save |
+| `POST /v1/nutrition-observations/analyze` + `POST …/{id}/review` | photo analysis and explicit owner review |
+| `POST /v1/intake-interactions/analyze`, `POST /v1/intake-interactions` | text/voice analysis and reviewed photo capture |
+| `POST /v1/intake-interactions/{id}/outcomes` | explicit consumed/not-consumed/cancelled result |
+| `POST /v1/medical-records` | medication/symptom capture |
+| `POST /v1/wellness-decisions` | natural-language wellness reasoning only |
+| `POST /v1/ingest/healthkit` (`healthmes.healthkit.v1`) | native HealthKit upload |
+
+HealthKit retries must reuse one outbox item's exact bytes and
+`Idempotency-Key`. The server's durable ACK must match those bytes and report
+an accepted forwarding state before the pairing-scoped anchors advance.
+Forwarding failures keep both the server receipt and encrypted iPhone outbox
+retryable without advancing the stored HealthKit anchor. Ordinary transport,
+`5xx`, durable `forward_failed`, and `skipped_no_user` responses remain on
+exponential backoff. A permanent client-side rejection is retained as an
+observable terminal entry and blocks only the affected HealthKit lanes until
+the owner retries or removes it; independent lanes may continue. Legacy
+uncommitted terminal entries created by the retired cursor-commit policy are
+migrated back to retryable state on the next drain. HealthKit deletion
+tombstones are retained in the native payload and raw store. The current server
+returns `503 healthkit_deletion_pending` for such a batch because the Open
+Wearables SDK contract has no deletion endpoint; the iPhone keeps the encrypted
+outbox item and deletion anchor pending rather than claiming synchronization.
+For compatibility, a legacy `202` with
+`forward_status=deletions_recorded` is also treated as retryable and never as an
+accepted anchor state. Normalized derivatives may remain until that upstream
+contract adds deletion support.
 
 Contracts are pinned twice: Swift decoding tests against
 `Tests/Fixtures/{glance,alerts,weekly_report}.json`, and those same three
@@ -99,12 +204,12 @@ fixture sets validate against the server's pydantic models in CI —
 `weekly_report.json` against `WeeklyReportOut`. Editing any fixture without
 running the Python suite will fail the server-side pinning test.
 
-Datetime note: glance/alerts serialize aware-UTC (`…Z`); store-backed
-endpoints (proposals, food logs) serialize sqlite's **naive** UTC datetimes
+Datetime note: glance/alerts serialize aware-UTC (`…Z`); some store-backed
+endpoints serialize sqlite's **naive** UTC datetimes
 (`2026-07-11T14:23:10.355753`). `GlanceJSON.parseISO8601` accepts both —
 found live, covered by `testAcceptsNaiveUTCTimestamps`.
 
-## Generate & build (simulator only)
+## Generate and build
 
 Requirements: Xcode 26.x with iOS **and watchOS** platform components, and
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
@@ -134,7 +239,11 @@ xcodebuild test -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion
   -destination "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2" CODE_SIGNING_ALLOWED=NO
 ```
 
-Signing is deliberately untouched (`CODE_SIGNING_ALLOWED=NO` everywhere).
+CI and simulator commands remain unsigned. For hardware QA, select one
+development team for every app/extension target. If the default identifiers
+conflict with another account, override the project settings
+`HEALTHMES_BUNDLE_ID_PREFIX` and `HEALTHMES_APP_GROUP_ID`. See
+`docs/qa/APPLE-REAL-DEVICE-QA.ko.md`.
 
 ## Live smoke test (what "works" means here)
 
@@ -161,29 +270,31 @@ xcodebuild test … -only-testing:HealthMesCompanionUITests
 
 ## Pairing flow
 
-1. Serve your instance. Same-machine simulator: `http://127.0.0.1:8100`
-   works with no token (loopback-open). Real devices need the LAN bind:
-   `HEALTHMES_HOST=0.0.0.0` **and** `HEALTHMES_API_TOKEN=<token>` in `.env`.
-2. First launch shows the pairing screen (later: Settings → Instance
-   pairing): base URL + token → **Save pairing** → **Test connection**
-   performs a real glance fetch. Saving also requests notification
-   permission and primes the alert seen-store so old alerts never replay.
-3. Widgets read the pairing through the App Group
+1. In the Mac app, choose **Settings → Set up this Mac**.
+2. Scan the five-minute QR with the iPhone Camera. iOS opens
+   `healthmes://pair`, exchanges the signed one-time code, stores the returned
+   token in Keychain, shows the connection result, and starts the first sync.
+   The QR never contains the long-lived bearer token.
+3. Advanced users can still enter an existing instance's base URL and token
+   manually under **Settings → Advanced → Self-host pairing**.
+4. Widgets read the pairing through the App Group
    (`group.com.healthmes.companion`); the token lives in the Keychain (App
    Group access group, unsigned-simulator fallback documented in
    `Pairing.swift`). The watch gets it over WatchConnectivity.
-4. **Unpair** clears pairing, snapshot cache, seen-alerts store and the watch.
+5. Input settings are not copied through WatchConnectivity. iPhone and Mac
+   read the same server-owned `/v1/inputs` descriptors.
+6. **Unpair** clears pairing, snapshot cache, seen-alerts store and the watch.
+   It also deletes the old pairing's encrypted HealthKit queue, anchors,
+   pause state and last-upload timestamp from this iPhone. Data already
+   stored on the server is unchanged.
 
-Plain-HTTP note: the ATS exception is **scoped to local networking**
-(`NSAllowsLocalNetworking`, not a global `NSAllowsArbitraryLoads`): the
-typical target `http://<LAN-IP>:8100` works regardless (ATS never applies
-to IP-literal URLs), and `.local`/unqualified hostnames — `localhost`
-included — are allowed. Plain HTTP to a qualified public DNS name (e.g. a
-Tailscale MagicDNS name) fails closed — use HTTPS there; the bearer token
-and tokenized viewer URLs must never cross an untrusted network in clear
-text. (Android's `usesCleartextTraffic` stays global: its pairing host is
-user-typed at runtime, and Android's network-security-config can only
-allowlist statically known domains.)
+Transport policy: production pairing requires **HTTPS**. Plain HTTP is
+accepted only for same-device loopback hosts (`localhost`, `127.0.0.0/8`,
+`::1`) used by local development and the Mac runtime. Private-LAN HTTP is
+rejected before a long-lived bearer token can be stored or returned. The
+scoped `NSAllowsLocalNetworking` entitlement remains for loopback tooling;
+it is not permission to pair over cleartext LAN. A Mac setup QR is offered
+to iPhone only when the configured public base URL is HTTPS.
 
 ## Layout
 
@@ -203,7 +314,7 @@ Sources/Shared/              # PLATFORM-AGNOSTIC (Foundation+Security only;
   AlertsContract.swift         GET /v1/alerts models + Page envelope
   ReportContract.swift         GET /reports/weekly.json models
   ScheduleContract.swift       proposals + accept/decline vocabulary
-  CaptureContract.swift        media upload + food/medical bodies
+  CaptureContract.swift        media + nutrition staged-write + medical bodies
   HealthMesAPI.swift           request builders + client + error envelope
   NotificationContent.swift    §8.5 grammar → notification content (pure)
   SeenAlertsStore.swift        exactly-once alert notification bookkeeping
@@ -242,11 +353,12 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   collector path was not compiled or exercised.
 - **4 UI acceptance tests passed against a LIVE instance** (`python -m healthmes
   serve` on :8199, seeded alert/proposal/energy rows): briefing home
-  rendered live data; Report tab rendered live `weekly.json`; Capture form
-  saved a real food log (`source: "ios-app"` row verified server-side);
-  ✅ Apply flipped the seeded proposal to `accepted` server-side and the
-  accepted block then appeared in glance `next_blocks`. Tests self-skip
-  (never fail) without a live pairing, so plain CI runs stay green.
+  rendered live data; Report tab rendered live `weekly.json`; Yes flipped
+  the seeded proposal to `accepted` server-side and the accepted block then
+  appeared in glance `next_blocks`. The earlier capture smoke predates the
+  review-first nutrition contract and is not evidence for the current
+  analyze/review/outcome flow; that flow requires a new live QA pass. Tests
+  self-skip (never fail) without a live pairing, so plain CI runs stay green.
 - **Capture chain proven with the app's own bytes**: `Sources/Shared`
   compiled verbatim into a macOS CLI (also proving the issue-#11 reuse
   claim), which uploaded via `POST /v1/media` (201), created a medical
@@ -450,14 +562,18 @@ See `docs/INPUT-CONTROL-PLANE.ko.md`.
   support them but starting requires app-foreground timing not driven in
   tests), notification banner delivery + action buttons under a real OS
   budget (content builder unit-tested; delivery path not UI-automated).
+- **HealthKit hardware behavior is unproven.** Authorization and query code
+  compile, but real permission prompts, observer cadence, anchored-query
+  recovery, and Apple Watch-origin samples require a signed hardware QA pass.
 - **WatchConnectivity pairing sync** still not exercised end-to-end (needs
   a paired phone+watch simulator pair or hardware); the watch app renders
   its "not paired" guidance until the first sync lands. Watch surfaces
   remain #7-era placeholders by design (expert worksheet pending).
 - **No push notifications** — polling only; APNs relay is deliberately out
   of scope (local-first). Telegram stays the guaranteed channel.
-- **No signing/distribution** — no team/profiles; the watch app is not
-  embedded into the iPhone app for distribution.
+- **No release signing/distribution** — no repository-owned team, profiles,
+  TestFlight, or App Store setup. The Watch app is embedded in the iPhone
+  target, and local developer signing is documented for hardware QA.
 - Voice-capture transcription is manual (a transcript field) — no on-device
   speech-to-text yet; the server accepts `transcript` when present.
 - Notification ✅/✏️/❌ buttons attach only when exactly one proposal is

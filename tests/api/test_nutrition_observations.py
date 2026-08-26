@@ -144,8 +144,9 @@ def _request(media_path, **overrides):
 
 
 def test_analyze_persists_sake_payload_and_reclassifies_media(
-    client, session
+    client, session, freeze_retention_clock
 ):
+    freeze_retention_clock(datetime(2026, 8, 7, 12, tzinfo=UTC), "nutrition_repository")
     provider = FakeVision()
     client.app.state.nutrition_vision_provider = provider
     media_path = _upload(client)
@@ -242,7 +243,10 @@ def test_photo_analysis_accepts_stable_fixed_offset_timezone(client) -> None:
     assert response.json()["capture"]["timezone"] == "UTC+09:00"
 
 
-def test_analysis_is_idempotent_per_uploaded_media(client, session):
+def test_analysis_is_idempotent_per_uploaded_media(
+    client, session, freeze_retention_clock
+):
+    freeze_retention_clock(datetime(2026, 8, 7, 12, tzinfo=UTC), "nutrition_repository")
     provider = FakeVision()
     client.app.state.nutrition_vision_provider = provider
     media_path = _upload(client)
@@ -542,7 +546,10 @@ def test_expired_photo_is_deleted_without_deleting_observation(
     )
 
 
-def test_photo_raw_evidence_expires_with_media(client, session, settings):
+def test_photo_raw_evidence_expires_with_media(
+    client, session, settings, freeze_retention_clock
+):
+    freeze_retention_clock(datetime(2026, 8, 7, 12, tzinfo=UTC), "nutrition_repository")
     secret = "Medication X 50 mg"
     extraction = _extraction()
     extraction.warnings = [secret]

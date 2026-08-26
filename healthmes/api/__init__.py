@@ -35,9 +35,12 @@ from healthmes.api import (
     nutrition_observations,
     reports,
     schedule,
+    settings_hub,
+    setup,
     sleep,
     storage,
     tasks,
+    wearables,
     wellness_decisions,
 )
 from healthmes.api.errors import install_error_handlers
@@ -63,10 +66,13 @@ routers: list[APIRouter] = [
     briefing.router,
     alerts.router,
     reports.router,
+    settings_hub.router,
+    setup.router,
     connect.router,
     google_oauth.router,
     sleep.router,
     storage.router,
+    wearables.router,
     wellness_decisions.router,
 ]
 

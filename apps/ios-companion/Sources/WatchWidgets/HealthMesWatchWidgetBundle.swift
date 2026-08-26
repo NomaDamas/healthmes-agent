@@ -29,12 +29,24 @@ struct EnergyComplicationWidget: Widget {
         }
         .configurationDisplayName("HealthMes energy")
         .description("Cognitive-energy score from your HealthMes instance.")
-        .supportedFamilies([
-            .accessoryCircular,
-            .accessoryCorner,
-            .accessoryRectangular,
-            .accessoryInline,
-        ])
+        .supportedFamilies(supportedFamilies)
+    }
+
+    private var supportedFamilies: [WidgetFamily] {
+        #if os(watchOS)
+            return [
+                .accessoryCircular,
+                .accessoryCorner,
+                .accessoryRectangular,
+                .accessoryInline,
+            ]
+        #else
+            return [
+                .accessoryCircular,
+                .accessoryRectangular,
+                .accessoryInline,
+            ]
+        #endif
     }
 }
 
@@ -50,10 +62,12 @@ struct EnergyComplicationView: View {
     @ViewBuilder
     private var content: some View {
         switch family {
-        case .accessoryCorner:
-            Text(GlanceFormat.scoreText(entry.payload?.energy.score))
-                .font(.title3.bold())
-                .widgetLabel { Text(cornerLabel) }
+        #if os(watchOS)
+            case .accessoryCorner:
+                Text(GlanceFormat.scoreText(entry.payload?.energy.score))
+                    .font(.title3.bold())
+                    .widgetLabel { Text(cornerLabel) }
+        #endif
         case .accessoryInline:
             Text(inlineLabel)
         case .accessoryRectangular:

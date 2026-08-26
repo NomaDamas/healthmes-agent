@@ -9,18 +9,24 @@ from healthmes.store import Base, create_db_engine
 
 
 @pytest.fixture(autouse=True)
-def stable_activity_wall_clock() -> Iterator[Any]:
+def stable_activity_wall_clock(request) -> Iterator[Any]:
     """Keep fixed 2026 activity fixtures inside the default retention window."""
-    freezer = freeze_time(
-        "2026-08-14 12:00:00",
-        tick=True,
-        real_asyncio=True,
-    )
-    freezer.start()
-    try:
-        yield freezer
-    finally:
-        freezer.stop()
+    if request.node.path.name == "test_control_postgres.py":
+        # This module explicitly pauses the freezer while FastAPI lazily
+        # compiles route schemas, so expose the freezer object to its tests.
+        freezer = freeze_time(
+            "2026-08-14 12:00:00",
+            tick=True,
+            real_asyncio=True,
+        )
+        freezer.start()
+        try:
+            yield freezer
+        finally:
+            freezer.stop()
+        return
+    with freeze_time("2026-08-14 12:00:00", tick=True, real_asyncio=True):
+        yield None
 
 
 @pytest.fixture
