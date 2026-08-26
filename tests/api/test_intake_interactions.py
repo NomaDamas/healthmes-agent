@@ -782,7 +782,12 @@ def test_voice_capture_requires_local_transcript_and_indexes_audio(
     assert obj.data_class == "nutrition_media"
 
 
-def test_uploaded_media_cannot_be_reused_by_another_capture(client):
+def test_uploaded_media_cannot_be_reused_by_another_capture(client, freeze_retention_clock):
+    freeze_retention_clock(
+        datetime(2026, 8, 7, 12, tzinfo=UTC),
+        "nutrition_repository",
+        "nutrition_intake",
+    )
     media_path = _upload(client, b"fake-m4a", "audio/m4a", "meal.m4a")
     observed_at = _recent_utc()
     first = client.post(
@@ -1564,8 +1569,13 @@ def test_voice_is_transcribed_locally_then_automatically_analyzed(
 
 
 def test_photo_adapter_keeps_sake_observation_and_maps_caffeine(
-    client, session
+    client, session, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        datetime(2026, 8, 7, 12, tzinfo=UTC),
+        "nutrition_repository",
+        "nutrition_intake",
+    )
     observation_id = _photo_observation(client)
     operation_id = str(uuid.uuid4())
     request_body = {
@@ -1607,7 +1617,14 @@ def test_photo_adapter_keeps_sake_observation_and_maps_caffeine(
     assert conflict.status_code == 409
 
 
-def test_confirmed_photo_review_promotes_nutrients_to_user_origin(client):
+def test_confirmed_photo_review_promotes_nutrients_to_user_origin(
+    client, freeze_retention_clock
+):
+    freeze_retention_clock(
+        datetime(2026, 8, 7, 12, tzinfo=UTC),
+        "nutrition_repository",
+        "nutrition_intake",
+    )
     observation_id = _photo_observation(client)
     reviewed = client.post(
         f"/v1/nutrition-observations/{observation_id}/review",
@@ -1637,8 +1654,13 @@ def test_confirmed_photo_review_promotes_nutrients_to_user_origin(client):
 
 
 def test_photo_review_correction_flows_into_interaction_search_and_context(
-    client, session
+    client, session, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        datetime(2026, 8, 7, 12, tzinfo=UTC),
+        "nutrition_repository",
+        "nutrition_intake",
+    )
     observation_id = _photo_observation(client)
     review_body = {
         "operation_id": str(uuid.uuid4()),

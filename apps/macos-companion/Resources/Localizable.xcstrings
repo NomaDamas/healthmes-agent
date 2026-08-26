@@ -176,6 +176,13 @@
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "처리 실패 — 다시 시도하세요" } }
       }
     },
+    "proposal.accepted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approved — calendar sync pending" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인됨 — 캘린더 동기화 대기" } }
+      }
+    },
     "proposal.adjust" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -216,6 +223,13 @@
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Kept as is" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "그대로 유지됨" } }
+      }
+    },
+    "proposal.expired" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Expired — calendar unchanged" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "만료됨 — 캘린더 변경 없음" } }
       }
     },
     "proposal.keep" : {

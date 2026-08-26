@@ -47,19 +47,28 @@ final class SharedContractMacTests: XCTestCase {
         XCTAssertEqual(report.energy.days.count, 7)
         // Honest missing day stays null.
         XCTAssertNil(report.energy.days[2].avgScore)
+        XCTAssertEqual(report.schedule.displayBreakdown.syncPending, 4)
+        XCTAssertEqual(report.schedule.displayBreakdown.applied, 1)
     }
 
     func testNotificationGrammarMappingOnMacOS() throws {
-        // Legacy alerts without a structured decision card stay compact.
-        // Structured schedule proposals use title / health reason / target
-        // time, which is pinned by the iOS notification tests.
+        // Legacy alerts with a real proposal still lead with the concrete
+        // action before exposing Yes/No.
         let page = try GlanceJSON.decoder().decode(AlertsPage.self, from: fixtureData("alerts"))
         let alert = page.data[0]
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example.com")!,
+            token: "secret"
+        )
 
-        let plain = AlertNotificationContent.from(alert: alert)
-        XCTAssertEqual(plain.title, "Recovery 38 today.")
-        XCTAssertEqual(plain.subtitle, "")
-        XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pc…")
+        let plain = AlertNotificationContent.from(
+            alert: alert,
+            pairingFingerprint: pairing.cacheFingerprint,
+            pairingGeneration: 7
+        )
+        XCTAssertEqual(plain.title, "Move the 14:00 block to tomorrow?")
+        XCTAssertEqual(plain.subtitle, "Recovery 38 today.")
+        XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pct -18")
         XCTAssertEqual(plain.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(plain.threadID, "deep_sleep_drop")
         XCTAssertNotNil(plain.userInfo[AlertNotificationContent.userInfoDecisionURL])
@@ -67,13 +76,45 @@ final class SharedContractMacTests: XCTestCase {
             plain.userInfo[AlertNotificationContent.userInfoProposalID],
             "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
         )
+        XCTAssertEqual(
+            plain.userInfo[AlertNotificationContent.userInfoPairingFingerprint],
+            pairing.cacheFingerprint
+        )
+        XCTAssertEqual(
+            plain.userInfo[AlertNotificationContent.userInfoPairingGeneration],
+            "7"
+        )
 
         let proposalID = UUID()
-        let actionable = AlertNotificationContent.from(alert: alert, pendingProposalID: proposalID)
+        let actionable = AlertNotificationContent.from(
+            alert: alert,
+            pendingProposalID: proposalID,
+            pairingFingerprint: pairing.cacheFingerprint
+        )
         XCTAssertEqual(actionable.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(
             actionable.userInfo[AlertNotificationContent.userInfoProposalID],
             proposalID.uuidString.lowercased()
+        )
+    }
+
+    func testProposalWithoutExactActionFailsClosedOnMacOS() {
+        let proposalID = UUID()
+        let alert = AlertItem(
+            id: UUID(),
+            ruleId: "missing-action",
+            firedAt: Date(),
+            summary: "Recovery changed.",
+            proposal: nil,
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID
+        )
+
+        XCTAssertNil(ProposalActionPresentation.exactPrompt(alert: alert))
+        XCTAssertEqual(
+            AlertNotificationContent.from(alert: alert).categoryID,
+            AlertNotificationContent.infoCategoryID
         )
     }
 
@@ -84,8 +125,14 @@ final class SharedContractMacTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let payloadData = try fixtureData("glance")
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "owner-token"
+        )
         cache.store(
             CachedGlance(
+                pairingFingerprint: pairing.cacheFingerprint,
+                pairingGeneration: 1,
                 etag: "\"abc123\"",
                 fetchedAt: Date(timeIntervalSince1970: 1_780_000_000),
                 maxAgeSeconds: 300,
@@ -95,6 +142,54 @@ final class SharedContractMacTests: XCTestCase {
         let loaded = try XCTUnwrap(cache.load())
         XCTAssertEqual(loaded.etag, "\"abc123\"")
         XCTAssertEqual(loaded.maxAgeSeconds, 300)
-        XCTAssertEqual(cache.decodedPayload()?.energy.score, 58)
+        let identity = PairingCacheIdentity(
+            fingerprint: pairing.cacheFingerprint,
+            generation: 1
+        )
+        XCTAssertEqual(cache.decodedPayload(for: identity)?.energy.score, 58)
+        let other = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "different-owner"
+        )
+        XCTAssertNil(
+            cache.decodedPayload(
+                for: PairingCacheIdentity(
+                    fingerprint: other.cacheFingerprint,
+                    generation: 1
+                )
+            )
+        )
+    }
+
+    func testGlanceSnapshotCacheRejectsOlderSameAccountWrite() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("healthmes-cache-order-\(UUID().uuidString)")
+        let cache = GlanceSnapshotCache(fileURL: directory.appendingPathComponent("snapshot.json"))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payloadData = try fixtureData("glance")
+        let fingerprint = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "owner-token"
+        ).cacheFingerprint
+        let newer = CachedGlance(
+            pairingFingerprint: fingerprint,
+            pairingGeneration: 4,
+            etag: "\"newer\"",
+            fetchedAt: Date(timeIntervalSince1970: 1_780_000_200),
+            maxAgeSeconds: 300,
+            payloadData: payloadData
+        )
+        let older = CachedGlance(
+            pairingFingerprint: fingerprint,
+            pairingGeneration: 4,
+            etag: "\"older\"",
+            fetchedAt: Date(timeIntervalSince1970: 1_780_000_100),
+            maxAgeSeconds: 300,
+            payloadData: payloadData
+        )
+
+        XCTAssertTrue(cache.store(newer))
+        XCTAssertFalse(cache.store(older))
+        XCTAssertEqual(cache.load()?.etag, "\"newer\"")
     }
 }

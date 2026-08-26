@@ -32,6 +32,27 @@ def fixture_clock(monkeypatch):
 
 
 @pytest.fixture
+def freeze_retention_clock(monkeypatch):
+    def freeze(current: datetime, *module_names: str) -> None:
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None) -> datetime:
+                value = current.astimezone(UTC)
+                return value if tz is not None else value.replace(tzinfo=None)
+
+        modules = {
+            "nutrition_repository": "healthmes.nutrition.repository",
+            "nutrition_intake": "healthmes.nutrition.intake_service",
+            "activity_aggregation": "healthmes.activity.aggregation",
+        }
+        for name in module_names:
+            module = __import__(modules[name], fromlist=["datetime"])
+            monkeypatch.setattr(module, "datetime", FrozenDateTime)
+
+    return freeze
+
+
+@pytest.fixture
 def settings(tmp_path) -> Settings:
     """Fully-explicit Settings for tests.
 

@@ -19,6 +19,19 @@ struct HealthMesCompanionApp: App {
         PhoneWatchSync.shared.activate()
 
         #if DEBUG
+            let arguments = ProcessInfo.processInfo.arguments
+            if let flagIndex = arguments.firstIndex(of: "-healthmes-ui-test-base-url"),
+                arguments.indices.contains(flagIndex + 1),
+                let pairing = try? PairingStore.shared.save(
+                    baseURLString: arguments[flagIndex + 1],
+                    token: ""
+                )
+            {
+                PhoneWatchSync.shared.pushPairing(
+                    baseURL: pairing.baseURL.absoluteString,
+                    token: pairing.token ?? ""
+                )
+            }
             if ProcessInfo.processInfo.arguments.contains("-healthmes-notification-demo") {
                 Task {
                     await NotificationManager.shared.postDecisionDemo()
@@ -42,7 +55,10 @@ struct HealthMesCompanionApp: App {
                 // even when iOS grants no background budget (README: the OS
                 // throttles BGAppRefreshTask; Telegram stays the guaranteed
                 // channel).
-                Task { await RefreshCoordinator.shared.sync(isForeground: true) }
+                Task {
+                    await HealthKitSyncManager.shared.resume()
+                    await RefreshCoordinator.shared.sync(isForeground: true)
+                }
                 Task {
                     await ScreenTimeActivityRuntime.shared.foregroundCatchUp()
                 }

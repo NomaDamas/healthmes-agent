@@ -98,17 +98,31 @@ public final class GlanceClient {
 
     /// Conditional GET honoring ETag/Cache-Control.
     public func fetch(pairing: Pairing, now: Date = Date()) async throws -> GlanceSnapshot {
+        guard let cacheIdentity = pairingStore.cacheIdentity(for: pairing) else {
+            throw GlanceClientError.notPaired
+        }
         do {
-            return try await performFetch(pairing: pairing, cached: cache.load(), now: now)
+            return try await performFetch(
+                pairing: pairing,
+                cacheIdentity: cacheIdentity,
+                cached: cache.load(for: cacheIdentity),
+                now: now
+            )
         } catch GlanceClientError.staleCacheMiss {
             // The server said 304 but our cached body was gone (evicted or
             // corrupted): one unconditional retry fetches a full body.
-            return try await performFetch(pairing: pairing, cached: nil, now: now)
+            return try await performFetch(
+                pairing: pairing,
+                cacheIdentity: cacheIdentity,
+                cached: nil,
+                now: now
+            )
         }
     }
 
     private func performFetch(
         pairing: Pairing,
+        cacheIdentity: PairingCacheIdentity,
         cached: CachedGlance?,
         now: Date
     ) async throws -> GlanceSnapshot {
@@ -137,13 +151,17 @@ public final class GlanceClient {
             } catch {
                 throw GlanceClientError.decoding(underlying: error)
             }
-            cache.store(
+            try storeIfCurrent(
                 CachedGlance(
+                    pairingFingerprint: cacheIdentity.fingerprint,
+                    pairingGeneration: cacheIdentity.generation,
                     etag: http.value(forHTTPHeaderField: "ETag"),
                     fetchedAt: now,
                     maxAgeSeconds: maxAge,
                     payloadData: data
-                )
+                ),
+                pairing: pairing,
+                expectedIdentity: cacheIdentity
             )
             return GlanceSnapshot(
                 payload: payload, fetchedAt: now, revalidated: false, nextRefresh: nextRefresh
@@ -158,13 +176,17 @@ public final class GlanceClient {
             }
             // Same data, refreshed validity window (304 carries the same
             // ETag/Cache-Control per the endpoint contract).
-            cache.store(
+            try storeIfCurrent(
                 CachedGlance(
+                    pairingFingerprint: cacheIdentity.fingerprint,
+                    pairingGeneration: cacheIdentity.generation,
                     etag: cached.etag,
                     fetchedAt: now,
                     maxAgeSeconds: maxAge,
                     payloadData: cached.payloadData
-                )
+                ),
+                pairing: pairing,
+                expectedIdentity: cacheIdentity
             )
             return GlanceSnapshot(
                 payload: payload, fetchedAt: now, revalidated: true, nextRefresh: nextRefresh
@@ -175,6 +197,25 @@ public final class GlanceClient {
 
         default:
             throw GlanceClientError.httpStatus(http.statusCode)
+        }
+    }
+
+    private func storeIfCurrent(
+        _ snapshot: CachedGlance,
+        pairing: Pairing,
+        expectedIdentity: PairingCacheIdentity
+    ) throws {
+        do {
+            let pairingLease = try pairingStore.acquirePairingLease(
+                for: pairing
+            )
+            defer { pairingLease.release() }
+            guard pairingLease.cacheIdentity == expectedIdentity else {
+                throw GlanceClientError.notPaired
+            }
+            _ = cache.store(snapshot)
+        } catch is PairingError {
+            throw GlanceClientError.notPaired
         }
     }
 }

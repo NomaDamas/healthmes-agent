@@ -46,6 +46,7 @@ from healthmes.api.local_session import (
     is_loopback_scope,
 )
 from healthmes.config import Settings
+from healthmes.pairing import PAIRING_EXCHANGE_PATH
 
 __all__ = [
     "BearerTokenMiddleware",
@@ -175,6 +176,11 @@ class BearerTokenMiddleware:
             return True
         if (
             scope.get("method") == "POST"
+            and path == PAIRING_EXCHANGE_PATH
+        ):
+            return True
+        if (
+            scope.get("method") == "POST"
             and path in LOCAL_SESSION_BOOTSTRAP_POST_PATHS
         ):
             return True
@@ -207,6 +213,9 @@ class BearerTokenMiddleware:
         return (
             path == "/connect"
             or path.startswith("/connect/google/")
+            or path.startswith("/connect/wearables/")
+            or path == "/v1/wearables"
+            or path.startswith("/v1/wearables/")
             or path == "/sleep"
             or path.startswith("/sleep/")
         )

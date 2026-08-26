@@ -100,6 +100,13 @@ final class SaverBriefingTests: XCTestCase {
         // Paired (base URL default present — the saver never reads the
         // keychain half) but cache still cold.
         defaults.set("http://127.0.0.1:8100", forKey: SaverDataSource.pairedBaseURLDefaultsKey)
+        let pairing = Pairing(
+            baseURL: URL(string: "http://127.0.0.1:8100")!,
+            token: "owner-token"
+        )
+        let fingerprint = pairing.cacheFingerprint
+        defaults.set(fingerprint, forKey: PairingStore.fingerprintDefaultsKey)
+        defaults.set(NSNumber(value: UInt64(1)), forKey: PairingStore.generationDefaultsKey)
         XCTAssertEqual(source.briefing(hideNumbers: false, now: now).state, .noData)
 
         // Warm cache → full briefing.
@@ -108,6 +115,8 @@ final class SaverBriefingTests: XCTestCase {
         )
         cache.store(
             CachedGlance(
+                pairingFingerprint: fingerprint,
+                pairingGeneration: 1,
                 etag: nil,
                 fetchedAt: now.addingTimeInterval(-60),
                 maxAgeSeconds: 300,

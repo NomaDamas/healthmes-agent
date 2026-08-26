@@ -5,6 +5,7 @@ import SwiftUI
 /// decline.
 struct ProposalRowView: View {
     let proposal: ProposalItem
+    let actionPrompt: String?
     let busy: Bool
     let onApply: () -> Void
     let onKeep: () -> Void
@@ -12,29 +13,34 @@ struct ProposalRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let actionPrompt {
+                Text(verbatim: actionPrompt)
+                    .font(.body.weight(.semibold))
+            }
             Text(verbatim: ProposalFormat.windowLine(proposal))
                 .font(.body)
             HStack(spacing: 12) {
-                Button(action: onApply) {
-                    Label("Apply", systemImage: "checkmark.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(busy)
-                .accessibilityHint(Text("Accepts this schedule proposal"))
+                if actionPrompt != nil {
+                    Button(action: onApply) {
+                        Label("Apply", systemImage: "checkmark.circle.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(busy)
+                    .accessibilityHint(Text("Accepts this schedule proposal"))
 
+                    Button(role: .destructive, action: onKeep) {
+                        Label("Keep as is", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(busy)
+                    .accessibilityHint(Text("Declines this schedule proposal"))
+                }
                 Button(action: onAdjust) {
                     Label("Adjust", systemImage: "pencil.circle")
                 }
                 .buttonStyle(.bordered)
                 .disabled(busy)
                 .accessibilityHint(Text("Opens the proposal details"))
-
-                Button(role: .destructive, action: onKeep) {
-                    Label("Keep as is", systemImage: "xmark.circle")
-                }
-                .buttonStyle(.bordered)
-                .disabled(busy)
-                .accessibilityHint(Text("Declines this schedule proposal"))
             }
             .font(.footnote)
             .labelStyle(.titleOnly)
@@ -56,6 +62,7 @@ struct ProposalDetailView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var proposal: ProposalItem?
+    @State private var actionPrompt: String?
     @State private var message: String?
     @State private var busy = false
 
@@ -84,8 +91,10 @@ struct ProposalDetailView: View {
                     Text("Proposed block")
                 }
 
-                if proposal.isActionable {
+                if proposal.isActionable, let actionPrompt {
                     Section {
+                        Text(verbatim: actionPrompt)
+                            .font(.body.weight(.semibold))
                         Button {
                             Task { await resolve(.accept) }
                         } label: {
@@ -102,6 +111,13 @@ struct ProposalDetailView: View {
                         Text(
                             "To change the times instead, reply to the alert in chat — the agent re-proposes and this list updates."
                         )
+                    }
+                } else if proposal.isActionable {
+                    Section {
+                        Text(
+                            "Approval controls are hidden because the exact calendar action is unavailable."
+                        )
+                        .foregroundStyle(.secondary)
                     }
                 }
             } else if let message {
@@ -138,10 +154,28 @@ struct ProposalDetailView: View {
     }
 
     private func load() async {
-        do {
-            proposal = try await api.getProposal(proposalID)
-        } catch {
+        async let proposalResult: Result<ProposalItem, Error> = productRefreshResult {
+            try await api.getProposal(proposalID)
+        }
+        async let alertsResult: Result<AlertsPage, Error> = productRefreshResult {
+            try await api.listAlerts(hours: 168)
+        }
+        let results = await (proposalResult, alertsResult)
+
+        switch results.0 {
+        case .success(let loadedProposal):
+            proposal = loadedProposal
+        case .failure(let error):
             message = BriefingHomeModel.describe(error)
+            return
+        }
+
+        switch results.1 {
+        case .success(let page):
+            let alert = page.data.first { $0.proposalId == proposalID }
+            actionPrompt = ProposalActionPresentation.exactPrompt(alert: alert)
+        case .failure:
+            actionPrompt = nil
         }
     }
 
@@ -151,10 +185,9 @@ struct ProposalDetailView: View {
         do {
             guard let current = proposal else { return }
             proposal = try await api.resolveProposal(current, action: action)
-            message =
-                action == .accept
-                ? String(localized: "Proposal applied.")
-                : String(localized: "Kept as is — proposal declined.")
+            if let proposal {
+                message = ProposalStatusPresentation.label(for: proposal.status)
+            }
         } catch let error as HealthMesAPIError where error.isAlreadyResolved {
             message = String(
                 localized: "Already resolved (\(error.alreadyResolvedStatus ?? "resolved"))."
@@ -163,24 +196,5 @@ struct ProposalDetailView: View {
         } catch {
             message = BriefingHomeModel.describe(error)
         }
-    }
-}
-
-enum ProposalFormat {
-    /// "Jul 12, 14:00–15:00" in the device locale/timezone (proposal times
-    /// are instants; unlike glance blocks there is no server-timezone string
-    /// on this payload).
-    static func windowLine(_ proposal: ProposalItem) -> String {
-        let day = DateFormatter()
-        day.dateStyle = .medium
-        day.timeStyle = .none
-        return "\(day.string(from: proposal.proposedStart)) · \(timeRange(proposal))"
-    }
-
-    static func timeRange(_ proposal: ProposalItem) -> String {
-        let time = DateFormatter()
-        time.dateStyle = .none
-        time.timeStyle = .short
-        return "\(time.string(from: proposal.proposedStart))–\(time.string(from: proposal.proposedEnd))"
     }
 }

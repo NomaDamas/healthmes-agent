@@ -54,6 +54,15 @@ final class WeeklyReportContractTests: XCTestCase {
         XCTAssertEqual(report.schedule.declined, 1)
         XCTAssertEqual(report.schedule.decided, 6)
         XCTAssertEqual(report.schedule.acceptancePct, 83)
+        XCTAssertEqual(
+            report.schedule.displayBreakdown,
+            ReportScheduleBreakdown(
+                syncPending: 4,
+                applied: 1,
+                declined: 1,
+                pending: 1
+            )
+        )
 
         // Alert digest.
         XCTAssertEqual(report.alerts.fired, 9)

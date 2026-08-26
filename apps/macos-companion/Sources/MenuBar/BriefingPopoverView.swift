@@ -11,6 +11,8 @@ import SwiftUI
 /// open the default browser.
 struct BriefingPopoverView: View {
     @ObservedObject var store: GlanceStore
+    @EnvironmentObject private var router: MacAppRouter
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -188,7 +190,12 @@ struct BriefingPopoverView: View {
         VStack(alignment: .leading, spacing: 6) {
             sectionHeader("section.proposals")
             ForEach(store.pendingProposals) { proposal in
-                ProposalRowView(store: store, proposal: proposal, timezone: store.payload?.timezone)
+                ProposalRowView(
+                    store: store,
+                    proposal: proposal,
+                    alert: store.alerts.first(where: { $0.proposalId == proposal.id }),
+                    timezone: store.payload?.timezone
+                )
             }
         }
     }
@@ -234,6 +241,15 @@ struct BriefingPopoverView: View {
 
     private var footer: some View {
         HStack {
+            Button {
+                router.section = .today
+                openWindow(id: "healthmes-main")
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label("Open HealthMes", systemImage: "macwindow")
+            }
+            .font(.caption)
+
             SettingsLink {
                 Label("popover.openSettings", systemImage: "gearshape")
                     .labelStyle(.titleAndIcon)
@@ -267,13 +283,12 @@ struct BriefingPopoverView: View {
     }
 }
 
-/// One pending proposal with the real §8.5 buttons: ✅ Apply → accept,
-/// ❌ Keep as is → decline; ✏️ Adjust discloses the details (the desktop
-/// adjust surface is the decision viewer / chat until a native editor
-/// exists — placeholder noted).
+/// One pending proposal with explicit desktop actions. The compact
+/// notification and watch surfaces use the shorter No/Yes vocabulary.
 struct ProposalRowView: View {
     @ObservedObject var store: GlanceStore
     let proposal: ProposalItem
+    let alert: AlertItem?
     let timezone: String?
 
     @State private var outcome: ProposalOutcome?
@@ -282,12 +297,17 @@ struct ProposalRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
+            if let actionPrompt {
+                Text(verbatim: actionPrompt)
+                    .font(.callout)
+                    .fontWeight(.semibold)
+            }
             Text(verbatim: timeRange)
-                .font(.callout)
-                .fontWeight(.medium)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if let outcome {
                 outcomeLine(outcome)
-            } else if proposal.isActionable {
+            } else if proposal.isActionable, actionPrompt != nil {
                 HStack(spacing: 8) {
                     Button {
                         Task { await act(.accept) }
@@ -310,6 +330,10 @@ struct ProposalRowView: View {
                     .font(.caption)
                 }
                 .controlSize(.small)
+            } else if proposal.isActionable {
+                Text("Exact action details unavailable")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } else {
                 Text(verbatim: proposal.status.rawValue)
                     .font(.caption)
@@ -330,6 +354,10 @@ struct ProposalRowView: View {
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
     }
 
+    private var actionPrompt: String? {
+        ProposalActionPresentation.exactPrompt(alert: alert)
+    }
+
     private var timeRange: String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -347,10 +375,14 @@ struct ProposalRowView: View {
     @ViewBuilder
     private func outcomeLine(_ outcome: ProposalOutcome) -> some View {
         switch outcome {
+        case .accepted:
+            Text("proposal.accepted").font(.caption).foregroundStyle(.orange)
         case .applied:
             Text("proposal.applied").font(.caption).foregroundStyle(.green)
         case .kept:
             Text("proposal.declined").font(.caption).foregroundStyle(.secondary)
+        case .expired:
+            Text("proposal.expired").font(.caption).foregroundStyle(.orange)
         case .alreadyResolved(let status):
             Text("proposal.alreadyResolved \(status)").font(.caption).foregroundStyle(.orange)
         case .failed:

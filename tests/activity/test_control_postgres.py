@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
@@ -56,6 +56,11 @@ from healthmes.app import create_app
 from healthmes.config import Settings
 from healthmes.store import Base, WellnessEvent, create_db_engine
 from healthmes.store.session import get_session
+
+
+def _recent_activitywatch_window() -> tuple[datetime, datetime]:
+    end = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    return end - timedelta(hours=1), end
 
 
 def _hold_postgres_write_plane(
@@ -686,6 +691,7 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     device_id = f"mac-rest-race-{boundary_change}"
+    start_at, end_at = _recent_activitywatch_window()
     network_started = threading.Event()
     network_release = threading.Event()
     responses = []
@@ -704,7 +710,7 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
             return [
                 {
                     "id": 1,
-                    "timestamp": "2026-08-09T10:00:00Z",
+                    "timestamp": start_at.isoformat(),
                     "duration": 3600,
                     "data": {
                         "app": "Code",
@@ -715,7 +721,7 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
         return [
             {
                 "id": 2,
-                "timestamp": "2026-08-09T10:00:00Z",
+                "timestamp": start_at.isoformat(),
                 "duration": 3600,
                 "data": {"status": "not-afk"},
             }
@@ -767,8 +773,8 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
                         "device_id": device_id,
                         "platform": "macos",
                         "timezone": "UTC",
-                        "start_at": "2026-08-09T10:00:00Z",
-                        "end_at": "2026-08-09T11:00:00Z",
+                        "start_at": start_at.isoformat(),
+                        "end_at": end_at.isoformat(),
                     },
                 )
             )
@@ -792,7 +798,9 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
                     "platform": "macos",
                     "capability": "detailed",
                     "permission_status": "revoked",
-                    "status_observed_at": "2026-08-09T10:30:00Z",
+                    "status_observed_at": (
+                        start_at + timedelta(minutes=30)
+                    ).isoformat(),
                 },
             )
         assert boundary_response.status_code == 200
@@ -867,6 +875,7 @@ def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     device_id = "mac-rest-latest-started-wins"
+    start_at, end_at = _recent_activitywatch_window()
     old_network_started = threading.Event()
     old_network_release = threading.Event()
     window_call_lock = threading.Lock()
@@ -892,7 +901,7 @@ def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
                 return [
                     {
                         "id": 1,
-                        "timestamp": "2026-08-09T10:00:00Z",
+                        "timestamp": start_at.isoformat(),
                         "duration": 3600,
                         "data": {
                             "app": "Code",
@@ -951,8 +960,8 @@ def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
         "device_id": device_id,
         "platform": "macos",
         "timezone": "UTC",
-        "start_at": "2026-08-09T10:00:00Z",
-        "end_at": "2026-08-09T11:00:00Z",
+        "start_at": start_at.isoformat(),
+        "end_at": end_at.isoformat(),
     }
 
     def run_old_import() -> None:
@@ -1007,7 +1016,7 @@ def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
             )
             assert stored == []
             assert state["cursors"]["activitywatch:window"] == (
-                "2026-08-09T11:00:00+00:00"
+                end_at.isoformat()
             )
             assert state["last_uploaded_at"] is not None
     finally:

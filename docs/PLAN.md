@@ -3,6 +3,8 @@ Originally recovered from the 2026-07-09 cloud ultraplan session, then updated
 by later owner decisions. This file preserves the broad product roadmap.
 HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md is authoritative for the current
 wellness runtime, MCP, storage, and iPhone Screen Time boundaries.
+APPLE-MAIN-INTEGRATION.ko.md is authoritative for Apple UI, one-page setup,
+and first-party HealthKit integration boundaries.
 -->
 # HealthMes Agent — 아키텍처 & 구현 플랜
 
@@ -72,6 +74,15 @@ HealthMes 서비스
 - **HealthMes ↔ Open Wearables:** `OWClient` REST read-only adapter를 사용한다.
   트리거·에너지 엔진과 MCP wearable 도구가 같은 사용자, 기간, provenance와
   local mirror 경계를 공유한다.
+- **Apple UI ↔ Main:** 일반 dashboard·일정·알림·설정은 기존 Main REST API와
+  `/v1/inputs`를 직접 사용한다. 자연어 wellness 질문만
+  `POST /v1/wellness-decisions`로 보내며, Apple 앱은 Hermes, HealthMes MCP 또는
+  Open Wearables를 직접 호출하지 않는다.
+- **Apple Health ↔ Main:** Apple Watch 데이터는 iPhone HealthKit을 거쳐
+  first-party collector의 pairing별 encrypted outbox에 저장된 뒤
+  `POST /v1/ingest/healthkit`으로 전송한다. durable ACK, hash/size와 accepted
+  forward status를 확인한 뒤에만 anchor를 확정한다. 외부 Health Auto Export
+  계열 앱은 같은 endpoint의 optional legacy 호환이다.
 - **글루 위치:** 루트에 `healthmes/`(uv 패키지, Python 3.12), `config/`, `scripts/`, 루트 `docker-compose.yml`(postgres+redis+open-wearables+healthmes+hermes). 벤더에 닿는 유일한 산출물은 `HERMES_HOME`에 렌더되는 config 파일과 스킬 심링크 — 둘 다 벤더 트리 밖.
 
 ## 1.5 지표 카탈로그 → 의사결정 도구 레이어 (스킬/MCP 설계)
@@ -277,14 +288,17 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
   background task와 bounded offline outbox는 같은 UI-neutral single-flight
   pipeline에 연결한다. entitlement 승인, 실제 권한 UI, distribution signing과
   실기기 dogfood는 외부/device-team 조건이다.
-- **통합 설정:** 데스크톱 웹과 미래 iPhone UI는
+- **통합 설정:** iPhone과 macOS의 one-page Settings는
+  `GET /v1/setup/readiness`,
   `GET /v1/inputs`, `GET /v1/inputs/{source_id}`,
   `PUT /v1/inputs/{source_id}/settings`를 사용한다. 이 API는 별도 설정 DB를
   만들지 않고 activity collector의 기기별 수집 제어, domain별 Decision Agent
   동의와 데이터 클래스별 보존 정책을 합성한다. Nutrition, Wearable, Calendar는
   실제 adapter가 강제하는 connect/disconnect/sync action만 노출하며 구현되지
   않은 범용 enable/pause를 만들지 않는다. 기존 HealthKit raw-first receiver도
-  `wearable.healthkit-bridge` source로 같은 목록에 포함한다.
+  `wearable.healthkit-bridge` source로 같은 목록에 포함한다. Mac에서 바꾼 설정은
+  별도 Mac→iPhone 복사가 아니라 같은 서버 descriptor를 iPhone이 다시 읽어
+  동기화한다. 서버 secret은 앱으로 내려보내지 않는다.
 - **GPS/location 후속:** iOS와 Android의 opt-in, coarse-first 수집,
   source-side private zone, 짧은 raw 좌표 보존, 파생 이동 context와 Decision
   Agent provider는 Issue #158에서 구현한다.
@@ -570,23 +584,26 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 
 ## 13. 온보딩 마찰 제거 — "설치·로그인만으로 연동" (2026-07-16 결정)
 
-소유자 결정: 앱스토어 출시·위젯/화면보호기 UX(#7·#10·#11·#37·#38)는 뒤로 미루고,
+소유자 결정: 앱스토어 출시·위젯/화면보호기 UX(#7·#10·#11·#37·#38)보다
 **연동 온보딩을 "자동 또는 로그인만"으로 만드는 것**과 **의미 있는 데이터가 끊기지
-않고 계속 쌓이는 것**을 선행한다. 네이티브 앱 코드는 이 단계에서 건드리지 않는다.
+않고 계속 쌓이는 것**을 선행한다. Main runtime은 Apple UI를 위해 재구현하지 않고,
+native app은 기존 REST와 Input Control Plane을 소비하는 adapter만 추가한다.
 
 | 연동 | 목표 경험 | 방법 | 상태 |
 |---|---|---|---|
 | 애플워치 백필 | 파일 하나 업로드 | Health 앱 내보내기 ZIP → `healthmes import apple <file>` → OW `/import/apple/xml/direct` (`healthmes/apple_import.py`) | ✅ 구현 |
-| 애플워치 연속 수집 | 폰이 알아서 주기 업로드 | `POST /v1/ingest/healthkit`(`healthmes/api/ingest.py`): 기성 HealthKit 자동 내보내기 앱의 POST를 받아 **raw 원본을 무조건 먼저 저장**(`raw_ingest/` + `raw_ingest_event` 색인, 스냅샷 백업 포함) 후 베스트에포트로 OW SDK sync 계약으로 변환·전달. 파싱 실패도 저장·수용. `POST /v1/ingest/raw`는 임의 소스용 | ✅ 구현 |
+| 애플워치 연속 수집 | HealthMes iPhone만 설치하면 자동 증분 업로드 | Apple Watch → iPhone HealthKit → pairing별 encrypted outbox → native `healthmes.healthkit.v1` exact bytes + stable `Idempotency-Key` → `POST /v1/ingest/healthkit`. 서버의 durable ACK, hash/size와 accepted forward status를 확인한 뒤에만 anchor 확정 | ✅ repository 통합·focused test·unsigned build, signed hardware QA 필요 |
+| 외부 HealthKit exporter | 기존 자동화만 선택적으로 유지 | 같은 `POST /v1/ingest/healthkit`이 headerless legacy payload를 raw-first로 저장하고 `transform_hae()`로 best-effort 전달. Health Auto Export 설치는 필수 아님 | ✅ 정상·malformed·deep raw-first 호환 test |
 | 구글 캘린더 | 브라우저 로그인 한 번 | 프로젝트 명의 OAuth 클라이언트(설치형 앱, gcloud/rclone 패턴)를 동봉 — 코드는 이미 `HEALTHMES_GOOGLE_CLIENT_SECRET_FILE`+표준 경로 폴백 구조라 등록된 클라이언트 JSON만 실으면 됨. 민감 스코프 심사(수일~수주)는 병행 신청 | ⏳ 소유자 콘솔 등록 대기 |
 | iCloud 캘린더 | 앱 암호 1회 (구조적 한계 — 애플이 CalDAV OAuth 미제공) | 기존 `connect icloud` 안내 흐름 유지 | ✅ |
 | 알림 | 설정 0 | `native_alert_delivery` 기본값 **true** 전환 완료 — 컴패니언 폴링만으로 알림 수신, Telegram은 옵션 | ✅ |
 | 클라우드 웨어러블 (가민·오우라 등) | 로그인만 | 프로바이더별 파트너 앱 + OAuth 릴레이 호스팅 필요 — §9 시임과 같은 "통과만 하는 호스팅" 원칙으로만 허용. 배포 단계로 보류 | ⏸ |
 
 **데이터 연속성 원칙:** 실사용 데이터(수면·HRV·활동·캘린더·결정 기록)는 중단 없이
-축적된다 — 백필(import)로 과거를 채우고, 연속 수집(브리지/SDK)으로 미래를 잇고,
-주간 암호화 스냅샷으로 유실을 막는다. 데모 시드는 실데이터가 붙는 즉시 폐기 가능해야
-한다(`_demo` wipe 키 유지).
+축적된다 — 백필(import)로 과거를 채우고, first-party iPhone collector로 미래를
+잇고, 주간 암호화 스냅샷으로 유실을 막는다. 외부 exporter는 기존 사용자 호환용
+선택 경로다. 데모 시드는 실데이터가 붙는 즉시 폐기 가능해야 한다
+(`_demo` wipe 키 유지).
 
 ## 14. 연속 증거 원칙과 판단 보정 로드맵 (2026-07-27 소유자 결정)
 

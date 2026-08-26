@@ -6,6 +6,7 @@ import UIKit
 /// when a camera exists (not on simulators).
 struct CameraPicker: UIViewControllerRepresentable {
     let onImage: (UIImage) -> Void
+    let onDismiss: () -> Void
 
     static var isAvailable: Bool {
         UIImagePickerController.isSourceTypeAvailable(.camera)
@@ -22,16 +23,21 @@ struct CameraPicker: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIImagePickerController, context: Context) {}
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onImage: onImage)
+        Coordinator(onImage: onImage, onDismiss: onDismiss)
     }
 
     final class Coordinator: NSObject, UIImagePickerControllerDelegate,
         UINavigationControllerDelegate
     {
         let onImage: (UIImage) -> Void
+        let onDismiss: () -> Void
 
-        init(onImage: @escaping (UIImage) -> Void) {
+        init(
+            onImage: @escaping (UIImage) -> Void,
+            onDismiss: @escaping () -> Void
+        ) {
             self.onImage = onImage
+            self.onDismiss = onDismiss
         }
 
         func imagePickerController(
@@ -41,11 +47,11 @@ struct CameraPicker: UIViewControllerRepresentable {
             if let image = info[.originalImage] as? UIImage {
                 onImage(image)
             }
-            picker.dismiss(animated: true)
+            onDismiss()
         }
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-            picker.dismiss(animated: true)
+            onDismiss()
         }
     }
 }

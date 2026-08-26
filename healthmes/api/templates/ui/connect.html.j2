@@ -1,7 +1,7 @@
 {% extends "ui/_base.html.j2" %}
-{# Runtime-connection STATUS page (healthmes/api/connect.py) — read-only.
-   Renders Oura/Open Wearables freshness plus Calendar connection state;
-   performs no writes and shows no secret or connected identity. #}
+{# Runtime connection and wearable management page.
+   It renders safe provider/device state and keeps credentials and connected
+   identities out of the page. Mutations are restricted to local sessions. #}
 
 {% block title %}연결 상태 — HealthMes{% endblock %}
 {% block crumb %}<span class="crumb">/ 연결 상태</span>{% endblock %}
@@ -29,14 +29,86 @@
   .conn-actions .secondary {
     border-color: var(--line); background: var(--surface); color: var(--ink);
   }
+  .conn-secret-form {
+    display: grid; gap: 0.65rem; max-width: 34rem; margin-top: 0.7rem;
+  }
+  .conn-secret-form label { display: grid; gap: 0.25rem; font-weight: 700; }
+  .conn-secret-form input {
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 0.62rem 0.75rem; background: var(--surface); color: var(--ink);
+    font: inherit;
+  }
+  .pairing-flow {
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.55rem; margin-top: 0.8rem;
+  }
+  .pairing-step {
+    padding: 0.75rem; border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm); background: var(--surface-2);
+  }
+  .pairing-step strong {
+    display: block; color: var(--brand-deep); font-size: 0.78rem;
+    margin-bottom: 0.2rem;
+  }
+  .pairing-step span { display: block; font-size: 0.82rem; color: var(--ink-2); }
+  .wearable-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: 0.8rem; margin-top: 0.8rem;
+  }
+  .wearable-card {
+    padding: 0.9rem; border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm); background: var(--surface-2);
+  }
+  .wearable-card header {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 0.7rem; margin-bottom: 0.35rem;
+  }
+  .wearable-card h3 { margin: 0; font-size: 1rem; }
+  .wearable-meta { color: var(--ink-2); font-size: 0.82rem; }
+  .wearable-device {
+    display: grid; gap: 0.05rem; margin-top: 0.55rem;
+    padding-top: 0.5rem; border-top: 1px solid var(--line-soft);
+  }
+  .wearable-device strong { font-size: 0.86rem; }
+  .wearable-actions {
+    display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.7rem;
+  }
+  .wearable-actions form { margin: 0; }
+  .wearable-actions button {
+    border: 1px solid var(--brand); border-radius: var(--radius-sm);
+    padding: 0.45rem 0.65rem; background: var(--brand); color: #fff;
+    font: inherit; font-size: 0.82rem; font-weight: 700; cursor: pointer;
+  }
+  .wearable-actions .secondary {
+    border-color: var(--line); background: var(--surface); color: var(--ink);
+  }
+  .wearable-actions input {
+    width: 4.2rem; border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 0.45rem; background: var(--surface); color: var(--ink);
+    font: inherit; font-size: 0.82rem;
+  }
+  .wearable-status {
+    display: inline-block; padding: 0.16rem 0.45rem;
+    border: 1px solid var(--line); border-radius: 999px;
+    font-size: 0.72rem; color: var(--ink-2);
+  }
+  .wearable-status.active { color: var(--brand-deep); border-color: var(--brand); }
+  .wearable-status.expired, .wearable-status.error { color: var(--danger); }
+  .wearable-status.revoked, .wearable-status.not_connected {
+    color: var(--ink-2);
+  }
+  .wearable-empty { padding: 0.8rem 0; color: var(--ink-2); }
+  @media (max-width: 700px) {
+    .pairing-flow { grid-template-columns: 1fr; }
+  }
 </style>
 {% endblock %}
 
 {% block content %}
 <p class="eyebrow">Runtime readiness</p>
 <h1>연결 상태</h1>
-<p class="muted">Oura/Open Wearables의 연결·freshness와 Calendar 연결 상태를 읽기 전용으로
-  표시합니다. 토큰·앱 암호·계정 식별자는 이 페이지에 절대 표시되지 않습니다.</p>
+<p class="muted">Oura/Open Wearables의 연결·sync·device 상태와 Calendar 연결 상태를
+  한 곳에서 관리합니다. 토큰·앱 암호·계정 식별자는 이 페이지에 절대 표시되지 않습니다.</p>
 {% if not scheduler_enabled %}
 <p class="conn-note">참고: 연결되어 있어도 캘린더 폴링은 서비스가
   <code>HEALTHMES_SCHEDULER_ENABLED=true</code> 로 실행 중일 때만 동작합니다.</p>
@@ -44,13 +116,164 @@
 {% if google_result %}
 <p class="conn-note">Google Calendar: {{ google_result }}</p>
 {% endif %}
+{% if icloud_result %}
+<p class="conn-note">Apple Calendar: {{ icloud_result }}</p>
+{% endif %}
+{% if wearable_result %}
+<p class="conn-note">
+  {{ wearable_result | e }}
+  {% if wearable_status == "connected" %}연결이 완료되었습니다.
+  {% elif wearable_status == "disconnected" %}연결을 해제했습니다.
+  {% elif wearable_status == "sync_queued" %}동기화를 요청했습니다.
+  {% elif wearable_status == "history_queued" %}과거 데이터 동기화를 요청했습니다.
+  {% elif wearable_status == "invalid_days" %}과거 동기화 기간은 1~365일이어야 합니다.
+  {% elif wearable_status == "error" %}작업을 완료하지 못했습니다.
+  {% endif %}
+</p>
+{% endif %}
 {% if local_unlock_url %}
+<section class="card">
+  <p class="eyebrow">Apple 연결</p>
+  <h2>iPhone 연결</h2>
+  <div class="pairing-flow" aria-label="Tailscale 기반 iPhone 연결 5단계">
+    <div class="pairing-step"><strong>1 · 설치</strong><span>Mac/Linux와 iPhone에 Tailscale 설치</span></div>
+    <div class="pairing-step"><strong>2 · 로그인</strong><span>두 기기에서 같은 Tailnet 로그인</span></div>
+    <div class="pairing-step"><strong>3 · 연결</strong><span>HealthMes에서 iPhone 연결 선택</span></div>
+    <div class="pairing-step"><strong>4 · 스캔</strong><span>iPhone 카메라로 일회용 QR 스캔</span></div>
+    <div class="pairing-step"><strong>5 · 완료</strong><span>Watch는 iPhone을 통해 자동 연결</span></div>
+  </div>
+  <p class="conn-note">일반 사용자는 IP 주소, 포트, 도메인, API token 또는 인증서를 직접 입력하지 않습니다.</p>
+  <div class="conn-actions">
+    <a href="https://tailscale.com/download" rel="noopener noreferrer">Tailscale 설치</a>
+    <a href="{{ local_unlock_url }}" rel="noreferrer">이 Mac에서 iPhone 연결</a>
+  </div>
+</section>
 <section class="card">
   <h2>이 Mac에서 연결 관리 잠금 해제</h2>
   <p class="muted">전체 API 토큰 입력은 이 Mac의 직접 loopback 화면에서만 받습니다.</p>
   <p><a href="{{ local_unlock_url }}" rel="noreferrer">직접 loopback 화면 열기</a></p>
 </section>
 {% endif %}
+
+<section class="card" id="wearables">
+  <p class="eyebrow">Wearables</p>
+  <h2>웨어러블 Settings Hub</h2>
+  <p class="muted">
+    모든 provider 연결 상태와 실제 data source/device를 한 곳에서 관리합니다.
+    API key와 OAuth token은 HealthMes 서버에만 남고 이 화면에는 표시되지 않습니다.
+  </p>
+  {% if not wearable_hub.configured %}
+  <p class="conn-note">
+    Open Wearables 서버 설정이 아직 완료되지 않았습니다. 서버에서
+    <code>HEALTHMES_OW_API_KEY</code>와 단일 사용자 식별자를 설정하면 연결 버튼이 활성화됩니다.
+  </p>
+  {% endif %}
+  {% if wearable_hub.error %}
+  <p class="error">{{ wearable_hub.error }}</p>
+  {% endif %}
+  {% if wearable_hub.providers %}
+  <div class="wearable-grid">
+    {% for provider in wearable_hub.providers %}
+    <article class="wearable-card">
+      <header>
+        <div>
+          <h3>{{ provider.name }}</h3>
+          <div class="wearable-meta"><code>{{ provider.provider }}</code></div>
+        </div>
+        <span class="wearable-status {{ provider.connection_status }}">
+          {% if provider.connection_status == "active" %}연결됨
+          {% elif provider.connection_status == "data_available" %}데이터 있음
+          {% elif provider.connection_status == "expired" %}만료됨
+          {% elif provider.connection_status == "revoked" %}해제됨
+          {% elif provider.connection_status == "not_configured" %}설정 필요
+          {% else %}미연결{% endif %}
+        </span>
+      </header>
+      {% if provider.last_synced_at %}
+      <p class="wearable-meta">마지막 sync: {{ provider.last_synced_at }}</p>
+      {% endif %}
+      {% for device in provider.devices %}
+      <div class="wearable-device">
+        <strong>{{ device.display_name or device.device_model or "등록된 data source" }}</strong>
+        <span class="wearable-meta">
+          {{ device.device_type or "device" }}{% if device.source %} · {{ device.source }}{% endif %}
+        </span>
+      </div>
+      {% else %}
+      <p class="wearable-meta">등록된 device/data source 없음</p>
+      {% endfor %}
+      {% if local_session and wearable_hub.configured %}
+      <div class="wearable-actions">
+        {% if provider.can_sync %}
+        <form method="post" action="/connect/wearables/{{ provider.provider }}/sync">
+          <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+          <button type="submit">Sync now</button>
+        </form>
+        {% endif %}
+        {% if provider.can_historical_sync %}
+        <form method="post" action="/connect/wearables/{{ provider.provider }}/sync/historical">
+          <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+          <input name="days" type="number" min="1" max="{{ provider.historical_limit }}" value="{{ provider.default_historical_days }}" aria-label="과거 sync 일수">
+          <button type="submit">과거 sync</button>
+        </form>
+        {% endif %}
+        {% if provider.can_disconnect %}
+        <form method="post" action="/connect/wearables/{{ provider.provider }}/disconnect">
+          <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+          <button class="secondary" type="submit">연결 해제</button>
+        </form>
+        {% endif %}
+        {% if provider.can_authorize %}
+        <form method="post" action="/connect/wearables/{{ provider.provider }}/authorize">
+          <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+          <button type="submit">
+            {% if provider.connection_status == "expired" %}Reconnect{% else %}Connect{% endif %}
+          </button>
+        </form>
+        {% endif %}
+        {% if provider.connection_status == "expired" %}
+        <span class="wearable-meta">Authorization expired. Reconnect to resume sync.</span>
+        {% elif provider.connection_status == "active" and provider.client_sdk %}
+        <span class="wearable-meta">paired native app/device에서 HealthMes로 동기화됩니다.</span>
+        {% elif provider.connection_status == "active" and provider.devices %}
+        <span class="wearable-meta">HealthMes가 보고한 실제 data source를 사용 중입니다.</span>
+        {% elif not provider.management_supported %}
+        <span class="wearable-meta">Open Wearables에는 보이지만 HealthMes 관리 계약이 아직 활성화되지 않은 provider입니다.</span>
+        {% elif not provider.has_cloud_api %}
+        <span class="wearable-meta">paired mobile app에서 동기화</span>
+        {% elif not provider.catalog_available %}
+        <span class="wearable-meta">기존 연결 또는 데이터에서 발견했지만 현재 provider catalog에는 없습니다.</span>
+        {% elif not provider.is_enabled %}
+        <span class="wearable-meta">서버에서 provider가 비활성화되어 있습니다.</span>
+        {% elif provider.connection_status == "active" and provider.webhook_callback and not provider.rest_pull %}
+        <span class="wearable-meta">실시간 데이터는 webhook으로 수신하고 과거 데이터만 backfill합니다.</span>
+        {% elif provider.connection_status != "active" %}
+        <span class="wearable-meta">이 provider를 연결하면 sync를 사용할 수 있습니다.</span>
+        {% endif %}
+      </div>
+      {% elif provider.has_cloud_api and not wearable_hub.configured %}
+      <p class="wearable-meta">서버 설정 후 Connect 버튼이 표시됩니다.</p>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="wearable-empty">표시할 provider가 없습니다.</p>
+  {% endif %}
+  {% if wearable_hub.recent_sync %}
+  <details>
+    <summary>최근 sync 상태</summary>
+    {% for sync in wearable_hub.recent_sync %}
+    <p class="conn-note">
+      <code>{{ sync.provider }}</code> · {{ sync.status }} · {{ sync.message or "상태 업데이트" }}
+    </p>
+    {% endfor %}
+  </details>
+  {% endif %}
+  {% if not local_session and wearable_hub.configured %}
+  <p class="conn-note">변경하려면 이 Mac에서 연결 관리 잠금을 해제하세요. 현재 화면은 읽기 전용입니다.</p>
+  {% endif %}
+</section>
 
 {% for cal in cards %}
 <section class="card">
@@ -82,6 +305,31 @@
       <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
       <button type="submit">이 Mac에서 Google 로그인</button>
     </form>
+    {% endif %}
+  {% endif %}
+  {% if cal.key == "icloud" and local_session %}
+    {% if cal.connected and cal.disconnect_allowed %}
+    <form class="conn-actions" method="post" action="/connect/icloud/disconnect">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <button class="secondary" type="submit">Apple Calendar 연결 해제</button>
+    </form>
+    {% elif cal.connected %}
+    <p class="conn-note">.env에서 자격증명을 제거한 뒤 HealthMes를 다시 시작하세요.</p>
+    {% else %}
+    <form class="conn-secret-form" method="post" action="/connect/icloud">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <label>Apple ID
+        <input name="username" type="email" autocomplete="username" required>
+      </label>
+      <label>앱 전용 암호
+        <input name="app_password" type="password" autocomplete="new-password" required>
+      </label>
+      <div class="conn-actions">
+        <button type="submit">Apple Calendar 연결</button>
+      </div>
+    </form>
+    <p class="conn-note">이 값은 이 머신의 owner-only credential 파일에만 저장되며
+      화면과 로그에는 다시 표시되지 않습니다.</p>
     {% endif %}
   {% endif %}
   {% if not cal.connected and cal.command %}
