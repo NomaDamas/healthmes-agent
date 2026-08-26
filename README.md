@@ -18,6 +18,7 @@ third-party relay.
 - [Input Architecture](#-input-architecture)
 - [Product Gallery](#-product-gallery)
 - [Quick Start](#-quick-start)
+- [Mac → iPhone → Apple Watch](#-mac--iphone--apple-watch)
 - [Choose Your Path](#-choose-your-path)
 - [Companion Apps](#-companion-apps)
 - [How It Works](#-how-it-works)
@@ -206,22 +207,23 @@ fences, and platform-specific behavior, see
 
 ## 🖼️ Product Gallery
 
-The repository includes representative UI evidence for the unified product.
-The Web image is a visual reference for the workspace experience; the current
-`main` service exposes the Web entrypoint and report/decision pages rather than
-a `/dashboard` route.
+These screenshots were refreshed from the current `main` code on August 26,
+2026 using seeded local data. They show the real Web entrypoint, macOS
+workspace, iPhone Today canvas, and Apple Watch decision remote. The Web
+surface is the service entrypoint (`/`); current `main` does not expose a
+`/dashboard` route.
 
 | Web | iPhone |
 |---|---|
-| ![HealthMes web dashboard](artifacts/apple-unified-dashboard/web-dashboard.png) | ![HealthMes iPhone Today](artifacts/apple-unified-dashboard/iphone-today.png) |
+| **Web entrypoint**<br>![HealthMes web entrypoint](artifacts/apple-unified-dashboard/web-dashboard.png) | **iPhone Today**<br>![HealthMes iPhone Today](artifacts/apple-unified-dashboard/iphone-today.png) |
 
 | macOS | Apple Watch |
 |---|---|
-| ![HealthMes macOS dashboard](artifacts/apple-unified-dashboard/macos-dashboard.png) | ![HealthMes Apple Watch remote](artifacts/apple-unified-dashboard/watch-42mm.png) |
+| **macOS workspace**<br>![HealthMes macOS workspace](artifacts/apple-unified-dashboard/macos-dashboard.png) | **Apple Watch remote**<br>![HealthMes Apple Watch remote](artifacts/apple-unified-dashboard/watch-42mm.png) |
 
 ## ⚡ Quick Start
 
-The fastest path starts a local SQLite-backed service with no PostgreSQL,
+The fastest path is a local SQLite-backed service. It needs no PostgreSQL,
 Redis, wearable credentials, or Telegram configuration.
 
 ### 1. Install and start
@@ -233,12 +235,17 @@ uv sync
 make mac-run
 ```
 
+Keep this terminal running. `make mac-run` starts the local HealthMes service
+on `http://localhost:8100`; the macOS companion and the iPhone/Watch
+companions all consume this same instance.
+
 ### 2. Verify the service
 
 In a second terminal:
 
 ```bash
 curl http://localhost:8100/health
+curl http://localhost:8100/v1/briefing/glance
 ```
 
 Expected:
@@ -247,7 +254,10 @@ Expected:
 {"status":"ok"}
 ```
 
-### 3. Open the workspace
+The glance response should contain an energy score, a 24-hour curve, alert
+state, and the latest decision when demo data is available.
+
+### 3. Open the Web workspace
 
 | URL | Use |
 |---|---|
@@ -259,9 +269,8 @@ Expected:
 | `http://localhost:8100/connect` | Calendar and integration connection |
 
 The native iPhone, Apple Watch, and macOS workspaces use the same briefing,
-input, decision, and report contracts. If the optional dashboard workspace
-route is present on a product branch, it is available at
-`http://localhost:8100/dashboard`.
+input, decision, alert, and report contracts. Do not use `/dashboard` with the
+current `main` service; use `/`, `/decisions`, or `/reports/weekly` instead.
 
 Stop the service with `Ctrl-C`.
 
@@ -271,10 +280,97 @@ Stop the service with `Ctrl-C`.
 curl http://localhost:8100/v1/briefing/glance
 curl http://localhost:8100/v1/alerts
 curl http://localhost:8100/v1/setup/readiness
+curl http://localhost:8100/v1/inputs
 ```
 
-The same glance, alerts, and weekly-report contracts are used by the native
-companion apps.
+These are the same server-owned contracts used by the native companion apps.
+
+## 🍎 Mac → iPhone → Apple Watch
+
+Use this path when you want the complete Apple companion flow. The Mac and
+iPhone are the setup surfaces; the Watch is a compact remote that receives
+the active pairing from the iPhone through Apple's encrypted WatchConnectivity
+channel.
+
+### Mac: start the instance and pair the Mac app
+
+1. Start HealthMes with `make mac-run`, or use `make mac-setup` for the full
+   PostgreSQL + Redis development stack.
+2. Build and launch the macOS companion:
+
+   ```bash
+   cd apps/macos-companion
+   xcodegen generate
+   xcodebuild -project HealthMesMac.xcodeproj -scheme HealthMesMac \
+     -destination "platform=macOS" build CODE_SIGNING_ALLOWED=NO
+   open <DerivedData>/Build/Products/Debug/HealthMesMac.app
+   ```
+
+3. In the app, open **Settings → Set up this Mac**. For an existing instance,
+   use **Settings → Advanced → Self-host pairing**.
+
+The macOS workspace should show the current capacity/glance state, alerts,
+decisions, calendar, reports, local threads, and input controls. The menu bar
+glance, widgets, notifications, and ambient screensaver use the same pairing.
+
+### iPhone: pair to the same HealthMes instance
+
+For a real iPhone, the pairing URL must be HTTPS:
+
+1. Let the Mac app generate its five-minute QR code.
+2. Scan it with the iPhone Camera.
+3. iPhone exchanges the one-time code, stores the long-lived token in the
+   Keychain, and performs the first glance/alert sync.
+4. Open **Settings** in the iPhone app to inspect connection, input sources,
+   HealthKit, calendar, storage, notification, widget, and Live Activity
+   controls.
+
+For a same-Mac simulator smoke test, loopback HTTP is intentionally allowed:
+
+```bash
+cd apps/ios-companion
+xcodegen generate
+xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion \
+  -destination "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2" \
+  build CODE_SIGNING_ALLOWED=NO
+xcrun simctl install booted <BUILT_PRODUCTS_DIR>/HealthMesCompanion.app
+xcrun simctl launch booted com.healthmes.companion \
+  -healthmes-ui-test-base-url http://127.0.0.1:8100
+```
+
+The iPhone Today screen should show the capacity score and curve, current
+alerts, one decision surface, and any synced schedule blocks. If it says
+“Could not reach your instance”, check that the local server is still running
+and that the simulator launch argument uses the same port.
+
+### Apple Watch: receive the phone pairing
+
+1. Build and install the embedded Watch app with the iPhone companion.
+2. Launch the paired iPhone app first.
+3. Launch **HealthMes** on Apple Watch. The iPhone sends the current pairing
+   through WatchConnectivity; the Watch stores its own local copy and refreshes
+   its complication/widget surfaces.
+4. Use the Watch for the compact capacity glance, decision actions,
+   notification actions, and spoken-command relay. The iPhone remains the
+   source of HealthKit collection and the Watch does not become a standalone
+   health-data store.
+
+The Watch screen should show a capacity value and a **Current** or actionable
+decision state. **Offline** means the Watch has not received a valid pairing
+context yet; launch the iPhone app once more while both simulator devices are
+paired.
+
+### Cross-device verification
+
+| Check | Expected result |
+|---|---|
+| Mac app | Workspace loads glance, alerts, decisions, reports, and settings |
+| iPhone app | Today/Plan/Explore/Settings load from the same base URL |
+| Apple Watch | Capacity and decision remote are populated, not offline |
+| Notifications | Alert and proposal actions route to the exact server record |
+| Widgets | Energy, next block, alert, and freshness values use the shared cache |
+| Live Activities | Decision and focus-block status show explicit action/expiry state |
+| Input settings | Web, iPhone, and Mac show the same `/v1/inputs` descriptors |
 
 ## 🧩 Choose Your Path
 
