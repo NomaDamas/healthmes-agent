@@ -43,7 +43,7 @@ dependencies {
 
     implementation("androidx.core:core-ktx:1.18.0")
     // Tiles and ProtoLayout stay on their compatible 1.4.x line.
-    implementation("androidx.wear.tiles:tiles:1.4.1")
+    implementation("androidx.wear.tiles:tiles:1.6.2")
     implementation("androidx.wear.protolayout:protolayout:1.4.2")
     implementation("androidx.wear.protolayout:protolayout-material:1.4.2")
     // Watch-face complication data source (energy score).
