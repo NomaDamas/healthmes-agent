@@ -15,6 +15,7 @@ third-party relay.
 
 - [What is HealthMes?](#-what-is-healthmes)
 - [Everything That Is Built](#-everything-that-is-built)
+- [Input Architecture](#-input-architecture)
 - [Product Gallery](#-product-gallery)
 - [Quick Start](#-quick-start)
 - [Choose Your Path](#-choose-your-path)
@@ -84,9 +85,131 @@ Filtered HealthMes MCP
 Every response can carry evidence, confidence, coverage, and
 `insufficient_data` rather than inventing certainty.
 
+## 🎛️ Input Architecture
+
+Inputs are a first-class control plane, not a collection of one-off provider
+toggles. Web, iPhone, and macOS settings render the same server-owned
+descriptors from `GET /v1/inputs`, so capabilities, connection state,
+collection state, privacy notes, retention, and available actions stay
+consistent across clients.
+
+### Sources
+
+| Source ID | Domain | What it provides |
+|---|---|---|
+| `activity.android` | Activity | Hourly app and category usage from Android UsageStats |
+| `activity.activitywatch` | Activity | Desktop foreground, idle, and hourly activity summaries |
+| `activity.ios-screentime` | Activity | iPhone Screen Time hourly app/category contract when an eligible signed build is available |
+| `nutrition.capture` | Nutrition | Photo VLM, text, voice transcript, nutrition, and caffeine capture |
+| `wearable.healthkit-bridge` | Wearable | First-party iPhone HealthKit collection and Open Wearables forwarding |
+| `wearable.open-wearables` | Wearable | Sleep, recovery, HRV, stress, and workout data |
+| `calendar.google` | Calendar | Calendar mirror, availability, and schedule density |
+| `calendar.icloud` | Calendar | iCloud calendar mirror, availability, and schedule density |
+
+The registry is capability-driven: it does not expose settings that a collector
+cannot enforce. For example, device activity sources can expose `enabled`,
+`paused_until`, and `excluded_apps`; nutrition and calendar sources expose the
+connection, sync, retention, and Decision access actions they actually support.
+
+### Control Plane
+
+```text
+GET  /v1/setup/readiness
+GET  /v1/inputs
+GET  /v1/inputs/{source_id}
+PUT  /v1/inputs/{source_id}/settings
+```
+
+Each `InputSourceDescriptor` includes:
+
+- `instances`: device identity, platform, permission, effective collection
+  state, coverage, last collection/upload, pause state, and exclusions.
+- `settings`: UI-renderable keys with type, scope, and allowed values.
+- `actions`: whether an action runs on the device, server, browser, external
+  provider, or local CLI. These are UI contracts, not a generic RPC surface.
+- `privacy`: raw-content collection, source-side exclusions, and default
+  Decision Agent exposure.
+- `retention`: data-class policies using `1d`, `7d`, `14d`, `30d`, `90d`, or
+  `forever`.
+- `limitations`: OS, entitlement, provider, or build-specific constraints.
+
+Settings have explicit scopes:
+
+| Scope | Examples |
+|---|---|
+| Instance | Device `enabled`, `paused_until`, and excluded apps |
+| Source | Enable or disable one source without changing the whole domain |
+| Domain | Allow the Decision Agent to query activity, nutrition, wearable, or calendar context |
+| Data class | Retention for raw, hourly, daily, media, or provider snapshot data |
+
+### Safe Concurrent Updates
+
+Settings use compare-and-swap semantics. A client must read the current
+descriptor, preserve only the user's pending fields, and send the exact strong
+`ETag` back as `If-Match`:
+
+```text
+GET /v1/inputs/{source_id}
+        ↓
+render descriptor + remember ETag
+        ↓
+PUT /v1/inputs/{source_id}/settings
+If-Match: "<descriptor revision>"
+        ↓
+200 updated descriptor
+or
+428 missing revision / 409 stale revision
+        ↓
+re-read descriptor, reapply the pending patch, resolve conflicts
+```
+
+The server rejects stale writes atomically. A `409
+input_settings_revision_conflict` never partially applies collection,
+retention, or Decision access changes. After a successful write, the response
+body and response `ETag` become the next editing baseline.
+
+### Raw-First Ingest
+
+All incoming payloads are durable before parsing or forwarding:
+
+```text
+device/provider
+      ↓
+POST /v1/ingest/healthkit   or   POST /v1/ingest/raw
+      ↓
+raw bytes + sha256 + size + source index
+      ↓
+parse and normalize
+      ↓
+forward to canonical activity/wearable records
+      ↓
+decision context, alerts, reports, and client APIs
+```
+
+`POST /v1/ingest/healthkit` accepts the first-party
+`healthmes.healthkit.v1` batch and legacy HealthKit exporters. The server
+returns a durable acknowledgement with the raw object identity, parse status,
+forward status, hash, and byte size. Duplicate first-party batches are
+idempotent; deletion batches use tombstones and fail closed until canonical
+records can be removed.
+
+The iPhone HealthKit collector adds a pairing-scoped encrypted outbox. It
+stores exact request bytes, a stable `Idempotency-Key`, and candidate anchors;
+anchors advance only after a durable `202` acknowledgement with matching hash,
+size, and accepted forwarding state. Android UsageStats follows the same
+privacy boundary: no screenshots, keystrokes, URLs, or app content are
+collected.
+
+For the complete contract, including error codes, retention scope, lifecycle
+fences, and platform-specific behavior, see
+[`docs/INPUT-CONTROL-PLANE.ko.md`](docs/INPUT-CONTROL-PLANE.ko.md).
+
 ## 🖼️ Product Gallery
 
-The repository includes representative UI evidence for the unified product:
+The repository includes representative UI evidence for the unified product.
+The Web image is a visual reference for the workspace experience; the current
+`main` service exposes the Web entrypoint and report/decision pages rather than
+a `/dashboard` route.
 
 | Web | iPhone |
 |---|---|
@@ -128,12 +251,17 @@ Expected:
 
 | URL | Use |
 |---|---|
-| `http://localhost:8100/dashboard` | Main HealthMes workspace |
+| `http://localhost:8100/` | Web entrypoint with links to local surfaces |
 | `http://localhost:8100/docs` | OpenAPI documentation |
 | `http://localhost:8100/decisions` | Decision history and flowcharts |
 | `http://localhost:8100/reports/weekly` | Human-readable weekly report |
 | `http://localhost:8100/reports/weekly.json` | Machine-readable weekly report |
 | `http://localhost:8100/connect` | Calendar and integration connection |
+
+The native iPhone, Apple Watch, and macOS workspaces use the same briefing,
+input, decision, and report contracts. If the optional dashboard workspace
+route is present on a product branch, it is available at
+`http://localhost:8100/dashboard`.
 
 Stop the service with `Ctrl-C`.
 
@@ -414,6 +542,7 @@ Time capability paths still require device-specific QA.
 | Need | Document |
 |---|---|
 | Architecture and product rationale | [`docs/PLAN.md`](docs/PLAN.md) |
+| Unified input control plane and source contracts | [`docs/INPUT-CONTROL-PLANE.ko.md`](docs/INPUT-CONTROL-PLANE.ko.md) |
 | Wellness runtime architecture | [`docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md) |
 | Apple main integration | [`docs/APPLE-MAIN-INTEGRATION.ko.md`](docs/APPLE-MAIN-INTEGRATION.ko.md) |
 | Development, credentials, integrations, and tests | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) |
