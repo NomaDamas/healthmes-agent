@@ -1,89 +1,169 @@
-# HealthMes Agent
+# 🧠 HealthMes Agent
 
-**A local-first health assistant that turns wearable and calendar signals into
-clear, explainable next steps.**
+**Open, local-first infrastructure for wellness agents.**
 
-HealthMes watches your health context, estimates cognitive energy throughout
-the day, and can proactively message you on Telegram when your plan should
-change. Every recommendation is backed by the data available to the service
-and can be opened as a decision flowchart.
+HealthMes turns wearable, activity, nutrition, calendar, environment, and
+subjective signals into explainable decisions and practical next steps. It
+gives the same wellness context to a web workspace, iPhone, Apple Watch,
+macOS, Android, Wear OS, Windows, and Telegram without handing your data to a
+third-party relay.
 
-> HealthMes is a personal software project, not a medical device or a
-> substitute for professional medical advice.
+> HealthMes is personal software, not a medical device and not a substitute
+> for professional medical advice.
 
-## Why HealthMes
+## 🧭 Index
 
-- **Proactive:** detects recovery, stress, schedule, and deadline signals
-  instead of waiting for a question.
-- **Explainable:** uses deterministic energy and trigger engines with
-  inspectable component scores and decision records.
-- **Local-first:** keeps the service, database, media, and backups on your
-  machine by default.
-- **Provider-agnostic:** reads wearable data through
-  [`open-wearables`](https://github.com/the-momentum/open-wearables) and can
-  use the LLM provider supported by the Hermes runtime.
-- **Safe by default:** HTTP access is local by default; network binds require
-  a bearer token, and calendar changes use an explicit confirmation boundary.
+- [What is HealthMes?](#-what-is-healthmes)
+- [Everything That Is Built](#-everything-that-is-built)
+- [Product Gallery](#-product-gallery)
+- [Quick Start](#-quick-start)
+- [Choose Your Path](#-choose-your-path)
+- [Companion Apps](#-companion-apps)
+- [How It Works](#-how-it-works)
+- [Data Sources and Integrations](#-data-sources-and-integrations)
+- [Security and Privacy](#-security-and-privacy)
+- [Build Matrix](#-build-matrix)
+- [Documentation](#-documentation)
 
-## Try It In 5 Minutes
+## 🌿 What is HealthMes?
 
-This is the smallest working demo. It starts the HealthMes API against a
-repo-local SQLite database; PostgreSQL, Redis, wearable sync, and Telegram are
-not required.
+HealthMes is the glue plane between personal data and wellness automation:
 
-### 1. Install `uv`
+```text
+signals → normalized context → explainable decision → user action → outcome
+```
 
-Install [`uv`](https://docs.astral.sh/uv/) if it is not already available.
-HealthMes requires Python 3.12 or newer; `uv` can manage the project
-environment and interpreter.
+The system combines:
 
-### 2. Start the service
+- **Context:** wearable recovery, sleep, HRV, stress, body battery, activity,
+  nutrition, calendar load, environment, app fragmentation, and manual
+  captures.
+- **Reasoning:** deterministic energy and trigger engines plus one canonical
+  free-form reasoning path through the Hermes runtime.
+- **Action:** bounded proposals, exact Yes/No/Speak actions, schedule changes,
+  capture flows, reports, and proactive notifications.
+- **Inspection:** decision records, evidence, confidence, coverage, and local
+  Mermaid flowcharts instead of opaque recommendations.
+
+## ✅ Everything That Is Built
+
+| Surface | Implemented product experience |
+|---|---|
+| 🌐 Web workspace | Integrated dashboard with overview, calendar, insights, decisions, agent channels, setup, input controls, reports, and decision flowchart viewer |
+| 🧠 Decision runtime | `POST /v1/wellness-decisions` → `HealthMesDecisionService` → Hermes `/v1/responses` → filtered HealthMes MCP tools |
+| 📱 iPhone | Full wellness canvas, Today/Plan/Explore/Settings flows, voice and editable-text dock, calendar blocks, capture, reports, bounded decisions, notifications, widgets, and Live Activities |
+| ⌚ Apple Watch | iPhone-paired compact decision remote, notification actions, spoken-command relay, watch app, and complications |
+| 🖥️ macOS | Full SwiftUI workspace, local threads, sidebar and inspector, menu bar glance/popover, bounded voice/text commands, widgets, notifications, and ambient screensaver |
+| 🤖 Android | Compose companion with Home, Report, Capture, Proposals, Settings, real notification actions, ongoing focus block, and an ETag-aware widget |
+| ⌚ Wear OS | Standalone pairing activity, cache-first ProtoLayout briefing tile, energy complication, and phone notification bridge |
+| 🪟 Windows | .NET 8 tray/flyout, toast actions, privacy-aware `.scr` screensaver, DPAPI pairing, and Widgets Board integration point |
+| ✈️ Telegram + Hermes | Guaranteed-delivery channel, proactive briefings, capture skill, cron scheduling, and agent chat |
+| 💾 Storage | Local SQLite or PostgreSQL, Redis-backed runtime paths, retention controls, age-encrypted backups, and optional ciphertext-only remote vault |
+
+### One Canonical Decision Path
+
+The native clients and web UI consume the same decision contract. The reasoning
+runtime exposes six read-oriented tools:
+
+```text
+POST /v1/wellness-decisions
+        ↓
+HealthMesDecisionService
+        ↓
+Hermes /v1/responses
+        ↓
+Filtered HealthMes MCP
+        ├─ search_activity
+        ├─ search_nutrition
+        ├─ search_calendar
+        ├─ search_wearable
+        ├─ list_wellness_skills
+        └─ read_wellness_skill
+```
+
+Every response can carry evidence, confidence, coverage, and
+`insufficient_data` rather than inventing certainty.
+
+## 🖼️ Product Gallery
+
+The repository includes representative UI evidence for the unified product:
+
+| Web | iPhone |
+|---|---|
+| ![HealthMes web dashboard](artifacts/apple-unified-dashboard/web-dashboard.png) | ![HealthMes iPhone Today](artifacts/apple-unified-dashboard/iphone-today.png) |
+
+| macOS | Apple Watch |
+|---|---|
+| ![HealthMes macOS dashboard](artifacts/apple-unified-dashboard/macos-dashboard.png) | ![HealthMes Apple Watch remote](artifacts/apple-unified-dashboard/watch-42mm.png) |
+
+## ⚡ Quick Start
+
+The fastest path starts a local SQLite-backed service with no PostgreSQL,
+Redis, wearable credentials, or Telegram configuration.
+
+### 1. Install and start
+
+Requirements: Python 3.12+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
 make mac-run
 ```
 
-Leave the server running, then open a second terminal:
+### 2. Verify the service
+
+In a second terminal:
 
 ```bash
 curl http://localhost:8100/health
 ```
 
-Expected response:
+Expected:
 
 ```json
 {"status":"ok"}
 ```
 
-Open these local surfaces in a browser:
+### 3. Open the workspace
 
-- `http://localhost:8100/docs` — API documentation
-- `http://localhost:8100/decisions` — explainable decision records
-- `http://localhost:8100/reports/weekly` — weekly report
+| URL | Use |
+|---|---|
+| `http://localhost:8100/dashboard` | Main HealthMes workspace |
+| `http://localhost:8100/docs` | OpenAPI documentation |
+| `http://localhost:8100/decisions` | Decision history and flowcharts |
+| `http://localhost:8100/reports/weekly` | Human-readable weekly report |
+| `http://localhost:8100/reports/weekly.json` | Machine-readable weekly report |
+| `http://localhost:8100/connect` | Calendar and integration connection |
 
-Stop the API with `Ctrl-C`. If you used the PostgreSQL/Redis setup below,
-stop those services with:
+Stop the service with `Ctrl-C`.
+
+### 4. Try the API
 
 ```bash
-make mac-services-stop
+curl http://localhost:8100/v1/briefing/glance
+curl http://localhost:8100/v1/alerts
+curl http://localhost:8100/v1/setup/readiness
 ```
 
-## Choose Your Setup
+The same glance, alerts, and weekly-report contracts are used by the native
+companion apps.
 
-| Goal | Start here | What you get |
+## 🧩 Choose Your Path
+
+| Goal | Start here | Result |
 |---|---|---|
-| Explore the API locally | `uv sync && make mac-run` | SQLite-backed HealthMes service |
-| Run the complete local stack | `make mac-setup` then `make mac-run` | PostgreSQL, Redis, migrations, and the service |
-| Run the container stack | Docker section below | PostgreSQL, Redis, open-wearables, HealthMes, and Hermes |
-| Connect real health data | Development guide | Provider OAuth, sync workers, and credentials |
-| Use Telegram proactively | Hermes bootstrap section | Skills, cron briefings, webhook alerts, and chat |
+| Explore locally | `uv sync && make mac-run` | Credential-free SQLite demo |
+| Use the full Mac-native stack | `make mac-setup` | PostgreSQL, Redis, migrations, and service |
+| Run everything in containers | [Docker Compose](#-docker-compose) | HealthMes, open-wearables, Redis, PostgreSQL, and Hermes |
+| Add wearable data | [Development guide](docs/DEVELOPMENT.md) | Provider OAuth, sync workers, and credentials |
+| Install a companion | [Companion Apps](#-companion-apps) | Pair an iPhone, Mac, Android, Watch, Wear OS, or Windows client |
+| Receive proactive messages | [Telegram and Hermes](#telegram-and-hermes) | Briefings, capture, and agent chat |
 
-## Full Mac-Native Setup
+## 🛠️ Full Mac-Native Setup
 
-The mac-native path is the primary development path. It installs
-`postgresql@16` and Redis with Homebrew, but does not use `brew services` or
-register global services. Runtime data stays under `./data/`.
+The macOS path is the primary local development path. It installs PostgreSQL
+16 and Redis with Homebrew without registering global services. Runtime data
+stays under `./data/`.
 
 ```bash
 make mac-setup
@@ -91,152 +171,217 @@ install -m 600 .env.example .env
 make mac-run
 ```
 
-Verify the service:
-
-```bash
-curl http://localhost:8100/health
-```
-
 Useful commands:
 
 ```bash
-make mac-services-status   # show PostgreSQL and Redis state
-make mac-services-stop    # stop repo-local services
-make mac-test              # run the offline test suite
-make mac-ow                # start the open-wearables API
-make mac-ow-worker         # start its Celery worker
-make mac-ow-beat           # start its periodic scheduler
+make mac-services-status
+make mac-services-stop
+make mac-test
+make mac-ow
+make mac-ow-worker
+make mac-ow-beat
 ```
 
-The full wearable path needs PostgreSQL and multiple long-running processes.
-Run `mac-ow`, `mac-ow-worker`, and `mac-ow-beat` in separate terminals. The
-provider OAuth and dogfooding steps are in
+The complete wearable path needs PostgreSQL and multiple long-running
+processes. Provider OAuth and dogfooding instructions are in
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
-## Docker Compose
-
-Use Docker when you want the complete multi-service stack or do not want to
-install the native PostgreSQL/Redis tools.
+## 🐳 Docker Compose
 
 ```bash
 install -m 600 .env.example .env
 install -m 600 config/open-wearables.env.example config/open-wearables.env
-```
-
-Set an API token before starting. Compose binds HealthMes to all interfaces,
-so it refuses to start without one:
-
-```bash
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-Put the generated value in `.env`:
+Put the generated token in `.env` before starting:
 
 ```dotenv
 HEALTHMES_API_TOKEN=paste-a-new-token-here
 HEALTHMES_TIMEZONE=Asia/Seoul
 ```
 
-Start the stack:
+HealthMes binds to all interfaces in Compose and refuses to start without a
+bearer token.
 
 ```bash
 docker compose up -d --build
 curl http://localhost:8100/health
-```
-
-Check service state and logs:
-
-```bash
 docker compose ps
 docker compose logs -f healthmes
-```
-
-Stop containers without removing named volumes:
-
-```bash
 docker compose down
 ```
 
-For a full compose walkthrough, including Hermes credentials and wearable
-provider setup, see
+For Hermes credentials and the full compose walkthrough, see
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#full-stack-docker-compose-alternative-path).
 
-## Add Real Data And Telegram
+## 📲 Companion Apps
 
-The five-minute demo is intentionally credential-free. Add integrations only
-after the local service is working.
+All native clients pair with your own HealthMes instance and share the same
+bearer-authenticated APIs. They use ETag/304 caching and pinned fixtures so
+glance surfaces remain consistent across platforms.
 
-1. **Wearables:** configure an `open-wearables` provider and verify its API
-   credentials. Oura OAuth is documented as a concrete example in the
-   [development guide](docs/DEVELOPMENT.md#oura-oauth-dogfooding-mac-native).
-2. **Calendar:** use `uv run healthmes connect google` or the iCloud CalDAV
-   flow documented in the
-   [calendar section](docs/DEVELOPMENT.md#캘린더-연결-calendar-connect).
-3. **Telegram and Hermes:** fill in the required provider keys and run:
+### 🍎 iPhone and Apple Watch
 
-   ```bash
-   uv run python scripts/bootstrap.py --dry-run
-   uv run python scripts/bootstrap.py
-   ```
+Source: [`apps/ios-companion/`](apps/ios-companion/)
 
-   Bootstrap renders Hermes configuration outside `vendor/`, copies the
-   HealthMes skills, and registers morning, evening, and weekly briefings.
-4. **CLI chat without Telegram:** use the same configured agent from the
-   terminal:
+- iPhone wellness canvas with Today, Plan, Explore, Settings, calendar
+  blocks, goals, tasks, reports, capture, and decision details.
+- Voice and editable-text command dock for bounded wellness actions.
+- Local notifications from `/v1/alerts` with exact `proposal_id` routing and
+  **Yes / No / Speak** actions.
+- Decision Live Activity with action buttons and explicit expiration states.
+- Focus-block Live Activity with timer and progress.
+- Home and Lock Screen widgets for energy, next blocks, and alerts.
+- Apple Watch remote paired through WatchConnectivity, with compact decision
+  actions, notification actions, spoken-command relay, app, and complication.
+- First-party HealthKit collector on iPhone with a pairing-scoped encrypted
+  outbox, stable `Idempotency-Key`, retry, durable hash/size ACK, and anchor
+  advancement only after accepted forwarding state.
+- Real device pairing requires HTTPS. Loopback HTTP is for local development
+  only.
 
-   ```bash
-   cd vendor/hermes-agent
-   HERMES_HOME=~/.hermes \
-     UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
-     uv run --frozen --no-dev --extra messaging hermes
-   ```
+### 🖥️ macOS
 
-Required credentials and the provider matrix are listed in
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#real-credentials-what-needs-what).
-Never commit `.env`, OAuth client secrets, bearer tokens, refresh tokens, or
-raw health payloads.
+Source: [`apps/macos-companion/`](apps/macos-companion/)
 
-## What It Includes
+- Full SwiftUI workspace with sidebar, channels, local workspace threads,
+  inspector, calendar, goal, task, decision, and report views.
+- Bounded voice/text commands and local workspace state.
+- `HealthMesMac` main app plus menu bar glance/popover.
+- `HealthMesMacWidgets` WidgetKit extension.
+- `HealthMesSaver` `.saver` ambient briefing with a privacy toggle that
+  removes health-derived values while retaining schedule and freshness.
+- Notification manager polls `/v1/alerts`, follows the proposal grammar, and
+  supports exact Yes/No actions with outcome handling.
+- Setup can install/manage a local runtime and generate a one-time QR pairing
+  code.
 
-### Health and planning
+### 🤖 Android and Wear OS
 
-- Wearable health scores and daily readiness context through
-  `open-wearables`.
-- Explainable cognitive-energy forecasts with sleep, stress/HRV, body
-  battery, meeting load, app fragmentation, and optional signals.
-- Weekly goals, tasks, energy-aware schedule proposals, and calendar mirrors.
-- Deterministic proactive triggers for recovery, stress, schedule changes, and
-  deadline risk.
+Source: [`apps/android-usage/`](apps/android-usage/)
 
-### Explainability and capture
+- `:companion`: Jetpack Compose app with Home, Report, Capture, Proposals, and
+  Settings.
+- Home energy score, energy curve, next blocks, alerts, and decision links.
+- Camera/photo/voice capture flows.
+- Real notification buttons: **Apply / Adjust / Keep**, routed to the exact
+  proposal endpoint with explicit 409 already-resolved handling.
+- Ongoing focus-block notification with countdown, bridged from phone to Wear.
+- Glance widget with a 15-minute ETag-aware refresh.
+- `:wear`: standalone pairing activity, cache-first ProtoLayout briefing tile,
+  energy complication, and compact wearable briefing.
+- `:app`: Android UsageStats collector with encrypted pairing, collection
+  generation, privacy boundary, and HTTPS-only telemetry origin.
 
-- Decision records rendered as local Mermaid flowcharts at `/decisions/{id}`.
-- Weekly reports at `/reports/weekly` and `/reports/weekly.json`.
-- Telegram capture for food, medication, and symptoms through the
-  `healthmes-capture` skill.
-- Evidence-aware MCP tools that report confidence, coverage, and
-  `insufficient_data` instead of inventing certainty.
+### 🪟 Windows
 
-### Apps and glance surfaces
+Source: [`apps/windows-companion/`](apps/windows-companion/)
 
-Native companions use the same bearer-authenticated contracts and pair with
-your own HealthMes instance:
+- .NET 8 solution with portable `HealthMes.Glance.Core`.
+- Tray icon, flyout briefing, toast notifications, and proposal actions.
+- `.scr` screensaver supporting `/s`, `/p`, and `/c` modes.
+- Privacy toggle for removing health-derived values from ambient surfaces.
+- DPAPI-backed pairing and secure local configuration.
+- Widgets Board provider integration point is present; packaging/signing is
+  intentionally deferred because it requires an MSIX/signing environment.
 
-| Surface | Location | Purpose |
-|---|---|---|
-| Android + Wear OS | [`apps/android-usage/`](apps/android-usage/) | Briefing, weekly report, capture, widgets, Wear tile, usage collection |
-| iOS + watchOS | [`apps/ios-companion/`](apps/ios-companion/) | Briefing, capture, notifications, widgets, watch app, complications |
-| macOS | [`apps/macos-companion/`](apps/macos-companion/) | Menu bar briefing, widgets, ambient screensaver |
-| Windows | [`apps/windows-companion/`](apps/windows-companion/) | Tray briefing, notifications, widgets-board card, screensaver |
+### ✈️ Telegram and Hermes
 
-Build and verification status for each platform lives in its app README.
-Visual notification and watch UX remains deliberately placeholder-labeled;
-see [`docs/design/WATCH-NOTIFICATIONS.ko.md`](docs/design/WATCH-NOTIFICATIONS.ko.md).
+HealthMes remains paired to your local instance while Hermes provides the
+agent runtime, skills, memory, cron, Telegram gateway, and MCP client.
 
-### Backups
+```bash
+uv run python scripts/bootstrap.py --dry-run
+uv run python scripts/bootstrap.py
+```
 
-HealthMes can create local age-encrypted snapshots containing the HealthMes
-database, optional wearable database dump, media, and Hermes state:
+Bootstrap renders Hermes configuration outside `vendor/`, installs HealthMes
+skills, and registers morning, evening, and weekly briefings.
+
+For terminal chat without Telegram:
+
+```bash
+cd vendor/hermes-agent
+HERMES_HOME=~/.hermes \
+  UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+  uv run --frozen --no-dev --extra messaging hermes
+```
+
+Telegram is the guaranteed-delivery channel. Native notifications are
+polling- and OS-budgeted companions, not a replacement for Telegram delivery.
+
+## 🔌 How It Works
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ Inputs                                                               │
+│ HealthKit · wearables · UsageStats · calendar · nutrition · capture  │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ normalize, store, retain
+┌──────────────────────────────▼───────────────────────────────────────┐
+│ HealthMes local service                                              │
+│ energy engines · triggers · goals/tasks · alerts · reports · MCP     │
+└───────────────┬──────────────────────────────┬───────────────────────┘
+                │ REST / JSON                  │ MCP / responses
+┌───────────────▼───────────────┐  ┌───────────▼───────────────────────┐
+│ Web + native clients           │  │ Hermes agent runtime              │
+│ dashboard · iPhone · Watch    │  │ skills · memory · cron · Telegram  │
+│ macOS · Android · Wear · Win  │  └─────────────────────────────────────┘
+└───────────────┬───────────────┘
+                │ bounded action with exact proposal identity
+┌───────────────▼──────────────────────────────────────────────────────┐
+│ User-visible outcome                                                 │
+│ decision viewer · notification action · calendar proposal · report    │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+HealthMes-owned code lives at the repository root and communicates with two
+unmodified vendored upstreams through documented contracts:
+
+- `vendor/open-wearables/`: wearable data plane and provider integrations.
+- `vendor/hermes-agent/`: agent runtime, skills, memory, cron, Telegram, and
+  MCP client.
+
+Do not modify either vendored tree in HealthMes tasks.
+
+## 🧺 Data Sources and Integrations
+
+- Wearable recovery, sleep, activity, HRV, stress, and body-battery data
+  through `open-wearables`.
+- First-party Apple HealthKit ingestion with encrypted delivery buffering.
+- Android UsageStats for app-fragmentation and focus context.
+- Google Calendar and iCloud CalDAV connection flows.
+- Nutrition, medication, symptom, and subjective capture.
+- Environment and schedule context.
+- Input control plane at `/v1/inputs`, `/v1/inputs/{source_id}`, and
+  `PUT /v1/inputs/{source_id}/settings`.
+- Settings hub at `/v1/settings/hub` and setup readiness at
+  `/v1/setup/readiness`.
+- Strong ETag and `If-Match` concurrency controls for mutable settings and
+  proposals.
+
+Provider credentials, OAuth setup, and integration-specific requirements are
+documented in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+
+## 🔒 Security and Privacy
+
+- Local-first by default: no analytics, no third-party relay, and no hosted
+  wellness profile required.
+- Non-loopback network binds require a bearer token.
+- Native secrets use platform storage: Keychain, DPAPI, or
+  EncryptedSharedPreferences.
+- Real iPhone pairing requires HTTPS.
+- HealthKit forwarding uses pairing-scoped encryption, stable idempotency, and
+  durable acknowledgements.
+- Local backups are age-encrypted; remote replication stores ciphertext only
+  in S3-compatible storage such as S3, R2, or MinIO.
+- Calendar mutations and wellness proposals stop at explicit confirmation
+  boundaries.
+- Never commit `.env`, OAuth client secrets, bearer tokens, refresh tokens, or
+  raw health payloads.
+
+Create and manage backups with:
 
 ```bash
 export HEALTHMES_BACKUP_PASSPHRASE='use-a-password-manager'
@@ -246,40 +391,40 @@ uv run healthmes backup restore <name>       # dry-run
 uv run healthmes backup restore <name> --yes # apply
 ```
 
-An S3-compatible remote vault can replicate ciphertext-only snapshots. Read
-[`docs/BACKUP.md`](docs/BACKUP.md) before enabling remote replication. Losing
-the passphrase means losing access to the encrypted backups.
+Read [`docs/BACKUP.md`](docs/BACKUP.md) before enabling remote replication.
+Losing the passphrase means losing access to the encrypted backups.
 
-## How It Fits Together
+## 🧪 Build Matrix
 
-```text
-wearables ──REST──> HealthMes service ──MCP──> Hermes Agent ──> Telegram
-                         │       │
-                         │       ├── REST/MCP API
-                         │       ├── decision viewer
-                         │       └── weekly report
-                         └── local database + encrypted backups
-```
+| Surface | Implementation | Verification status |
+|---|---|---|
+| Web and API | Python, FastAPI, local store, MCP | Offline unit, API, contract, and integration coverage |
+| iPhone and Watch | SwiftUI, HealthKit, WatchConnectivity, WidgetKit, ActivityKit | Build and contract coverage; real hardware, signing, background-budget, and notification QA remain device-specific |
+| macOS | SwiftUI, WidgetKit, UserNotifications, screensaver target | Build and contract coverage; signing and OS behavior remain device-specific |
+| Android and Wear | Kotlin, Compose, Glance, ProtoLayout, UsageStats | Build and fixture/contract coverage; hardware and OS-budget QA remain device-specific |
+| Windows | .NET 8, WinUI/tray/toasts, screensaver | Build and core coverage; MSIX/signing and Widgets Board packaging remain environment-specific |
+| Telegram and Hermes | Hermes runtime, HealthMes skills, MCP | Bootstrap and contract coverage; external provider behavior depends on configured credentials |
 
-HealthMes is the glue plane around two unmodified vendored upstreams:
+The product surfaces above are implemented. Hardware, signing, OS
+notification delivery, background execution budgets, and some Apple Screen
+Time capability paths still require device-specific QA.
 
-- `vendor/open-wearables/` — wearable data plane and provider integrations.
-- `vendor/hermes-agent/` — agent runtime, skills, memory, cron, Telegram
-  gateway, and MCP client.
-
-HealthMes-owned code lives at the repository root and communicates with those
-upstreams through documented REST, MCP, webhook, and rendered-configuration
-contracts. Do not modify either vendored tree.
-
-## Repository Guide
+## 📚 Documentation
 
 | Need | Document |
 |---|---|
 | Architecture and product rationale | [`docs/PLAN.md`](docs/PLAN.md) |
-| Development, credentials, integrations, tests, and CI | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) |
-| Add metrics, skills, or insight templates | [`docs/EXTENDING.md`](docs/EXTENDING.md) |
+| Wellness runtime architecture | [`docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md) |
+| Apple main integration | [`docs/APPLE-MAIN-INTEGRATION.ko.md`](docs/APPLE-MAIN-INTEGRATION.ko.md) |
+| Development, credentials, integrations, and tests | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) |
+| Extend metrics, skills, or insight templates | [`docs/EXTENDING.md`](docs/EXTENDING.md) |
+| Backup format and remote vault | [`docs/BACKUP.md`](docs/BACKUP.md) |
+| Storage architecture | [`docs/STORAGE-ARCHITECTURE.ko.md`](docs/STORAGE-ARCHITECTURE.ko.md) |
 | Healthcare expert onboarding | [`docs/EXPERT-ONBOARDING.ko.md`](docs/EXPERT-ONBOARDING.ko.md) |
-| Backup format and remote-vault contract | [`docs/BACKUP.md`](docs/BACKUP.md) |
+| iPhone and Watch companion | [`apps/ios-companion/README.md`](apps/ios-companion/README.md) |
+| macOS companion | [`apps/macos-companion/README.md`](apps/macos-companion/README.md) |
+| Android and Wear companion | [`apps/android-usage/README.md`](apps/android-usage/README.md) |
+| Windows companion | [`apps/windows-companion/README.md`](apps/windows-companion/README.md) |
 | Contribution workflow | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 Main directories:
@@ -294,20 +439,6 @@ alembic/       HealthMes database migrations
 tests/         Offline unit, API, contract, and integration tests
 vendor/        Read-only upstream snapshots
 ```
-
-## Development Checks
-
-Run the checks used by CI before opening a change:
-
-```bash
-uv run ruff check .
-uv run pytest -q
-docker compose config -q
-make mac-test
-```
-
-CI covers Linux lint/tests, macOS native tests, compose validation, migration
-rendering, and a compose boot smoke test. Tests do not call external services.
 
 ## License
 
