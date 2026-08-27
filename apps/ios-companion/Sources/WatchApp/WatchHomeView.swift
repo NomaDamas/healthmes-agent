@@ -9,7 +9,17 @@ struct WatchHomeView: View {
     var body: some View {
         WatchDecisionRemoteView(model: model)
             .padding(.horizontal, 2)
-            .task { await model.refresh() }
+            .task {
+                #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains(
+                        "-healthmes-watch-decision-demo"
+                    ) {
+                        model.installDecisionDemo()
+                        return
+                    }
+                #endif
+                await model.refresh()
+            }
             .onReceive(
                 NotificationCenter.default.publisher(for: .healthmesPairingChanged)
             ) { _ in

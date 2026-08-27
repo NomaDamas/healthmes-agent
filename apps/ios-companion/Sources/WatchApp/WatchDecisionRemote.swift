@@ -124,6 +124,90 @@ final class WatchDecisionRemoteModel: ObservableObject {
     private var refreshOperationGate = PairingOperationGate()
     private var resolutionOperationGate = PairingOperationGate()
 
+    #if DEBUG
+        func installDecisionDemo() {
+            let calendar = Calendar(identifier: .gregorian)
+            let now = Date()
+            let before = calendar.date(
+                bySettingHour: 14,
+                minute: 0,
+                second: 0,
+                of: now
+            ) ?? now
+            let after = calendar.date(
+                byAdding: .hour,
+                value: 1,
+                to: before
+            ) ?? before.addingTimeInterval(60 * 60)
+            let endsAt = calendar.date(
+                byAdding: .minute,
+                value: 90,
+                to: after
+            ) ?? after.addingTimeInterval(90 * 60)
+            let expiresAt = calendar.date(
+                byAdding: .hour,
+                value: 6,
+                to: now
+            ) ?? now.addingTimeInterval(6 * 60 * 60)
+            let proposalID = UUID(uuidString: "00000000-0000-0000-0000-000000000091")
+                ?? UUID()
+            let decisionID = UUID(uuidString: "00000000-0000-0000-0000-000000000092")
+                ?? UUID()
+            let taskID = UUID(uuidString: "00000000-0000-0000-0000-000000000093")
+                ?? UUID()
+            let card = DecisionCard(
+                decisionId: decisionID,
+                proposalId: proposalID,
+                kind: "schedule_change",
+                severity: "medium",
+                title: "Deep Work",
+                observationShort: "Low recovery · sleep debt",
+                evidenceShort: "HRV is 18% below your baseline",
+                proposedAction: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?",
+                before: before,
+                after: after,
+                endsAt: endsAt,
+                expiresAt: expiresAt,
+                decisionUrl: nil
+            )
+            let alert = AlertItem(
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000094")
+                    ?? UUID(),
+                ruleId: "demo.schedule_change",
+                firedAt: now,
+                summary: "Low recovery · sleep debt",
+                proposal: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?",
+                evidence: nil,
+                decisionUrl: nil,
+                proposalId: proposalID,
+                decisionCard: card
+            )
+            let proposal = ProposalItem(
+                id: proposalID,
+                taskId: taskID,
+                proposedStart: after,
+                proposedEnd: endsAt,
+                status: .proposed,
+                decisionRecordId: decisionID,
+                healthmesKind: "schedule_change",
+                acceptResolutionToken: "demo-accept",
+                declineResolutionToken: "demo-decline"
+            )
+            decision = PendingDecision(
+                proposal: proposal,
+                alert: alert,
+                prompt: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
+            )
+            energyScore = 62
+            wellnessImpact = "Save capacity for one important block."
+            timezone = TimeZone.current.identifier
+            isDecisionContextReady = true
+            availability = .current
+            result = nil
+            isLoading = false
+        }
+    #endif
+
     func refresh() async {
         // Refresh leaves the transient action/result screen and recomputes the
         // best available proposal or wellness glance from current data.
@@ -573,24 +657,21 @@ struct WatchDecisionRemoteView: View {
                 if let spokenDraft {
                     spokenConfirmation(spokenDraft, decision: decision)
                 } else {
-                    VStack(spacing: 5) {
-                        HStack(spacing: 7) {
-                            decisionButton(
-                                title: "No",
-                                image: "xmark",
-                                action: .decline,
-                                prominent: false,
-                                accessibilityLabel: "Reject: \(decision.primaryActionText)"
-                            )
-                            decisionButton(
-                                title: "Yes",
-                                image: "checkmark",
-                                action: .accept,
-                                prominent: true,
-                                accessibilityLabel: "Approve: \(decision.primaryActionText)"
-                            )
-                        }
-
+                    HStack(spacing: 5) {
+                        decisionButton(
+                            title: "No",
+                            image: "xmark",
+                            action: .decline,
+                            prominent: false,
+                            accessibilityLabel: "Reject: \(decision.primaryActionText)"
+                        )
+                        decisionButton(
+                            title: "Yes",
+                            image: "checkmark",
+                            action: .accept,
+                            prominent: true,
+                            accessibilityLabel: "Approve: \(decision.primaryActionText)"
+                        )
                         Button {
                             presentSpeakInput(for: decision)
                         } label: {
@@ -599,7 +680,7 @@ struct WatchDecisionRemoteView: View {
                                     ProgressView()
                                 } else {
                                     Label("Speak", systemImage: "microphone.fill")
-                                        .font(.caption.weight(.bold))
+                                        .font(.caption2.weight(.bold))
                                 }
                             }
                             .frame(maxWidth: .infinity, minHeight: 28)
