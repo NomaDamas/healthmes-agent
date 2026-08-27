@@ -237,6 +237,13 @@ pending proposal during this capture.
 |---|---|
 | **macOS workspace**<br>![HealthMes macOS workspace](artifacts/apple-unified-dashboard/macos-dashboard.png) | **Apple Watch remote**<br>![HealthMes Apple Watch remote](artifacts/apple-unified-dashboard/watch-42mm.png) |
 
+### 🎬 Interactive Demo
+
+The demo uses real iPhone, macOS, and Apple Watch simulator recordings,
+including the Watch `No / Yes / Speak` interaction.
+
+![HealthMes Agent interactive demo](docs/assets/healthmes-demo.gif)
+
 ## ⚡ Quick Start
 
 The fastest path is a local SQLite-backed service. It needs no PostgreSQL,
