@@ -94,23 +94,36 @@ descriptors from `GET /v1/inputs`, so capabilities, connection state,
 collection state, privacy notes, retention, and available actions stay
 consistent across clients.
 
-### Sources
+### The four inputs that shape a decision
 
-| Source ID | Domain | What it provides |
+HealthMes treats inputs as user-controlled domains. Each domain can be
+connected, paused, scoped, retained, and exposed to the Decision Agent
+independently.
+
+| Input | Sources | What HealthMes does with it |
 |---|---|---|
-| `activity.android` | Activity | Hourly app and category usage from Android UsageStats |
-| `activity.activitywatch` | Activity | Desktop foreground, idle, and hourly activity summaries |
-| `activity.ios-screentime` | Activity | iPhone Screen Time hourly app/category contract when an eligible signed build is available |
-| `nutrition.capture` | Nutrition | Photo VLM, text, voice transcript, nutrition, and caffeine capture |
-| `wearable.healthkit-bridge` | Wearable | First-party iPhone HealthKit collection and Open Wearables forwarding |
-| `wearable.open-wearables` | Wearable | Sleep, recovery, HRV, stress, and workout data |
-| `calendar.google` | Calendar | Calendar mirror, availability, and schedule density |
-| `calendar.icloud` | Calendar | iCloud calendar mirror, availability, and schedule density |
+| 🍽️ **Nutrition** | Photo capture, text, voice transcript, caffeine and food observations | Stores the original capture first, then normalizes bounded observations such as item, meal, caffeine, confidence, and confirmation state. Photo VLM output is an observation, not an unquestioned fact; the user can correct or mark the result as consumed, not consumed, or unknown. |
+| ⌚ **Open Wearables** | HealthKit bridge plus the separate Open Wearables data plane and its 11 provider integrations | Reads recovery, sleep, HRV, stress, readiness, body battery, strain, workouts, and supported time series through HealthMes's read-only REST adapter. HealthMes does not connect Hermes directly to the vendor MCP or modify `vendor/open-wearables/`. |
+| 🖥️ **Activity Monitoring** | ActivityWatch desktop, Android UsageStats, and eligible iPhone Screen Time aggregate | Converts foreground, idle, category, and app-usage summaries into canonical activity events for fragmentation and focus context. The privacy boundary excludes screenshots, keystrokes, URLs, and app content. Activity ingest is separate from Open Wearables ingest. |
+| 📅 **Calendar** | Google Calendar API and iCloud Calendar over CalDAV | Mirrors events, availability, schedule density, and sync metadata for planning. External events remain the source of truth; HealthMes proposes changes and requires explicit approval before changing an eligible HealthMes-owned block. It never silently edits a user's calendar. |
 
-The registry is capability-driven: it does not expose settings that a collector
-cannot enforce. For example, device activity sources can expose `enabled`,
-`paused_until`, and `excluded_apps`; nutrition and calendar sources expose the
-connection, sync, retention, and Decision access actions they actually support.
+The source registry behind these domains includes:
+
+| Source ID | Domain | Collection boundary |
+|---|---|---|
+| `nutrition.capture` | Nutrition | Photo VLM, text, voice transcript, nutrition, and caffeine capture |
+| `wearable.healthkit-bridge` | Open Wearables | iPhone HealthKit collector, encrypted outbox, and optional forwarding |
+| `wearable.open-wearables` | Open Wearables | Read-only REST mirror of wearable provider data |
+| `activity.activitywatch` | Activity Monitoring | Desktop foreground and idle activity summaries |
+| `activity.android` | Activity Monitoring | Android UsageStats app/category aggregates |
+| `activity.ios-screentime` | Activity Monitoring | Eligible iPhone Screen Time hourly app/category contract |
+| `calendar.google` | Calendar | Google Calendar mirror and sync |
+| `calendar.icloud` | Calendar | iCloud CalDAV mirror and sync |
+
+Every normalized record carries provenance, confidence or coverage where
+applicable, consent scope, retention class, and source/domain/data-class
+permissions. Missing data stays missing: engines omit unavailable factors and
+return `insufficient_data` instead of manufacturing certainty.
 
 ### Control Plane
 
@@ -209,9 +222,12 @@ fences, and platform-specific behavior, see
 
 These screenshots were refreshed from the current `main` code on August 26,
 2026 using seeded local data. They show the real Web entrypoint, macOS
-workspace, iPhone Today canvas, and Apple Watch decision remote. The Web
+workspace, iPhone Today canvas, and paired Apple Watch surface. The Web
 surface is the service entrypoint (`/`); current `main` does not expose a
-`/dashboard` route.
+`/dashboard` route. The Watch implementation also has an actionable decision
+remote and interactive notification category with **No / Yes / Speak**; the
+shown Watch frame is the glance state because the simulator did not surface a
+pending proposal during this capture.
 
 | Web | iPhone |
 |---|---|
@@ -257,7 +273,24 @@ Expected:
 The glance response should contain an energy score, a 24-hour curve, alert
 state, and the latest decision when demo data is available.
 
-### 3. Open the Web workspace
+### 3. Connect the Apple surfaces
+
+For the shortest end-to-end path:
+
+1. Keep the HealthMes service running on the Mac.
+2. Pair the iPhone with the same instance from **Settings**. Use HTTPS for a
+   real iPhone; loopback HTTP is only for a local simulator.
+3. Launch HealthMes on the paired Apple Watch. WatchConnectivity transfers the
+   pairing; the Watch then shows the current glance or an actionable decision.
+4. When a proposal is pending, choose **No**, **Yes**, or **Speak** on the
+   Watch. **Speak** opens the watch text-input/voice reply path and relays the
+   reviewed command through the iPhone.
+
+The Mac, iPhone, and Watch do not maintain separate wellness backends. They
+read the same HealthMes instance and preserve the proposal identity through
+each action.
+
+### 4. Open the Web workspace
 
 | URL | Use |
 |---|---|
@@ -274,7 +307,7 @@ current `main` service; use `/`, `/decisions`, or `/reports/weekly` instead.
 
 Stop the service with `Ctrl-C`.
 
-### 4. Try the API
+### 5. Try the API
 
 ```bash
 curl http://localhost:8100/v1/briefing/glance
@@ -537,28 +570,77 @@ polling- and OS-budgeted companions, not a replacement for Telegram delivery.
 
 ## 🔌 How It Works
 
+This is the top-level system boundary: HealthMes owns the product contract,
+canonical storage, normalization, policy, and delivery; Hermes owns the
+autonomous reasoning loop; Open Wearables remains a separate read-only data
+plane; clients never call either vendor runtime directly.
+
 ```text
-┌──────────────────────────────────────────────────────────────────────┐
-│ Inputs                                                               │
-│ HealthKit · wearables · UsageStats · calendar · nutrition · capture  │
-└──────────────────────────────┬───────────────────────────────────────┘
-                               │ normalize, store, retain
-┌──────────────────────────────▼───────────────────────────────────────┐
-│ HealthMes local service                                              │
-│ energy engines · triggers · goals/tasks · alerts · reports · MCP     │
-└───────────────┬──────────────────────────────┬───────────────────────┘
-                │ REST / JSON                  │ MCP / responses
-┌───────────────▼───────────────┐  ┌───────────▼───────────────────────┐
-│ Web + native clients           │  │ Hermes agent runtime              │
-│ dashboard · iPhone · Watch    │  │ skills · memory · cron · Telegram  │
-│ macOS · Android · Wear · Win  │  └─────────────────────────────────────┘
-└───────────────┬───────────────┘
-                │ bounded action with exact proposal identity
-┌───────────────▼──────────────────────────────────────────────────────┐
-│ User-visible outcome                                                 │
-│ decision viewer · notification action · calendar proposal · report    │
-└───────────────────────────────────────────────────────────────────────┘
+                                      +-------------------------------------+
+                                      |           USER SURFACES              |
+                                      | Web  macOS  iPhone  Apple Watch      |
+                                      | Android  Wear OS  Windows  Telegram  |
+                                      +------------------+------------------+
+                                                         | REST / JSON
+                                                         | inputs, glance,
+                                                         | alerts, reports
++----------------------------------------------------------------------------------------------------------------+
+|                                          HEALTHMES PRODUCT PLANE                                              |
+|                                                                                                                |
+|  +----------------------+    +----------------------+    +-----------------------------------------------+   |
+|  | INPUT ADAPTERS       |    | CONTROL + POLICY     |    | CANONICAL DOMAIN SERVICES                     |   |
+|  | Nutrition            |--->| /v1/inputs           |--->| raw-first ingest, normalization, provenance  |   |
+|  | Open Wearables       |    | consent, retention   |    | activity, nutrition, calendar, wearable       |   |
+|  | Activity Monitoring  |    | source/data scopes   |    | energy, triggers, goals, tasks, reports       |   |
+|  | Calendar             |    | ETag / If-Match CAS  |    | alerts, proposals, decision records           |   |
+|  +----------+-----------+    +----------------------+    +-------------------------+---------------------+   |
+|             |                                                                      |                     |
+|             | durable raw bytes + canonical records                                 | bounded context     |
+|             v                                                                      v                     |
+|  +------------------------------------------------------------------------------------------------------+  |
+|  | STORAGE + DURABILITY                                                                                  |  |
+|  | SQLite/PostgreSQL, raw ingest/media, encrypted HealthKit outbox, Redis runtime, encrypted backups  |  |
+|  +------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                |
+|  +------------------------------------------------------------------------------------------------------+  |
+|  | HEALTHMES MCP: search_activity, search_nutrition, search_calendar, search_wearable                 |  |
+|  |                list_wellness_skills, read_wellness_skill                                             |  |
+|  +------------------------------------------------------+-----------------------------------------------+  |
++---------------------------------------------------------|------------------------------------------------------+
+                                                          | filtered, read-oriented MCP only
+                                                          v
+                          +----------------------------------------------------------------+
+                          | HERMES AGENT RUNTIME                                         |
+                          | autonomous LLM + tool loop, skills, memory, cron, Telegram  |
+                          | POST /v1/responses                                            |
+                          +-------------------------------+--------------------------------+
+                                                          | evidence, confidence, source refs
+                                                          v
+                          +----------------------------------------------------------------+
+                          | DECISION + DELIVERY                                         |
+                          | deterministic trigger -> Hermes reasoning -> record       |
+                          | alert -> proposal -> explicit Yes / No / Speak -> outcome  |
+                          +----------------------------------------------------------------+
+
+  Apple Watch data path:
+  Apple Watch --HealthKit--> iPhone collector --encrypted outbox-->
+  POST /v1/ingest/healthkit --durable ACK/hash/size--> canonical records
+
+  Vendor boundaries:
+  HealthMes --OWClient REST read-only--> vendor/open-wearables/ (separate data plane)
+  HealthMes --rendered config and skills outside vendor--> vendor/hermes-agent/
 ```
+
+The canonical question path is:
+
+```text
+Client -> POST /v1/wellness-decisions -> Hermes /v1/responses
+       -> filtered HealthMes MCP -> evidence-backed decision/proposal
+       -> explicit user action -> persisted outcome
+```
+
+Native clients use the Main REST APIs. They do not call Hermes, HealthMes MCP,
+or Open Wearables directly.
 
 HealthMes-owned code lives at the repository root and communicates with two
 unmodified vendored upstreams through documented contracts:
