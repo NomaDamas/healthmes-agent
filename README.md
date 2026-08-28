@@ -11,6 +11,13 @@ third-party relay.
 > HealthMes is personal software, not a medical device and not a substitute
 > for professional medical advice.
 
+### 🎬 Interactive Demo
+
+The demo uses real iPhone, macOS, and Apple Watch simulator recordings,
+including the Watch `No / Yes / Speak` interaction.
+
+![HealthMes Agent interactive demo](docs/assets/healthmes-demo.gif)
+
 ## 🧭 Index
 
 - [What is HealthMes?](#-what-is-healthmes)
@@ -236,13 +243,6 @@ pending proposal during this capture.
 | macOS | Apple Watch |
 |---|---|
 | **macOS workspace**<br>![HealthMes macOS workspace](artifacts/apple-unified-dashboard/macos-dashboard.png) | **Apple Watch remote**<br>![HealthMes Apple Watch remote](artifacts/apple-unified-dashboard/watch-42mm.png) |
-
-### 🎬 Interactive Demo
-
-The demo uses real iPhone, macOS, and Apple Watch simulator recordings,
-including the Watch `No / Yes / Speak` interaction.
-
-![HealthMes Agent interactive demo](docs/assets/healthmes-demo.gif)
 
 ## ⚡ Quick Start
 
